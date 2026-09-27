@@ -9,5 +9,8 @@
 *.o
 *.out
 
+# 部署时由 GitHub Actions 生成
+/ostep-labs.zip
+
 node_modules/
 __pycache__/

@@ -13,6 +13,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: 打包实验代码（国内读者从本站下载，不必访问 GitHub）
+        # 固定文件时间和顺序，代码没变时 zip 逐字节不变，rsync -c 就不会重传
+        run: |
+          find labs -type f -exec touch -d '2000-01-01 00:00:00 UTC' {} +
+          find labs -type f | LC_ALL=C sort | zip -qX ostep-labs.zip -@
+
       - name: rsync 到腾讯云
         env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -25,7 +31,7 @@ jobs:
           # 服务器端用 rrsync 把这把钥匙限制在 /var/www/tutorials 内，所以目标路径是相对的 ostep/
           # 跨境线路偶尔会抖，失败重试两次
           for i in 1 2 3; do
-            rsync -rlcz --delete --chmod=D755,F644 --timeout=60 \
+            rsync -rlczi --delete --chmod=D755,F644 --timeout=60 \
               --exclude=/.git/ --exclude=/.github/ --exclude=/.gitignore \
               --exclude=/source/ --exclude=/AUTHORING.md --exclude=/NEXT_STEPS.md --exclude=/README.md \
               -e "ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o ConnectTimeout=20" \

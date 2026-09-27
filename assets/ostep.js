@@ -197,17 +197,20 @@
     const all = document.querySelectorAll(".mcq"), done = document.querySelectorAll(".mcq.answered"), right = document.querySelectorAll('.mcq[data-correct="1"]');
     document.querySelectorAll(".quiz-score").forEach((el) => (el.textContent = `已答 ${done.length} / ${all.length}，答对 ${right.length}`));
   }
-  // 实验块：从 "cd labs/<slug>" 里认出实验目录，在块首加上 GitHub 源码链接和获取方式
+  // 实验块：从 "cd labs/<slug>" 里认出实验目录，在块首加上源码链接（本站镜像 + GitHub）和获取方式。
+  // 本站的 labs/ 由 Nginx 开了目录浏览；ostep-labs.zip 由部署流程打包，本地预览时不存在。
   const REPO = "https://github.com/shakespark/ostep-illustrated";
   function wireLabs(root) {
+    const site = /\/chapters\//.test(location.pathname) ? "../" : "";
     root.querySelectorAll(".lab").forEach((lab) => {
       const m = lab.textContent.match(/labs\/([0-9a-z-]+)/);
       if (!m || lab.querySelector(".lab-src")) return;
       const ext = { target: "_blank", rel: "noopener" };
       lab.prepend(h("p", { class: "lab-src" },
-        "代码：", h("a", { href: `${REPO}/tree/main/labs/${m[1]}`, ...ext }, `GitHub 上的 labs/${m[1]} ↗`),
-        "。下面的命令在仓库根目录运行，先用 ", h("code", {}, `git clone ${REPO}.git`),
-        " 或", h("a", { href: `${REPO}/archive/refs/heads/main.zip` }, "下载 zip"), " 获取整个仓库。"));
+        "代码：", h("a", { href: `${site}labs/${m[1]}/` }, `labs/${m[1]}`),
+        "（", h("a", { href: `${REPO}/tree/main/labs/${m[1]}`, ...ext }, "GitHub ↗"), "）。获取全部实验：",
+        h("a", { href: `${site}ostep-labs.zip` }, "下载 ostep-labs.zip"), " 解压，或 ", h("code", {}, `git clone ${REPO}.git`),
+        "；下面的命令在 labs/ 所在的目录运行。"));
     });
   }
   function wireCopy(root) {
