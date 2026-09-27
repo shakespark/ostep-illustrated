@@ -1,0 +1,969 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 49 章 · Sun 的网络文件系统（NFS）</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+  .defs { position: absolute; width: 0; height: 0; overflow: hidden; }
+  .trace td, .trace th { font-size: 13px; padding: 6px 9px; }
+  .trace td.msg { font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+  .trace tr.cur td { background: var(--accent-soft); }
+  .trace tr.bad td { color: var(--bad); }
+  .trace td.call { font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+  .panel-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; margin-top: 12px; }
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font-size: 13.5px; }
+  .panel h5 { margin: 0 0 4px; font-size: 13.5px; }
+  .panel.hot { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .panel.down { border-color: var(--bad); background: var(--bad-soft); }
+  .panel .mono { font-family: var(--mono); font-size: 12.5px; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; }
+  .kv span:nth-child(odd) { color: var(--muted); }
+  .ops-area { display: grid; grid-template-columns: minmax(180px, 260px) 1fr; gap: 12px; align-items: start; }
+  @media (max-width: 640px) { .ops-area { grid-template-columns: 1fr; } }
+  .ops-area textarea { min-height: 230px; font-size: 13px; }
+  .err { color: var(--bad); font-size: 13px; white-space: pre-wrap; }
+  .blk { display: inline-block; font-family: var(--mono); font-size: 13px; padding: 2px 8px; border-radius: 5px; border: 1px solid var(--border); background: var(--surface); margin: 2px 0; letter-spacing: .05em; }
+  .blk.new { border-color: var(--ok); background: var(--ok-soft); }
+  .blk.old { border-color: var(--bad); background: var(--bad-soft); }
+  .blk.mem { border-color: var(--warn); background: var(--warn-soft); }
+  .tag-ok { color: var(--ok); font-weight: 600; }
+  .tag-bad { color: var(--bad); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  #rt-stage svg, #cc-stage svg { max-width: none; }
+  .scrolly { max-height: 460px; overflow-y: auto; }
+  .sim select { max-width: 100%; }
+</style>
+</head>
+<body data-chapter="49">
+<main>
+
+<svg class="defs" aria-hidden="true" focusable="false">
+  <defs>
+    <marker id="d49-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker>
+    <marker id="d49-ah-c1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--c1)"/></marker>
+    <marker id="d49-ah-c3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--c3)"/></marker>
+  </defs>
+</svg>
+
+<h2>关键问题：如何构建分布式文件系统</h2>
+<div class="crux">
+  <p><strong>如何构建一个分布式文件系统？</strong>需要考虑哪些关键方面？哪些地方容易出错？能从现有系统中学到什么？</p>
+  <p class="small muted">原文：HOW TO BUILD A DISTRIBUTED FILE SYSTEM. How do you build a distributed file system? What are the key aspects to think about? What is easy to get wrong? What can we learn from existing systems?</p>
+</div>
+<p>分布式客户端/服务器计算最早的用途之一就是分布式文件系统：若干客户端机器、一台（或少数几台）服务器；服务器把数据存在自己的磁盘上，客户端通过格式良好的协议消息请求数据。本章研究其中最成功的一个：Sun 的 <strong>NFS（Network File System）</strong>，重点是它的第二版 NFSv2。上一章讲了通信和 RPC；这一章会看到，<strong>把协议设计成"无状态 + 幂等"</strong>，就能用上一章的"超时重试"统一地应对丢包和服务器崩溃。下一章的 AFS 则走了另一条路。</p>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>透明访问</h4><p>应用照常调用 open/read/write，感觉不到文件其实在远程服务器上（性能除外）。</p></div>
+  <div class="card"><h4>无状态（stateless）</h4><p>服务器不记录客户端在干什么；每个请求自带完成它所需的全部信息。</p></div>
+  <div class="card"><h4>文件句柄（file handle）</h4><p>卷 ID + inode 号 + 世代号，唯一标识一个文件或目录，几乎每个请求都带着它。</p></div>
+  <div class="card"><h4>幂等（idempotent）</h4><p>执行多次与执行一次效果相同。LOOKUP、READ、WRITE 都幂等，所以客户端可以放心重试。</p></div>
+  <div class="card"><h4>客户端缓存</h4><p>缓存读到的数据，并把写先缓冲在本地——性能大增，但带来缓存一致性问题。</p></div>
+  <div class="card"><h4>关闭时刷新（flush-on-close）</h4><p>文件关闭时把脏数据刷到服务器，让之后在别处打开的人看到新版本。</p></div>
+  <div class="card"><h4>GETATTR 与属性缓存</h4><p>用缓存前先问"文件改过没"；属性缓存减少询问次数，却让语义变得难以捉摸。</p></div>
+  <div class="card"><h4>服务器先落盘再回复</h4><p>WRITE 必须写入稳定存储后才能回复成功，否则崩溃会丢掉客户端以为已写入的数据。</p></div>
+</div>
+
+<h2>一个基本的分布式文件系统</h2>
+<figure class="fig">
+  <svg viewBox="0 0 720 210" width="720" role="img" aria-label="通用客户端/服务器系统">
+    <g font-size="13">
+      <rect x="20" y="20" width="110" height="36" rx="7" class="box-strong"/><text x="75" y="43" text-anchor="middle">Client 0</text>
+      <rect x="20" y="66" width="110" height="36" rx="7" class="box-strong"/><text x="75" y="89" text-anchor="middle">Client 1</text>
+      <rect x="20" y="112" width="110" height="36" rx="7" class="box-strong"/><text x="75" y="135" text-anchor="middle">Client 2</text>
+      <rect x="20" y="158" width="110" height="36" rx="7" class="box-strong"/><text x="75" y="181" text-anchor="middle">Client 3</text>
+      <ellipse cx="300" cy="107" rx="95" ry="50" class="box"/><text x="300" y="112" text-anchor="middle">网络（Network）</text>
+      <line x1="130" y1="38" x2="215" y2="88" class="arrow"/><line x1="130" y1="84" x2="206" y2="100" class="arrow"/>
+      <line x1="130" y1="130" x2="206" y2="114" class="arrow"/><line x1="130" y1="176" x2="215" y2="126" class="arrow"/>
+      <rect x="470" y="70" width="110" height="74" rx="8" class="accent-soft"/><text x="525" y="112" text-anchor="middle" font-weight="700">Server</text>
+      <line x1="395" y1="107" x2="470" y2="107" class="arrow"/>
+      <rect x="610" y="62" width="90" height="90" rx="8" class="box"/><text x="655" y="82" text-anchor="middle" font-size="12">RAID</text>
+      <rect x="622" y="92" width="18" height="46" rx="3" class="box-strong"/><rect x="646" y="92" width="18" height="46" rx="3" class="box-strong"/><rect x="670" y="92" width="18" height="46" rx="3" class="box-strong"/>
+      <line x1="580" y1="107" x2="610" y2="107" class="arrow"/>
+    </g>
+  </svg>
+  <figcaption>图 49.1：通用的客户端/服务器系统。磁盘都在服务器上。</figcaption>
+</figure>
+<p>为什么要这样安排，而不让客户端用自己的本地盘？首要原因是<strong>方便共享</strong>：在 Client 0 上访问的文件，换到 Client 2 上看到的还是同一个文件系统视图。其次是<strong>集中管理</strong>：备份只需在少数服务器上做。另外还有<strong>安全</strong>：把服务器锁在机房里能避免某些问题。</p>
+<figure class="fig">
+  <svg viewBox="0 0 600 220" width="600" role="img" aria-label="分布式文件系统架构">
+    <g font-size="13.5">
+      <rect x="20" y="20" width="230" height="40" rx="7" class="box-strong"/><text x="135" y="45" text-anchor="middle">客户端应用</text>
+      <rect x="20" y="80" width="230" height="40" rx="7" class="accent-soft"/><text x="135" y="105" text-anchor="middle" font-weight="600">客户端文件系统</text>
+      <rect x="20" y="140" width="230" height="40" rx="7" class="box"/><text x="135" y="165" text-anchor="middle">网络层</text>
+      <rect x="350" y="20" width="230" height="40" rx="7" class="accent-soft"/><text x="465" y="45" text-anchor="middle" font-weight="600">文件服务器</text>
+      <rect x="350" y="80" width="230" height="40" rx="7" class="box"/><text x="465" y="105" text-anchor="middle">网络层</text>
+      <rect x="350" y="140" width="230" height="40" rx="7" class="box-strong"/><text x="465" y="165" text-anchor="middle">磁盘</text>
+      <line x1="135" y1="60" x2="135" y2="78" class="arrow" marker-end="url(#d49-ah)"/><line x1="135" y1="120" x2="135" y2="138" class="arrow" marker-end="url(#d49-ah)"/>
+      <path d="M250,160 C300,160 300,100 348,100" class="arrow" marker-end="url(#d49-ah)"/>
+      <line x1="465" y1="80" x2="465" y2="62" class="arrow" marker-end="url(#d49-ah)"/><line x1="465" y1="60" x2="465" y2="138" class="arrow" style="stroke-dasharray:3 3"/>
+      <text x="135" y="205" text-anchor="middle" font-size="12" class="t-muted">系统调用 open/read/write/close/mkdir…</text>
+      <text x="465" y="205" text-anchor="middle" font-size="12" class="t-muted">读磁盘（或自己的内存缓存）</text>
+    </g>
+  </svg>
+  <figcaption>图 49.2：分布式文件系统的架构。两块关键软件：客户端文件系统与文件服务器。</figcaption>
+</figure>
+<p>客户端应用通过系统调用访问<strong>客户端文件系统</strong>。对应用而言，它和本地磁盘文件系统没有区别（性能除外）——这叫<strong>透明访问</strong>，谁会想用一个需要另一套 API 的文件系统呢？客户端文件系统负责执行系统调用所需的动作：比如 <code>read()</code> 时，向<strong>文件服务器</strong>发消息读某个块；服务器从磁盘（或自己的内存缓存）读出来，回消息；客户端把数据拷进用户缓冲区。之后再读同一块，可能直接命中客户端内存（甚至客户端磁盘）上的缓存，最好的情况下根本不产生网络流量。</p>
+
+<div class="aside" data-title="旁注：服务器为什么会崩溃">
+  <p>断电（恢复供电后才能重启）；服务器由几十万甚至上百万行代码组成，总有 bug 会被触发；内存泄漏，哪怕很小，最终也会耗尽内存；还有网络——如果网络分区了，客户端和服务器都在正常运行却无法通信，在客户端看来就像服务器崩溃了一样。</p>
+</div>
+
+<h2>NFS 的目标：简单快速的崩溃恢复</h2>
+<p>Sun 定义 NFS 的方式很特别：不做封闭的专有系统，而是发布一个<strong>开放协议</strong>，只规定客户端和服务器之间的消息格式。不同厂商可以各自开发 NFS 服务器，在保持互操作的前提下竞争（Oracle/Sun、NetApp、EMC、IBM……）。这种"开放市场"很可能就是 NFS 成功的原因。</p>
+<p>NFSv2 协议设计的首要目标是<strong>简单快速的服务器崩溃恢复</strong>。在多客户端、单服务器的环境里这非常合理：服务器宕机的每一分钟，所有客户端和它们的用户都没法干活——服务器怎么样，整个系统就怎么样。</p>
+<h3>关键：无状态</h3>
+<p>NFSv2 用<strong>无状态（stateless）协议</strong>实现这一目标：服务器从设计上就<strong>不追踪每个客户端在做什么</strong>——不知道谁缓存了哪些块、谁打开了哪些文件、每个文件的当前指针在哪。协议让每个请求都携带完成它所需的全部信息。</p>
+<p>反例是有状态的 <code>open()</code>：它返回一个文件描述符，之后的 <code>read()</code>/<code>write()</code> 都用这个描述符。</p>
+<pre><code>char buffer[MAX];
+int fd = open("foo", O_RDONLY);   // 得到描述符 fd
+read(fd, buffer, MAX);            // 通过 fd 从 foo 读 MAX 字节
+read(fd, buffer, MAX);            // 再读 MAX
+...
+read(fd, buffer, MAX);            // 再读 MAX
+close(fd);                        // 关闭文件</code></pre>
+<p>假如客户端把 <code>open</code> 直接变成一条"打开 foo，给我一个描述符"的消息，服务器在本地打开文件并把描述符发回来，之后客户端每次 read 都把描述符传给服务器。这个描述符就是客户端与服务器之间的<strong>共享状态</strong>（Ousterhout 称之为分布式状态）。它让崩溃恢复变得复杂：</p>
+<figure class="fig">
+  <svg viewBox="0 0 740 230" width="740" role="img" aria-label="有状态协议的两个恢复难题">
+    <g font-size="12.5">
+      <text x="180" y="20" text-anchor="middle" font-weight="700">服务器崩溃：描述符在服务器内存里</text>
+      <text x="70" y="44" text-anchor="middle" font-weight="600">客户端</text><text x="290" y="44" text-anchor="middle" font-weight="600">服务器</text>
+      <line x1="70" y1="52" x2="70" y2="220" class="stroke"/><line x1="290" y1="52" x2="290" y2="220" class="stroke"/>
+      <line x1="70" y1="62" x2="288" y2="80" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d49-ah-c1)"/><text x="120" y="66" style="fill:var(--c1)">OPEN("foo")</text>
+      <line x1="290" y1="86" x2="72" y2="104" style="stroke:var(--c3);stroke-width:2" marker-end="url(#d49-ah-c3)"/><text x="130" y="106" style="fill:var(--c3)">fd = 3</text>
+      <text x="298" y="84">表：3 → foo</text>
+      <line x1="70" y1="116" x2="288" y2="134" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d49-ah-c1)"/><text x="120" y="120" style="fill:var(--c1)">READ(fd=3)</text>
+      <rect x="230" y="146" width="120" height="22" rx="4" class="bad-soft"/><text x="290" y="161" text-anchor="middle" style="fill:var(--bad)">崩溃、重启</text>
+      <line x1="70" y1="176" x2="288" y2="194" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d49-ah-c1)"/><text x="120" y="180" style="fill:var(--c1)">READ(fd=3)</text>
+      <text x="298" y="200" style="fill:var(--bad)">fd 3 是什么？？</text>
+      <text x="400" y="20" font-weight="700">客户端崩溃：服务器不知道何时可以关闭</text>
+      <text x="470" y="44" text-anchor="middle" font-weight="600">客户端</text><text x="690" y="44" text-anchor="middle" font-weight="600">服务器</text>
+      <line x1="470" y1="52" x2="470" y2="220" class="stroke"/><line x1="690" y1="52" x2="690" y2="220" class="stroke"/>
+      <line x1="470" y1="62" x2="688" y2="80" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d49-ah-c1)"/><text x="520" y="66" style="fill:var(--c1)">OPEN("foo")</text>
+      <line x1="690" y1="86" x2="472" y2="104" style="stroke:var(--c3);stroke-width:2" marker-end="url(#d49-ah-c3)"/><text x="530" y="106" style="fill:var(--c3)">fd = 3</text>
+      <rect x="420" y="126" width="100" height="22" rx="4" class="bad-soft"/><text x="470" y="141" text-anchor="middle" style="fill:var(--bad)">客户端崩溃</text>
+      <text x="600" y="176" text-anchor="middle">永远等不到 CLOSE</text>
+      <text x="600" y="196" text-anchor="middle" class="t-muted">fd 3 一直占着……</text>
+    </g>
+  </svg>
+  <figcaption>图 49-A：共享状态让两边的崩溃都难以处理。</figcaption>
+</figure>
+<ul>
+  <li><strong>服务器崩溃</strong>：第一次 read 完成后、第二次 read 之前服务器崩溃。重启后客户端发来第二次 read，服务器根本不知道 fd 指的是哪个文件——那个信息只在内存里，崩溃时丢了。要处理这种情况，客户端和服务器必须设计某种<strong>恢复协议</strong>：客户端在内存里保留足够的信息，告诉服务器"fd 指的是 foo"。</li>
+  <li><strong>客户端崩溃</strong>更糟：客户端打开文件后崩溃了，服务器上的描述符被占着。正常情况下客户端最终会调用 close 通知服务器；可客户端崩溃时服务器永远收不到 close，它必须想办法察觉客户端已经崩溃，才能关闭文件。</li>
+</ul>
+<p>因此 NFS 的设计者选择了无状态方案：<strong>每个客户端操作都包含完成请求所需的全部信息</strong>。不需要花哨的崩溃恢复——服务器重新跑起来就行，客户端最坏也只是需要重试一次请求。</p>
+
+<h2>NFSv2 协议：文件句柄与协议消息</h2>
+<div class="crux">
+  <p><strong>如何定义一个无状态的文件协议？</strong><code>open()</code> 这类有状态调用显然不能出现在协议中（那需要服务器追踪打开的文件），可客户端应用又要调用 open、read、write、close 等标准 API。怎样让协议既无状态，又能支撑 POSIX 文件系统 API？</p>
+  <p class="small muted">原文：HOW TO DEFINE A STATELESS FILE PROTOCOL. How can we define the network protocol to enable stateless operation?</p>
+</div>
+<p>理解 NFS 协议的钥匙是<strong>文件句柄（file handle）</strong>：它唯一地描述一个操作要作用的文件或目录，因此许多协议请求都包含文件句柄。</p>
+<figure class="fig">
+  <svg viewBox="0 0 720 250" width="720" role="img" aria-label="文件句柄三个组成部分与世代号的作用">
+    <g font-size="13">
+      <text x="20" y="22" font-weight="700">文件句柄 = </text>
+      <rect x="110" y="6" width="150" height="30" rx="5" class="accent-soft"/><text x="185" y="26" text-anchor="middle">卷标识符（volume ID）</text>
+      <rect x="264" y="6" width="150" height="30" rx="5" class="ok-soft"/><text x="339" y="26" text-anchor="middle">inode 号</text>
+      <rect x="418" y="6" width="150" height="30" rx="5" class="warn-soft"/><text x="493" y="26" text-anchor="middle">世代号（generation）</text>
+      <text x="185" y="56" text-anchor="middle" font-size="12" class="t-muted">服务器可导出多个文件系统，</text>
+      <text x="185" y="72" text-anchor="middle" font-size="12" class="t-muted">指明是哪一个</text>
+      <text x="339" y="56" text-anchor="middle" font-size="12" class="t-muted">该分区中的哪个文件</text>
+      <text x="493" y="56" text-anchor="middle" font-size="12" class="t-muted">inode 号被重用时 +1</text>
+      <text x="20" y="110" font-weight="700">世代号为什么必要：</text>
+      <rect x="20" y="122" width="210" height="100" rx="8" class="box"/>
+      <text x="125" y="142" text-anchor="middle" font-weight="600">① 客户端 A 拿到句柄</text>
+      <text x="125" y="166" text-anchor="middle" class="mono">foo → {1, 37, 3}</text>
+      <text x="125" y="190" text-anchor="middle" font-size="12" class="t-muted">A 把它存在自己的</text>
+      <text x="125" y="206" text-anchor="middle" font-size="12" class="t-muted">打开文件表里</text>
+      <rect x="255" y="122" width="210" height="100" rx="8" class="box"/>
+      <text x="360" y="142" text-anchor="middle" font-weight="600">② B 删除 foo，新建 bar</text>
+      <text x="360" y="166" text-anchor="middle" class="mono">bar → {1, 37, 4}</text>
+      <text x="360" y="190" text-anchor="middle" font-size="12" class="t-muted">inode 37 被重用，</text>
+      <text x="360" y="206" text-anchor="middle" font-size="12" class="t-muted">世代号 3 → 4</text>
+      <rect x="490" y="122" width="210" height="100" rx="8" class="ok-soft"/>
+      <text x="595" y="142" text-anchor="middle" font-weight="600">③ A 用旧句柄 READ</text>
+      <text x="595" y="166" text-anchor="middle" class="mono">{1, 37, 3} ≠ 4</text>
+      <text x="595" y="190" text-anchor="middle" font-size="12">服务器发现世代号不符</text>
+      <text x="595" y="206" text-anchor="middle" font-size="12">→ 报错，而不是读到 bar</text>
+      <line x1="230" y1="172" x2="253" y2="172" class="arrow" marker-end="url(#d49-ah)"/><line x1="465" y1="172" x2="488" y2="172" class="arrow" marker-end="url(#d49-ah)"/>
+    </g>
+  </svg>
+  <figcaption>图 49-B：文件句柄的三个组成部分。服务器每次重用 inode 号时递增世代号，保证持有旧句柄的客户端不会意外访问新分配的文件。</figcaption>
+</figure>
+<p>协议中的重要消息（原书 Figure 49.4），外加一列本章后面会用到的"是否幂等"：</p>
+<div class="table-wrap"><table>
+  <tr><th>消息</th><th>参数</th><th>返回</th><th>幂等？</th></tr>
+  <tr><td><code>NFSPROC_GETATTR</code></td><td>文件句柄</td><td>属性</td><td class="tag-ok">是（只读）</td></tr>
+  <tr><td><code>NFSPROC_SETATTR</code></td><td>文件句柄、属性</td><td>属性</td><td class="tag-ok">是（设为给定值）</td></tr>
+  <tr><td><code>NFSPROC_LOOKUP</code></td><td>目录文件句柄、要查找的文件/目录名</td><td>文件句柄、属性</td><td class="tag-ok">是（只读）</td></tr>
+  <tr><td><code>NFSPROC_READ</code></td><td>文件句柄、偏移（offset）、字节数（count）</td><td>数据、属性</td><td class="tag-ok">是（只读）</td></tr>
+  <tr><td><code>NFSPROC_WRITE</code></td><td>文件句柄、偏移、字节数、数据</td><td>属性</td><td class="tag-ok">是（写到确切的偏移）</td></tr>
+  <tr><td><code>NFSPROC_CREATE</code></td><td>目录文件句柄、文件名、属性</td><td>文件句柄、属性</td><td class="tag-warn">需仔细考虑</td></tr>
+  <tr><td><code>NFSPROC_REMOVE</code></td><td>目录文件句柄、要删除的文件名</td><td>–</td><td class="tag-bad">否（重试时文件已不存在）</td></tr>
+  <tr><td><code>NFSPROC_MKDIR</code></td><td>目录文件句柄、目录名、属性</td><td>文件句柄、属性</td><td class="tag-bad">否（原书的例子）</td></tr>
+  <tr><td><code>NFSPROC_RMDIR</code></td><td>目录文件句柄、要删除的目录名</td><td>–</td><td class="tag-bad">否</td></tr>
+  <tr><td><code>NFSPROC_READDIR</code></td><td>目录句柄、要读的字节数、cookie</td><td>目录项、cookie（用来取后续目录项）</td><td class="tag-ok">是（只读）</td></tr>
+</table></div>
+<ul>
+  <li><strong>LOOKUP</strong> 用来取得文件句柄：客户端传入目录的句柄和要查找的名字，服务器返回该文件（或目录）的句柄及其属性。根目录 <code>/</code> 的句柄通过 <strong>挂载协议（mount protocol）</strong>获得（本章不展开）。例如打开 <code>/foo.txt</code>，客户端发送 LOOKUP(根目录句柄, "foo.txt")。</li>
+  <li><strong>属性（attributes）</strong>就是文件系统为每个文件记录的元数据：创建时间、最后修改时间、大小、属主和权限等——和 <code>stat()</code> 得到的信息是同一类。</li>
+  <li><strong>READ</strong> 带着句柄、偏移和字节数：句柄告诉服务器是哪个卷、哪个 inode，偏移和字节数告诉它读哪些字节。<strong>WRITE</strong> 类似，只是数据从客户端传给服务器，返回成功码和最新属性。</li>
+  <li><strong>GETATTR</strong> 给定句柄，取回文件属性，包括最后修改时间。为什么它很重要？看完后面的缓存一节就明白了。</li>
+</ul>
+
+<h2>从协议到文件系统：读一个文件的全过程</h2>
+<p>客户端文件系统跟踪打开的文件，把应用请求翻译成相应的协议消息；服务器只是响应协议消息，每条消息都包含完成请求所需的全部信息。下面的模拟器复刻原书 Figure 49.5：一个应用打开文件、读三次、关闭。注意三个细节：</p>
+<ol>
+  <li><strong>状态全在客户端</strong>：从整数 fd 到 NFS 文件句柄的映射、当前文件位置，都保存在客户端的打开文件表里。所以应用的 read（不带偏移）能被翻译成带确切偏移的 READ 消息；读成功后客户端更新文件位置。</li>
+  <li><strong>与服务器交互的时机</strong>：第一次 open 时发 LOOKUP；路径长的话要逐级查找，例如 <code>/home/remzi/foo.txt</code> 要发三次 LOOKUP。close 完全不用联系服务器。</li>
+  <li><strong>每个请求都自包含</strong>：这是能从服务器故障中优雅恢复的关键。试试勾选"服务器崩溃"，再切换到假想的有状态协议对比。</li>
+</ol>
+
+<section class="sim" id="sim-trace">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>open / read / close → NFS 协议消息</h3>
+    <div class="desc">逐步看应用的每个系统调用在客户端文件系统和服务器上分别引发了什么动作、发出了哪条消息。右侧面板显示客户端打开文件表和服务器保存的状态（无状态协议下永远是空的）。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>路径 <select id="tr-path"><option value="/foo">/foo</option><option value="/home/remzi/foo.txt">/home/remzi/foo.txt</option></select></label>
+      <label>MAX（每次读的字节数）<input type="number" id="tr-max" min="512" max="65536" step="512" value="4096"></label>
+      <label>read 次数 <input type="number" id="tr-n" min="1" max="6" value="3"></label>
+      <label>文件大小 <input type="number" id="tr-size" min="0" max="100000" step="512" value="16384"></label>
+    </div>
+    <div class="controls">
+      <label>服务器崩溃重启：<select id="tr-crash"><option value="0">不崩溃</option><option value="1" selected>第 1 次 read 之后</option><option value="2">第 2 次 read 之后</option></select></label>
+      <label>协议 <select id="tr-proto"><option value="nfs">NFSv2（无状态）</option><option value="stateful">假想的有状态协议</option></select></label>
+      <button id="tr-book">载入原书 Figure 49.5</button>
+    </div>
+    <div id="tr-step"></div>
+    <div class="stage"><div class="table-wrap scrolly" style="margin:0"><table class="trace" id="tr-table"></table></div></div>
+    <div class="panel-row" id="tr-panels"></div>
+    <div class="narrate" id="tr-narr"></div>
+    <div class="stats" id="tr-stats"></div>
+  </div>
+</section>
+
+<h2>用幂等操作处理服务器故障</h2>
+<p>客户端发出请求后，有时收不到回复。原因可能是请求在网络中丢了，可能是回复丢了，也可能是服务器崩溃了（过一会儿会重启，但这期间的请求全都丢失）。客户端该怎么办？</p>
+<p>NFSv2 的客户端用一种<strong>统一而优雅</strong>的方式处理所有这些失败：<strong>重试</strong>。发请求时设一个定时器；定时器到期前收到回复，就取消定时器，一切正常；到期了还没回复，客户端就假设请求没被处理，重发一次。</p>
+<p>能这样无脑重试，是因为大多数 NFS 请求都是<strong>幂等（idempotent）</strong>的：执行多次的效果等同于执行一次。往一个内存地址存一个值三次，和存一次一样，所以"存值"是幂等的；而把计数器加一三次，结果和加一次不同，所以"递增"不是幂等的。一般来说，只读数据的操作显然幂等；更新数据的操作则要仔细分析。</p>
+<ul>
+  <li><strong>LOOKUP 和 READ</strong> 平凡地幂等：它们只从服务器读信息。</li>
+  <li><strong>WRITE 也幂等</strong>，这更有意思：WRITE 消息包含数据、字节数，以及（关键地）<strong>要写入的确切偏移</strong>。重复写，结果和写一次一样。</li>
+</ul>
+<figure class="fig">
+  <svg viewBox="0 0 760 200" width="760" role="img" aria-label="三种丢失">
+    <g font-size="12.5">
+      <text x="125" y="20" text-anchor="middle" font-weight="700">情况 1：请求丢失</text>
+      <text x="40" y="42" text-anchor="middle" font-weight="600">客户端</text><text x="210" y="42" text-anchor="middle" font-weight="600">服务器</text>
+      <line x1="40" y1="50" x2="40" y2="190" class="stroke"/><line x1="210" y1="50" x2="210" y2="190" class="stroke"/>
+      <line x1="40" y1="65" x2="120" y2="85" style="stroke:var(--bad);stroke-width:2;stroke-dasharray:5 4"/>
+      <path d="M114,78 L126,92 M126,78 L114,92" style="stroke:var(--bad);stroke-width:2.5"/>
+      <text x="48" y="120">[send request]</text><text x="218" y="100" class="t-muted">（没收到消息）</text>
+      <text x="380" y="20" text-anchor="middle" font-weight="700">情况 2：服务器宕机</text>
+      <text x="295" y="42" text-anchor="middle" font-weight="600">客户端</text><text x="465" y="42" text-anchor="middle" font-weight="600">服务器</text>
+      <line x1="295" y1="50" x2="295" y2="190" class="stroke"/><line x1="465" y1="50" x2="465" y2="190" class="stroke" style="stroke-dasharray:3 4"/>
+      <line x1="295" y1="65" x2="463" y2="95" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d49-ah-c1)"/>
+      <rect x="430" y="100" width="70" height="22" rx="4" class="bad-soft"/><text x="465" y="115" text-anchor="middle" style="fill:var(--bad)">（down）</text>
+      <text x="303" y="140">[send request]</text>
+      <text x="635" y="20" text-anchor="middle" font-weight="700">情况 3：回复在返回途中丢失</text>
+      <text x="550" y="42" text-anchor="middle" font-weight="600">客户端</text><text x="720" y="42" text-anchor="middle" font-weight="600">服务器</text>
+      <line x1="550" y1="50" x2="550" y2="190" class="stroke"/><line x1="720" y1="50" x2="720" y2="190" class="stroke"/>
+      <line x1="550" y1="65" x2="718" y2="95" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d49-ah-c1)"/>
+      <text x="714" y="112" text-anchor="end" font-size="11.5">[recv] [handle] [send reply]</text>
+      <line x1="720" y1="125" x2="640" y2="145" style="stroke:var(--bad);stroke-width:2;stroke-dasharray:5 4"/>
+      <path d="M634,138 L646,152 M646,138 L634,152" style="stroke:var(--bad);stroke-width:2.5"/>
+      <text x="558" y="180">[send request]</text>
+    </g>
+  </svg>
+  <figcaption>图 49.6：三种丢失。客户端看到的都一样——没有回复——处理方式也都一样：超时后重试。</figcaption>
+</figure>
+<p>于是客户端可以用统一的方式处理所有超时：WRITE 请求丢了（情况 1），客户端重试，服务器执行写入，一切正常；请求发出时服务器宕机、第二次请求时已恢复（情况 2），同样正常；服务器收到 WRITE、写了盘、发了回复，但回复丢了（情况 3），客户端重发，服务器<strong>做完全相同的事</strong>：把同样的数据写到同样的位置并回复。消息丢失和服务器故障被统一处理了。</p>
+<p>一个小插曲：有些操作很难做成幂等。比如创建一个已经存在的目录会失败。于是如果服务器收到 MKDIR 并成功执行，但回复丢了，客户端重发时就会得到"失败"——而实际上操作第一次已经成功了。生活并不完美。</p>
+
+<section class="sim" id="sim-retry">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>服务器崩溃与幂等性</h3>
+    <div class="desc">选一个操作和一种失败情况，单步观察客户端超时重试的全过程，以及服务器上的数据被执行了几次。比较 WRITE（幂等）与 MKDIR、REMOVE、假想的 APPEND（不幂等）在"回复丢失"时的结局。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>操作 <select id="rt-op">
+        <option value="write">WRITE(FH, offset=2, "abc")</option>
+        <option value="read">READ(FH, offset=0, count=8)</option>
+        <option value="lookup">LOOKUP(dirFH, "data.txt")</option>
+        <option value="mkdir">MKDIR(dirFH, "new")</option>
+        <option value="remove">REMOVE(dirFH, "data.txt")</option>
+        <option value="append">APPEND(FH, "abc")（假想，NFSv2 没有）</option>
+      </select></label>
+      <label>失败情况 <select id="rt-fail">
+        <option value="none">无故障</option>
+        <option value="req">情况 1：请求丢失</option>
+        <option value="down">情况 2：服务器宕机</option>
+        <option value="reply" selected>情况 3：回复丢失</option>
+      </select></label>
+    </div>
+    <div id="rt-step"></div>
+    <div class="stage" id="rt-stage"></div>
+    <div class="panel-row" id="rt-panels"></div>
+    <div class="narrate" id="rt-narr"></div>
+    <div class="stats" id="rt-stats"></div>
+  </div>
+</section>
+
+<div class="aside" data-title="提示：幂等性威力强大 · 完美是优秀的敌人（伏尔泰定律）">
+  <p>当一个操作可以被执行多次时，处理它的失败就容易得多：直接重试即可；不幂等的操作让生活困难得多。</p>
+  <p>即使设计得很漂亮，也总有角落情况处理得不尽如人意。可以重新设计 mkdir 的语义让它幂等（想想怎么做？），但何必呢？NFS 的设计哲学覆盖了大多数重要情况，让整个系统在故障处理上简洁清晰。接受生活不完美、依然把系统造出来，是好工程的标志。据说这句智慧出自伏尔泰："……一位聪明的意大利人说，最好是好的敌人"，所以称之为伏尔泰定律（Voltaire's Law）。</p>
+</div>
+
+<h2>提升性能：客户端缓存</h2>
+<p>把所有读写请求都发到网络上会带来严重的性能问题：网络一般没那么快，尤其和本地内存或磁盘比。答案是<strong>客户端缓存（client-side caching）</strong>：NFS 客户端文件系统把从服务器读到的文件数据（和元数据）缓存在客户端内存里。第一次访问昂贵（要走网络），之后的访问由客户端内存快速服务。</p>
+<p>缓存还充当写操作的临时缓冲：应用第一次写文件时，客户端先把数据放进内存（与读缓存同一个缓存），稍后再写到服务器。这种<strong>写缓冲（write buffering）</strong>让应用 <code>write()</code> 的延迟与实际写入性能解耦：<code>write()</code> 立刻成功（只是把数据放进客户端缓存），之后才真正写到文件服务器。</p>
+<p>缓存让性能大增，问题解决了？并不。在有多个客户端缓存的系统中引入缓存，会带来一个有趣的大难题：<strong>缓存一致性问题（cache consistency problem）</strong>。</p>
+
+<h2>缓存一致性问题</h2>
+<figure class="fig">
+  <svg viewBox="0 0 640 210" width="640" role="img" aria-label="缓存一致性问题">
+    <g font-size="13">
+      <rect x="20" y="20" width="170" height="60" rx="8" class="box"/><text x="105" y="44" text-anchor="middle" font-weight="700">C1</text><text x="105" y="66" text-anchor="middle" class="mono">cache: F[v1]</text>
+      <rect x="235" y="20" width="170" height="60" rx="8" class="warn-soft"/><text x="320" y="44" text-anchor="middle" font-weight="700">C2</text><text x="320" y="66" text-anchor="middle" class="mono">cache: F[v2]</text>
+      <rect x="450" y="20" width="170" height="60" rx="8" class="box"/><text x="535" y="44" text-anchor="middle" font-weight="700">C3</text><text x="535" y="66" text-anchor="middle" class="mono">cache: empty</text>
+      <rect x="220" y="130" width="200" height="66" rx="8" class="accent-soft"/><text x="320" y="152" text-anchor="middle" font-weight="700">Server S</text>
+      <text x="320" y="172" text-anchor="middle" class="mono" font-size="12.5">disk: F[v1] at first</text><text x="320" y="189" text-anchor="middle" class="mono" font-size="12.5">F[v2] eventually</text>
+      <line x1="105" y1="80" x2="250" y2="128" class="arrow"/><line x1="320" y1="80" x2="320" y2="128" class="arrow"/><line x1="535" y1="80" x2="390" y2="128" class="arrow"/>
+    </g>
+  </svg>
+  <figcaption>图 49.7：缓存一致性问题。C1 读过 F 并缓存了 v1；C2 覆写了 F（v2）；C3 还没访问过 F。</figcaption>
+</figure>
+<p>这里其实有两个子问题：</p>
+<ul>
+  <li><strong>更新可见性（update visibility）</strong>：C2 可能把写缓冲在自己的缓存里一段时间才传给服务器。F[v2] 还在 C2 内存里时，其他客户端（比如 C3）访问 F 拿到的是旧版本 F[v1]。想象你在 C2 上更新了 F，再登录到 C3 读它，却得到旧的副本——令人沮丧。问题是：<em>一个客户端的更新，什么时候对其他客户端可见？</em></li>
+  <li><strong>陈旧缓存（stale cache）</strong>：C2 终于把写刷到了服务器，服务器有了最新版本 F[v2]。但 C1 的缓存里还是 F[v1]；C1 上的程序读 F，得到的是陈旧版本。</li>
+</ul>
+<p>NFSv2 的实现用两招应对：</p>
+<ol>
+  <li><strong>关闭时刷新（flush-on-close，又称 close-to-open 一致性语义）</strong>：应用写文件并关闭时，客户端把所有更新（缓存中的脏页）刷到服务器。这保证之后在另一个节点上的 open 能看到最新版本。</li>
+  <li><strong>使用缓存前先检查</strong>：客户端文件系统在使用缓存块之前，先发 <strong>GETATTR</strong> 请求取回文件属性，其中包括服务器上的最后修改时间。如果修改时间比文件被取进客户端缓存的时间更新，客户端就作废（invalidate）缓存中的这个文件，后续读会去服务器取最新版本；否则放心使用缓存。</li>
+</ol>
+<p>Sun 的团队实现后发现了新问题：服务器被 GETATTR 请求<strong>淹没</strong>了。好的工程原则是为常见情况设计并让它高效：常见情况是一个文件只被一个客户端访问（也许反复访问），可客户端每次都得发 GETATTR 确认没人改过——不停地问"有人改过这个文件吗？"，而绝大多数时候答案是"没有"。</p>
+<p>为此每个客户端加了<strong>属性缓存（attribute cache）</strong>：客户端仍然在访问前验证文件，但多数时候只查属性缓存。文件的属性在第一次访问时放进缓存，经过一段时间（比如 3 秒）后超时。在这 3 秒内，所有文件访问都会认定可以使用缓存文件，完全不与服务器通信。</p>
+
+<section class="sim" id="sim-cache">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>三个客户端的缓存一致性时间线</h3>
+    <div class="desc">在左边写操作序列（每行一个操作，每个操作耗时 1 秒），右边逐步观察 C1/C2/C3 的数据缓存、属性缓存、脏数据，以及服务器上的文件版本。统计栏会标出"读到陈旧数据"和"看不到别人未刷写的更新"。试着改属性缓存超时、关掉 flush-on-close，看问题何时出现、何时消失。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <span class="muted small">预设：</span>
+      <button data-cc="vis">更新可见性（图 49.7）</button>
+      <button data-cc="stale">属性缓存导致陈旧读</button>
+      <button data-cc="flood">GETATTR 风暴</button>
+      <button data-cc="noflush">不做 flush-on-close</button>
+    </div>
+    <div class="controls">
+      <label>属性缓存超时 T（秒）<input type="number" id="cc-T" min="0" max="30" value="3"></label>
+      <label><input type="checkbox" id="cc-flush" checked> 关闭时刷新（flush-on-close）</label>
+      <label><input type="checkbox" id="cc-val" checked> 使用缓存前检查（GETATTR）</label>
+      <label><input type="checkbox" id="cc-force"> open 时绕过属性缓存、强制 GETATTR</label>
+    </div>
+    <div class="ops-area">
+      <div>
+        <textarea id="cc-ops" spellcheck="false" aria-label="操作序列"></textarea>
+        <div class="muted small">语法：<code>C1 open</code> · <code>C1 read</code> · <code>C2 write v2</code> · <code>C2 close</code> · <code>C2 flush</code>（手动刷写）· <code>wait 3</code>（空等 3 秒）· <code>#</code> 开头为注释。服务器上 F 初始为 v1。</div>
+        <div class="err" id="cc-err"></div>
+      </div>
+      <div>
+        <div id="cc-step"></div>
+        <div class="panel-row" id="cc-panels" style="margin-top:0"></div>
+      </div>
+    </div>
+    <div class="stage" style="margin-top:12px"><div class="table-wrap scrolly" style="margin:0"><table class="trace" id="cc-table"></table></div></div>
+    <div class="narrate" id="cc-narr"></div>
+    <div class="stats" id="cc-stats"></div>
+  </div>
+</section>
+
+<h3>评价 NFS 的缓存一致性</h3>
+<p>flush-on-close 是为了"讲得通"而加的，却带来了性能问题：如果客户端创建了一个临时的、很快就删除的文件，它仍会被强制写到服务器。更理想的实现可以把这种短命文件留在内存里直到被删除，完全省掉与服务器的交互。</p>
+<p>更重要的是，属性缓存让人<strong>很难理解或推断自己到底拿到的是哪个版本的文件</strong>：有时是最新的，有时只是因为属性缓存还没超时，客户端就乐呵呵地把内存里的旧版本给了你。虽然大多数时候这没问题，但它（至今！）偶尔会导致奇怪的行为。NFS 客户端缓存就是这样一个有趣的例子：<strong>实现细节定义了用户可见的语义</strong>，而不是反过来。</p>
+
+<h2>服务端写缓冲的陷阱</h2>
+<p>NFS 服务器通常是内存充足的高配机器，也有缓存问题。读的时候，服务器把从磁盘读到的数据（和元数据）留在内存里，后续读就不用再访问磁盘，性能有（小）提升。更微妙的是写缓冲：<strong>NFS 服务器在把写强制写入稳定存储（比如磁盘或其他持久设备）之前，绝对不能对 WRITE 请求返回成功</strong>。它可以在内存里放一份副本，但提前回复成功会导致错误行为。为什么？答案在于我们对客户端如何处理服务器故障的假设。</p>
+<pre><code>write(fd, a_buffer, size);   // 用 a 填满第 1 块
+write(fd, b_buffer, size);   // 用 b 填满第 2 块
+write(fd, c_buffer, size);   // 用 c 填满第 3 块</code></pre>
+<section class="sim" id="sim-wb">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>服务器写缓冲 + 崩溃</h3>
+    <div class="desc">文件原来是 x/y/z 三块。客户端依次发出三个 WRITE（a、b、c），服务器在处理第 2 个 WRITE 时崩溃。比较"先回复、后落盘"和"先落盘、再回复"两种服务器的结局。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>服务器策略 <select id="wb-mode"><option value="unsafe">先回复、后落盘（错误）</option><option value="safe">先落盘、再回复（正确）</option></select></label>
+    </div>
+    <div id="wb-step"></div>
+    <div class="panel-row" id="wb-panels" style="margin-top:0"></div>
+    <div class="narrate" id="wb-narr"></div>
+  </div>
+</section>
+<p>在错误的实现里，客户端收到了三个"成功"，文件却变成 <code>aaaa / yyyy / cccc</code>：服务器在把第二块写盘之前就告诉客户端成功了，崩溃后旧数据留在了文件中间——视应用而定，这可能是灾难性的。</p>
+<p>为避免这个问题，NFS 服务器<strong>必须先把每个写提交到稳定（持久）存储，再告知客户端成功</strong>。这样客户端就能在写操作期间察觉服务器故障，并一直重试直到成功，永远不会出现上面那种新旧内容混杂的文件。</p>
+<p>这个要求让写性能（如果不花大功夫）成为 NFS 服务器的主要瓶颈。有些公司（例如 Network Appliance）就是为了"造一台写得快的 NFS 服务器"而成立的：一招是先把写放进<strong>带电池的内存（battery-backed memory）</strong>，既能快速回复 WRITE，又不怕丢数据，也不用马上写盘；另一招是使用专门为快速写盘设计的文件系统（受第 43 章日志结构文件系统影响）。</p>
+
+<div class="aside" data-title="旁注：创新孕育创新——VFS/vnode">
+  <p>把 NFS 带到世界上还需要其他基础创新，其中最持久的是 Sun 引入的<strong>虚拟文件系统（Virtual File System，VFS）/ 虚拟节点（vnode）接口</strong>，让不同的文件系统能方便地插入操作系统。VFS 层包括对整个文件系统的操作（挂载/卸载、获取全局统计、把所有脏数据刷盘等），vnode 层包括对文件的所有操作（open、close、read、write 等）。要实现一个新文件系统，只需定义这些"方法"，框架负责其余：把系统调用接到具体实现上、以集中方式完成所有文件系统通用的功能（如缓存），并让多种文件系统实现同时运行。今天的 Linux、BSD、macOS，甚至 Windows（可安装文件系统）都有某种形式的 VFS/vnode 层。即使 NFS 不再重要，它底下这些基础也会延续下去。</p>
+</div>
+
+<h2>先预测再验证</h2>
+<div class="exercise"><div class="q">在"open/read/close"模拟器里选 <code>/home/remzi/foo.txt</code>，read 3 次。预测：一共会发出多少条 LOOKUP、多少条 READ？close 会发消息吗？</div>
+  <details class="reveal"><summary>看答案</summary><div>3 条 LOOKUP（在 / 中查 home、在 home 中查 remzi、在 remzi 中查 foo.txt），3 条 READ（offset 分别为 0、MAX、2·MAX），close 不发任何消息，只释放本地打开文件表中的 fd。共 6 条请求。</div></details></div>
+<div class="exercise"><div class="q">保持"第 1 次 read 之后服务器崩溃"，分别选择 NFSv2 与假想的有状态协议。预测：第 2 次 read 在两种协议下各会怎样？</div>
+  <details class="reveal"><summary>看答案</summary><div>NFSv2：第 2 次 READ 带着文件句柄和 offset=MAX，重启后的服务器用句柄直接定位卷和 inode，照常返回数据——它本来就没保存任何客户端状态。有状态协议：READ(sfd=7) 到达时，服务器内存中的打开文件表已随崩溃消失，它不知道 7 指什么，只能报错；要恢复就需要额外的恢复协议。</div></details></div>
+<div class="exercise"><div class="q">在"服务器崩溃与幂等性"模拟器里，对 WRITE 依次试三种失败情况。预测：服务器执行 WRITE 的次数分别是多少？最终文件内容一样吗？</div>
+  <details class="reveal"><summary>看答案</summary><div>请求丢失：1 次；服务器宕机：1 次（第一次请求到达时服务器宕机，没有执行）；回复丢失：2 次。但三种情况的最终内容都是 <code>xxabcxxx</code>，与无故障时完全一样——这就是幂等。客户端不需要、也无法知道是哪种情况，一律重试即可。</div></details></div>
+<div class="exercise"><div class="q">改选 MKDIR，失败情况为"回复丢失"。预测：服务器上最终有没有 new 目录？客户端看到的结果是成功还是失败？换成 REMOVE 呢？</div>
+  <details class="reveal"><summary>看答案</summary><div>MKDIR：目录已经建好（第一次执行成功），但重试得到"目录已存在"错误，客户端被告知失败。REMOVE 同理：文件已被删除，重试得到"文件不存在"。服务器状态是对的，客户端看到的结果却是错的——这就是原书说的"有些操作很难做成幂等"。</div></details></div>
+<div class="exercise"><div class="q">在缓存一致性模拟器里点"属性缓存导致陈旧读"。预测：C1 在 t=5 和 t=6 的两次 read 各读到哪个版本？然后把 T 改为 0 再看。</div>
+  <details class="reveal"><summary>看答案</summary><div>C1 在 t=3 的 READ 顺带刷新了属性缓存。t=4 C2 关闭并刷写 v2。t=5 时属性缓存才过了 2 秒（&lt; 3），C1 不联系服务器，直接读缓存里的 v1——陈旧读！t=6 时属性缓存过期，GETATTR 发现 mtime 变了，作废缓存并重新 READ，得到 v2。T=0 时每次读前都会 GETATTR，t=5 就能读到 v2，但 GETATTR 次数增加。</div></details></div>
+<div class="exercise"><div class="q">点"GETATTR 风暴"，分别把 T 设为 0、3、10。预测 GETATTR 数量的变化。T 越大越好吗？</div>
+  <details class="reveal"><summary>看答案</summary><div>T=0 时每次 open/read 都要 GETATTR，共 9 次（单个客户端反复读一个没人改的文件，却不停问服务器"改过没"）；T=3 时降到 3 次；T=10 时只剩 1 次。但 T 越大，别的客户端修改后你读到旧数据的时间窗就越长。这是性能与一致性的权衡，也正是 NFS 语义难以捉摸的原因。</div></details></div>
+
+<h2>动手实验</h2>
+<div class="lab">
+  <p>NFS 需要服务器和挂载权限，不方便随手实验。这里用一个单进程 C 模拟器 <code>nfs_sim.c</code> 把本章的四个论点"跑一遍"：无状态读、幂等重试、世代号、服务器写缓冲。</p>
+  <pre><code><span class="cmd">cd labs/49-nfs &amp;&amp; make &amp;&amp; ./nfs_sim</span></code></pre>
+  <p class="small muted">示例输出（本机真实运行结果；该程序是确定性的，你的输出应当相同）：</p>
+  <pre><code>=== 1. Stateless READ survives a server crash (Figure 49.5) ===
+app: fd = open("/foo")
+  client -&gt; LOOKUP(rootdir FH{vol=1,ino=2,gen=1}, "foo")
+  server &lt;- returns FH{vol=1,ino=3,gen=1} + attributes (size=40)
+  client: open file table[fd=3] = { fh, pos=0 }
+app: read(fd=3, buf, 16)
+  client -&gt; READ(FH{vol=1,ino=3,gen=1}, offset=0, count=16)
+  server &lt;- 16 bytes "0123456789ABCDEF"
+  client: pos = 16
+  *** server crashes and reboots here (all server memory lost) ***
+app: read(fd=3, buf, 16)
+  client -&gt; READ(FH{vol=1,ino=3,gen=1}, offset=16, count=16)
+  server &lt;- 16 bytes "GHIJ0123456789ab"
+  client: pos = 32
+...
+--- same program over a hypothetical STATEFUL protocol ---
+  client -&gt; OPEN("/foo")
+  server &lt;- sfd=7 (server remembers: sfd 7 = foo, pos 0)
+  client -&gt; READ(sfd=7, count=16)
+  server &lt;- 16 bytes, server pos now 16
+  *** server crashes and reboots here ***
+  client -&gt; READ(sfd=7, count=16)
+  server &lt;- ERROR: unknown descriptor 7 (state lost in crash!)
+
+=== 2. Retrying after a LOST REPLY (Figure 49.6, case 3) ===
+WRITE(fh, offset=2, count=3, "abc")
+    before: size=8 data="xxxxxxxx"
+    try 1: server executes, result=3, reply LOST -&gt; client times out, retries
+    try 2: server executes again, result=3 -&gt; client sees this result
+    after : size=8 data="xxabcxxx"
+    =&gt; idempotent: same as executing once
+APPEND(fh, "abc")  [hypothetical]
+    ...
+    after : size=14 data="xxxxxxxxabcabc"
+    =&gt; NOT idempotent: data appended twice
+MKDIR(rootdir, "newdir")
+    try 1: server executes, result=0, reply LOST -&gt; client times out, retries
+    try 2: server executes again, result=-17 (EEXIST) -&gt; client sees this result
+    =&gt; NOT idempotent: op succeeded, but client is told it failed
+...
+=== 3. Generation number in the file handle ===
+[server CHECKS generation]
+  client A caches handle for foo: FH{vol=1,ino=3,gen=1}
+  client B: rm foo; create secret -&gt; reuses inode 3, new handle FH{vol=1,ino=3,gen=2}
+  client A: READ(old handle) -&gt; ESTALE (stale file handle), good
+[server IGNORES generation]
+  ...
+  client A: READ(old handle) -&gt; "TOP-SECRET"  &lt;-- read someone else's file!
+
+=== 4. Server-side write buffering + crash ===
+[reply BEFORE commit (wrong)]
+  WRITE block 0 = aaaaaaaa: server buffers in memory, replies OK; later flushed to disk
+  WRITE block 1 = bbbbbbbb: server buffers in memory, replies OK
+  *** server crashes: memory lost (block 1 never reached disk) ***
+  WRITE block 2 = cccccccc: server buffers in memory, replies OK; later flushed to disk
+  client believes all 3 writes succeeded. Final file on server disk:
+    aaaaaaaa
+    yyyyyyyy   &lt;--- oops
+    cccccccc</code></pre>
+  <p>对照本页的模拟器阅读每一段输出；可以试着修改 <code>nfs_sim.c</code>：例如给 APPEND 加上"请求编号去重"，或者把 MKDIR 改成"目录已存在且是我刚建的就返回成功"，想想它们各需要服务器保存什么状态。详见 <code>labs/49-nfs/README.md</code>。</p>
+</div>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="1"><div class="q">NFSv2 协议设计的首要目标是什么？</div>
+  <div class="opts"><button>A. 支持尽可能多的客户端</button><button>B. 简单快速的服务器崩溃恢复</button><button>C. 严格的缓存一致性</button><button>D. 最高的读写带宽</button></div>
+  <div class="explain">原书："the main goal in the design of the protocol was simple and fast server crash recovery"。追求可扩展性（支持更多客户端）是下一章 AFS 的目标。</div></div>
+<div class="mcq" data-answer="0"><div class="q">应用调用 <code>read(fd, buf, MAX)</code> 时，NFS 客户端发出的 READ 消息中的偏移从哪里来？</div>
+  <div class="opts"><button>A. 客户端打开文件表中保存的当前文件位置</button><button>B. 每次都是 0</button><button>C. 应用在 read 调用中显式传入</button><button>D. 服务器记录的当前文件位置</button></div>
+  <div class="explain">服务器是无状态的，不记录文件位置。客户端的打开文件表保存 fd → (文件句柄, 当前位置)，把不带偏移的 read 翻译成带确切偏移的 READ，成功后更新位置。</div></div>
+<div class="mcq" data-answer="2"><div class="q">文件句柄中为什么要有世代号（generation number）？</div>
+  <div class="opts"><button>A. 记录客户端打开该文件的次数</button><button>B. 记录文件被修改了多少次，用于缓存一致性</button><button>C. inode 号被重用时递增，防止持有旧句柄的客户端意外访问新分配的文件</button><button>D. 标识服务器导出的是哪个文件系统</button></div>
+  <div class="explain">标识文件系统的是卷 ID；判断缓存是否过期用的是 GETATTR 返回的修改时间。世代号只在 inode 号被重用时递增。</div></div>
+<div class="mcq" data-answer="2"><div class="q">为什么 NFS 客户端在超时后可以不加区分地重试 WRITE？</div>
+  <div class="opts"><button>A. 因为服务器会记住每个客户端最后一次写的位置</button><button>B. 因为服务器会用序列号去除重复的 WRITE</button><button>C. 因为 WRITE 携带了确切的偏移和数据，执行多次与执行一次效果相同（幂等）</button><button>D. 因为 NFS 建在 TCP 上，不会丢包</button></div>
+  <div class="explain">幂等让客户端无需知道失败原因（请求丢失、服务器宕机、回复丢失），一律重试即可；NFSv2 服务器无状态，不做去重。</div></div>
+<div class="mcq" data-answer="3"><div class="q">服务器执行了 MKDIR 但回复丢失，客户端重试。结果是？</div>
+  <div class="opts"><button>A. 服务器识别出重复请求，返回成功</button><button>B. 服务器上出现两个同名目录</button><button>C. 目录没有创建</button><button>D. 目录已创建，但客户端收到"目录已存在"的失败</button></div>
+  <div class="explain">这正是原书"some operations are hard to make idempotent"的例子：操作第一次其实成功了，只在重试时失败。</div></div>
+<div class="mcq" data-answer="0"><div class="q">flush-on-close（close-to-open）一致性主要解决哪个子问题？</div>
+  <div class="opts"><button>A. 更新可见性：写入者关闭后，其他节点随后 open 能看到新版本</button><button>B. 陈旧缓存</button><button>C. 服务器写缓冲导致丢数据</button><button>D. GETATTR 请求过多</button></div>
+  <div class="explain">陈旧缓存靠"使用前 GETATTR 检查修改时间"解决；GETATTR 过多靠属性缓存缓解；服务器写缓冲问题靠"先落盘再回复"解决。</div></div>
+<div class="mcq" data-answer="3"><div class="q">关于属性缓存（attribute cache），下列哪项正确？</div>
+  <div class="opts"><button>A. 它缓存在服务器上，记录哪些客户端缓存了哪些文件</button><button>B. 它让 flush-on-close 变得不再必要</button><button>C. 它保证客户端总是读到最新版本</button><button>D. 它减少了 GETATTR 请求，但在超时之前客户端可能使用陈旧的缓存数据</button></div>
+  <div class="explain">属性缓存是客户端的；超时（如 3 秒）内的访问不联系服务器，于是"有时你拿到旧版本只是因为属性缓存还没超时"。NFS 服务器保持无状态，不跟踪谁缓存了什么——那是 AFS 的回调。</div></div>
+<div class="mcq" data-answer="1"><div class="q">NFS 服务器为什么必须在 WRITE 数据写入稳定存储后才回复成功？</div>
+  <div class="opts"><button>A. 为了实现 flush-on-close</button><button>B. 否则服务器在回复后、落盘前崩溃，客户端以为写成功不会重试，数据就丢了，文件可能新旧混杂</button><button>C. 为了让 WRITE 成为幂等操作</button><button>D. 为了减少 GETATTR 请求</button></div>
+  <div class="explain">客户端靠"没收到回复就重试"来应对故障；服务器提前回复成功就破坏了这一前提。原书示例的结果是 a/y/c。</div></div>
+<div class="mcq" data-answer="0"><div class="q">应用调用 <code>close(fd)</code> 关闭一个只读打开的 NFS 文件，客户端会？</div>
+  <div class="opts"><button>A. 只清理本地结构（释放打开文件表中的 fd），不与服务器通信</button><button>B. 发送 CLOSE 消息让服务器释放描述符</button><button>C. 发送 GETATTR 确认文件未被修改</button><button>D. 把整个文件写回服务器</button></div>
+  <div class="explain">原书 Figure 49.5：close 只需清理本地结构，No need to talk to server。若文件被写过，flush-on-close 会先把脏数据 WRITE 到服务器，但也没有"CLOSE"消息。</div></div>
+
+<h2>常见误区与小结</h2>
+<div class="warn">
+  <ul>
+    <li><strong>"NFS 协议里有 OPEN/CLOSE 消息"</strong>：NFSv2 没有。open 被翻译成 LOOKUP，close 只在本地清理（有脏数据时先 WRITE 刷写）。（NFSv4 才加入了服务器状态，如 open 消息。）</li>
+    <li><strong>"无状态 = 服务器什么都不存"</strong>：服务器当然存着文件数据和元数据（磁盘上的持久状态）；无状态指的是不保存<em>关于客户端的</em>状态，如谁打开了什么、文件指针在哪、谁缓存了什么。</li>
+    <li><strong>"所有 NFS 操作都幂等"</strong>：MKDIR、REMOVE、RMDIR 等在"回复丢失 + 重试"时会返回错误。NFS 接受了这点不完美。</li>
+    <li><strong>"NFS 保证读到最新数据"</strong>：属性缓存超时之前，客户端可能直接使用陈旧缓存；别的客户端还没关闭文件时，它的写也不可见。</li>
+    <li><strong>"服务器用内存做写缓冲可以提升性能，没有风险"</strong>：回复 WRITE 成功前必须落到稳定存储；想要快，得用带电池的内存等手段。</li>
+  </ul>
+</div>
+<div class="key">
+  <p><strong>本章小结（原书"关键 NFS 术语"）</strong></p>
+  <ul>
+    <li>实现"简单快速的崩溃恢复"的关键是<strong>无状态协议</strong>：服务器崩溃后迅速重启继续服务，客户端只需重试直到成功。</li>
+    <li><strong>幂等</strong>是 NFS 协议的核心：执行多次等同于执行一次。它让客户端可以放心重试，并把"丢失消息的重传"与"服务器崩溃的处理"统一起来。</li>
+    <li>性能需要<strong>客户端缓存与写缓冲</strong>，但带来了<strong>缓存一致性问题</strong>（更新可见性、陈旧缓存）。</li>
+    <li>NFS 用多种工程手段应对：<strong>flush-on-close（close-to-open）</strong>让文件关闭时内容被强制写到服务器；<strong>GETATTR + 属性缓存</strong>在"检查文件是否变化"和"减少询问次数"之间折中——代价是偶尔出现怪异行为。</li>
+    <li>NFS 服务器必须把写<strong>提交到持久介质后才能返回成功</strong>，否则会丢数据。</li>
+    <li>为了把 NFS 集成进操作系统，Sun 引入了 <strong>VFS/vnode 接口</strong>，让多种文件系统实现共存。</li>
+    <li>早期 NFS 的<strong>安全性</strong>非常宽松，客户端上的用户很容易冒充他人；后来与 Kerberos 等认证服务集成才弥补了这一点。</li>
+    <li><strong>接下来</strong>：第 50 章的 AFS 以"可扩展性"为首要目标，用整文件缓存 + 服务器<strong>回调（callback）</strong>取代 NFS 的反复询问，提供了更容易理解的一致性语义——代价是服务器必须保存状态，崩溃恢复更复杂。</li>
+  </ul>
+</div>
+
+</main>
+<script>
+/*CORE-BEGIN*/
+// ================= 1. open/read/close → NFS 协议消息（Figure 49.5） =================
+const NFS_TREE = {
+  2: { name: "/", gen: 1, dir: { foo: 12, home: 10 } },
+  12: { name: "foo", gen: 3 },
+  10: { name: "home", gen: 1, dir: { remzi: 23 } },
+  23: { name: "remzi", gen: 1, dir: { "foo.txt": 37 } },
+  37: { name: "foo.txt", gen: 2 },
+};
+function fhStr(ino) { return `FH{vol=1,ino=${ino},gen=${NFS_TREE[ino].gen}}`; }
+function nfsReadTrace(cfg) {
+  const rows = [];
+  const oft = {};                 // 客户端打开文件表 fd -> {fh, pos}
+  const srv = { up: true, table: {} };  // 服务器（有状态协议才会用 table）
+  const st = { msgs: 0, lookups: 0, reads: 0, bytes: 0, errors: 0 };
+  const snap = () => ({ oft: JSON.parse(JSON.stringify(oft)), srv: JSON.parse(JSON.stringify(srv)), st: { ...st } });
+  const row = (r) => rows.push(Object.assign({ call: "", client: "", msg: "", server: "", side: "C" }, r, { snap: snap() }));
+  const comps = cfg.path.split("/").filter(Boolean);
+  const fd = 3, size = cfg.size, MAX = cfg.max;
+  if (cfg.proto === "nfs") {
+    let dir = 2;
+    comps.forEach((c, k) => {
+      const dname = k === 0 ? "rootdir" : comps[k - 1];
+      const child = NFS_TREE[dir].dir[c];
+      st.msgs++; st.lookups++;
+      row({ call: k === 0 ? `fd = open("${cfg.path}", ...);` : "", client: `发送 LOOKUP（${dname} 的 FH, "${c}"）`, msg: `LOOKUP(${fhStr(dir)}, "${c}") →`, side: "C",
+        text: k === 0 ? `应用调用 open。客户端文件系统需要 ${cfg.path} 的文件句柄：从挂载时得到的根目录句柄开始，逐级 LOOKUP。${comps.length > 1 ? `路径有 ${comps.length} 级，所以要发 ${comps.length} 次 LOOKUP。` : ""}` : `继续下一级：在 ${dname} 中查找 "${c}"。` });
+      row({ server: `收到 LOOKUP 请求；在 ${dname} 目录中查找 "${c}"；返回 ${c} 的 FH + 属性`, msg: `← ${fhStr(child)} + 属性`, side: "S",
+        text: `服务器用请求里的目录句柄（卷 1、inode ${dir}）直接定位目录，查到 "${c}" 的 inode 号 ${child}，把句柄（含世代号 ${NFS_TREE[child].gen}）和属性发回。它不记录"谁在查什么"。` });
+      if (k === comps.length - 1) {
+        oft[fd] = { fh: fhStr(child), pos: 0 };
+        row({ client: `收到 LOOKUP 回复；在打开文件表中分配文件描述符 fd=${fd}；存入 ${c} 的 FH；存入当前文件位置（0）；把 fd 返回给应用`, side: "C",
+          text: `客户端把 fd=${fd} → (${c} 的句柄, 位置 0) 记在<strong>自己的</strong>打开文件表里，返回给应用。所有与"这次打开"有关的状态都在客户端。` });
+      } else row({ client: `收到 LOOKUP 回复，得到 ${c} 的 FH`, side: "C", text: `客户端拿到 ${c} 的句柄（也可以缓存起来，下次打开同一路径就不用再查）。` });
+      dir = child;
+    });
+    for (let r = 1; r <= cfg.nreads; r++) {
+      const e = oft[fd], off = e.pos;
+      const n = Math.max(0, Math.min(MAX, size - off));
+      st.msgs++; st.reads++;
+      row({ call: "read(fd, buffer, MAX);", client: `用 fd 索引打开文件表；取出 NFS 文件句柄（FH）；用当前文件位置作为 offset`, msg: `READ(FH, offset=${off}, count=${MAX}) →`, side: "C",
+        text: `第 ${r} 次 read。应用没给偏移，但客户端知道当前位置是 ${off}，于是发出<strong>自包含</strong>的 READ：句柄 + offset=${off} + count=${MAX}。` });
+      row({ server: `收到 READ 请求；用 FH 得到卷号/inode 号；从磁盘（或缓存）读 inode；用 offset 计算块位置；从磁盘（或缓存）读数据；把数据返回客户端`, msg: `← ${n} 字节数据 + 属性`, side: "S",
+        text: `服务器${r > 1 && cfg.crash && cfg.crash < r ? "（刚刚重启过，内存全空）" : ""}只凭请求本身就能完成：句柄 → 卷 1、inode ${e.fh.match(/ino=(\d+)/)[1]}；offset ${off} → 第 ${Math.floor(off / 4096)} 个 4KB 块起。` + (n < MAX ? `文件只有 ${size} 字节，这次只读到 ${n} 字节。` : "") });
+      e.pos = off + n; st.bytes += n;
+      row({ client: `收到 READ 回复；更新文件位置（+${n}）：当前位置 = ${e.pos}；把数据/错误码返回给应用`, side: "C",
+        text: `客户端把位置从 ${off} 更新为 ${e.pos}${MAX === n && off === (r - 1) * MAX ? `（= ${r}·MAX）` : ""}，下一次 READ 用同一个句柄、不同的 offset。` });
+      if (cfg.crash === r && r < cfg.nreads) {
+        row({ server: `<b>服务器崩溃！</b>……重启完成`, side: "S", crash: true,
+          text: `服务器崩溃并重启，内存中的一切都丢了。但无状态服务器本来就没在内存里保存任何客户端状态：客户端的打开文件表完好无损，下一次 READ 照样带着句柄和 offset。` });
+      }
+    }
+    delete oft[fd];
+    row({ call: "close(fd);", client: `只需清理本地结构：在打开文件表中释放描述符 fd（无需与服务器通信）`, side: "C",
+      text: `close 完全在本地完成（只读打开，没有脏数据要刷写）。服务器自始至终不知道这个文件"被打开过"。` });
+  } else {
+    const sfd = 7;
+    st.msgs++;
+    row({ call: `fd = open("${cfg.path}", ...);`, client: `发送 OPEN("${cfg.path}")`, msg: `OPEN("${cfg.path}") →`, side: "C", text: `假想的有状态协议：open 直接变成一条 OPEN 消息，把整个路径交给服务器。` });
+    srv.table[sfd] = { file: cfg.path, pos: 0 };
+    row({ server: `沿路径找到文件并打开；在<strong>服务器的</strong>打开文件表中分配 sfd=${sfd}，记录位置 0`, msg: `← sfd=${sfd}`, side: "S", text: `服务器在内存里记下"sfd ${sfd} = ${cfg.path}，位置 0"——这就是客户端与服务器之间的共享状态。` });
+    oft[fd] = { sfd, pos: "（在服务器上）" };
+    row({ client: `记录 fd=${fd} ↔ sfd=${sfd}；返回 fd`, side: "C", text: `客户端只记住服务器给的描述符，文件位置由服务器维护。` });
+    let broken = false;
+    for (let r = 1; r <= cfg.nreads; r++) {
+      st.msgs++; st.reads++;
+      row({ call: "read(fd, buffer, MAX);", client: `发送 READ(sfd=${sfd}, count=${MAX})`, msg: `READ(sfd=${sfd}, count=${MAX}) →`, side: "C", text: `请求里没有偏移、没有句柄，只有服务器发的描述符——服务器必须"记得"它。` });
+      if (!srv.table[sfd]) {
+        st.errors++; broken = true;
+        row({ server: `查找 sfd=${sfd}：<b>不存在！</b>返回错误`, msg: `← ERROR：未知描述符`, side: "S", bad: true, text: `服务器重启后打开文件表是空的，它不知道 sfd ${sfd} 指哪个文件、读到了哪里。` });
+        row({ client: `read 失败；需要一套恢复协议（客户端重新 OPEN 并告诉服务器之前读到哪里）`, side: "C", bad: true, text: `这就是共享状态带来的麻烦：要恢复，客户端得保存足够的信息并与服务器执行某种恢复协议。NFS 用无状态设计完全避开了它。` });
+        break;
+      }
+      const t = srv.table[sfd], off = t.pos, n = Math.max(0, Math.min(MAX, size - off));
+      t.pos = off + n; st.bytes += n;
+      row({ server: `用服务器表中的位置 ${off} 读 ${n} 字节；位置更新为 ${t.pos}`, msg: `← ${n} 字节数据`, side: "S", text: `服务器替客户端维护文件位置。` });
+      row({ client: `收到数据，返回给应用`, side: "C", text: `第 ${r} 次 read 完成。` });
+      if (cfg.crash === r && r < cfg.nreads) {
+        srv.table = {};
+        row({ server: `<b>服务器崩溃！</b>……重启完成（打开文件表丢失）`, side: "S", crash: true, text: `服务器崩溃重启，内存里的打开文件表没了。客户端对此一无所知，还拿着 sfd=${sfd}。` });
+      }
+    }
+    if (!broken) {
+      st.msgs++;
+      delete srv.table[sfd];
+      row({ call: "close(fd);", client: `发送 CLOSE(sfd=${sfd})`, msg: `CLOSE(sfd=${sfd}) →`, side: "C", text: `有状态协议里 close 必须通知服务器释放描述符。如果客户端在此之前崩溃，服务器就永远收不到它。` });
+      row({ server: `释放 sfd=${sfd}`, msg: `← OK`, side: "S", text: `服务器释放表项。` });
+      delete oft[fd];
+      row({ client: `释放本地 fd`, side: "C", text: `完成。` });
+    }
+  }
+  return rows;
+}
+
+// ================= 2. 超时重试与幂等性（Figure 49.6） =================
+const RT_OPS = {
+  read: { req: 'READ(FH, offset=0, count=8)', idem: true },
+  write: { req: 'WRITE(FH, offset=2, count=3, "abc")', idem: true },
+  lookup: { req: 'LOOKUP(dirFH, "data.txt")', idem: true },
+  mkdir: { req: 'MKDIR(dirFH, "new")', idem: false },
+  remove: { req: 'REMOVE(dirFH, "data.txt")', idem: false },
+  append: { req: 'APPEND(FH, "abc")', idem: false },
+};
+function rtExec(op, S) {        // 在服务器状态 S 上执行一次，返回结果字符串（会修改 S）
+  const has = (n) => S.dir.includes(n);
+  switch (op) {
+    case "read": return has("data.txt") ? `OK，数据 "${S.data}"` : "错误：文件不存在";
+    case "write": if (!has("data.txt")) return "错误：文件不存在"; S.data = S.data.slice(0, 2) + "abc" + S.data.slice(5); return "OK，写入 3 字节";
+    case "lookup": return has("data.txt") ? "OK，FH{vol=1,ino=41,gen=1}" : "错误：文件不存在";
+    case "mkdir": if (has("new")) return "错误：EEXIST（目录已存在）"; S.dir.push("new"); return "OK，目录已创建";
+    case "remove": if (!has("data.txt")) return "错误：ENOENT（文件不存在）"; S.dir = S.dir.filter((x) => x !== "data.txt"); return "OK，已删除";
+    case "append": S.data += "abc"; return "OK，追加 3 字节";
+  }
+}
+function nfsRetry(op, fail) {
+  const S = { data: "xxxxxxxx", dir: ["data.txt"], up: true };
+  const once = { data: "xxxxxxxx", dir: ["data.txt"] };
+  const onceRes = rtExec(op, once);
+  const D = 2, TO = 6, req = RT_OPS[op].req;
+  const steps = [], arrows = [], notes = [];
+  let execs = 0, downSpan = null, clientRes = null;
+  const snap = () => ({ data: S.data, dir: S.dir.slice(), up: S.up, execs });
+  const step = (t, text, extra) => steps.push(Object.assign({ t, text, snap: snap(), nA: arrows.length, nN: notes.length }, extra || {}));
+  // 第一次发送
+  const a1 = { from: "C", t0: 0, t1: D, label: req, lost: fail === "req" };
+  if (fail === "down") { S.up = false; downSpan = [0, 5]; }
+  arrows.push(a1);
+  notes.push({ side: "C", t: 0, text: "发送请求，设定时器" });
+  step(0, `客户端发送 <code>${req}</code>，同时设置定时器（t=${TO} 到期）。`);
+  if (fail === "req") {
+    notes.push({ side: "S", t: D, text: "（没收到消息）" });
+    step(D, `请求在网络中<strong>丢失</strong>。服务器什么都不知道，客户端也不知道——它只能等。`);
+  } else if (fail === "down") {
+    notes.push({ side: "S", t: D, text: "宕机，请求丢失" });
+    step(D, `请求到达时服务器正处于<strong>宕机</strong>状态，请求随之丢失，什么也没执行。`);
+    S.up = true;
+    notes.push({ side: "S", t: 5, text: "重启完成" });
+    step(5, `服务器重启完成。无状态服务器不需要任何恢复协议，重启即可继续服务。`);
+  } else {
+    const r = rtExec(op, S); execs++;
+    notes.push({ side: "S", t: D, text: `执行（第 ${execs} 次）` });
+    const rep = { from: "S", t0: D, t1: 2 * D, label: "回复：" + r, lost: fail === "reply" };
+    arrows.push(rep);
+    step(D, `服务器收到请求并执行（第 ${execs} 次）：${r}。发送回复。` + (fail === "reply" ? `可惜回复在返回途中<strong>丢失</strong>了。` : ""));
+    if (fail !== "reply") {
+      clientRes = r;
+      notes.push({ side: "C", t: 2 * D, text: "收到回复，取消定时器" });
+      step(2 * D, `客户端收到回复，取消定时器。结果：${r}。`, { end: true });
+    }
+  }
+  if (clientRes === null) {
+    notes.push({ side: "C", t: TO, text: "超时！重发同一请求" });
+    arrows.push({ from: "C", t0: TO, t1: TO + D, label: req, lost: false });
+    step(TO, `定时器到期，客户端没收到回复。它<strong>不知道也不关心</strong>是哪种情况（请求丢了？服务器宕机？回复丢了？），直接重发完全相同的请求。`);
+    const r = rtExec(op, S); execs++;
+    notes.push({ side: "S", t: TO + D, text: `执行（第 ${execs} 次）` });
+    arrows.push({ from: "S", t0: TO + D, t1: TO + 2 * D, label: "回复：" + r, lost: false });
+    step(TO + D, `服务器执行请求（第 ${execs} 次）：${r}。` + (execs > 1 ? (RT_OPS[op].idem ? `因为操作是幂等的，再执行一次不会改变结果。` : `<strong>这个操作不幂等</strong>，第二次执行的效果和第一次不同！`) : ""));
+    clientRes = r;
+    notes.push({ side: "C", t: TO + 2 * D, text: "收到回复" });
+    step(TO + 2 * D, `客户端收到回复：${r}。`, { end: true });
+  }
+  const sameState = S.data === once.data && S.dir.join() === once.dir.join();
+  const sameRes = clientRes === onceRes;
+  const last = steps[steps.length - 1];
+  last.text += sameState && sameRes ? ` <span class="tag-ok">与"无故障、只执行一次"的结果完全相同</span>。`
+    : `<br><span class="tag-bad">与只执行一次不同</span>：` + (!sameState ? `服务器数据变成了 "${S.data}"（执行一次应为 "${once.data}"）。` : "") + (!sameRes ? `客户端看到"${clientRes}"，而操作其实第一次就成功了（"${onceRes}"）。` : "");
+  return { steps, arrows, notes, execs, downSpan, final: { data: S.data, dir: S.dir.slice() }, once, clientRes, onceRes, sameState, sameRes, end: TO + 2 * D };
+}
+
+// ================= 3. 三客户端缓存一致性 =================
+function nfsCacheRun(text, cfg) {
+  const errors = [], rows = [];
+  const mk = () => ({ data: null, dirty: false, attr: null, open: false });
+  const C = { C1: mk(), C2: mk(), C3: mk() };
+  const srv = { label: "v1", seq: 1, mtime: 0 };
+  const st = { GETATTR: 0, READ: 0, WRITE: 0, reads: 0, stale: 0, invisible: 0 };
+  let t = 0, wseq = 1;
+  const lines = text.split("\n");
+  lines.forEach((raw, ln) => {
+    const line = raw.replace(/#.*/, "").trim();
+    if (!line) return;
+    let m = line.match(/^wait\s+(\d+)$/i);
+    if (m) { const k = +m[1]; rows.push({ t, who: "—", op: `wait ${k}`, msgs: [], notes: [`时间流逝 ${k} 秒`], snap: snapC() }); t += k; return; }
+    m = line.match(/^(C[123])\s+(open|read|write|close|flush)(?:\s+(\S+))?$/i);
+    if (!m) { errors.push(`第 ${ln + 1} 行无法识别：${line}`); return; }
+    const who = m[1].toUpperCase(), op = m[2].toLowerCase(), arg = m[3];
+    const c = C[who];
+    const r = { t, who, op: op + (arg ? " " + arg : ""), msgs: [], notes: [], result: null, cls: "" };
+    const validate = (force) => {
+      if (!cfg.validate) { r.notes.push("不做一致性检查，直接用缓存"); return; }
+      if (!force && c.attr && t - c.attr.at < cfg.T) r.notes.push(`属性缓存未过期（取于 t=${c.attr.at}，${t}−${c.attr.at} &lt; ${cfg.T}），不联系服务器`);
+      else { r.msgs.push("GETATTR"); st.GETATTR++; c.attr = { mtime: srv.mtime, at: t }; r.notes.push(`GETATTR → 服务器上 mtime=${srv.mtime}`); }
+      if (c.data && !c.dirty && c.attr.mtime > c.data.mtime) { r.notes.push(`mtime ${c.attr.mtime} 比缓存数据取来时的 ${c.data.mtime} 新 → 作废缓存`); c.data = null; }
+    };
+    const flush = () => {
+      r.msgs.push("WRITE"); st.WRITE++;
+      srv.label = c.data.label; srv.seq = c.data.seq; srv.mtime = t;
+      c.data.mtime = t; c.attr = { mtime: t, at: t }; c.dirty = false;
+      r.notes.push(`把脏数据 ${c.data.label} 刷到服务器，服务器 mtime=${t}`);
+    };
+    if (op === "open") {
+      c.open = true;
+      validate(cfg.openForce);
+    } else if (op === "read") {
+      if (!c.open) r.notes.push("（注意：文件未打开）");
+      st.reads++;
+      let ret;
+      if (c.dirty) { ret = c.data; r.notes.push("读自己缓存里尚未刷写的数据"); }
+      else {
+        validate(false);
+        if (c.data) { ret = c.data; r.notes.push(`缓存命中，读到 ${c.data.label}`); }
+        else {
+          r.msgs.push("READ"); st.READ++;
+          c.data = { label: srv.label, seq: srv.seq, mtime: srv.mtime };
+          c.attr = { mtime: srv.mtime, at: t };
+          ret = c.data; r.notes.push(`缓存未命中 → READ，取回 ${srv.label}（回复顺带更新属性缓存）`);
+        }
+      }
+      r.result = ret.label;
+      const newerDirty = Object.entries(C).some(([k, o]) => k !== who && o.dirty && o.data.seq > ret.seq);
+      if (ret.seq < srv.seq) { st.stale++; r.cls = "bad"; r.tag = "陈旧缓存"; }
+      else if (newerDirty) { st.invisible++; r.cls = "warn"; r.tag = "看不到未刷写的更新"; }
+    } else if (op === "write") {
+      if (!arg) { errors.push(`第 ${ln + 1} 行：write 需要一个版本名，例如 C2 write v2`); return; }
+      if (!c.open) r.notes.push("（注意：文件未打开）");
+      c.data = { label: arg, seq: ++wseq, mtime: c.data ? c.data.mtime : srv.mtime };
+      c.dirty = true;
+      r.notes.push(`写入客户端缓存（写缓冲），服务器上仍是 ${srv.label}`);
+    } else if (op === "close") {
+      if (c.dirty && cfg.flushOnClose) flush();
+      else if (c.dirty) r.notes.push("没有 flush-on-close：脏数据继续留在客户端");
+      else r.notes.push("没有脏数据，本地关闭");
+      c.open = false;
+    } else if (op === "flush") {
+      if (c.dirty) flush(); else r.notes.push("没有脏数据");
+    }
+    r.snap = snapC();
+    rows.push(r);
+    t += 1;
+  });
+  function snapC() { return { C: JSON.parse(JSON.stringify(C)), srv: { ...srv }, st: { ...st } }; }
+  return { rows, errors, st };
+}
+/*CORE-END*/
+
+(function () {
+  const { h, s } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  const keepVisible = (tb) => { const wrap = tb.parentElement, cur = tb.querySelector("tr.cur"); if (cur) wrap.scrollTop = Math.max(0, cur.offsetTop - wrap.clientHeight + cur.offsetHeight + 8); };
+  const stat = (v, l, cls) => h("div", { class: "stat" }, h("div", { class: "v " + (cls || "") }, v), h("div", { class: "l" }, l));
+
+  // ---------- 模拟器 1：trace ----------
+  let rows = [];
+  const trStep = OSTEP.stepper($("tr-step"), { steps: () => Math.max(1, rows.length), render: renderTrace, autoplayMs: 1100 });
+  function trRun() {
+    rows = nfsReadTrace({ path: $("tr-path").value, max: Math.max(1, +$("tr-max").value || 4096), nreads: Math.max(1, Math.min(6, +$("tr-n").value || 1)), size: Math.max(0, +$("tr-size").value || 0), crash: +$("tr-crash").value, proto: $("tr-proto").value });
+    trStep.reset();
+  }
+  ["tr-path", "tr-max", "tr-n", "tr-size", "tr-crash", "tr-proto"].forEach((id) => $(id).addEventListener("input", trRun));
+  $("tr-book").onclick = () => { $("tr-path").value = "/foo"; $("tr-max").value = 4096; $("tr-n").value = 3; $("tr-size").value = 16384; $("tr-crash").value = "0"; $("tr-proto").value = "nfs"; trRun(); };
+  function renderTrace(i) {
+    const tb = $("tr-table");
+    tb.replaceChildren(h("tr", {}, h("th", {}, "#"), h("th", {}, "应用调用"), h("th", {}, "客户端文件系统"), h("th", {}, "网络消息"), h("th", {}, "文件服务器")));
+    rows.slice(0, i + 1).forEach((r, k) => tb.append(h("tr", { class: (k === i ? "cur " : "") + (r.bad || r.crash ? "bad" : "") },
+      h("td", { class: "num" }, k + 1), h("td", { class: "call" }, r.call), h("td", { html: r.client }), h("td", { class: "msg" }, r.msg), h("td", { html: r.server }))));
+    keepVisible(tb);
+    const r = rows[i], sn = r.snap;
+    const oftEntries = Object.entries(sn.oft);
+    const proto = $("tr-proto").value;
+    $("tr-panels").replaceChildren(
+      h("div", { class: "panel" + (r.side === "C" ? " hot" : "") }, h("h5", {}, "客户端打开文件表"),
+        oftEntries.length ? h("div", { class: "mono" }, oftEntries.map(([fd, e]) => h("div", {}, proto === "nfs" ? `fd ${fd} → ${e.fh}, 位置 ${e.pos}` : `fd ${fd} → sfd ${e.sfd}`))) : h("div", { class: "muted" }, "（空）")),
+      h("div", { class: "panel" + (r.side === "S" ? " hot" : "") + (r.crash ? " down" : "") }, h("h5", {}, "服务器保存的客户端状态"),
+        proto === "nfs" ? h("div", { class: "muted" }, "无——无状态服务器不记录任何客户端信息" + (r.crash ? "（崩溃也没有东西可丢）" : "")) :
+          Object.keys(sn.srv.table).length ? h("div", { class: "mono" }, Object.entries(sn.srv.table).map(([k, e]) => h("div", {}, `sfd ${k} → ${e.file}, 位置 ${e.pos}`))) : h("div", { class: "muted" }, r.crash ? "（崩溃后丢失！）" : "（空）")));
+    $("tr-narr").innerHTML = r.text;
+    $("tr-stats").replaceChildren(stat(sn.st.msgs, "发给服务器的请求"), stat(sn.st.lookups, "LOOKUP"), stat(sn.st.reads, "READ"), stat(sn.st.bytes, "已读字节"), stat(sn.st.errors, "失败的请求", sn.st.errors ? "tag-bad" : ""));
+  }
+  trRun();
+
+  // ---------- 模拟器 2：retry ----------
+  let rt = null;
+  const rtStep = OSTEP.stepper($("rt-step"), { steps: () => (rt ? rt.steps.length : 1), render: renderRt, autoplayMs: 1300 });
+  function rtRun() { rt = nfsRetry($("rt-op").value, $("rt-fail").value); rtStep.reset(); }
+  ["rt-op", "rt-fail"].forEach((id) => $(id).addEventListener("input", rtRun));
+  function renderRt(i) {
+    const stp = rt.steps[i];
+    const W = 680, top = 40, yPer = 26, xC = 120, xS = 520;
+    const H = top + rt.end * yPer + 24;
+    const Y = (t) => top + t * yPer;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "客户端与服务器时序" });
+    svg.append(s("text", { x: xC, y: 20, "text-anchor": "middle", "font-weight": 700, text: "客户端" }));
+    svg.append(s("text", { x: xS, y: 20, "text-anchor": "middle", "font-weight": 700, text: "服务器" }));
+    svg.append(s("line", { x1: xC, y1: top - 8, x2: xC, y2: H - 6, class: "stroke" }));
+    if (rt.downSpan && stp.t >= 0) {
+      svg.append(s("line", { x1: xS, y1: top - 8, x2: xS, y2: Y(rt.downSpan[0]), class: "stroke" }));
+      svg.append(s("rect", { x: xS - 6, y: Y(rt.downSpan[0]), width: 12, height: (rt.downSpan[1] - rt.downSpan[0]) * yPer, rx: 3, class: "bad-soft" }));
+      svg.append(s("line", { x1: xS, y1: Y(rt.downSpan[1]), x2: xS, y2: H - 6, class: "stroke" }));
+    } else svg.append(s("line", { x1: xS, y1: top - 8, x2: xS, y2: H - 6, class: "stroke" }));
+    svg.append(s("line", { x1: 20, x2: W - 10, y1: Y(stp.t), y2: Y(stp.t), style: "stroke:var(--accent);stroke-dasharray:3 4;opacity:.7" }));
+    rt.arrows.slice(0, stp.nA).forEach((a, k) => {
+      const fx = a.from === "C" ? xC : xS, tx = a.from === "C" ? xS : xC;
+      const col = a.lost ? "var(--bad)" : a.from === "C" ? "var(--c1)" : "var(--c3)";
+      const cur = k === stp.nA - 1;
+      if (a.lost) {
+        const mx = fx + (tx - fx) * 0.55, my = Y(a.t0) + (Y(a.t1) - Y(a.t0)) * 0.55;
+        svg.append(s("line", { x1: fx, y1: Y(a.t0), x2: mx, y2: my, style: `stroke:${col};stroke-width:2;stroke-dasharray:5 4` }));
+        svg.append(s("path", { d: `M${mx - 6},${my - 6} L${mx + 6},${my + 6} M${mx + 6},${my - 6} L${mx - 6},${my + 6}`, style: "stroke:var(--bad);stroke-width:2.5" }));
+      } else {
+        svg.append(s("line", { x1: fx, y1: Y(a.t0), x2: tx + (fx < tx ? -2 : 2), y2: Y(a.t1), "marker-end": a.from === "C" ? "url(#d49-ah-c1)" : "url(#d49-ah-c3)", style: `stroke:${col};stroke-width:${cur ? 3 : 2}` }));
+      }
+      svg.append(s("text", { x: (fx + tx) / 2, y: (Y(a.t0) + Y(a.t1)) / 2 - 6, "text-anchor": "middle", "font-size": 11.5, class: "mono", style: `fill:${col}`, text: a.label + (a.lost ? "（丢失）" : "") }));
+    });
+    rt.notes.slice(0, stp.nN).forEach((n) => {
+      svg.append(s("text", { x: n.side === "C" ? xC - 10 : xS + 12, y: Y(n.t) + 4, "text-anchor": n.side === "C" ? "end" : "start", "font-size": 12, style: /超时/.test(n.text) ? "fill:var(--warn);font-weight:700" : /宕机|丢失/.test(n.text) ? "fill:var(--bad)" : /执行/.test(n.text) ? "fill:var(--accent);font-weight:600" : "", text: n.text }));
+    });
+    $("rt-stage").replaceChildren(svg);
+    const sn = stp.snap;
+    const fileBox = h("div", { class: "panel" + (sn.up ? "" : " down") }, h("h5", {}, "服务器上的数据" + (sn.up ? "" : "（宕机中）")),
+      h("div", { class: "kv" }, h("span", {}, "data.txt"), h("span", { class: "mono" }, sn.dir.includes("data.txt") ? `"${sn.data}"` : "（不存在）"),
+        h("span", {}, "目录项"), h("span", { class: "mono" }, sn.dir.join(", ") || "（空）")));
+    const endBox = h("div", { class: "panel" }, h("h5", {}, "对照：无故障、只执行一次"),
+      h("div", { class: "kv" }, h("span", {}, "data.txt"), h("span", { class: "mono" }, rt.once.dir.includes("data.txt") ? `"${rt.once.data}"` : "（不存在）"),
+        h("span", {}, "目录项"), h("span", { class: "mono" }, rt.once.dir.join(", ") || "（空）"), h("span", {}, "客户端结果"), h("span", {}, rt.onceRes)));
+    $("rt-panels").replaceChildren(fileBox, endBox);
+    $("rt-narr").innerHTML = stp.text;
+    $("rt-stats").replaceChildren(stat(sn.execs, "服务器执行次数"), stat(RT_OPS[$("rt-op").value].idem ? "是" : "否", "操作幂等？"),
+      stat(stp.end ? (rt.sameState && rt.sameRes ? "✓" : "✗") : "…", "结局与执行一次相同", stp.end ? (rt.sameState && rt.sameRes ? "tag-ok" : "tag-bad") : ""));
+  }
+  rtRun();
+
+  // ---------- 模拟器 3：cache ----------
+  const CC_PRESETS = {
+    vis: { T: 3, flush: true, val: true, force: false, ops: "# 图 49.7：更新可见性\nC1 open\nC1 read\nC1 close\nC2 open\nC2 write v2\nC3 open\nC3 read\nC2 close\nC3 close\nC3 open\nC3 read\nC1 open\nC1 read" },
+    stale: { T: 3, flush: true, val: true, force: false, ops: "# 属性缓存导致陈旧读\nC2 open\nC2 write v2\nC1 open\nC1 read\nC2 close\nC1 read\nC1 read" },
+    flood: { T: 0, flush: true, val: true, force: false, ops: "# 单个客户端反复读一个没人改的文件\nC1 open\nC1 read\nC1 read\nC1 read\nC1 read\nC1 read\nC1 read\nC1 close\nC1 open\nC1 read\nC1 close" },
+    noflush: { T: 3, flush: false, val: true, force: false, ops: "# 关掉 flush-on-close：C2 关闭后更新仍不可见\nC2 open\nC2 write v2\nC2 close\nwait 3\nC3 open\nC3 read\nC3 close\nC2 flush\nwait 3\nC3 open\nC3 read" },
+  };
+  let cc = null;
+  const ccStep = OSTEP.stepper($("cc-step"), { steps: () => (cc && cc.rows.length ? cc.rows.length : 1), render: renderCc, autoplayMs: 1100 });
+  function loadCc(k) {
+    const p = CC_PRESETS[k];
+    $("cc-T").value = p.T; $("cc-flush").checked = p.flush; $("cc-val").checked = p.val; $("cc-force").checked = p.force; $("cc-ops").value = p.ops;
+    ccRun();
+  }
+  function ccRun() {
+    cc = nfsCacheRun($("cc-ops").value, { T: Math.max(0, +$("cc-T").value || 0), flushOnClose: $("cc-flush").checked, validate: $("cc-val").checked, openForce: $("cc-force").checked });
+    $("cc-err").textContent = cc.errors.join("\n");
+    ccStep.reset();
+  }
+  document.querySelectorAll("#sim-cache [data-cc]").forEach((b) => b.addEventListener("click", () => loadCc(b.dataset.cc)));
+  ["cc-T", "cc-flush", "cc-val", "cc-force", "cc-ops"].forEach((id) => $(id).addEventListener("input", ccRun));
+  function renderCc(i) {
+    const tb = $("cc-table");
+    tb.replaceChildren(h("tr", {}, h("th", {}, "t"), h("th", {}, "客户端"), h("th", {}, "操作"), h("th", {}, "发给服务器"), h("th", {}, "读到"), h("th", {}, "说明")));
+    if (!cc.rows.length) { $("cc-panels").replaceChildren(); $("cc-narr").textContent = "没有可执行的操作。"; $("cc-stats").replaceChildren(); return; }
+    cc.rows.slice(0, i + 1).forEach((r, k) => tb.append(h("tr", { class: k === i ? "cur" : "" },
+      h("td", { class: "num" }, r.t), h("td", {}, r.who), h("td", { class: "call" }, r.op), h("td", { class: "msg" }, r.msgs.join(", ") || "—"),
+      h("td", {}, r.result ? h("span", { class: r.cls === "bad" ? "tag-bad" : r.cls === "warn" ? "tag-warn" : "" }, r.result + (r.tag ? "（" + r.tag + "）" : "")) : ""),
+      h("td", { class: "small", html: r.notes.join("；") }))));
+    keepVisible(tb);
+    const r = cc.rows[i], sn = r.snap, T = Math.max(0, +$("cc-T").value || 0);
+    const panels = ["C1", "C2", "C3"].map((k) => {
+      const c = sn.C[k];
+      const attr = c.attr ? `mtime=${c.attr.mtime}，取于 t=${c.attr.at}` + (T > 0 ? (r.t - c.attr.at < T ? `（还剩 ${T - (r.t - c.attr.at)} 秒有效）` : "（已过期）") : "") : "（空）";
+      return h("div", { class: "panel" + (k === r.who ? " hot" : "") }, h("h5", {}, k + (c.open ? " · 已打开 F" : "")),
+        h("div", { class: "kv" },
+          h("span", {}, "数据缓存"), h("span", { class: "mono" }, c.data ? `F[${c.data.label}]` + (c.dirty ? " 脏" : ` (mtime ${c.data.mtime})`) : "空"),
+          h("span", {}, "属性缓存"), h("span", { class: "mono" }, attr)));
+    });
+    panels.push(h("div", { class: "panel" }, h("h5", {}, "服务器 S"), h("div", { class: "kv" }, h("span", {}, "磁盘"), h("span", { class: "mono" }, `F[${sn.srv.label}]`), h("span", {}, "mtime"), h("span", { class: "mono" }, sn.srv.mtime))));
+    $("cc-panels").replaceChildren(...panels);
+    $("cc-narr").innerHTML = `<b>t=${r.t} · ${r.who} ${r.op}</b>：` + r.notes.join("；") + (r.result ? `。读到 <b>${r.result}</b>` + (r.tag ? `——<span class="${r.cls === "bad" ? "tag-bad" : "tag-warn"}">${r.tag}</span>` : "") : "") + "。";
+    const st = sn.st;
+    $("cc-stats").replaceChildren(stat(st.GETATTR, "GETATTR 次数"), stat(st.READ, "READ 次数"), stat(st.WRITE, "WRITE（刷写）次数"),
+      stat(st.stale, "陈旧读（服务器已有新版本）", st.stale ? "tag-bad" : ""), stat(st.invisible, "看不到未刷写的更新", st.invisible ? "tag-warn" : ""));
+  }
+  loadCc("vis");
+
+  // ---------- 模拟器 4：服务器写缓冲 ----------
+  const WB = {
+    unsafe: [
+      { disk: ["x", "y", "z"], mem: [], acked: [], text: "文件原有 3 块：x、y、z（每块示意为 8 个相同字符）。服务器策略：收到 WRITE 先放内存、立即回复成功，稍后再后台写盘。" },
+      { disk: ["x", "y", "z"], mem: [0], acked: [0], text: "WRITE（块 0 = a）：服务器把 a 放进内存，<strong>立即</strong>回复成功。客户端记下：块 0 已写好。" },
+      { disk: ["a", "y", "z"], mem: [], acked: [0], text: "后台刷写：块 0 的 a 写到了磁盘。" },
+      { disk: ["a", "y", "z"], mem: [1], acked: [0, 1], text: "WRITE（块 1 = b）：同样放进内存并立即回复成功。客户端记下：块 1 已写好。" },
+      { disk: ["a", "y", "z"], mem: [], acked: [0, 1], crash: true, text: "<strong>服务器崩溃！</strong>内存中的 b 还没来得及写盘，就这样丢了。可客户端已经收到“成功”，它<strong>没有任何理由重试</strong>。" },
+      { disk: ["a", "y", "z"], mem: [2], acked: [0, 1, 2], text: "服务器很快重启，收到 WRITE（块 2 = c），放进内存并回复成功。" },
+      { disk: ["a", "y", "c"], mem: [], acked: [0, 1, 2], end: true, text: "后台刷写 c。客户端认为三个写全部成功，磁盘上却是 a / <b>y</b> / c：旧数据夹在中间（原书：“Yikes!”）。" },
+    ],
+    safe: [
+      { disk: ["x", "y", "z"], mem: [], acked: [], text: "文件原有 3 块：x、y、z。服务器策略：收到 WRITE 先强制写入稳定存储，<strong>之后</strong>才回复成功。" },
+      { disk: ["a", "y", "z"], mem: [], acked: [0], text: "WRITE（块 0 = a）：a 写入磁盘后，服务器回复成功。" },
+      { disk: ["a", "y", "z"], mem: [1], acked: [0], text: "WRITE（块 1 = b）：服务器开始处理，b 还在内存里，尚未落盘，因此<strong>还没有回复</strong>。" },
+      { disk: ["a", "y", "z"], mem: [], acked: [0], crash: true, text: "<strong>服务器崩溃！</strong>b 丢了——但客户端从没收到“成功”。" },
+      { disk: ["a", "b", "z"], mem: [], acked: [0, 1], text: "客户端定时器到期，重发 WRITE（块 1 = b）。重启后的服务器把 b 写盘后回复成功。（WRITE 是幂等的，重发完全安全。）" },
+      { disk: ["a", "b", "c"], mem: [], acked: [0, 1, 2], end: true, text: "WRITE（块 2 = c）：写盘后回复。最终 a / b / c，正确。代价：每次 WRITE 都要等磁盘——除非用带电池的内存等手段。" },
+    ],
+  };
+  const wbStep = OSTEP.stepper($("wb-step"), { steps: () => WB[$("wb-mode").value].length, render: renderWb, autoplayMs: 1500 });
+  $("wb-mode").addEventListener("input", () => wbStep.reset());
+  function renderWb(i) {
+    const seq = WB[$("wb-mode").value], stp = seq[i];
+    const want = ["a", "b", "c"];
+    const disk = h("div", { class: "panel" + (stp.crash ? " down" : "") }, h("h5", {}, "服务器磁盘（稳定存储）"),
+      stp.disk.map((b, k) => h("div", {}, h("span", { class: "blk " + (b === want[k] ? "new" : stp.end ? "old" : "") }, b.repeat(8)), stp.end && b !== want[k] ? h("span", { class: "tag-bad" }, "  ← oops") : "")));
+    const mem = h("div", { class: "panel" + (stp.crash ? " down" : "") }, h("h5", {}, "服务器内存" + (stp.crash ? "（崩溃，全部丢失）" : "")),
+      stp.mem.length ? stp.mem.map((k) => h("div", {}, h("span", { class: "blk mem" }, want[k].repeat(8)), ` 块 ${k}`)) : h("div", { class: "muted" }, "（空）"));
+    const cli = h("div", { class: "panel" }, h("h5", {}, "客户端认为已成功的写"),
+      stp.acked.length ? stp.acked.map((k) => h("div", {}, `块 ${k} = ${want[k].repeat(4)}… ✓`)) : h("div", { class: "muted" }, "（无）"));
+    $("wb-panels").replaceChildren(cli, mem, disk);
+    $("wb-narr").innerHTML = stp.text;
+  }
+})();
+</script>
+</body></html>

@@ -1,0 +1,1252 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 44 章 · 基于闪存的 SSD</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+/* 闪存块 / 页可视化 */
+.fb-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }
+.fb { border: 1px solid var(--border); border-radius: 8px; padding: 6px 6px 5px; background: var(--surface); }
+.fb.cur { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.fb.erasing { border-color: var(--warn); box-shadow: 0 0 0 2px var(--warn); }
+.fb-h { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; gap: 10px; margin-bottom: 4px; white-space: nowrap; }
+.fb-h b { color: var(--fg); font-weight: 650; }
+.fb-pages { display: flex; gap: 3px; }
+.pg { width: 46px; border: 1px solid var(--border); border-radius: 5px; text-align: center; font: 12px/1.35 var(--mono); padding: 2px 0; background: var(--surface-2); transition: background .2s, border-color .2s; }
+.pg .n { color: var(--faint); font-size: 10.5px; }
+.pg .d { font-weight: 700; min-height: 17px; }
+.pg .l { font-size: 10px; color: var(--muted); min-height: 14px; }
+.pg .st { font-size: 11px; font-weight: 700; }
+.pg.s-i { color: var(--faint); }
+.pg.s-i .st { color: var(--faint); }
+.pg.s-E { background: var(--surface); border-style: dashed; }
+.pg.s-E .st { color: var(--warn); }
+.pg.s-V { background: var(--ok-soft); border-color: var(--ok); }
+.pg.s-V .st { color: var(--ok); }
+.pg.dead { background: var(--bad-soft); border-color: var(--bad); }
+.pg.dead .d { text-decoration: line-through; color: var(--bad); }
+.pg.dead .st { color: var(--bad); }
+.pg.hl { outline: 2.5px solid var(--accent); outline-offset: 1px; }
+.pg.hl-src { outline: 2.5px dashed var(--c6); outline-offset: 1px; }
+.wear { height: 5px; background: var(--surface-2); border-radius: 3px; margin-top: 5px; overflow: hidden; }
+.wear > i { display: block; height: 100%; background: var(--warn); }
+.maptab { font: 12.5px var(--mono); display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 10px; }
+.maptab .ttl { font: 12.5px var(--font); color: var(--muted); margin-right: 4px; }
+.maptab .ent { border: 1px solid var(--border); border-radius: 4px; padding: 0 6px; background: var(--surface); }
+.maptab .ent.new { border-color: var(--accent); background: var(--accent-soft); }
+.maptab .ent.gone { opacity: .5; text-decoration: line-through; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12.5px; color: var(--muted); margin-top: 8px; }
+.legend .sw { display: inline-block; width: 14px; height: 12px; border-radius: 3px; border: 1px solid var(--border); vertical-align: -1px; margin-right: 4px; }
+.oplist { font: 12.5px var(--mono); display: flex; flex-wrap: wrap; gap: 3px; margin: 0 0 10px; }
+.oplist span { padding: 0 6px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface); }
+.oplist span.done { color: var(--muted); }
+.oplist span.now { border-color: var(--accent); background: var(--accent-soft); color: var(--fg); font-weight: 700; }
+.oplist span.bad { border-color: var(--bad); background: var(--bad-soft); }
+.narrate .err { color: var(--bad); font-weight: 650; }
+.cmp { margin-top: 12px; }
+.cmp td, .cmp th { font-size: 13.5px; padding: 6px 10px; }
+.bits { font: 13px var(--mono); letter-spacing: .08em; }
+.bitdiff { color: var(--bad); font-weight: 700; }
+.calc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px 14px; margin-bottom: 10px; font-size: 14px; }
+.calc-grid label { display: flex; flex-direction: column; gap: 3px; color: var(--muted); }
+.calc-grid input, .calc-grid select { width: 100%; }
+</style>
+</head>
+<body data-chapter="44">
+<main>
+
+<h2>本章要解决什么</h2>
+<div class="crux">
+<p><b>如何用闪存构建 SSD？</b>如何应对擦除（erase）操作的高昂代价？反复覆盖写会把器件"写坏"（磨损，wear out），如何让设备用得久？</p>
+<p class="small muted">How can we build a flash-based SSD? How can we handle the expensive nature of erasing? How can we build a device that lasts a long time, given that repeated overwrite will wear the device out?</p>
+</div>
+<p>前几章我们一直在和机械硬盘打交道：寻道、旋转、顺序比随机快几百倍。这一章换成另一种持久存储——<b>固态存储（solid-state storage）</b>，它没有任何机械部件，由晶体管构成，却和 DRAM 不同，断电后数据不丢。我们关注的技术是 <b>NAND 闪存（NAND-based flash）</b>。</p>
+<p>闪存有两个"怪脾气"：<b>要写一个页，必须先擦除它所在的整个块</b>（而且擦除很慢）；<b>同一个块擦写太多次会磨损报废</b>。SSD 内部的<b>闪存转换层（FTL，flash translation layer）</b>要在这两个限制下，对外假装成一块普通的"按块读写"的磁盘。你会看到，第 43 章日志结构文件系统（LFS）的思想——<b>追加写 + 映射 + 垃圾回收</b>——在这里被原样搬进了设备内部。</p>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>页（page）与块（block）</h4><p>页约 4KB，是读和编程的单位；块（擦除块）约 128KB–2MB，含几十到几百页，是擦除的单位。</p></div>
+  <div class="card"><h4>擦除 → 编程 → 读</h4><p>擦除把整块置为全 1（几毫秒）；编程把已擦除页的某些 1 改成 0（几百微秒）；读一页只要几十微秒。</p></div>
+  <div class="card"><h4>页状态 i / E / V</h4><p>INVALID → 擦除 → ERASED → 编程 → VALID。VALID 页不能再编程，只能等整个块被擦除。</p></div>
+  <div class="card"><h4>FTL</h4><p>把主机对逻辑块的读写，翻译成对物理块/页的 read / erase / program；目标是高性能、高可靠。</p></div>
+  <div class="card"><h4>写放大（write amplification）</h4><p>FTL 发给闪存的总写入量 ÷ 主机发给 SSD 的写入量。越接近 1 越好。</p></div>
+  <div class="card"><h4>日志结构 FTL</h4><p>写总是追加到当前块的下一个空闲页，用映射表记录"逻辑页 → 物理页"；覆盖写留下垃圾。</p></div>
+  <div class="card"><h4>垃圾回收（GC）</h4><p>挑一个含垃圾页的块，把其中存活页搬到日志末尾，再擦除整块回收空间。</p></div>
+  <div class="card"><h4>磨损均衡（wear leveling）</h4><p>让所有块被擦写的次数大致相同，避免少数"热"块先坏掉；代价是额外的数据搬迁。</p></div>
+</div>
+
+<h2>从比特到块和页</h2>
+<h3>一个单元存几个比特：SLC / MLC / TLC</h3>
+<p>闪存芯片把一个或多个比特存进<b>一个晶体管</b>：晶体管里困住的电荷量高低被映射成二进制值。</p>
+<ul>
+  <li><b>单层单元（SLC，single-level cell）</b>：每个晶体管只存 1 个比特（0 或 1），只需区分两种电荷水平。</li>
+  <li><b>多层单元（MLC，multi-level cell）</b>：存 2 个比特，00、01、10、11 分别对应低、偏低、偏高、高四种电荷水平。</li>
+  <li><b>三层单元（TLC，triple-level cell）</b>：存 3 个比特，要区分 8 种电荷水平。</li>
+</ul>
+<figure class="fig">
+<svg viewBox="0 0 720 250" width="720" role="img" aria-label="SLC、MLC、TLC 的电荷水平划分">
+  <text x="360" y="18" text-anchor="middle" font-size="13" class="t-muted">同一个晶体管的"电荷量"区间被切成 2 / 4 / 8 段 —— 段越窄，越难分辨、越慢、越容易出错</text>
+  <!-- SLC -->
+  <text x="100" y="44" text-anchor="middle" font-size="14" font-weight="700">SLC · 1 bit</text>
+  <g>
+    <rect x="65" y="56" width="70" height="75" style="fill:var(--c1);opacity:.85"/>
+    <rect x="65" y="131" width="70" height="75" style="fill:var(--c1);opacity:.25"/>
+    <rect x="65" y="56" width="70" height="150" class="stroke"/>
+    <text x="145" y="98" font-size="13" class="mono">1</text><text x="145" y="173" font-size="13" class="mono">0</text>
+  </g>
+  <!-- MLC -->
+  <text x="360" y="44" text-anchor="middle" font-size="14" font-weight="700">MLC · 2 bits</text>
+  <g>
+    <rect x="325" y="56" width="70" height="37.5" style="fill:var(--c1);opacity:.9"/>
+    <rect x="325" y="93.5" width="70" height="37.5" style="fill:var(--c1);opacity:.65"/>
+    <rect x="325" y="131" width="70" height="37.5" style="fill:var(--c1);opacity:.4"/>
+    <rect x="325" y="168.5" width="70" height="37.5" style="fill:var(--c1);opacity:.18"/>
+    <rect x="325" y="56" width="70" height="150" class="stroke"/>
+    <text x="405" y="79" font-size="13" class="mono">11 高</text><text x="405" y="117" font-size="13" class="mono">10 偏高</text>
+    <text x="405" y="154" font-size="13" class="mono">01 偏低</text><text x="405" y="192" font-size="13" class="mono">00 低</text>
+  </g>
+  <!-- TLC -->
+  <text x="610" y="44" text-anchor="middle" font-size="14" font-weight="700">TLC · 3 bits</text>
+  <g>
+    <rect x="575" y="56" width="70" height="150" class="stroke"/>
+    <rect x="575" y="56" width="70" height="18.75" style="fill:var(--c1);opacity:.95"/>
+    <rect x="575" y="74.75" width="70" height="18.75" style="fill:var(--c1);opacity:.83"/>
+    <rect x="575" y="93.5" width="70" height="18.75" style="fill:var(--c1);opacity:.71"/>
+    <rect x="575" y="112.25" width="70" height="18.75" style="fill:var(--c1);opacity:.59"/>
+    <rect x="575" y="131" width="70" height="18.75" style="fill:var(--c1);opacity:.47"/>
+    <rect x="575" y="149.75" width="70" height="18.75" style="fill:var(--c1);opacity:.35"/>
+    <rect x="575" y="168.5" width="70" height="18.75" style="fill:var(--c1);opacity:.23"/>
+    <rect x="575" y="187.25" width="70" height="18.75" style="fill:var(--c1);opacity:.12"/>
+    <text x="655" y="70" font-size="11" class="mono">111</text><text x="655" y="201" font-size="11" class="mono">000</text>
+    <text x="655" y="136" font-size="11" class="t-muted">…8 级</text>
+  </g>
+  <line x1="30" y1="206" x2="30" y2="60" class="arrow"/><path d="M26,66 L30,56 L34,66" class="arrow"/>
+  <text x="22" y="140" font-size="12" class="t-muted" transform="rotate(-90 22 140)" text-anchor="middle">电荷量</text>
+  <text x="100" y="230" text-anchor="middle" font-size="12.5">最快 · 最贵 · 最耐用</text>
+  <text x="360" y="230" text-anchor="middle" font-size="12.5">折中</text>
+  <text x="610" y="230" text-anchor="middle" font-size="12.5">最便宜（容量大）· 最慢</text>
+</svg>
+<figcaption>图 1：每个单元存的比特越多，需要区分的电荷水平越多。原书："SLC chips achieve higher performance and are more expensive."</figcaption>
+</figure>
+
+<h3>块和页：闪存的两级组织</h3>
+<p>闪存芯片由若干 <b>bank（也叫 plane）</b>组成，每个 bank 里有大量单元，按两种不同大小的单位访问：</p>
+<ul>
+  <li><b>块（block，也叫擦除块 erase block）</b>：通常 128KB 或 256KB（原书术语总结里给出的范围是 128KB–2MB）；</li>
+  <li><b>页（page）</b>：几 KB（例如 4KB；范围 1KB–8KB）。每个 bank 里有很多块，每个块里有很多页。</li>
+</ul>
+<div class="tip"><p>注意术语！这里的"块"和"页"跟磁盘的块、虚拟内存的页<b>不是一回事</b>。原书提示："What is a block to you may be a page to someone else"——在闪存语境里，<b>页是读/写的小单位，块是擦除的大单位</b>。</p></div>
+<figure class="fig">
+<svg viewBox="0 0 740 250" width="740" role="img" aria-label="闪存 plane 中的块与页">
+  <rect x="10" y="10" width="720" height="165" rx="10" class="box"/>
+  <text x="24" y="32" font-size="13" class="t-muted">一个 plane（bank）——真实芯片里有数千个块，每块几十到几百页；这里画 3 块 × 4 页（原书 Figure 44.1）</text>
+  <g font-size="13">
+    <rect x="30" y="50" width="220" height="110" rx="8" class="box-strong"/><text x="140" y="70" text-anchor="middle" font-weight="700">块 0</text>
+    <rect x="270" y="50" width="220" height="110" rx="8" class="box-strong"/><text x="380" y="70" text-anchor="middle" font-weight="700">块 1</text>
+    <rect x="510" y="50" width="220" height="110" rx="8" class="box-strong"/><text x="620" y="70" text-anchor="middle" font-weight="700">块 2</text>
+  </g>
+  <g font-size="13" class="mono">
+    <rect x="40" y="82" width="46" height="62" rx="5" class="accent-soft"/><text x="63" y="118" text-anchor="middle">00</text>
+    <rect x="92" y="82" width="46" height="62" rx="5" class="box"/><text x="115" y="118" text-anchor="middle">01</text>
+    <rect x="144" y="82" width="46" height="62" rx="5" class="box"/><text x="167" y="118" text-anchor="middle">02</text>
+    <rect x="196" y="82" width="46" height="62" rx="5" class="box"/><text x="219" y="118" text-anchor="middle">03</text>
+    <rect x="280" y="82" width="46" height="62" rx="5" class="box"/><text x="303" y="118" text-anchor="middle">04</text>
+    <rect x="332" y="82" width="46" height="62" rx="5" class="box"/><text x="355" y="118" text-anchor="middle">05</text>
+    <rect x="384" y="82" width="46" height="62" rx="5" class="box"/><text x="407" y="118" text-anchor="middle">06</text>
+    <rect x="436" y="82" width="46" height="62" rx="5" class="box"/><text x="459" y="118" text-anchor="middle">07</text>
+    <rect x="520" y="82" width="46" height="62" rx="5" class="warn-soft"/><text x="543" y="118" text-anchor="middle">08</text>
+    <rect x="572" y="82" width="46" height="62" rx="5" class="warn-soft"/><text x="595" y="118" text-anchor="middle">09</text>
+    <rect x="624" y="82" width="46" height="62" rx="5" class="warn-soft"/><text x="647" y="118" text-anchor="middle">10</text>
+    <rect x="676" y="82" width="46" height="62" rx="5" class="warn-soft"/><text x="699" y="118" text-anchor="middle">11</text>
+  </g>
+  <path d="M63,178 L63,195" class="arrow"/>
+  <text x="40" y="214" font-size="13"><tspan style="fill:var(--accent);font-weight:700">页</tspan>：读（read）和编程（program）的单位，约 4KB</text>
+  <path d="M520,182 Q620,196 722,182" class="arrow"/>
+  <text x="400" y="214" font-size="13"><tspan style="fill:var(--warn);font-weight:700">块</tspan>：擦除（erase）的单位，128KB–2MB</text>
+  <text x="370" y="240" text-anchor="middle" font-size="12.5" class="t-muted">要改写页 08 中的任何一个比特，都得先把 08~11 整个块擦掉</text>
+</svg>
+<figcaption>图 2：页在块之内。"要写块里的一页，必须先擦除整个块"是本章最重要（也最奇怪）的事实。</figcaption>
+</figure>
+
+<h2>三种基本操作：读、擦除、编程</h2>
+<p>闪存芯片支持三种底层操作：<b>读</b>用来读页；<b>擦除</b>和<b>编程</b>配合起来完成写。</p>
+<div class="table-wrap"><table>
+<tr><th>操作</th><th>粒度</th><th>效果</th><th>耗时</th></tr>
+<tr><td><b>读（read）</b></td><td>页</td><td>给出页号即可读出，与位置和上一个请求的位置基本无关——闪存是<b>随机访问设备</b></td><td>几十 µs</td></tr>
+<tr><td><b>擦除（erase）</b></td><td>块</td><td>把块内每个比特置为 1，<b>销毁整块内容</b>；执行前必须先把块里还有用的数据搬走</td><td>几 ms（最贵）</td></tr>
+<tr><td><b>编程（program）</b></td><td>页</td><td>在已擦除的页上把某些 1 改成 0，写入页内容</td><td>几百 µs</td></tr>
+</table></div>
+<p>最好用<b>页的状态</b>来理解这些操作：页一开始是 <b>INVALID（i）</b>；擦除所在块后，块内所有页变成 <b>ERASED（E）</b>——内容被重置，并且<b>可编程</b>；编程一个页后它变成 <b>VALID（V）</b>，内容已设定、可以读取。读不改变状态。<b>一个页一旦被编程，想改它的内容只能擦除整个块。</b></p>
+<figure class="fig">
+<svg viewBox="0 0 720 230" width="720" role="img" aria-label="闪存页状态机">
+  <defs><marker id="ah44" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker>
+  <marker id="ah44b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--bad)"/></marker></defs>
+  <rect x="20" y="90" width="150" height="54" rx="27" class="box"/><text x="95" y="114" text-anchor="middle" font-weight="700">INVALID</text><text x="95" y="133" text-anchor="middle" font-size="12" class="t-muted">i · 初始状态</text>
+  <rect x="285" y="90" width="150" height="54" rx="27" class="warn-soft"/><text x="360" y="114" text-anchor="middle" font-weight="700">ERASED</text><text x="360" y="133" text-anchor="middle" font-size="12" class="t-muted">E · 全 1，可编程</text>
+  <rect x="550" y="90" width="150" height="54" rx="27" class="ok-soft"/><text x="625" y="114" text-anchor="middle" font-weight="700">VALID</text><text x="625" y="133" text-anchor="middle" font-size="12" class="t-muted">V · 内容已写入</text>
+  <line x1="172" y1="112" x2="282" y2="112" class="arrow" marker-end="url(#ah44)"/>
+  <text x="227" y="104" text-anchor="middle" font-size="12.5">Erase(块)</text>
+  <line x1="437" y1="112" x2="547" y2="112" class="arrow" marker-end="url(#ah44)"/>
+  <text x="492" y="104" text-anchor="middle" font-size="12.5">Program(页)</text>
+  <path d="M590,146 C560,200 420,200 380,148" class="arrow" marker-end="url(#ah44)"/>
+  <text x="485" y="206" text-anchor="middle" font-size="12.5">Erase(整个块)：同块所有页一起回到 E</text>
+  <path d="M600,88 C585,40 665,40 650,88" class="arrow" marker-end="url(#ah44)"/>
+  <text x="625" y="34" text-anchor="middle" font-size="12.5">Read：状态不变</text>
+  <path d="M560,92 C500,40 430,40 410,86" style="stroke:var(--bad);fill:none;stroke-dasharray:5 4;stroke-width:1.5" marker-end="url(#ah44b)"/>
+  <text x="470" y="46" text-anchor="middle" font-size="12.5" style="fill:var(--bad)">Program(已 V 的页) ✗ 出错</text>
+  <text x="95" y="190" text-anchor="middle" font-size="12" class="t-muted">原书示例（4 页的块）：</text>
+  <text x="95" y="208" text-anchor="middle" font-size="12" class="mono">iiii → EEEE → VEEE</text>
+  <text x="95" y="224" text-anchor="middle" font-size="12" class="mono">→ VVEE → EEEE</text>
+</svg>
+<figcaption>图 3：闪存页的状态机。关键在右边那条红色虚线——已编程的页不能"原地改写"。</figcaption>
+</figure>
+
+<section class="sim" id="sim-block">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>一个闪存块：擦除、编程、读</h3>
+    <div class="desc">一个含 4 个 8 比特页的块（尺寸是故意缩小的）。试着对已经 VALID 的页再编程；试着在块里还有有用数据时擦除——观察内容和状态如何变化。编程只能把 1 变成 0，所以只有擦除过（全 1）的页才能写入任意内容。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <button id="blk-preset1">载入：原书状态转换序列</button>
+      <button id="blk-preset2">载入：原书"详细示例"</button>
+      <span class="sep"></span>
+      <button id="blk-erase">Erase()</button>
+      <label>页 <select id="blk-page"><option>0</option><option>1</option><option>2</option><option>3</option></select></label>
+      <label>内容 <input type="text" id="blk-val" value="00000011" size="9" maxlength="8"></label>
+      <button id="blk-prog">Program(页)</button>
+      <button id="blk-read">Read(页)</button>
+    </div>
+    <div class="stage"><div id="blk-stage"></div></div>
+    <div class="narrate" id="blk-narr">点"载入"或直接操作。</div>
+    <div class="readout" id="blk-log"></div>
+  </div>
+</section>
+
+<p>原书的详细示例：块里 4 个页都已 VALID（内容 <code>00011000 11001110 00000001 00111111</code>）。想把页 0 改成 <code>00000011</code>，必须先擦除整个块（4 页全变 <code>11111111</code>），再编程页 0。<b>坏消息是：页 1、2、3 的旧内容全没了！</b>所以覆盖块内任意一页之前，必须先把我们关心的数据搬到别处（内存或另一个闪存块）。擦除的这个性质，将决定整个 SSD 的设计。</p>
+
+<h2>闪存的性能与可靠性</h2>
+<div class="table-wrap"><table>
+<tr><th>器件</th><th class="num">读（µs）</th><th class="num">编程（µs）</th><th class="num">擦除（µs）</th></tr>
+<tr><td>SLC</td><td class="num">25</td><td class="num">200–300</td><td class="num">1500–2000</td></tr>
+<tr><td>MLC</td><td class="num">50</td><td class="num">600–900</td><td class="num">~3000</td></tr>
+<tr><td>TLC</td><td class="num">~75</td><td class="num">~900–1350</td><td class="num">~4500</td></tr>
+</table></div>
+<p class="small muted">原书 Figure 44.2：裸闪存的性能特征（数字来自大众媒体 [V12]）。</p>
+<figure class="fig">
+<svg viewBox="0 0 720 150" width="720" role="img" aria-label="MLC 读、编程、擦除延迟对比">
+  <text x="10" y="20" font-size="13" class="t-muted">MLC 三种操作的延迟（线性刻度，每格 500µs）</text>
+  <g font-size="13">
+    <text x="10" y="52">读 50µs</text><rect x="120" y="38" width="9" height="20" rx="3" style="fill:var(--c3)"/>
+    <text x="10" y="87">编程 ~750µs</text><rect x="120" y="73" width="135" height="20" rx="3" style="fill:var(--c5)"/>
+    <text x="10" y="122">擦除 ~3000µs</text><rect x="120" y="108" width="540" height="20" rx="3" style="fill:var(--c2)"/>
+  </g>
+  <text x="668" y="123" font-size="12.5">60×</text>
+  <text x="264" y="88" font-size="12.5">15×</text>
+  <g class="t-muted" font-size="10"><line x1="120" y1="32" x2="120" y2="134" class="arrow" style="stroke:var(--border)"/><line x1="210" y1="32" x2="210" y2="134" style="stroke:var(--border)"/><line x1="300" y1="32" x2="300" y2="134" style="stroke:var(--border)"/><line x1="390" y1="32" x2="390" y2="134" style="stroke:var(--border)"/><line x1="480" y1="32" x2="480" y2="134" style="stroke:var(--border)"/><line x1="570" y1="32" x2="570" y2="134" style="stroke:var(--border)"/><line x1="660" y1="32" x2="660" y2="134" style="stroke:var(--border)"/></g>
+</svg>
+<figcaption>图 4：读很快；编程慢一个数量级，而且单元存的比特越多越慢——想要好的写性能，就得<b>并行使用多个闪存芯片</b>；擦除要几毫秒，处理擦除的代价是闪存设计的核心问题。</figcaption>
+</figure>
+
+<h3>可靠性：磨损与扰动</h3>
+<p>闪存是纯硅器件，不像硬盘那样会出现磁头划伤盘面（head crash）这类机械故障。它最主要的问题是：</p>
+<ul>
+  <li><b>磨损（wear out）</b>：每次擦除和编程，块里都会积累一点额外电荷；积累多了，就越来越难区分 0 和 1，最终整块不可用。厂商给 MLC 块标称 <b>10,000 次 P/E（Program/Erase）周期</b>，SLC 因为每个晶体管只存 1 比特，通常标称 <b>100,000 次</b>。不过研究发现实际寿命比预期长得多 [BD10]。</li>
+  <li><b>扰动（disturbance）</b>：访问某个页时，相邻页的某些比特可能被翻转。读引起的叫<b>读扰动（read disturb）</b>，编程引起的叫<b>编程扰动（program disturb）</b>。为了减少编程扰动，FTL 通常在一个已擦除块内<b>按页号从低到高顺序编程</b>。</li>
+</ul>
+<figure class="fig">
+<svg viewBox="0 0 720 150" width="720" role="img" aria-label="编程扰动与顺序编程">
+  <text x="10" y="20" font-size="13" class="t-muted">编程页 2 时，相邻页 1、3 的比特可能被"带偏"</text>
+  <g class="mono" font-size="12.5">
+    <rect x="20" y="40" width="70" height="46" rx="5" class="ok-soft"/><text x="55" y="68" text-anchor="middle">页 0</text>
+    <rect x="100" y="40" width="70" height="46" rx="5" class="warn-soft"/><text x="135" y="68" text-anchor="middle">页 1</text>
+    <rect x="180" y="40" width="70" height="46" rx="5" class="accent-soft" style="stroke-width:2.5"/><text x="215" y="68" text-anchor="middle">页 2</text>
+    <rect x="260" y="40" width="70" height="46" rx="5" class="warn-soft"/><text x="295" y="68" text-anchor="middle">页 3</text>
+  </g>
+  <path d="M180,55 L170,60 L176,63 L166,70" style="stroke:var(--warn);fill:none;stroke-width:2"/>
+  <path d="M250,55 L260,60 L254,63 L264,70" style="stroke:var(--warn);fill:none;stroke-width:2"/>
+  <text x="175" y="110" text-anchor="middle" font-size="12.5">Program(2) → 邻居可能出现比特翻转</text>
+  <g font-size="12.5">
+    <text x="400" y="45">对策：在已擦除的块内按 0 → 1 → 2 → 3 顺序编程</text>
+    <rect x="400" y="58" width="60" height="30" rx="4" class="ok-soft"/><text x="430" y="78" text-anchor="middle" class="mono">①</text>
+    <rect x="470" y="58" width="60" height="30" rx="4" class="ok-soft"/><text x="500" y="78" text-anchor="middle" class="mono">②</text>
+    <rect x="540" y="58" width="60" height="30" rx="4" class="ok-soft"/><text x="570" y="78" text-anchor="middle" class="mono">③</text>
+    <rect x="610" y="58" width="60" height="30" rx="4" class="ok-soft"/><text x="640" y="78" text-anchor="middle" class="mono">④</text>
+    <line x1="400" y1="104" x2="668" y2="104" class="arrow" marker-end="url(#ah44)"/>
+    <text x="400" y="128" class="t-muted">磨损：P/E 次数有限（MLC≈1 万，SLC≈10 万）</text>
+  </g>
+</svg>
+<figcaption>图 5：扰动和磨损是闪存的两类可靠性问题；后面的日志结构 FTL 天然满足"块内顺序编程"。</figcaption>
+</figure>
+
+<h2>从裸闪存到 SSD：FTL</h2>
+<p>标准的存储接口很简单：按块地址读写 512 字节（或更大）的扇区。SSD 的任务就是<b>在裸闪存芯片之上提供这个标准块接口</b>。</p>
+<div class="aside" data-title="向后兼容的重要性"><p>原书的 TIP：定义稳定的接口，两边就能各自创新而保持互操作——文件系统看到的 SSD 和硬盘一样都是"块设备"。但接口过于僵化也有代价，比如 ZFS 就通过重新思考文件系统与 RAID 的分工，得到了更好的整体设计。后面的 trim 接口也是"实现反过来塑造接口"的例子。</p></div>
+<p>SSD 内部有三样东西：若干<b>闪存芯片</b>（持久存储）；一些<b>易失性内存</b>（如 SRAM，用来缓存和缓冲数据、存放映射表）；以及协调一切的<b>控制逻辑</b>。控制逻辑里最核心的就是 <b>FTL</b>：把对<b>逻辑块</b>的读写请求，变成对<b>物理块、物理页</b>的 read / erase / program 命令。</p>
+<figure class="fig">
+<svg viewBox="0 0 760 260" width="760" role="img" aria-label="SSD 逻辑结构图">
+  <rect x="10" y="100" width="112" height="60" rx="8" class="box-strong"/><text x="66" y="126" text-anchor="middle" font-weight="700">主机</text><text x="66" y="145" text-anchor="middle" font-size="12" class="t-muted">文件系统</text>
+  <line x1="122" y1="130" x2="176" y2="130" class="arrow" marker-end="url(#ah44)"/>
+  <text x="150" y="118" text-anchor="middle" font-size="11" class="t-muted">读/写 LBA</text>
+  <rect x="150" y="8" width="600" height="244" rx="12" style="fill:none;stroke:var(--muted);stroke-dasharray:6 5"/>
+  <text x="165" y="28" font-size="13" font-weight="700">SSD</text>
+  <rect x="180" y="100" width="110" height="60" rx="8" class="accent-soft"/><text x="235" y="126" text-anchor="middle" font-size="13" font-weight="700">接口逻辑</text><text x="235" y="145" text-anchor="middle" font-size="11" class="t-muted">Interface Logic</text>
+  <line x1="290" y1="130" x2="322" y2="130" class="arrow" marker-end="url(#ah44)"/>
+  <rect x="325" y="95" width="140" height="70" rx="8" class="accent-soft" style="stroke-width:2"/><text x="395" y="120" text-anchor="middle" font-size="13" font-weight="700">闪存控制器</text><text x="395" y="139" text-anchor="middle" font-size="12">运行 FTL</text><text x="395" y="156" text-anchor="middle" font-size="11" class="t-muted">Flash Controller</text>
+  <rect x="325" y="190" width="140" height="50" rx="8" class="warn-soft"/><text x="395" y="211" text-anchor="middle" font-size="13" font-weight="700">内存（SRAM）</text><text x="395" y="229" text-anchor="middle" font-size="11">映射表 · 缓存/写缓冲</text>
+  <line x1="395" y1="165" x2="395" y2="188" class="arrow" marker-end="url(#ah44)" marker-start="url(#ah44)"/>
+  <g font-size="12.5">
+    <rect x="510" y="40" width="68" height="50" rx="6" class="ok-soft"/><text x="544" y="70" text-anchor="middle">Flash</text>
+    <rect x="590" y="40" width="68" height="50" rx="6" class="ok-soft"/><text x="624" y="70" text-anchor="middle">Flash</text>
+    <rect x="670" y="40" width="68" height="50" rx="6" class="ok-soft"/><text x="704" y="70" text-anchor="middle">Flash</text>
+    <rect x="510" y="170" width="68" height="50" rx="6" class="ok-soft"/><text x="544" y="200" text-anchor="middle">Flash</text>
+    <rect x="590" y="170" width="68" height="50" rx="6" class="ok-soft"/><text x="624" y="200" text-anchor="middle">Flash</text>
+    <rect x="670" y="170" width="68" height="50" rx="6" class="ok-soft"/><text x="704" y="200" text-anchor="middle">Flash</text>
+  </g>
+  <path d="M465,120 L495,120 L495,65 L508,65" class="arrow" marker-end="url(#ah44)"/>
+  <path d="M465,140 L495,140 L495,195 L508,195" class="arrow" marker-end="url(#ah44)"/>
+  <text x="624" y="130" text-anchor="middle" font-size="12" class="t-muted">多个芯片并行 → 高带宽</text>
+  <text x="624" y="146" text-anchor="middle" font-size="12" class="t-muted">read / erase / program</text>
+</svg>
+<figcaption>图 6：基于闪存的 SSD 逻辑结构（仿原书 Figure 44.3）。FTL 运行在控制器里，映射表放在控制器旁边的内存中。</figcaption>
+</figure>
+<p>FTL 的设计目标：</p>
+<ul>
+  <li><b>高性能</b>：① 并行使用多个闪存芯片（现代 SSD 都这么做，本章不展开）；② 降低<b>写放大（write amplification）</b>——FTL 发给闪存芯片的总写流量（字节）÷ 客户端发给 SSD 的总写流量（字节）。</li>
+  <li><b>高可靠</b>：① <b>磨损均衡（wear leveling）</b>——把写负载尽量均匀地分散到所有块上，让它们差不多同时磨损完；② 减少<b>编程扰动</b>——在已擦除块内按页号从低到高顺序编程。</li>
+</ul>
+
+<h2>糟糕的方案：直接映射</h2>
+<p>最简单的 FTL 叫<b>直接映射（direct mapped）</b>：读逻辑页 N 就读物理页 N。写逻辑页 N 就麻烦了：FTL 要先<b>读出 N 所在的整个块</b>，然后<b>擦除这个块</b>，最后把<b>旧页和新页一起重新编程</b>。</p>
+<figure class="fig">
+<svg viewBox="0 0 760 210" width="760" role="img" aria-label="直接映射 FTL 的读-改-写">
+  <g font-size="13" font-weight="700">
+    <text x="90" y="22" text-anchor="middle">初始：块内 4 页都有效</text>
+    <text x="280" y="22" text-anchor="middle">① 读出其余 3 页</text>
+    <text x="470" y="22" text-anchor="middle">② 擦除整个块</text>
+    <text x="660" y="22" text-anchor="middle">③ 编程 4 页</text>
+  </g>
+  <g class="mono" font-size="13">
+    <rect x="20" y="36" width="32" height="44" rx="4" class="ok-soft"/><text x="36" y="63" text-anchor="middle">A</text>
+    <rect x="56" y="36" width="32" height="44" rx="4" class="ok-soft"/><text x="72" y="63" text-anchor="middle">B</text>
+    <rect x="92" y="36" width="32" height="44" rx="4" class="ok-soft"/><text x="108" y="63" text-anchor="middle">C</text>
+    <rect x="128" y="36" width="32" height="44" rx="4" class="ok-soft"/><text x="144" y="63" text-anchor="middle">D</text>
+
+    <rect x="210" y="36" width="32" height="44" rx="4" class="ok-soft"/><text x="226" y="63" text-anchor="middle">A</text>
+    <rect x="246" y="36" width="32" height="44" rx="4" class="ok-soft" style="stroke-width:2.5;stroke:var(--c6)"/><text x="262" y="63" text-anchor="middle">B</text>
+    <rect x="282" y="36" width="32" height="44" rx="4" class="ok-soft" style="stroke-width:2.5;stroke:var(--c6)"/><text x="298" y="63" text-anchor="middle">C</text>
+    <rect x="318" y="36" width="32" height="44" rx="4" class="ok-soft" style="stroke-width:2.5;stroke:var(--c6)"/><text x="334" y="63" text-anchor="middle">D</text>
+    <rect x="236" y="110" width="110" height="30" rx="5" class="warn-soft"/><text x="291" y="130" text-anchor="middle" font-size="12">内存：B C D</text>
+    <line x1="291" y1="84" x2="291" y2="106" class="arrow" marker-end="url(#ah44)"/>
+
+    <rect x="400" y="36" width="32" height="44" rx="4" class="bad-soft"/><text x="416" y="63" text-anchor="middle">E</text>
+    <rect x="436" y="36" width="32" height="44" rx="4" class="bad-soft"/><text x="452" y="63" text-anchor="middle">E</text>
+    <rect x="472" y="36" width="32" height="44" rx="4" class="bad-soft"/><text x="488" y="63" text-anchor="middle">E</text>
+    <rect x="508" y="36" width="32" height="44" rx="4" class="bad-soft"/><text x="524" y="63" text-anchor="middle">E</text>
+
+    <rect x="590" y="36" width="32" height="44" rx="4" class="accent-soft" style="stroke-width:2.5"/><text x="606" y="63" text-anchor="middle">A'</text>
+    <rect x="626" y="36" width="32" height="44" rx="4" class="ok-soft"/><text x="642" y="63" text-anchor="middle">B</text>
+    <rect x="662" y="36" width="32" height="44" rx="4" class="ok-soft"/><text x="678" y="63" text-anchor="middle">C</text>
+    <rect x="698" y="36" width="32" height="44" rx="4" class="ok-soft"/><text x="714" y="63" text-anchor="middle">D</text>
+  </g>
+  <line x1="168" y1="58" x2="202" y2="58" class="arrow" marker-end="url(#ah44)"/>
+  <line x1="358" y1="58" x2="392" y2="58" class="arrow" marker-end="url(#ah44)"/>
+  <line x1="548" y1="58" x2="582" y2="58" class="arrow" marker-end="url(#ah44)"/>
+  <text x="470" y="110" text-anchor="middle" font-size="12.5">几毫秒；块的 P/E 计数 +1</text>
+  <text x="660" y="110" text-anchor="middle" font-size="12.5">主机只写了 A'，闪存写了 4 页</text>
+  <text x="380" y="172" text-anchor="middle" font-size="14" font-weight="700">主机写 1 页 = 读 3 页 + 擦除 1 块 + 编程 4 页 → 写放大 = 块内页数</text>
+  <text x="380" y="196" text-anchor="middle" font-size="12.5" class="t-muted">真实块有 64~256 页：写放大可达几十到几百倍，比有机械寻道的硬盘还慢；热点逻辑页所在的块会被反复擦写，很快磨损报废</text>
+</svg>
+<figcaption>图 7：直接映射 FTL 每次覆盖写都要"读-改-写"整块。</figcaption>
+</figure>
+<p>直接映射在<b>性能</b>和<b>可靠性</b>上都很糟：性能上，每次写都要读整块（贵）、擦除（很贵）、再编程（贵），写放大与每块页数成正比；可靠性上，如果文件系统元数据或用户数据被反复覆盖，同一个块就被反复擦写，很快磨损坏掉——<b>直接映射把磨损的控制权完全交给了客户端负载</b>。</p>
+
+<h2>日志结构 FTL</h2>
+<p>因此今天大多数 FTL 都是<b>日志结构（log structured）</b>的——这个思想既可以用在存储设备里（本章），也可以用在设备之上的文件系统里（第 43 章 LFS）。写逻辑块 N 时，设备把它<b>追加（append）到当前正在写的块的下一个空闲页</b>；为了之后能读 N，设备维护一张<b>映射表（mapping table）</b>，记录每个逻辑块所在的物理地址。</p>
+<p>原书示例：SSD 有若干 16KB 的块，每块 4 个 4KB 的页；客户端依次执行 <code>Write(100)=a1</code>、<code>Write(101)=a2</code>、<code>Write(2000)=b1</code>、<code>Write(2001)=b2</code>。一开始所有页都是 INVALID，所以 FTL 决定把第一个写放到物理块 0 时，必须先<b>擦除块 0</b>；随后按顺序编程页 0、1、2、3，并记下 <code>100→0, 101→1, 2000→2, 2001→3</code>。读逻辑块 100 时，查表得到物理页 0，直接读即可。</p>
+<p>和直接映射相比：擦除只是偶尔发生，昂贵的读-改-写完全消失；FTL 还可以把写分散到所有页上（磨损均衡）。下面的模拟器可以逐步重现原书的每一张状态图。</p>
+
+<section class="sim" id="sim-ftl">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>FTL 模拟器：直接映射 vs 日志结构（仿 ssd.py）</h3>
+    <div class="desc">输入请求序列（逻辑页），逐步观察每个请求被翻译成哪些 erase / program / read。绿色 = 存活的 VALID 页；红色删除线 = 已是垃圾（VALID 但映射表不再指向它）；虚线框 = ERASED；灰色 = INVALID。每个块下面的橙色条是擦除次数（磨损）。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <button id="ftl-p1" class="primary">原书：日志 FTL + GC</button>
+      <button id="ftl-p2">直接映射：反复覆盖</button>
+      <button id="ftl-p3">同样请求 → 日志 FTL</button>
+      <button id="ftl-p4">随机负载 + 自动 GC</button>
+    </div>
+    <div class="controls">
+      <label>FTL <select id="ftl-type"><option value="log">日志结构（页映射）</option><option value="direct">直接映射</option></select></label>
+      <label>块数 <input type="number" id="ftl-blocks" min="2" max="12" value="3"></label>
+      <label>每块页数 <input type="number" id="ftl-ppb" min="2" max="8" value="4"></label>
+      <label><input type="checkbox" id="ftl-auto"> 自动 GC</label>
+      <label>高水位 G <input type="number" id="ftl-G" min="1" max="12" value="3"></label>
+      <label>低水位 g <input type="number" id="ftl-g" min="0" max="12" value="2"></label>
+    </div>
+    <div style="margin-bottom:14px">
+      <div class="small muted" style="margin-bottom:4px">请求序列：<code>w逻辑页:内容</code>（内容可省略）、<code>r逻辑页</code> 读、<code>t逻辑页</code> trim、<code>gc块号</code> 手动回收某块</div>
+      <textarea id="ftl-ops" spellcheck="false" style="min-height:52px" aria-label="请求序列"></textarea>
+    </div>
+    <div class="controls">
+      <button id="ftl-run" class="primary">应用请求序列 ↻</button>
+      <span class="sep"></span>
+      <label>随机：种子 <input type="number" id="ftl-seed" value="1"></label>
+      <label>请求数 <input type="number" id="ftl-n" value="50" min="1" max="200"></label>
+      <label>逻辑页范围 <input type="number" id="ftl-L" value="12" min="1" max="96"></label>
+      <label>读 % <input type="number" id="ftl-rp" value="20" min="0" max="100"></label>
+      <label>trim % <input type="number" id="ftl-tp" value="0" min="0" max="100"></label>
+      <label><input type="checkbox" id="ftl-skew"> 80/20 偏斜</label>
+      <button id="ftl-gen">生成随机请求</button>
+    </div>
+    <div class="controls">
+      <label>擦除 µs <input type="number" id="ftl-te" value="1000"></label>
+      <label>编程 µs <input type="number" id="ftl-tw" value="40"></label>
+      <label>读 µs <input type="number" id="ftl-tr" value="10"></label>
+      <span class="small muted">（ssd.py 的默认值）</span>
+    </div>
+    <div id="ftl-step"></div>
+    <div class="oplist" id="ftl-oplist"></div>
+    <div class="stage"><div id="ftl-stage"></div></div>
+    <div class="legend">
+      <span><i class="sw" style="background:var(--surface-2)"></i>i INVALID</span>
+      <span><i class="sw" style="background:var(--surface);border-style:dashed"></i>E ERASED</span>
+      <span><i class="sw" style="background:var(--ok-soft);border-color:var(--ok)"></i>V 存活</span>
+      <span><i class="sw" style="background:var(--bad-soft);border-color:var(--bad)"></i>V 垃圾（旧版本/已 trim）</span>
+      <span><i class="sw" style="outline:2px solid var(--accent)"></i>本步写入/读取</span>
+      <span><i class="sw" style="outline:2px dashed var(--c6)"></i>本步读出的源页</span>
+      <span><i class="sw" style="border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)"></i>当前追加块</span>
+    </div>
+    <div class="narrate" id="ftl-narr"></div>
+    <div class="stats" id="ftl-stats"></div>
+    <div class="table-wrap cmp" id="ftl-cmp"></div>
+  </div>
+</section>
+
+<div class="aside" data-title="映射信息如何持久化？"><p>断电后内存里的映射表就没了，这对"持久"存储设备是不可接受的。最简单的办法是在每个页旁边的<b>带外区域（OOB，out-of-band）</b>记录一些映射信息（比如"这一页存的是逻辑块 100"）。重启时扫描所有 OOB 区重建映射表——但大容量 SSD 全盘扫描很慢，高端设备会用更复杂的日志和检查点（checkpoint）技术加速恢复（参见第 42 章崩溃一致性、第 43 章 LFS）。</p></div>
+
+<p>日志结构并非没有代价。原书指出两个缺点：<b>① 覆盖写产生垃圾</b>，需要垃圾回收，过多的 GC 会推高写放大、降低性能；<b>② 内存中的映射表很大</b>，设备越大需要的内存越多。下面两节分别讨论。</p>
+
+<h2>垃圾回收（Garbage Collection）</h2>
+<p>接着原书的例子：逻辑块 100 和 101 再次被写入，内容为 c1、c2。它们被写到下一个空闲页（物理页 4、5）——在此之前设备必须先擦除块 1；映射表更新为 <code>100→4, 101→5</code>。现在问题来了：物理页 0 和 1 虽然状态仍是 VALID，里面却是 100、101 的<b>旧版本</b>——<b>垃圾（garbage）</b>。</p>
+<p>找出<b>垃圾块（也叫死块，dead block）</b>并回收的过程叫<b>垃圾回收</b>。基本流程很简单：</p>
+<ol>
+  <li>找到一个含有垃圾页的块（例如块 0：页 0、1 是死的，页 2、3 存活）；</li>
+  <li><b>读出</b>其中的存活页（页 2、3）；</li>
+  <li>把存活页<b>写到日志末尾</b>（页 6、7）；</li>
+  <li><b>擦除</b>这个块，供以后写入。</li>
+</ol>
+<p>GC 怎么知道一页是死是活？每个块要在某处记下"每一页存的是哪个逻辑块"（类似 LFS 的段摘要）。GC 查映射表：块 0 存的是 100、101、2000、2001，映射表是 <code>100→4, 101→5, 2000→2, 2001→3</code>——页 2、3 仍被映射表指着，是活的；页 0、1 没有被指着，可以回收。</p>
+<figure class="fig" id="fig-gc"></figure>
+<p>可见 GC 可能很昂贵：要读、要重写存活数据。<b>最理想的回收对象是只含死页的块</b>——直接擦除就能复用，无需任何数据搬迁。</p>
+<div class="aside" data-title="新的存储接口：trim"><p>硬盘的接口基本只有 read 和 write（外加缓存刷新）。对于日志结构的 SSD（以及任何维护"逻辑→物理"灵活映射的设备），多一个 <b>trim</b> 操作很有用：它告诉设备某个地址（范围）上的块<b>已被删除</b>，设备不必再维护它的映射，GC 时可以直接把对应物理页当垃圾回收，而不用傻傻地搬迁。对硬盘来说 trim 几乎没用，因为它的地址映射是静态的。这是"实现反过来塑造接口"的好例子。在上面的模拟器里试试 <code>t逻辑页</code>。</p></div>
+<p>为了降低 GC 代价，一些 SSD 会<b>预留空间（overprovision）</b>：多装一些闪存容量，这样清理就可以推迟、放到后台、在设备空闲时做；更多容量也带来更多内部带宽用于清理，不影响客户端感知到的带宽。本章的 C 实验会定量展示预留比例与写放大的关系。</p>
+
+<h2>映射表的大小</h2>
+<p>日志结构的第二个代价是映射表可能非常大：每个 4KB 页一个表项。原书的例子：<b>1TB 的 SSD，每 4KB 页一个 4 字节表项，光映射表就要 1GB 内存</b>！所以纯页级 FTL 不现实。</p>
+<section class="sim" id="sim-mapsize">
+  <div class="sim-head"><span class="tag">计算器</span><h3>映射表要多大？</h3>
+    <div class="desc">改容量、页大小、块大小，比较页级映射与块级映射的内存开销。</div></div>
+  <div class="sim-body">
+    <div class="calc-grid">
+      <label>SSD 容量 <select id="ms-cap"><option value="30">1 GB</option><option value="37">128 GB</option><option value="39">512 GB</option><option value="40" selected>1 TB</option><option value="41">2 TB</option><option value="42">4 TB</option></select></label>
+      <label>页大小 <select id="ms-page"><option value="11">2 KB</option><option value="12" selected>4 KB</option><option value="13">8 KB</option><option value="14">16 KB</option></select></label>
+      <label>块大小 <select id="ms-block"><option value="17">128 KB</option><option value="18" selected>256 KB</option><option value="20">1 MB</option><option value="21">2 MB</option></select></label>
+      <label>每表项字节数 <input type="number" id="ms-entry" value="4" min="1" max="16"></label>
+    </div>
+    <div class="readout" id="ms-out"></div>
+  </div>
+</section>
+
+<h3>块级映射（block-based mapping）</h3>
+<p>一种思路是每个<b>块</b>只存一个指针，映射信息缩小为原来的 <sup>Size<sub>block</sub></sup>⁄<sub>Size<sub>page</sub></sub>。这类似于虚拟内存里用更大的页：VPN 位数更少、偏移量更长。逻辑地址被切成"<b>块号（chunk number）+ 偏移（offset）</b>"两部分：每块 4 页时偏移占 2 位，其余高位是块号。</p>
+<p>原书例子：逻辑块 2000~2003（内容 a、b、c、d）位于物理块 1（物理页 4~7）。页级映射要 4 个表项 <code>2000→4, 2001→5, 2002→6, 2003→7</code>；块级映射只需一个 <code>500→4</code>（2000~2003 的块号都是 500，偏移 0~3）。读 2002：块号 500 → 查表得 4 → 加偏移 2 → 物理页 6，读出 c。</p>
+<section class="sim" id="sim-blockmap">
+  <div class="sim-head"><span class="tag">计算器</span><h3>块级映射的地址翻译</h3>
+    <div class="desc">映射表只有一项 <code>500 → 4</code>（每块 4 页）。输入逻辑块地址，看 FTL 如何拆出块号和偏移。</div></div>
+  <div class="sim-body">
+    <div class="controls"><label>逻辑块地址 <input type="number" id="bm-lba" value="2002"></label><button id="bm-go" class="primary">翻译</button></div>
+    <div class="readout" id="bm-out"></div>
+  </div>
+</section>
+<p>但块级映射对<b>小写（small write，小于一个物理块）</b>很不友好。客户端写 2002（新内容 c'）时，FTL 必须读出 2000、2001、2003，再把四个逻辑块一起写到新位置（物理块 2，页 8~11），更新表项为 <code>500→8</code>，然后块 1 可以擦除复用。一次 4KB 的写引起了 3 次读和 4 次编程——物理块往往是 256KB 甚至更大，这种写放大太严重了。</p>
+
+<h3>混合映射（hybrid mapping）</h3>
+<p>为了兼顾灵活写入和较小的映射开销，许多现代 FTL 使用<b>混合映射</b>：</p>
+<ul>
+  <li>FTL 保留少量已擦除的块，所有写都先写到这些块里，称为<b>日志块（log block）</b>；日志块使用<b>页级映射</b>，记在小小的<b>日志表（log table）</b>里；</li>
+  <li>其余数据块使用<b>块级映射</b>，记在大一些的<b>数据表（data table）</b>里；</li>
+  <li>查找时<b>先查日志表，没找到再查数据表</b>。</li>
+</ul>
+<p>关键是让日志块数量保持很少。FTL 要定期检查日志块，把它们"转换"成只需一个块指针就能表示的块。根据块中内容不同，有三种合并方式 [KK+02]：</p>
+<section class="sim" id="sim-hybrid">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>混合映射的三种合并：switch / partial / full</h3>
+    <div class="desc">逐步观察日志表和数据表如何变化，以及每种合并需要多少额外的读、编程、擦除。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <button data-hy="switch" class="primary">switch merge（最好）</button>
+      <button data-hy="partial">partial merge</button>
+      <button data-hy="full">full merge（最差）</button>
+    </div>
+    <div id="hy-step"></div>
+    <div class="stage"><div id="hy-stage"></div></div>
+    <div class="narrate" id="hy-narr"></div>
+    <div class="stats" id="hy-stats"></div>
+  </div>
+</section>
+<ul>
+  <li><b>switch merge</b>：客户端恰好按原顺序覆盖了 1000~1003（a'、b'、c'、d'），日志块 0 里的页排列与一个完整数据块一模一样——只需把数据表改成 <code>250→0</code>，旧块 2 擦除后当作新的日志块。所有页级指针被一个块指针取代，这是最好情况。</li>
+  <li><b>partial merge</b>：只覆盖了 1000、1001。要把块"凑完整"，FTL 从旧块 2 读出 1002、1003 追加进日志块，结果与 switch merge 相同，但多了额外 I/O，写放大增加。</li>
+  <li><b>full merge</b>：日志块里是 0、4、8、12 这种分属不同逻辑块的页。FTL 要为 0 凑齐 0、1、2、3（从别处读 1、2、3，一起写出），对 4、8、12 重复同样的工作，最后才能释放日志块 A。频繁的 full merge 会严重伤害性能，应尽量避免 [GY+09]。</li>
+</ul>
+<h3>页映射 + 缓存</h3>
+<p>另一种更简单的办法：仍然用页级映射，但<b>只把映射表的活跃部分缓存在内存中</b> [GY+09]。如果负载只访问一小部分页，它们的映射都在内存里，性能好且内存开销小；如果内存装不下工作集，每次访问都要先多一次闪存读把映射取进来；更糟的是，腾位置时若被淘汰的映射是脏的（还没持久化），还要额外写一次。好在大多数负载具有局部性——这和 TLB、页缓存的道理完全一样。</p>
+
+<h2>磨损均衡（Wear Leveling）</h2>
+<p>多次擦除/编程会磨损闪存块，因此 FTL 要尽量把这些工作均匀分摊到设备的所有块上，让它们差不多同时"寿终正寝"，而不是几个"热门"块很快报废。</p>
+<p>日志结构本身已经能较好地分散写负载，垃圾回收也有帮助。但有一种情况它们都无能为力：<b>某个块装满了长期不被覆盖的冷数据</b>——GC 永远不会回收它（里面没有垃圾），它也就得不到公平的写负载份额。解决办法：FTL 必须<b>定期把这类块中的存活数据全部读出、重写到别处</b>，让这个块重新可写。这种迁移<b>增加了写放大、降低了性能</b>——为了让所有块磨损速度一致，只能付出额外 I/O。</p>
+<figure class="fig">
+<svg viewBox="0 0 740 230" width="740" role="img" aria-label="磨损均衡前后各块擦除次数示意">
+  <text x="185" y="20" text-anchor="middle" font-size="13" font-weight="700">没有磨损均衡：冷数据块从不被擦除</text>
+  <text x="555" y="20" text-anchor="middle" font-size="13" font-weight="700">静态磨损均衡：搬走冷数据</text>
+  <line x1="20" y1="180" x2="350" y2="180" class="stroke" style="stroke:var(--border)"/>
+  <line x1="390" y1="180" x2="720" y2="180" class="stroke" style="stroke:var(--border)"/>
+  <g>
+    <rect x="30" y="40" width="30" height="140" rx="3" style="fill:var(--c2)"/>
+    <rect x="70" y="55" width="30" height="125" rx="3" style="fill:var(--c2)"/>
+    <rect x="110" y="48" width="30" height="132" rx="3" style="fill:var(--c2)"/>
+    <rect x="150" y="176" width="30" height="4" rx="1" style="fill:var(--c1)"/>
+    <rect x="190" y="176" width="30" height="4" rx="1" style="fill:var(--c1)"/>
+    <rect x="230" y="176" width="30" height="4" rx="1" style="fill:var(--c1)"/>
+    <rect x="270" y="176" width="30" height="4" rx="1" style="fill:var(--c1)"/>
+    <rect x="310" y="176" width="30" height="4" rx="1" style="fill:var(--c1)"/>
+    <text x="85" y="198" text-anchor="middle" font-size="12">热块：快被写坏</text>
+    <text x="245" y="198" text-anchor="middle" font-size="12">冷数据块：擦除 0 次</text>
+  </g>
+  <g>
+    <rect x="400" y="95" width="30" height="85" rx="3" style="fill:var(--c2)"/>
+    <rect x="440" y="100" width="30" height="80" rx="3" style="fill:var(--c2)"/>
+    <rect x="480" y="92" width="30" height="88" rx="3" style="fill:var(--c2)"/>
+    <rect x="520" y="110" width="30" height="70" rx="3" style="fill:var(--c1)"/>
+    <rect x="560" y="104" width="30" height="76" rx="3" style="fill:var(--c1)"/>
+    <rect x="600" y="115" width="30" height="65" rx="3" style="fill:var(--c1)"/>
+    <rect x="640" y="108" width="30" height="72" rx="3" style="fill:var(--c1)"/>
+    <rect x="680" y="112" width="30" height="68" rx="3" style="fill:var(--c1)"/>
+    <text x="555" y="198" text-anchor="middle" font-size="12">各块擦除次数接近 → 一起老化</text>
+  </g>
+  <text x="370" y="222" text-anchor="middle" font-size="12.5" class="t-muted">柱高 = 块的擦除次数（示意）。右边付出的代价：搬迁冷数据带来的额外读和编程（写放大上升）</text>
+</svg>
+<figcaption>图 8：磨损均衡的目标是"整体寿命最长"，而不是"写放大最低"。C 实验的 cold90 负载给出了真实数字。</figcaption>
+</figure>
+
+<h2>SSD 的性能与成本</h2>
+<p>SSD 没有机械部件，在"随机访问"这一点上更像 DRAM。和硬盘相比差别最大的是<b>随机读写</b>：硬盘每秒只能做几百次随机 I/O，SSD 则好得多。原书 Figure 44.4 给出了三款 SSD 和一款顶级硬盘的数据：</p>
+<div class="table-wrap"><table>
+<tr><th>设备</th><th class="num">随机读 MB/s</th><th class="num">随机写 MB/s</th><th class="num">顺序读 MB/s</th><th class="num">顺序写 MB/s</th></tr>
+<tr><td>Samsung 840 Pro SSD</td><td class="num">103</td><td class="num">287</td><td class="num">421</td><td class="num">384</td></tr>
+<tr><td>Seagate 600 SSD</td><td class="num">84</td><td class="num">252</td><td class="num">424</td><td class="num">374</td></tr>
+<tr><td>Intel SSD 335 SSD</td><td class="num">39</td><td class="num">222</td><td class="num">344</td><td class="num">354</td></tr>
+<tr><td>Seagate Savvio 15K.3 HDD</td><td class="num">2</td><td class="num">2</td><td class="num">223</td><td class="num">223</td></tr>
+</table></div>
+<figure class="fig">
+<svg viewBox="0 0 760 330" width="760" role="img" aria-label="SSD 与硬盘性能对比柱状图">
+  <g font-size="12">
+    <rect x="200" y="8" width="12" height="12" rx="2" style="fill:var(--c1)"/><text x="217" y="18">随机读</text>
+    <rect x="290" y="8" width="12" height="12" rx="2" style="fill:var(--c2)"/><text x="307" y="18">随机写</text>
+    <rect x="380" y="8" width="12" height="12" rx="2" style="fill:var(--c3)"/><text x="397" y="18">顺序读</text>
+    <rect x="470" y="8" width="12" height="12" rx="2" style="fill:var(--c4)"/><text x="487" y="18">顺序写</text>
+  </g>
+  <g id="perfbars"></g>
+</svg>
+<figcaption>图 9：SSD vs HDD（MB/s，原书 Figure 44.4）。随机 I/O 差距巨大，顺序 I/O 差距小得多。</figcaption>
+</figure>
+<p>从表中可以读出几点：</p>
+<ol>
+  <li><b>随机 I/O 差距最惊人</b>：SSD 随机读写有几十到几百 MB/s，这块"高性能"硬盘只有约 2 MB/s（还是向上取整的）。</li>
+  <li><b>顺序性能差距小得多</b>：如果只需要顺序性能，硬盘依然是不错的选择。</li>
+  <li><b>SSD 的随机读反而不如随机写</b>：原因正是日志结构设计——它把随机写变成了顺序写。</li>
+  <li>SSD 的顺序与随机 I/O 之间<b>仍有差距</b>，所以前面为硬盘设计文件系统的许多技巧（如 FFS 的局部性）对 SSD 仍然适用。</li>
+</ol>
+<h3>成本</h3>
+<p>既然 SSD 这么快，为什么没有完全取代硬盘？答案是<b>每单位容量的成本</b>。原书写作时（[A15]）：250GB 的 SSD 约 150 美元，即<b>每 GB 60 美分</b>；1TB 的硬盘约 50 美元，即<b>每 GB 5 美分</b>——相差 10 倍以上。所以：看重性能（尤其随机读）选 SSD；要存海量数据的数据中心会倾向于硬盘；也可以混合使用——少量 SSD 存"热"数据，大量硬盘存"冷"数据。只要价格差距存在，硬盘就不会消失。</p>
+
+<h2>先预测再验证</h2>
+<div class="exercise"><div class="q">在 FTL 模拟器里点"原书：日志 FTL + GC"，停在第 5 个请求 <code>w100:c1</code> 之前。预测：c1 会被写到哪个物理页？这一步之前需要擦除哪个块？执行后映射表是什么？</div>
+<details class="reveal"><summary>看答案</summary><div>块 0 已写满（页 0~3），所以 FTL 需要一个新块：块 1 还处于 INVALID 状态，必须先擦除块 1，然后把 c1 编程到物理页 4。映射表变成 <code>100→4, 101→1, 2000→2, 2001→3</code>，物理页 0（a1）变成垃圾。再写 c2 后页 5 = c2，页 1 也变成垃圾，此时页 6、7 为 E，块 2 仍为 i——与原书图一致。</div></details></div>
+<div class="exercise"><div class="q">继续：执行 <code>gc0</code> 回收块 0 之前，预测 GC 需要多少次闪存读、编程和擦除？回收后映射表和块 0 的状态是什么？</div>
+<details class="reveal"><summary>看答案</summary><div>块 0 中页 2（2000:b1）、页 3（2001:b2）存活，页 0、1 是垃圾。GC 读 2 次、编程 2 次（写到页 6、7）、擦除 1 次。之后映射表为 <code>100→4, 101→5, 2000→6, 2001→7</code>，块 0 四页全为 E，块 1 为 c1 c2 b1 b2——正是原书 44.8 节最后那张图。</div></details></div>
+<div class="exercise"><div class="q">（改编自 Homework 第 4 题）用 ssd.py 的默认时间（擦除 1000µs、编程 40µs、读 10µs），估算原书示例全部 7 个请求（含 gc0）的总耗时，再看模拟器的统计核对。</div>
+<details class="reveal"><summary>看答案</summary><div>擦除 3 次（块 0 初次、块 1、GC 时块 0）= 3000µs；编程 4 + 2 + 2 = 8 次 = 320µs；读 2 次（GC 迁移）= 20µs；合计 <b>3340µs</b>。擦除占了绝大部分时间。写放大 = 8 次编程 ÷ 6 次主机写 ≈ 1.33。</div></details></div>
+<div class="exercise"><div class="q">（改编自 Homework 第 5 题）点"直接映射：反复覆盖"：请求是 <code>w0 w1 w2 w3</code> 然后对逻辑页 0 覆盖写 4 次。先预测直接映射下擦除、编程、读各多少次，写放大多少；再点"同样请求 → 日志 FTL"对比。</div>
+<details class="reveal"><summary>看答案</summary><div>直接映射：第一个 w0 要擦除块 0（1 次擦除、1 次编程），w1~w3 目标页已擦除，直接编程（3 次）。之后每次覆盖 w0 都要读 3 页、擦除 1 次、编程 4 页，4 次共读 12、擦 4、编 16。合计擦除 5、编程 20、读 12，写放大 20/8 = <b>2.5</b>（块越大越糟）。日志 FTL：8 个写依次追加到块 0、块 1，只擦除 2 次、编程 8 次、读 0 次，写放大 <b>1.0</b>。模拟器下方的对比表会同时列出两种 FTL 和"理想 SSD"的数字。</div></details></div>
+<div class="exercise"><div class="q">（改编自 Homework 第 6、7 题）点"随机负载 + 自动 GC"，然后<b>取消</b>勾选"自动 GC"再点"应用"。预测会发生什么？再把高水位 G 设为 5、低水位 g 设为 4 并重新勾选，结果如何？</div>
+<details class="reveal"><summary>看答案</summary><div>关闭 GC 后，日志不断追加。一开始 FTL 偶尔还能碰到"只剩垃圾页"的块直接擦除复用，但很快每个块都至少含一个存活页，找不到能擦除的块，后面的写入失败（红色"没有可用的块"；种子 1 下有 7 个请求失败）——对应 homework 里"不开 GC 跑大负载"。开启 GC 后，每当使用中的块数 ≥ G，就挑存活页最少的块回收，直到 ≤ g，写入一直成功；代价是出现 GC 读和 GC 编程（种子 1 下共迁移 12 页），写放大 &gt; 1。但对比表里直接映射要擦除 35 次，日志 FTL 只要 16 次。</div></details></div>
+<div class="exercise"><div class="q">用"映射表要多大？"计算器：2TB 的 SSD、8KB 页、4 字节表项，页级映射表多大？改用 1MB 块的块级映射呢？</div>
+<details class="reveal"><summary>看答案</summary><div>页级：2<sup>41</sup> / 2<sup>13</sup> = 2<sup>28</sup> 项 × 4B = <b>1GB</b>。块级：2<sup>41</sup> / 2<sup>20</sup> = 2<sup>21</sup> 项 × 4B = <b>8MB</b>，缩小了 128 倍（= 每块页数），但代价是小写要读-改-写整块。</div></details></div>
+
+<h2>动手实验：C 语言 FTL 模拟器</h2>
+<div class="lab">
+<p>在 <code>labs/44-ssd/</code> 里有一个几百行的 C 程序 <code>ftlsim.c</code>，实现了三种 FTL：<code>direct</code>（直接映射）、<code>log</code>（页映射日志结构 + 贪心 GC，预留 10% 空间）、<code>log+wl</code>（再加静态磨损均衡）。闪存为 256 块 × 64 页；先把逻辑空间顺序写满一遍，再测 20 万次写。四种负载：顺序覆盖、均匀随机、80/20 热点、cold90（只改写 10% 的逻辑页，其余是冷数据）。</p>
+<pre><code><span class="cmd">cd labs/44-ssd &amp;&amp; make &amp;&amp; ./ftlsim -op</span></code></pre>
+<p>示例输出（模拟是确定性的，你的机器上应得到相同数字）：</p>
+<pre><code>workload  FTL         host      prog   erase      read     WA      wear  time(s)
+seq       direct    200000  12800000  200000  12600000  64.00   768/832  10830.0
+seq       log       200000    200000    3125         0   1.00      0/14    159.4
+seq       log+wl    200000    200000    3125         0   1.00      0/14    159.4
+random    direct    200000  12800000  200000  12600000  64.00   708/882  10830.0
+random    log       200000   1010167   15785    810167   5.05     56/69    845.5
+random    log+wl    200000   1010167   15785    810167   5.05     56/69    845.5
+hot80/20  direct    200000  12800000  200000  12600000  64.00  158/3310  10830.0
+hot80/20  log       200000   1052361   16444    852361   5.26     47/91    881.2
+hot80/20  log+wl    200000   1049956   16407    849956   5.25     53/83    879.2
+cold90    direct    200000  12800000  200000  12600000  64.00    0/7978  10830.0
+cold90    log       200000    246984    3861     46984   1.23      0/84    199.2
+cold90    log+wl    200000    722492   11290    522492   3.61     37/68    601.9
+
+预留空间比例 vs 写放大（log FTL，均匀随机写）
+      OP       WA    erase
+      5%     9.82    30683
+      7%     7.11    22211
+     10%     5.05    15785
+     15%     3.44    10747
+     20%     2.63     8230
+     28%     1.95     6108
+     40%     1.45     4546
+     50%     1.24     3868</code></pre>
+<p>怎么读这些数字：</p>
+<ul>
+  <li><b>direct 的写放大恒为 64 = 每块页数</b>，每次主机写都擦除一次；cold90 下热点块被擦了 7978 次而冷块 0 次——直接映射"把磨损的控制权交给了负载"。</li>
+  <li><b>log 对顺序覆盖写放大 1.00</b>：整块数据一起失效，GC 只需擦除，不用搬迁。对<b>均匀随机写约 5</b>：受害块里还混着存活页。</li>
+  <li><b>预留越多、写放大越低</b>（5% → 9.8，50% → 1.24）：预留空间让 GC 更容易找到"几乎全是垃圾"的块。</li>
+  <li><b>磨损均衡的代价</b>：cold90 负载下纯 log 的写放大仅 1.23，但冷数据块一次都没被擦除（0/84）；加上磨损均衡后擦除次数分布变均匀（37/68），写放大却涨到 3.61。</li>
+</ul>
+</div>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="1"><div class="q">1. NAND 闪存中"擦除"操作的单位是什么？</div>
+<div class="opts"><button>A. 页（page）</button><button>B. 块（block，擦除块）</button><button>C. 整个芯片</button><button>D. 512 字节扇区</button></div>
+<div class="explain">擦除以块为单位（128KB–2MB），把块内所有比特置 1；读和编程以页为单位。"要写一页必须先擦整块"正是闪存最大的怪癖。</div></div>
+<div class="mcq" data-answer="2"><div class="q">2. 某个页已经是 VALID 状态，想把它的内容改掉，闪存芯片要求怎么做？</div>
+<div class="opts"><button>A. 先 Read，再 Program</button><button>B. 直接再 Program 一次即可</button><button>C. 先擦除该页所在的整个块（之前要把块内有用的数据搬走），再 Program</button><button>D. 只擦除这一个页再 Program</button></div>
+<div class="explain">编程只能把 1 变成 0，已编程的页不能再次编程；唯一改变其内容的方法是擦除整个块。擦除会销毁同块其他页，所以要先搬走有用数据。</div></div>
+<div class="mcq" data-answer="3"><div class="q">3. 直接映射（direct mapped）FTL 的写放大大致与什么成正比？</div>
+<div class="opts"><button>A. 读请求的比例</button><button>B. 映射表的大小</button><button>C. 闪存芯片的个数</button><button>D. 每个块中的页数</button></div>
+<div class="explain">每次写都要读出整块、擦除、再把整块页重新编程——主机写 1 页，闪存写 P 页（P = 每块页数）。原书："severe write amplification (proportional to the number of pages in a block)"。</div></div>
+<div class="mcq" data-answer="2"><div class="q">4. 日志结构 FTL 中，逻辑块 100 被覆盖写后，它原来所在的物理页处于什么情况？</div>
+<div class="opts"><button>A. 状态变成 INVALID，可以立即重新编程</button><button>B. 状态变成 ERASED</button><button>C. 状态仍是 VALID，但映射表不再指向它，成为等待 GC 的垃圾</button><button>D. 立刻被 FTL 擦除</button></div>
+<div class="explain">原书："physical pages 0 and 1, although marked VALID, have garbage in them"。单独一页无法被擦除，必须等 GC 处理整个块。</div></div>
+<div class="mcq" data-answer="3"><div class="q">5. 1TB 的 SSD、4KB 页、每页一个 4 字节表项，页级映射表需要多少内存？</div>
+<div class="opts"><button>A. 256MB</button><button>B. 4GB</button><button>C. 4MB</button><button>D. 1GB</button></div>
+<div class="explain">2<sup>40</sup> / 2<sup>12</sup> = 2<sup>28</sup> 个页，每个 4 字节 = 2<sup>30</sup> 字节 = 1GB——这就是纯页级 FTL 不实用的原因。</div></div>
+<div class="mcq" data-answer="0"><div class="q">6. 原书 Figure 44.4 中，SSD 的随机<b>写</b>带宽反而高于随机<b>读</b>，主要原因是？</div>
+<div class="opts"><button>A. 日志结构 FTL 把随机写变成了顺序追加写（还能利用缓冲和并行）</button><button>B. 测试数据有误</button><button>C. 写请求不需要查映射表</button><button>D. 闪存的编程延迟比读延迟低</button></div>
+<div class="explain">编程本身比读慢一个数量级，所以原因不在芯片；日志结构设计把随机写转换成顺序写，提高了性能。</div></div>
+<div class="mcq" data-answer="0"><div class="q">7. 对 GC 来说，最理想的回收对象是？</div>
+<div class="opts"><button>A. 全部是死页（垃圾）的块</button><button>B. 擦除次数最多的块</button><button>C. 最近刚写满的块</button><button>D. 全部是存活页的块</button></div>
+<div class="explain">全是死页的块可以直接擦除复用，无需搬迁任何数据，GC 代价最低。全是存活页的块回收了也腾不出空间。</div></div>
+<div class="mcq" data-answer="1"><div class="q">8. trim 操作对日志结构 SSD 的主要意义是？</div>
+<div class="opts"><button>A. 让硬盘的寻道更快</button><button>B. 告诉设备这些逻辑块已被删除，设备不必再维护其映射，GC 可以直接回收而不必搬迁</button><button>C. 把数据压缩后写入</button><button>D. 立即擦除对应的物理块</button></div>
+<div class="explain">trim 只是"通知"，不强制立即擦除。对静态映射的硬盘几乎没用；对维护灵活映射的 SSD 很有用。</div></div>
+<div class="mcq" data-answer="0"><div class="q">9. 混合映射中，partial merge 相比 switch merge 的额外代价来自哪里？</div>
+<div class="opts"><button>A. 要从旧数据块读出未被覆盖的页，再追加进日志块</button><button>B. 要把整个数据表写回闪存</button><button>C. 没有额外代价，二者完全相同</button><button>D. 需要额外擦除日志块两次</button></div>
+<div class="explain">switch merge 时日志块已完整，只需改一个块指针；partial merge 只覆盖了部分页，必须把其余页（如 1002、1003）读出并写入日志块，增加写放大。</div></div>
+<div class="mcq" data-answer="1"><div class="q">10. 关于磨损均衡（wear leveling），下列说法正确的是？</div>
+<div class="opts"><button>A. 日志结构 FTL 天然实现了完美的磨损均衡，无需额外工作</button><button>B. 存放长期不变冷数据的块需要被主动迁移，这会增加写放大</button><button>C. 磨损均衡只对直接映射 FTL 有意义</button><button>D. 磨损均衡能降低写放大</button></div>
+<div class="explain">冷数据块里没有垃圾，GC 永远不会选它，它就分不到擦写负载；FTL 必须定期把其中数据搬走——原书明确说这会增加写放大、降低性能。</div></div>
+
+<h2>常见误区与小结</h2>
+<div class="warn">
+<ul>
+  <li><b>"SSD 的块 = 文件系统的块"</b>：不对。闪存的"页"（~4KB）才接近文件系统块大小；闪存的"块"是擦除单位，大得多。</li>
+  <li><b>"覆盖写就是原地改写"</b>：闪存不能原地改写；日志结构 FTL 总是写到新位置，旧版本变成垃圾。</li>
+  <li><b>"擦除只擦一页"</b>：擦除总是整块，会销毁同块的其他页。</li>
+  <li><b>"写放大只由 GC 造成"</b>：直接映射的读-改-写、块级映射的小写、混合映射的 merge、磨损均衡的迁移都会产生写放大。</li>
+  <li><b>"SSD 上随机和顺序一样快"</b>：Figure 44.4 显示差距仍在，局部性优化依旧有价值。</li>
+</ul>
+</div>
+<div class="key">
+<ul>
+  <li>闪存以<b>页</b>读和编程、以<b>块</b>擦除；页状态 INVALID → ERASED → VALID，VALID 页不能重编程。</li>
+  <li>读几十 µs、编程几百 µs、擦除几 ms；SLC/MLC/TLC 每单元存 1/2/3 比特，越多越便宜、越慢、越不耐用。</li>
+  <li>可靠性问题：<b>磨损</b>（P/E 次数有限）和<b>读/编程扰动</b>（块内按顺序编程可缓解）。</li>
+  <li><b>FTL</b> 把逻辑块读写翻译成闪存操作。直接映射性能和寿命都糟；<b>日志结构 FTL</b> 追加写 + 映射表是主流。</li>
+  <li>日志结构的两个代价：<b>垃圾回收</b>（推高写放大；trim、预留空间可缓解）与<b>映射表太大</b>（块级映射、混合映射、映射缓存可缓解）。</li>
+  <li><b>磨损均衡</b>定期搬迁冷数据，用额外写放大换取整体寿命。</li>
+  <li>SSD 随机 I/O 远超硬盘，但每 GB 成本贵 10 倍以上，冷热分层混合使用很常见。</li>
+</ul>
+<p>与后续章节的联系：第 45 章"数据完整性"会讨论设备可能以各种方式悄悄出错（包括闪存的比特翻转），以及校验和如何检测它们；而本章的日志结构、映射与垃圾回收思想和第 43 章 LFS 一脉相承——同一个想法，既可以放在文件系统里，也可以放在设备固件里。</p>
+</div>
+
+</main>
+<script>
+/* ============ 第 44 章脚本 ============ */
+(function () {
+"use strict";
+const { h, s } = OSTEP;
+const $ = (id) => document.getElementById(id);
+
+// ==FTL-CORE-BEGIN==
+// 解析请求序列：w100:a1 r100 t100 gc0
+function ftlAutoData(k) { return String.fromCharCode(97 + (k % 26)) + (Math.floor(k / 26) + 1); }
+function ftlParse(text) {
+  const ops = [], errs = [];
+  let k = 0;
+  for (const tok of String(text).trim().split(/[\s,;]+/)) {
+    if (!tok) continue;
+    let m;
+    if ((m = /^w(\d+)(?::(\S+))?$/i.exec(tok))) { ops.push({ op: "w", l: +m[1], d: (m[2] || ftlAutoData(k)).slice(0, 5), src: tok }); k++; }
+    else if ((m = /^r(\d+)$/i.exec(tok))) ops.push({ op: "r", l: +m[1], src: tok });
+    else if ((m = /^t(\d+)$/i.exec(tok))) ops.push({ op: "t", l: +m[1], src: tok });
+    else if ((m = /^gc?(\d+)$/i.exec(tok))) ops.push({ op: "gc", b: +m[1], src: tok });
+    else errs.push(tok);
+  }
+  return { ops, errs };
+}
+
+// 核心：把请求序列翻译成闪存操作，返回每一个微步骤的快照
+// cfg = { type: 'log' | 'direct', blocks, ppb, gc: { auto, high, low } }
+function ftlSimulate(cfg, ops) {
+  const B = cfg.blocks, P = cfg.ppb, N = B * P, type = cfg.type;
+  const gcCfg = cfg.gc || { auto: false, high: B, low: B - 1 };
+  const pages = [];
+  for (let i = 0; i < N; i++) pages.push({ s: "i", d: null, l: null });
+  const map = new Map();
+  const erases = new Array(B).fill(0);
+  const st = { erase: 0, program: 0, read: 0, hw: 0, hr: 0, ht: 0, gcRead: 0, gcProg: 0, fail: 0 };
+  let cur = -1, pos = P, opi = -1;
+  const frames = [];
+  const isLive = (p) => pages[p].s === "V" && pages[p].l !== null && map.get(pages[p].l) === p;
+  const liveIn = (b) => { let n = 0; for (let i = 0; i < P; i++) if (isLive(b * P + i)) n++; return n; };
+  const usedIn = (b) => { for (let i = 0; i < P; i++) if (pages[b * P + i].s === "V") return true; return false; };
+  const usedBlocks = () => { let n = 0; for (let b = 0; b < B; b++) if (usedIn(b)) n++; return n; };
+
+  function snap(kind, text, hl) {
+    frames.push({
+      kind, text, op: opi, hl: hl || {},
+      pages: pages.map((p, i) => ({ s: p.s, d: p.d, l: p.l, live: isLive(i) })),
+      map: [...map.entries()], erases: erases.slice(), stats: Object.assign({}, st),
+      cur: type === "log" ? cur : -1,
+    });
+  }
+  function eraseBlock(b) {
+    for (let i = 0; i < P; i++) pages[b * P + i] = { s: "E", d: null, l: null };
+    erases[b]++; st.erase++;
+  }
+  function program(p, l, d) {
+    if (pages[p].s !== "E") throw new Error("program on non-erased page " + p);
+    pages[p] = { s: "V", d, l }; st.program++;
+  }
+  // 日志结构：当前块写满后找下一个"没有存活页"的块；不是全 E 就先擦除
+  function openBlock() {
+    for (let k = 1; k <= B; k++) {
+      const b = (cur + k + B) % B;
+      if (b === cur) continue;
+      if (liveIn(b) > 0) continue;
+      let allE = true;
+      for (let i = 0; i < P; i++) if (pages[b * P + i].s !== "E") { allE = false; break; }
+      const prev = cur;
+      cur = b; pos = 0;
+      if (!allE) {
+        const garbage = usedIn(b);
+        eraseBlock(b);
+        snap("erase", `需要一个新块来追加：选中块 ${b}。它${garbage ? "里只剩垃圾页（没有存活数据）" : "还处于 INVALID 状态"}，必须先<b>擦除整块</b>（块 ${b} 擦除次数 → ${erases[b]}）。`, { erase: b });
+        return "";
+      }
+      return prev < 0 ? "" : `块 ${prev} 已写满，切换到已擦除的块 ${b}。`;
+    }
+    return null;
+  }
+  function logAppend(l, d, pre, src) {
+    let note = "";
+    if (pos >= P) {
+      note = openBlock();
+      if (note === null) {
+        st.fail++;
+        snap("error", `<span class="err">没有可用的块！</span>每个块都还有存活数据，无法擦除复用。需要垃圾回收（勾选"自动 GC"，或插入 gc 请求）。`, { err: true });
+        return false;
+      }
+    }
+    const p = cur * P + pos++;
+    const old = map.get(l);
+    program(p, l, d);
+    map.set(l, p);
+    const hl = { pages: [p] };
+    if (src !== undefined) hl.src = [src];
+    let txt = (note ? note + " " : "") + (pre || "") + `编程物理页 ${p} ← <b>${l}:${d}</b>，映射表记下 ${l}→${p}。`;
+    if (old !== undefined && src === undefined) txt += ` 旧版本所在的页 ${old} 仍是 VALID，但已成为<b>垃圾</b>。`;
+    snap("program", txt, hl);
+    return true;
+  }
+  function gcBlock(b, why) {
+    const lv = [], dead = [];
+    for (let i = 0; i < P; i++) {
+      const p = b * P + i;
+      if (isLive(p)) lv.push(p); else if (pages[p].s === "V") dead.push(p);
+    }
+    snap("gc", `${why}GC 回收块 ${b}：存活页 ${lv.length ? lv.join("、") : "无"}，垃圾页 ${dead.length ? dead.join("、") : "无"}。${lv.length ? "先读出存活页、写到日志末尾，" : "没有存活页要搬，"}再擦除整块。`, { src: lv, block: b });
+    for (const p of lv) {
+      const { l, d } = pages[p];
+      st.read++; st.gcRead++;
+      if (!logAppend(l, d, `迁移：读出页 ${p}（${l}:${d}），`, p)) return false;
+      st.gcProg++;
+    }
+    eraseBlock(b);
+    snap("erase", `擦除块 ${b}（擦除次数 → ${erases[b]}）：${P} 个页全部变为 ERASED，可以接收新的写入。`, { erase: b });
+    return true;
+  }
+  function autoGC() {
+    if (type !== "log" || !gcCfg.auto || usedBlocks() < gcCfg.high) return true;
+    let guard = 0, first = true;
+    while (usedBlocks() > gcCfg.low && guard++ < 4 * B) {
+      let victim = -1, best = Infinity;
+      for (let b = 0; b < B; b++) {
+        if (!usedIn(b) || (b === cur && pos < P)) continue;
+        const lv = liveIn(b);
+        if (lv >= P) continue;
+        if (lv < best) { best = lv; victim = b; }
+      }
+      if (victim < 0) break;
+      const why = first ? `使用中的块数 ${usedBlocks()} ≥ 高水位 G=${gcCfg.high}，启动自动 GC（直到 ≤ 低水位 g=${gcCfg.low}），贪心挑存活页最少的块。` : "继续 GC：";
+      first = false;
+      if (!gcBlock(victim, why)) return false;
+    }
+    return true;
+  }
+  function directWrite(l, d) {
+    if (l >= N) {
+      st.fail++;
+      snap("error", `<span class="err">直接映射要求逻辑页 &lt; 物理页总数 ${N}</span>，逻辑页 ${l} 无处可放。`, { err: true });
+      return;
+    }
+    const b = Math.floor(l / P), p = l;
+    if (pages[p].s === "E") {
+      program(p, l, d); map.set(l, p);
+      snap("program", `直接映射：逻辑页 ${l} → 物理页 ${p}。该页恰好是 ERASED，直接编程 ← <b>${l}:${d}</b>。`, { pages: [p] });
+      return;
+    }
+    const keep = [];
+    for (let i = 0; i < P; i++) { const q = b * P + i; if (q !== p && isLive(q)) keep.push({ q, l: pages[q].l, d: pages[q].d }); }
+    const why = pages[p].s === "V" ? "已被编程（VALID）" : "还处于 INVALID 状态";
+    if (keep.length) {
+      st.read += keep.length;
+      snap("read", `直接映射：逻辑页 ${l} 固定在物理页 ${p}，但它${why}，不能直接写。读-改-写 ①：读出块 ${b} 中其余 ${keep.length} 个有效页（${keep.map((k) => k.q).join("、")}）到内存。`, { src: keep.map((k) => k.q) });
+      eraseBlock(b);
+      snap("erase", `读-改-写 ②：擦除整个块 ${b}（擦除次数 → ${erases[b]}）。`, { erase: b });
+    } else {
+      eraseBlock(b);
+      snap("erase", `直接映射：逻辑页 ${l} 固定在物理页 ${p}，但它${why}，必须先擦除整个块 ${b}（块内没有其他有效数据，无需读出；擦除次数 → ${erases[b]}）。`, { erase: b });
+    }
+    for (const k of keep) program(k.q, k.l, k.d);
+    program(p, l, d); map.set(l, p);
+    snap("program", keep.length
+      ? `读-改-写 ③：重新编程 ${keep.length} 个旧页 + 1 个新页（${l}:${d}）。主机只写了 1 页，闪存编程了 ${keep.length + 1} 页。`
+      : `编程物理页 ${p} ← <b>${l}:${d}</b>。`, { pages: [...keep.map((k) => k.q), p] });
+  }
+
+  snap("init", `初始状态：${B} 个块 × ${P} 页，所有页都是 INVALID（i），映射表为空。` + (type === "log" ? "日志结构 FTL：写入追加到当前块的下一个空闲页。" : "直接映射 FTL：逻辑页 N 固定对应物理页 N。"), {});
+  for (opi = 0; opi < ops.length; opi++) {
+    const o = ops[opi];
+    if (o.op === "w") {
+      st.hw++;
+      if (type === "log") { if (logAppend(o.l, o.d, `写逻辑页 ${o.l}：追加到日志末尾，`)) autoGC(); }
+      else directWrite(o.l, o.d);
+    } else if (o.op === "r") {
+      const p = map.get(o.l);
+      if (p === undefined) { st.fail++; snap("error", `读逻辑页 ${o.l}：映射表里没有它（从未写过或已 trim），读失败。`, { err: true }); }
+      else { st.read++; st.hr++; snap("read", `读逻辑页 ${o.l}：查映射表 ${o.l}→${p}，读物理页 ${p}，得到 <b>${pages[p].d}</b>。读不改变页状态。`, { pages: [p] }); }
+    } else if (o.op === "t") {
+      const p = map.get(o.l);
+      st.ht++;
+      if (p === undefined) snap("trim", `trim ${o.l}：本来就没有映射，什么也不做。`, {});
+      else { map.delete(o.l); snap("trim", `trim ${o.l}：删除映射 ${o.l}→${p}。物理页 ${p} 仍是 VALID，但已成为垃圾——GC 可以直接回收它，无需搬迁。`, { src: [p] }); }
+    } else if (o.op === "gc") {
+      if (type !== "log") snap("error", "直接映射 FTL 没有垃圾回收（它原地读-改-写，不产生垃圾）。", { err: true });
+      else if (o.b >= B) snap("error", `块 ${o.b} 不存在。`, { err: true });
+      else if (o.b === cur && pos < P) snap("error", `块 ${o.b} 是当前正在追加的块，不能回收。`, { err: true });
+      else if (!usedIn(o.b)) snap("gc", `块 ${o.b} 里没有 VALID 页，无需回收。`, {});
+      else gcBlock(o.b, "手动：");
+    }
+  }
+  return frames;
+}
+
+// 随机负载（仿 ssd.py 的 -n / -s / -r / -K）
+function ftlGen(rng, n, L, readPct, trimPct, skew) {
+  const written = [], toks = [];
+  const pickWritten = () => written[Math.floor(rng() * written.length)];
+  for (let i = 0; i < n; i++) {
+    const x = rng() * 100;
+    if (x < readPct && written.length) toks.push("r" + pickWritten());
+    else if (x < readPct + trimPct && written.length) {
+      const l = pickWritten();
+      written.splice(written.indexOf(l), 1);
+      toks.push("t" + l);
+    } else {
+      let l;
+      if (skew) { const hot = Math.max(1, Math.floor(L * 0.2)); l = rng() < 0.8 ? Math.floor(rng() * hot) : hot + Math.floor(rng() * Math.max(1, L - hot)); if (l >= L) l = L - 1; }
+      else l = Math.floor(rng() * L);
+      if (!written.includes(l)) written.push(l);
+      toks.push("w" + l);
+    }
+  }
+  return toks.join(" ");
+}
+// ==FTL-CORE-END==
+
+/* ---------------- 通用：画闪存块 ---------------- */
+function renderFlash(host, fr, B, P, opts) {
+  opts = opts || {};
+  const hl = fr.hl || {};
+  const hlP = new Set(hl.pages || []), hlS = new Set(hl.src || []);
+  const maxE = Math.max(1, ...fr.erases);
+  const kids = [];
+  for (const t of opts.tables || []) {
+    kids.push(h("div", { class: "maptab" }, h("span", { class: "ttl" }, t.title),
+      t.entries.length ? t.entries.map(([k, v]) => h("span", { class: "ent" + (t.hot && t.hot(k, v) ? " new" : "") }, `${k}→${v}`)) : h("span", { class: "muted small" }, "（空）")));
+  }
+  const row = h("div", { class: "fb-row" });
+  for (let b = 0; b < B; b++) {
+    const pgs = h("div", { class: "fb-pages" });
+    for (let i = 0; i < P; i++) {
+      const p = b * P + i, pg = fr.pages[p];
+      const dead = pg.s === "V" && !pg.live;
+      pgs.append(h("div", { class: `pg s-${pg.s}` + (dead ? " dead" : "") + (hlP.has(p) ? " hl" : "") + (hlS.has(p) ? " hl-src" : ""), title: `物理页 ${p}` },
+        h("div", { class: "n" }, String(p).padStart(2, "0")),
+        h("div", { class: "d" }, pg.d == null ? "" : pg.d),
+        h("div", { class: "l" }, pg.l == null ? "" : "L" + pg.l),
+        h("div", { class: "st" }, pg.s)));
+    }
+    const label = opts.blockLabel ? opts.blockLabel(b) : "";
+    row.append(h("div", { class: "fb" + (b === fr.cur ? " cur" : "") + (hl.erase === b ? " erasing" : "") },
+      h("div", { class: "fb-h" }, h("b", {}, `块 ${b}` + (label ? " · " + label : "")), opts.wear === false ? null : h("span", {}, `擦除 ${fr.erases[b]}`)),
+      pgs,
+      opts.wear === false ? null : h("div", { class: "wear", title: `擦除 ${fr.erases[b]} 次` }, h("i", { style: { width: (100 * fr.erases[b] / maxE) + "%" } }))));
+  }
+  kids.push(row);
+  host.replaceChildren(...kids);
+}
+function stat(v, l) { return h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l)); }
+
+/* ---------------- 模拟器 1：一个闪存块 ---------------- */
+(function blockSim() {
+  const BOOK = ["00011000", "11001110", "00000001", "00111111"];
+  let pg = [], log = [];
+  const stateStr = () => pg.map((p) => p.s).join("");
+  function reset(kind) {
+    log = [];
+    if (kind === "detail") pg = BOOK.map((b) => ({ s: "V", bits: b }));
+    else pg = [0, 1, 2, 3].map(() => ({ s: "i", bits: "????????" }));
+  }
+  function narr(html) { $("blk-narr").innerHTML = html; }
+  function draw(changed, prevBits) {
+    const row = h("div", { class: "fb-pages", style: { gap: "8px", flexWrap: "wrap" } });
+    pg.forEach((p, k) => {
+      let bitsEl;
+      if (changed === k && prevBits) {
+        bitsEl = h("div", { class: "bits" }, [...p.bits].map((c, j) => h("span", { class: prevBits[j] !== c ? "bitdiff" : "" }, c)));
+      } else bitsEl = h("div", { class: "bits" }, p.bits);
+      row.append(h("div", { class: `pg s-${p.s}` + (changed === k ? " hl" : ""), style: { width: "118px", padding: "4px 0" } },
+        h("div", { class: "n" }, "Page " + k), bitsEl,
+        h("div", { class: "st" }, { i: "INVALID", E: "ERASED", V: "VALID" }[p.s])));
+    });
+    $("blk-stage").replaceChildren(h("div", { class: "fb" }, h("div", { class: "fb-h" }, h("b", {}, "一个 4 页的块"), h("span", {}, "状态：" + stateStr())), row));
+    $("blk-log").textContent = log.length ? log.join("\n") : "（操作记录）";
+  }
+  function doErase() {
+    const lost = pg.filter((p) => p.s === "V").length;
+    pg = pg.map(() => ({ s: "E", bits: "11111111" }));
+    log.push(`Erase()      → ${stateStr()}`);
+    narr(`擦除整个块：每个比特置 1，4 个页都变成 ERASED，可以编程了。` + (lost ? ` <span class="err">注意：原来 ${lost} 个 VALID 页的内容全部丢失！</span>如果还需要它们，擦除前必须先复制到别处。` : ""));
+    draw();
+  }
+  function doProgram(k, val) {
+    if (!/^[01]{8}$/.test(val)) { narr(`<span class="err">内容必须是 8 位二进制，例如 00000011。</span>`); return; }
+    const p = pg[k];
+    if (p.s !== "E") {
+      log.push(`Program(${k})   → error`);
+      narr(`<span class="err">Program(${k}) 失败：</span>页 ${k} 处于 ${p.s === "V" ? "VALID（已编程过）" : "INVALID（所在块尚未擦除）"}状态。` + (p.s === "V" ? "编程只能把 1 变成 0，已写入的页不能再编程——唯一的办法是擦除整个块。" : "先 Erase() 整个块。"));
+      draw();
+      return;
+    }
+    const prev = p.bits;
+    pg[k] = { s: "V", bits: val };
+    log.push(`Program(${k})   → ${stateStr()}`);
+    const zeros = [...val].filter((c) => c === "0").length;
+    narr(`编程页 ${k}：从全 1 出发，把其中 ${zeros} 个比特从 1 改成 0（红色），得到 <code>${val}</code>，状态变为 VALID。`);
+    draw(k, prev);
+  }
+  function doRead(k) {
+    const p = pg[k];
+    log.push(`Read(${k})      → ${p.s === "V" ? p.bits : p.s === "E" ? "11111111（未编程）" : "未定义"}`);
+    narr(p.s === "V" ? `读页 ${k} 得到 <code>${p.bits}</code>；读不改变任何状态，只需几十微秒。` : p.s === "E" ? `页 ${k} 已擦除但尚未编程，读到全 1——应当只读已编程的页。` : `页 ${k} 处于 INVALID 状态，内容无意义。`);
+    draw(k);
+  }
+  $("blk-preset1").onclick = () => {
+    reset("book");
+    log.push("初始            → iiii");
+    doErase();
+    doProgram(0, "00000011");
+    doProgram(0, "00001111");
+    doProgram(1, "11001110");
+    doErase();
+    narr("已重放原书序列：<code>iiii → Erase → EEEE → Program(0) → VEEE → Program(0) → error → Program(1) → VVEE → Erase → EEEE</code>。第二次 Program(0) 失败，因为页不能重复编程。");
+  };
+  $("blk-preset2").onclick = () => {
+    reset("detail");
+    log.push("初始（4 页都已 VALID）");
+    narr("原书详细示例：4 页都已编程。现在想把页 0 改成 <code>00000011</code>：先试试直接 Program(0)，再 Erase()，再 Program(0)，最后看看页 1~3 还剩什么。");
+    draw();
+  };
+  $("blk-erase").onclick = doErase;
+  $("blk-prog").onclick = () => doProgram(+$("blk-page").value, $("blk-val").value.trim());
+  $("blk-read").onclick = () => doRead(+$("blk-page").value);
+  reset("detail");
+  log.push("初始（4 页都已 VALID）");
+  draw();
+})();
+
+/* ---------------- 模拟器 2：FTL ---------------- */
+(function ftlSim() {
+  let frames = [], ops = [], cfg = null, badOps = new Set();
+  const stepper = OSTEP.stepper($("ftl-step"), { steps: () => Math.max(1, frames.length), render, autoplayMs: 1000 });
+  const T = () => ({ e: +$("ftl-te").value || 0, w: +$("ftl-tw").value || 0, r: +$("ftl-tr").value || 0 });
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, Math.round(+v || lo)));
+  function readCfg() {
+    const blocks = clamp($("ftl-blocks").value, 2, 12), ppb = clamp($("ftl-ppb").value, 2, 8);
+    $("ftl-blocks").value = blocks; $("ftl-ppb").value = ppb;
+    return { type: $("ftl-type").value, blocks, ppb, gc: { auto: $("ftl-auto").checked, high: clamp($("ftl-G").value, 1, 12), low: clamp($("ftl-g").value, 0, 12) } };
+  }
+  const us = (st) => { const t = T(); return st.erase * t.e + st.program * t.w + st.read * t.r; };
+  function run() {
+    const parsed = ftlParse($("ftl-ops").value);
+    ops = parsed.ops;
+    cfg = readCfg();
+    frames = ftlSimulate(cfg, ops);
+    if (parsed.errs.length) frames[0].text = `<span class="err">无法识别的请求已忽略：${parsed.errs.join(" ")}</span> ` + frames[0].text;
+    badOps = new Set(frames.filter((f) => f.kind === "error").map((f) => f.op));
+    compare();
+    stepper.reset();
+  }
+  function compare() {
+    const rows = [];
+    const t = T();
+    const mk = (name, st, note) => h("tr", {}, h("td", {}, name), h("td", { class: "num" }, st ? st.erase : "—"), h("td", { class: "num" }, st ? st.program : "—"), h("td", { class: "num" }, st ? st.read : "—"),
+      h("td", { class: "num" }, st && st.hw ? (st.program / st.hw).toFixed(2) : "—"), h("td", { class: "num" }, st ? us(st) : "—"), h("td", { class: "small" }, note || ""));
+    const run2 = (type) => { const f = ftlSimulate(Object.assign({}, cfg, { type }), ops); return f[f.length - 1].stats; };
+    const lg = run2("log"), dr = run2("direct");
+    const nw = ops.filter((o) => o.op === "w").length;
+    const ideal = { erase: 0, program: nw, read: lg.hr, hw: nw };
+    rows.push(mk("理想 SSD（-T ideal）", ideal, "每次写 = 1 次编程，不计擦除"));
+    rows.push(mk("日志结构 FTL", lg, lg.fail ? `有 ${lg.fail} 个请求失败` : (cfg.gc.auto ? "含自动 GC" : "")));
+    rows.push(mk("直接映射 FTL", dr, dr.fail ? `有 ${dr.fail} 个请求失败（逻辑页超出范围？）` : ""));
+    $("ftl-cmp").replaceChildren(h("table", {}, h("tr", {}, h("th", {}, "同一请求序列"), h("th", { class: "num" }, "擦除"), h("th", { class: "num" }, "编程"), h("th", { class: "num" }, "闪存读"), h("th", { class: "num" }, "写放大"), h("th", { class: "num" }, `估算 µs`), h("th", {}, "")), rows));
+  }
+  function render(i) {
+    const fr = frames[i];
+    if (!fr) return;
+    $("ftl-oplist").replaceChildren(...ops.map((o, k) => h("span", {
+      class: (k < fr.op ? "done" : k === fr.op ? "now" : "") + (badOps.has(k) && k <= fr.op ? " bad" : ""), title: "跳到这个请求",
+      style: { cursor: "pointer" }, onclick: () => { const j = frames.findIndex((f) => f.op === k); if (j >= 0) stepper.go(j); },
+    }, o.src)));
+    const hot = new Set(fr.hl.pages || []);
+    renderFlash($("ftl-stage"), fr, cfg.blocks, cfg.ppb, {
+      tables: [{ title: "内存映射表（逻辑→物理）", entries: cfg.type === "log" ? fr.map : fr.map, hot: (k, v) => hot.has(v) }],
+    });
+    const head = fr.op >= 0 ? `<b>请求 ${fr.op + 1}/${ops.length}</b> <code>${ops[fr.op].src}</code>：` : "";
+    $("ftl-narr").innerHTML = head + fr.text;
+    const st = fr.stats;
+    $("ftl-stats").replaceChildren(
+      stat(`${st.hw} / ${st.hr}`, "主机写 / 主机读"),
+      stat(st.erase, "闪存擦除"), stat(st.program, "闪存编程"), stat(st.read, "闪存读"),
+      stat(`${st.gcRead}`, "GC 迁移页数"),
+      stat(st.hw ? (st.program / st.hw).toFixed(2) : "—", "写放大（编程÷主机写）"),
+      stat(us(st) + " µs", "估算耗时"),
+      stat(st.fail, "失败请求"));
+  }
+  function preset(o) {
+    $("ftl-type").value = o.type; $("ftl-blocks").value = o.blocks; $("ftl-ppb").value = o.ppb;
+    $("ftl-auto").checked = !!o.auto; $("ftl-G").value = o.G || 3; $("ftl-g").value = o.g || 2;
+    $("ftl-ops").value = o.ops;
+    run();
+  }
+  const REWRITE = "w0:A w1:B w2:C w3:D w0:A2 w0:A3 w0:A4 w0:A5";
+  $("ftl-p1").onclick = () => preset({ type: "log", blocks: 3, ppb: 4, ops: "w100:a1 w101:a2 w2000:b1 w2001:b2 w100:c1 w101:c2 gc0" });
+  $("ftl-p2").onclick = () => preset({ type: "direct", blocks: 3, ppb: 4, ops: REWRITE });
+  $("ftl-p3").onclick = () => preset({ type: "log", blocks: 3, ppb: 4, ops: REWRITE });
+  $("ftl-p4").onclick = () => {
+    $("ftl-seed").value = 1; $("ftl-n").value = 50; $("ftl-L").value = 12; $("ftl-rp").value = 20; $("ftl-tp").value = 0; $("ftl-skew").checked = false;
+    preset({ type: "log", blocks: 6, ppb: 4, auto: true, G: 5, g: 4, ops: gen() });
+  };
+  function gen() {
+    return ftlGen(OSTEP.rng(+$("ftl-seed").value || 1), clamp($("ftl-n").value, 1, 200), clamp($("ftl-L").value, 1, 96), +$("ftl-rp").value || 0, +$("ftl-tp").value || 0, $("ftl-skew").checked);
+  }
+  $("ftl-gen").onclick = () => { $("ftl-ops").value = gen(); run(); };
+  $("ftl-run").onclick = run;
+  ["ftl-type", "ftl-blocks", "ftl-ppb", "ftl-auto", "ftl-G", "ftl-g"].forEach((id) => $(id).addEventListener("change", run));
+  ["ftl-te", "ftl-tw", "ftl-tr"].forEach((id) => $(id).addEventListener("change", () => { compare(); stepper.refresh(); }));
+  preset({ type: "log", blocks: 3, ppb: 4, ops: "w100:a1 w101:a2 w2000:b1 w2001:b2 w100:c1 w101:c2 gc0" });
+
+  // 图：垃圾回收前后（直接取模拟结果，保证与模拟器一致）
+  const fg = ftlSimulate({ type: "log", blocks: 3, ppb: 4 }, ftlParse("w100:a1 w101:a2 w2000:b1 w2001:b2 w100:c1 w101:c2 gc0").ops);
+  const before = fg.filter((f) => f.op === 5).pop(), after = fg[fg.length - 1];
+  const hb = h("div"), ha = h("div");
+  renderFlash(hb, Object.assign({}, before, { hl: {}, cur: -1 }), 3, 4, { wear: false, tables: [{ title: "映射表：", entries: before.map }] });
+  renderFlash(ha, Object.assign({}, after, { hl: {}, cur: -1 }), 3, 4, { wear: false, tables: [{ title: "映射表：", entries: after.map, hot: (k) => k === 2000 || k === 2001 }] });
+  $("fig-gc").replaceChildren(
+    h("div", { class: "small", style: { fontWeight: 650, marginBottom: "6px" } }, "GC 之前：页 0、1 是 100、101 的旧版本（垃圾）"), hb,
+    h("div", { class: "small", style: { fontWeight: 650, margin: "14px 0 6px" } }, "GC 之后：读出页 2、3 → 写到页 6、7 → 擦除块 0"), ha,
+    h("figcaption", {}, "图 7b：原书 44.8 节的垃圾回收示例（由上面的模拟器生成）。代价：2 次读 + 2 次编程 + 1 次擦除。"));
+})();
+
+/* ---------------- 计算器：映射表大小 ---------------- */
+(function mapSize() {
+  const fmt = (bytes) => {
+    const u = ["B", "KB", "MB", "GB", "TB"];
+    let k = 0; while (bytes >= 1024 && k < u.length - 1) { bytes /= 1024; k++; }
+    return (Number.isInteger(bytes) ? bytes : bytes.toFixed(2)) + " " + u[k];
+  };
+  function calc() {
+    const cap = +$("ms-cap").value, pg = +$("ms-page").value, bl = +$("ms-block").value, e = Math.max(1, +$("ms-entry").value || 4);
+    const np = 2 ** (cap - pg), nb = 2 ** (cap - bl);
+    $("ms-out").textContent =
+      `容量 ${fmt(2 ** cap)}，页 ${fmt(2 ** pg)}，块 ${fmt(2 ** bl)}（每块 ${2 ** (bl - pg)} 页）\n` +
+      `页级映射：${fmt(2 ** cap)} / ${fmt(2 ** pg)} = 2^${cap - pg} = ${np.toLocaleString()} 项 × ${e}B = ${fmt(np * e)}\n` +
+      `块级映射：${fmt(2 ** cap)} / ${fmt(2 ** bl)} = 2^${cap - bl} = ${nb.toLocaleString()} 项 × ${e}B = ${fmt(nb * e)}\n` +
+      `块级映射小了 ${2 ** (bl - pg)} 倍（= 每块页数），但小写需要读-改-写整块。`;
+  }
+  ["ms-cap", "ms-page", "ms-block", "ms-entry"].forEach((id) => $(id).addEventListener("input", calc));
+  calc();
+})();
+
+/* ---------------- 计算器：块级映射地址翻译 ---------------- */
+(function blockMap() {
+  function go() {
+    const lba = Math.max(0, Math.floor(+$("bm-lba").value || 0));
+    const chunk = lba >> 2, off = lba & 3;
+    let out = `逻辑块地址 ${lba} = 二进制 ${lba.toString(2)}\n` +
+      `  低 2 位 = 偏移 offset = ${off}（每块 4 页）\n  其余高位 = 块号 chunk = ${lba} >> 2 = ${chunk}\n`;
+    if (chunk === 500) out += `查块级映射表：500 → 4（物理块 1 的起始页）\n物理页 = 4 + ${off} = ${4 + off}，读出内容 ${"abcd"[off]}`;
+    else out += `查块级映射表：块号 ${chunk} 不在表中（未映射）——试试 2000~2003`;
+    $("bm-out").textContent = out;
+  }
+  $("bm-go").onclick = go;
+  $("bm-lba").addEventListener("change", go);
+  go();
+})();
+
+/* ---------------- 模拟器 3：混合映射 ---------------- */
+(function hybridSim() {
+  let frames = [], B = 3;
+  const P = 4;
+  const stepper = OSTEP.stepper($("hy-step"), { steps: () => Math.max(1, frames.length), render, autoplayMs: 1300 });
+  function build(kind) {
+    const fr = [];
+    B = kind === "full" ? 6 : 3;
+    const pages = [];
+    for (let i = 0; i < B * P; i++) pages.push({ s: "i", d: null, l: null, live: false });
+    const logT = new Map(), dataT = new Map(), erases = new Array(B).fill(0);
+    const ms = { read: 0, program: 0, erase: 0 };
+    let merging = false;
+    const snap = (text, hl, logBlock) => fr.push({ text, hl: hl || {}, pages: pages.map((p) => Object.assign({}, p)), logT: [...logT], dataT: [...dataT], erases: erases.slice(), ms: Object.assign({}, ms), cur: logBlock === undefined ? -1 : logBlock });
+    const erase = (b) => { for (let i = 0; i < P; i++) pages[b * P + i] = { s: "E", d: null, l: null, live: false }; erases[b]++; if (merging) ms.erase++; };
+    const prog = (p, l, d) => { pages[p] = { s: "V", d, l, live: true }; if (merging) ms.program++; };
+    const kill = (p) => { pages[p].live = false; };
+    if (kind !== "full") {
+      ["a", "b", "c", "d"].forEach((d, j) => prog(8 + j, 1000 + j, d));
+      dataT.set(250, 8);
+      snap("初始：逻辑块 1000~1003（a b c d）在物理块 2（页 8~11）。数据表（块级）只有一项 250→8（1000>>2 = 250）；日志表为空。块 0 被选作日志块。", {});
+      erase(0);
+      snap("擦除块 0，准备作为日志块（log block）。", { erase: 0 }, 0);
+      const n = kind === "switch" ? 4 : 2;
+      for (let j = 0; j < n; j++) {
+        prog(j, 1000 + j, "abcd"[j] + "'"); kill(8 + j); logT.set(1000 + j, j);
+        snap(`客户端覆盖写逻辑块 ${1000 + j}（${"abcd"[j]}'）：写进日志块的页 ${j}，日志表（页级）记下 ${1000 + j}→${j}；块 2 中的旧版本成为垃圾。`, { pages: [j] }, 0);
+      }
+      merging = true;
+      if (kind === "switch") {
+        dataT.set(250, 0); logT.clear();
+        snap("<b>switch merge</b>：日志块 0 的 4 页恰好按顺序存放 1000~1003，和一个完整数据块完全一样。只需把数据表改成 250→0，清空 4 个页级指针——<b>没有任何数据搬迁</b>。", { pages: [0, 1, 2, 3] });
+      } else {
+        for (let j = 2; j < 4; j++) {
+          ms.read++; prog(j, 1000 + j, "abcd"[j]); kill(8 + j);
+          snap(`<b>partial merge</b>：从旧块 2 读出 ${1000 + j}（页 ${8 + j}，内容 ${"abcd"[j]}），追加写到日志块的页 ${j}——这是额外 I/O。`, { pages: [j], src: [8 + j] }, 0);
+        }
+        dataT.set(250, 0); logT.clear();
+        snap("日志块 0 现在凑齐了 1000~1003，数据表改成 250→0，清空日志表。结果和 switch merge 相同，但多做了 2 次读、2 次编程。", { pages: [0, 1, 2, 3] });
+      }
+      erase(2);
+      snap("擦除旧数据块 2，它成为新的日志块。（原书的图中把这些页画成 i，意思是它们不再存放有效数据）", { erase: 2 });
+      return fr;
+    }
+    // full merge：块 0 = 日志块 A，块 1~4 = chunk 0~3 的数据块，块 5 = 空闲
+    for (let c = 0; c < 4; c++) { for (let j = 0; j < 4; j++) prog((c + 1) * P + j, 4 * c + j, String(4 * c + j)); dataT.set(c, (c + 1) * P); }
+    erase(5); erase(0);
+    [0, 4, 8, 12].forEach((l, j) => { prog(j, l, l + "'"); kill((l / 4 + 1) * P); logT.set(l, j); });
+    snap("初始：日志块 A（块 0）里存着逻辑块 0'、4'、8'、12'——它们分属 4 个不同的逻辑块号（chunk 0、1、2、3）。数据表：chunk c → 块 c+1；块 5 是空闲的已擦除块。", {}, 0);
+    merging = true;
+    let target = 5;
+    for (let c = 0; c < 4; c++) {
+      const old = c + 1, src = [c, old * P + 1, old * P + 2, old * P + 3];
+      ms.read += 4;
+      snap(`<b>full merge</b>，处理 chunk ${c}：要凑齐逻辑块 ${4 * c}~${4 * c + 3}，读出日志块中的 ${4 * c}'（页 ${c}）和块 ${old} 中的 ${4 * c + 1}、${4 * c + 2}、${4 * c + 3}（共 4 次读）。`, { src }, 0);
+      for (let j = 0; j < 4; j++) prog(target * P + j, 4 * c + j, j === 0 ? 4 * c + "'" : String(4 * c + j));
+      kill(c); logT.delete(4 * c); dataT.set(c, target * P);
+      for (let j = 0; j < 4; j++) kill(old * P + j);
+      snap(`把这 4 页按顺序编程到空闲块 ${target}（4 次编程），数据表改为 chunk ${c}→${target * P}，删除日志表项 ${4 * c}。`, { pages: [0, 1, 2, 3].map((j) => target * P + j) }, 0);
+      erase(old);
+      snap(`擦除旧数据块 ${old}，它成为下一个 chunk 的空闲目标块。`, { erase: old }, 0);
+      target = old;
+    }
+    erase(0);
+    snap("4 个 chunk 都处理完后，日志块 A 里已全是垃圾，最后擦除它。一个日志块的合并，花了 16 次读、16 次编程、5 次擦除！", { erase: 0 });
+    return fr;
+  }
+  function render(i) {
+    const fr = frames[i];
+    if (!fr) return;
+    const hot = new Set(fr.hl.pages || []);
+    renderFlash($("hy-stage"), fr, B, P, {
+      wear: false,
+      blockLabel: (b) => (B === 6 && b === 0 ? "日志块 A" : ""),
+      tables: [
+        { title: "Log Table（页级）", entries: fr.logT, hot: (k, v) => hot.has(v) },
+        { title: "Data Table（块级）", entries: fr.dataT, hot: (k, v) => hot.has(v) },
+      ],
+    });
+    $("hy-narr").innerHTML = fr.text;
+    $("hy-stats").replaceChildren(stat(fr.ms.read, "合并：额外读"), stat(fr.ms.program, "合并：额外编程"), stat(fr.ms.erase, "合并：擦除"), stat(fr.logT.length, "页级指针数"));
+  }
+  document.querySelectorAll("[data-hy]").forEach((btn) => btn.addEventListener("click", () => {
+    document.querySelectorAll("[data-hy]").forEach((b) => b.classList.toggle("primary", b === btn));
+    frames = build(btn.dataset.hy);
+    stepper.reset();
+  }));
+  frames = build("switch");
+})();
+
+/* ---------------- 图：SSD vs HDD 性能 ---------------- */
+(function perf() {
+  const data = [
+    ["Samsung 840 Pro SSD", [103, 287, 421, 384]],
+    ["Seagate 600 SSD", [84, 252, 424, 374]],
+    ["Intel SSD 335 SSD", [39, 222, 344, 354]],
+    ["Seagate Savvio 15K.3 HDD", [2, 2, 223, 223]],
+  ];
+  const g = $("perfbars"), k = 1.1;
+  data.forEach(([name, v], i) => {
+    const y0 = 40 + i * 72;
+    g.append(s("text", { x: 10, y: y0 + 32, "font-size": 12.5, "font-weight": 600, text: name.replace(/ (SSD|HDD)$/, "") }));
+    g.append(s("text", { x: 10, y: y0 + 48, "font-size": 11.5, class: "t-muted", text: /HDD$/.test(name) ? "硬盘 HDD" : "SSD" }));
+    v.forEach((x, j) => {
+      const y = y0 + j * 15;
+      g.append(s("rect", { x: 200, y, width: Math.max(2, x * k), height: 12, rx: 2, style: `fill:${OSTEP.color(j)}` }));
+      g.append(s("text", { x: 206 + Math.max(2, x * k), y: y + 10.5, "font-size": 11, class: "mono", text: x }));
+    });
+  });
+})();
+})();
+
+</script>
+</body></html>

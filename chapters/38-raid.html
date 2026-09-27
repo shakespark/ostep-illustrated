@@ -1,0 +1,1023 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 38 章 · 廉价冗余磁盘阵列（RAID）</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+.rt { border-collapse: collapse; font: 13px var(--mono); margin: 0 auto; background: transparent; width: auto; }
+.rt th, .rt td { border: 1px solid var(--border); padding: 4px 8px; text-align: center; min-width: 58px; }
+.rt th { background: var(--surface-2); font-family: var(--font); font-size: 12.5px; }
+.rt td.off { color: var(--faint); background: var(--surface-2); min-width: 40px; font-size: 11.5px; }
+.rt td { background: var(--surface); cursor: default; transition: background .2s; }
+.rt td .val { display: block; font-size: 10px; color: var(--muted); line-height: 1.1; }
+.rt td.par { background: color-mix(in srgb, var(--c4) 16%, var(--surface)); }
+.rt td.cp2 { color: var(--muted); }
+.rt td.rd { background: var(--accent-soft); outline: 2px solid var(--accent); outline-offset: -2px; }
+.rt td.wr { background: var(--bad-soft); outline: 2px solid var(--bad); outline-offset: -2px; }
+.rt td.rw { background: linear-gradient(135deg, var(--accent-soft) 50%, var(--bad-soft) 50%); outline: 2px solid var(--warn); outline-offset: -2px; }
+.rt td.tgt { font-weight: 800; }
+.rt td.q { background: var(--warn-soft); outline: 2px solid var(--warn); outline-offset: -2px; font-weight: 700; }
+.rt th.dead, .rt td.dead { background: repeating-linear-gradient(45deg, var(--surface-2), var(--surface-2) 5px, var(--bad-soft) 5px, var(--bad-soft) 10px); color: var(--faint); }
+.rt td.dead.rd, .rt td.dead.wr { color: var(--fg); }
+.rt td.c0 { box-shadow: inset 0 -3px 0 var(--c1); } .rt td.c1 { box-shadow: inset 0 -3px 0 var(--c2); }
+.rt td.c2 { box-shadow: inset 0 -3px 0 var(--c3); } .rt td.c3 { box-shadow: inset 0 -3px 0 var(--c4); }
+.load { display: grid; grid-template-columns: 56px 1fr 60px; gap: 4px 8px; align-items: center; font-size: 12.5px; margin-top: 12px; }
+.load .bar { height: 14px; border-radius: 4px; background: var(--surface-2); position: relative; overflow: hidden; }
+.load .bar i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--c1); border-radius: 4px; }
+.load .bar b { position: absolute; top: 0; bottom: 0; background: var(--warn); opacity: .85; }
+.load .n { font: 12px var(--mono); color: var(--muted); }
+.reqline { font: 14px var(--mono); padding: 8px 10px; border-radius: 8px; background: var(--code-bg); margin-bottom: 10px; overflow-x: auto; white-space: nowrap; }
+.reqline.fail { background: var(--bad-soft); }
+.bitbtn { font: 13px var(--mono); min-width: 28px; padding: 3px 6px; }
+.bitbtn.one { background: var(--accent-soft); border-color: var(--accent); }
+.xorgrid { display: grid; grid-template-columns: repeat(6, auto); gap: 6px 10px; align-items: center; justify-content: center; font-size: 13px; }
+.xorgrid .hd { font-weight: 600; text-align: center; color: var(--muted); }
+.xorgrid .lost { opacity: .35; }
+.cmp td, .cmp th { font-size: 13px; }
+.cmp td .f { display: block; font: 11.5px var(--mono); color: var(--muted); }
+.cmp td.best { background: var(--ok-soft); }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12.5px; color: var(--muted); margin-top: 8px; justify-content: center; }
+.legend i { display: inline-block; width: 13px; height: 13px; border-radius: 3px; vertical-align: -2px; margin-right: 4px; border: 1px solid var(--border); }
+</style>
+</head>
+<body data-chapter="38">
+<main>
+
+<h2><span class="num">1</span>本章要解决的问题</h2>
+<div class="crux">
+  <p><strong>如何构建一个大、快、可靠的存储系统？</strong>关键技术是什么？不同做法之间有哪些权衡？</p>
+  <p class="small muted">How can we make a large, fast, and reliable storage system? What are the key techniques? What are trade-offs between different approaches?</p>
+</div>
+<p>上一章我们看到，一块磁盘又慢（随机 I/O 只有不到 1MB/s）、又有限（容量固定），还会坏（坏了数据就没了）。我们总是希望磁盘<strong>更快、更大、更可靠</strong>。1980 年代后期，伯克利的 Patterson、Katz 和当时的学生 Gibson 提出了 <strong>RAID（Redundant Array of Inexpensive Disks，廉价冗余磁盘阵列）</strong>：把多块便宜的磁盘组合起来，对外假装成"一块"更好的磁盘。</p>
+<p>本章是持久化部分承上启下的一环：它建立在第 37 章的磁盘性能模型之上（顺序带宽 S、随机带宽 R），又把"透明地在下层提供可靠性"这一思想带进后面的文件系统章节——第 42 章的日志、第 45 章的数据完整性都会再次遇到"一致更新"和"故障模型"的问题。</p>
+
+<h2><span class="num">2</span>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>透明性（transparency）</h4><p>对外 RAID 就是一块普通磁盘：一个线性块数组。操作系统和应用一行代码都不用改。</p></div>
+  <div class="card"><h4>映射问题（mapping）</h4><p>给定逻辑块号，RAID 要算出去哪块盘、哪个偏移，并发出一个或多个物理 I/O。</p></div>
+  <div class="card"><h4>fail-stop 故障模型</h4><p>磁盘要么完全正常，要么整块坏掉，而且坏了能立刻被发现。先不考虑静默损坏。</p></div>
+  <div class="card"><h4>RAID-0 条带化</h4><p>把块轮流分到各盘，性能和容量的上限，但没有任何冗余：坏一块盘就丢数据。</p></div>
+  <div class="card"><h4>RAID-1 镜像</h4><p>每个块存两份。可靠、随机读快，但容量减半，每次写都要写两份。</p></div>
+  <div class="card"><h4>RAID-4 奇偶校验</h4><p>每个条带加一个 XOR 校验块，只花一块盘的容量就能容忍一块盘故障；但小写要"读-改-写"。</p></div>
+  <div class="card"><h4>小写问题（small-write problem）</h4><p>RAID-4 每次小写都要读写校验盘，校验盘成为瓶颈，随机写只有 R/2。</p></div>
+  <div class="card"><h4>RAID-5 旋转校验</h4><p>把校验块轮流放在各盘上，消除单一校验盘瓶颈，随机写提升到 N·R/4。</p></div>
+</div>
+
+<h2><span class="num">3</span>接口、内部结构与故障模型</h2>
+<p>在文件系统看来，RAID 就是一块又大又快（但愿如此）又可靠（但愿如此）的磁盘：一个线性的块数组，每块可读可写。文件系统发出<strong>逻辑 I/O</strong> 后，RAID 在内部计算该访问哪些盘，再发出一个或多个<strong>物理 I/O</strong>。例如镜像 RAID 每收到一次逻辑写，就要发出两次物理写。</p>
+<figure class="fig">
+<svg viewBox="0 0 680 250" width="680" role="img" aria-label="RAID 的外部接口与内部结构">
+  <defs><marker id="ra1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <rect x="20" y="20" width="150" height="54" rx="8" class="box-strong"/>
+  <text x="95" y="44" text-anchor="middle" font-weight="700">主机 / 文件系统</text>
+  <text x="95" y="62" text-anchor="middle" font-size="11" class="t-muted">以为自己在用一块盘</text>
+  <line x1="170" y1="47" x2="232" y2="47" class="arrow" marker-end="url(#ra1)"/>
+  <text x="200" y="38" text-anchor="middle" font-size="10.5" class="t-muted">逻辑 I/O</text>
+  <text x="200" y="64" text-anchor="middle" font-size="10.5" class="t-muted">SCSI/SATA</text>
+  <rect x="236" y="12" width="424" height="226" rx="12" class="box"/>
+  <text x="250" y="32" font-size="12.5" font-weight="700">RAID（其实是一台专用计算机）</text>
+  <rect x="252" y="44" width="120" height="44" rx="6" class="accent-soft"/><text x="312" y="63" text-anchor="middle" font-size="12">微控制器</text><text x="312" y="79" text-anchor="middle" font-size="10.5" class="t-muted">运行 RAID 固件</text>
+  <rect x="384" y="44" width="80" height="44" rx="6" class="box-strong"/><text x="424" y="63" text-anchor="middle" font-size="12">DRAM</text><text x="424" y="79" text-anchor="middle" font-size="10.5" class="t-muted">缓冲读写</text>
+  <rect x="476" y="44" width="80" height="44" rx="6" class="warn-soft"/><text x="516" y="63" text-anchor="middle" font-size="12">NVRAM</text><text x="516" y="79" text-anchor="middle" font-size="10.5" class="t-muted">安全缓冲写</text>
+  <rect x="568" y="44" width="80" height="44" rx="6" class="ok-soft"/><text x="608" y="63" text-anchor="middle" font-size="12">校验逻辑</text><text x="608" y="79" text-anchor="middle" font-size="10.5" class="t-muted">XOR 硬件</text>
+  <line x1="450" y1="92" x2="450" y2="130" class="arrow" marker-end="url(#ra1)"/>
+  <text x="458" y="116" font-size="10.5" class="t-muted">物理 I/O（一个或多个）</text>
+  <g font-size="12">
+    <rect x="262" y="140" width="80" height="80" rx="10" class="box-strong"/><text x="302" y="184" text-anchor="middle">磁盘 0</text>
+    <rect x="360" y="140" width="80" height="80" rx="10" class="box-strong"/><text x="400" y="184" text-anchor="middle">磁盘 1</text>
+    <rect x="458" y="140" width="80" height="80" rx="10" class="box-strong"/><text x="498" y="184" text-anchor="middle">磁盘 2</text>
+    <rect x="556" y="140" width="80" height="80" rx="10" class="box-strong"/><text x="596" y="184" text-anchor="middle">磁盘 3</text>
+  </g>
+  <text x="95" y="130" text-anchor="middle" font-size="11.5" class="t-muted">对外：块 0 … n−1</text>
+  <text x="95" y="148" text-anchor="middle" font-size="11.5" class="t-muted">的线性数组</text>
+</svg>
+<figcaption>外面看是一块盘，里面是处理器 + 内存 + 多块磁盘。透明性让 RAID 可以"即插即用"</figcaption>
+</figure>
+<div class="aside" data-title="提示 · 透明性促成部署">
+<p>给系统加新功能时，要想想能不能<strong>透明地</strong>加上，不要求系统其他部分做任何改变。RAID 就是完美的例子：管理员把 SCSI 磁盘换成 SCSI 接口的 RAID，主机、操作系统都一点不用改。解决了部署问题，RAID 从第一天起就更容易成功。</p>
+</div>
+<p><strong>故障模型（fault model）</strong>：要讨论"可靠"，先要说清楚会发生什么故障。本章采用最简单的 <strong>fail-stop</strong> 模型：磁盘只有两种状态——<em>正常</em>（所有块都能读写）或<em>故障</em>（永久丢失）。并且故障<strong>很容易被检测到</strong>：RAID 控制器能立刻发现某块盘坏了。暂时不考虑更复杂的"静默"故障，比如磁盘内容损坏、某个扇区读不出来（潜在扇区错误，latent sector error）——这些留到第 45 章。</p>
+
+<h2><span class="num">4</span>怎样评估一个 RAID</h2>
+<p>三个维度：</p>
+<ul>
+<li><strong>容量（capacity）</strong>：N 块盘、每块 B 个块，客户能用多少？没有冗余是 N·B；每块存两份（镜像）是 N·B/2；基于校验的方案介于两者之间。</li>
+<li><strong>可靠性（reliability）</strong>：能容忍几块盘故障？（按 fail-stop 模型，只考虑整盘故障。）</li>
+<li><strong>性能（performance）</strong>：很依赖负载。我们看两个指标——<strong>单请求延迟</strong>（一次逻辑 I/O 内部有多少并行）和<strong>稳态吞吐量</strong>（大量并发请求时的总带宽，本章重点）。</li>
+</ul>
+<p>负载分两类：<strong>顺序</strong>（大块连续访问，如读 1MB，从块 x 到 x+1MB）和<strong>随机</strong>（每次一个小请求，如 4KB，地址随机，如数据库事务）。第 37 章告诉我们，一块盘在两种负载下差别巨大，所以设一块盘的顺序带宽为 <strong>S</strong> MB/s、随机带宽为 <strong>R</strong> MB/s，通常 S ≫ R。原书的例子：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>参数</th><th>值</th><th>顺序：每次 10MB</th><th>随机：每次 10KB</th></tr></thead>
+<tbody>
+<tr><td>平均寻道</td><td class="num">7 ms</td><td class="num">7 ms</td><td class="num">7 ms</td></tr>
+<tr><td>平均旋转延迟</td><td class="num">3 ms</td><td class="num">3 ms</td><td class="num">3 ms</td></tr>
+<tr><td>传输速率</td><td class="num">50 MB/s</td><td class="num">10MB / 50MB/s = 200 ms</td><td class="num">10KB / 50MB/s = 0.195 ms</td></tr>
+<tr><td colspan="2"><strong>一次请求总时间</strong></td><td class="num">210 ms</td><td class="num">10.195 ms</td></tr>
+<tr><td colspan="2"><strong>带宽</strong></td><td class="num"><strong>S</strong> = 10MB / 210ms = <strong>47.62 MB/s</strong></td><td class="num"><strong>R</strong> = 10KB / 10.195ms = <strong>0.981 MB/s</strong></td></tr>
+</tbody></table></div>
+<p class="small muted">顺序访问时寻道和旋转被大块传输"摊薄"，S 接近磁盘峰值；随机访问几乎全在寻道和旋转，R 不到 1MB/s，S/R 接近 50。（原书把 KB/ms 近似记作 MB/s。）后面分析各级 RAID 时，都用 N、S、R 来表示吞吐量。</p>
+
+<h2><span class="num">5</span>RAID-0：条带化</h2>
+<p>RAID-0 严格来说不算 RAID——它<strong>没有冗余</strong>。但作为性能和容量的上限，它值得先弄懂。最简单的<strong>条带化（striping）</strong>把块轮流（round-robin）分到各块盘上。同一行的块叫一个<strong>条带（stripe）</strong>：块 0、1、2、3 就在同一个条带里。这样做是为了在访问连续的大块数据时，尽量让所有盘并行工作。</p>
+<p>每块盘上连续放几个块再换下一块盘，这个量叫 <strong>chunk 大小</strong>。原书 Figure 38.1 是 chunk = 1 块（4KB），Figure 38.2 是 chunk = 2 块（8KB），此时一个条带是 4 × 8KB = 32KB。拖动下面的参数看布局怎么变，输入逻辑块号看它被映射到哪里：</p>
+
+<figure class="fig" id="fig-stripe">
+  <div class="controls" style="justify-content:center">
+    <label>磁盘数 N <input type="number" id="st-n" value="4" min="2" max="8"></label>
+    <label>chunk 大小 <select id="st-c"><option>1</option><option>2</option><option>3</option><option>4</option></select> 块</label>
+    <label>逻辑块 A <input type="number" id="st-a" value="14" min="0"></label>
+    <button id="st-b1">Figure 38.1</button><button id="st-b2">Figure 38.2</button>
+  </div>
+  <div id="st-table"></div>
+  <div class="readout" id="st-out"></div>
+  <figcaption>RAID-0 条带化布局。颜色下划线区分不同 chunk 所在的"行"，黄框是查询的块</figcaption>
+</figure>
+
+<div class="aside" data-title="旁注 · RAID 映射问题">
+<p>给定逻辑块 A，RAID 怎么知道去哪块盘、哪个偏移？chunk = 1 时只要两个整数运算：</p>
+<pre><code>Disk   = A % number_of_disks
+Offset = A / number_of_disks     // 整数除法，4 / 3 = 1</code></pre>
+<p>原书的例子：4 块盘，请求块 14 → 盘 14 % 4 = <strong>2</strong>，偏移 14 / 4 = <strong>3</strong>，即第三块盘（从 0 数是盘 2）的第四个块（偏移 3）。原书留了个练习："改一改公式支持别的 chunk 大小"。答案是先算 A 在第几个 chunk，再算 chunk 内的位置：</p>
+<pre><code>chunk  = A / C                 // 第几个 chunk
+Disk   = chunk % N
+Offset = (chunk / N) * C + A % C   // 前面完整的行数 × C + chunk 内偏移</code></pre>
+<p>例如 N=4、C=2 时块 14：chunk = 7，盘 7 % 4 = 3，偏移 (7/4)×2 + 0 = 2——对照上面 Figure 38.2 验证一下。</p>
+</div>
+
+<h3>chunk 大小的权衡</h3>
+<ul>
+<li><strong>小 chunk</strong>：一个文件被切到很多盘上，单个文件的读写并行度高；但一个请求的定位时间取决于<strong>所有</strong>参与盘里最慢的那个，跨的盘越多，最大定位时间越大。</li>
+<li><strong>大 chunk</strong>：单文件内部的并行度低，要靠多个并发请求才能跑满吞吐；但定位时间短——如果一个文件完整落在一个 chunk 里，就只付一块盘的定位时间。</li>
+</ul>
+<p>"最好"的 chunk 大小取决于负载，很难确定。实际阵列常用较大的 chunk（如 64KB），但本章分析里 chunk 大小不影响结论，所以下面都假设 chunk = 1 块。</p>
+
+<h3>RAID-0 分析</h3>
+<ul>
+<li><strong>容量</strong>：完美，N·B。</li>
+<li><strong>可靠性</strong>：也"完美"——完美地糟糕：任何一块盘坏了，数据就丢了。</li>
+<li><strong>延迟</strong>：单块请求只是被转发给某一块盘，延迟和单盘一样。</li>
+<li><strong>吞吐量</strong>：顺序 N·S，随机 N·R——所有盘都在并行干活，这是其他级别的上限。</li>
+</ul>
+
+<h2><span class="num">6</span>RAID-1：镜像</h2>
+<p><strong>镜像（mirroring）</strong>：每个块存不止一份，每份放在不同的盘上，于是能容忍磁盘故障。典型做法是每个逻辑块两份物理副本（原书 Figure 38.3）：盘 0 和盘 1 内容完全相同，盘 2 和盘 3 相同，数据在这两对镜像之间再条带化。</p>
+<figure class="fig">
+<svg viewBox="0 0 680 210" width="680" role="img" aria-label="RAID-10 与 RAID-01">
+  <text x="170" y="20" text-anchor="middle" font-weight="700" font-size="13">RAID-10（1+0，镜像的条带）</text>
+  <text x="510" y="20" text-anchor="middle" font-weight="700" font-size="13">RAID-01（0+1，条带的镜像）</text>
+  <g font-size="11.5" font-family="var(--mono)">
+    <rect x="20" y="34" width="140" height="30" rx="6" class="accent-soft"/><text x="90" y="54" text-anchor="middle">RAID-0 条带：块 0,1,2,3…</text>
+    <rect x="30" y="90" width="120" height="26" rx="6" class="ok-soft"/><text x="90" y="108" text-anchor="middle">镜像对 A</text>
+    <rect x="190" y="90" width="120" height="26" rx="6" class="ok-soft"/><text x="250" y="108" text-anchor="middle">镜像对 B</text>
+    <rect x="30" y="140" width="56" height="54" rx="6" class="box-strong"/><text x="58" y="162" text-anchor="middle">盘0</text><text x="58" y="180" text-anchor="middle" class="t-muted">0 2 4</text>
+    <rect x="94" y="140" width="56" height="54" rx="6" class="box-strong"/><text x="122" y="162" text-anchor="middle">盘1</text><text x="122" y="180" text-anchor="middle" class="t-muted">0 2 4</text>
+    <rect x="190" y="140" width="56" height="54" rx="6" class="box-strong"/><text x="218" y="162" text-anchor="middle">盘2</text><text x="218" y="180" text-anchor="middle" class="t-muted">1 3 5</text>
+    <rect x="254" y="140" width="56" height="54" rx="6" class="box-strong"/><text x="282" y="162" text-anchor="middle">盘3</text><text x="282" y="180" text-anchor="middle" class="t-muted">1 3 5</text>
+    <path d="M90 64 L90 90 M160 49 L250 49 L250 90" class="arrow"/>
+    <path d="M58 116 L58 140 M122 116 L122 140 M218 116 L218 140 M282 116 L282 140" class="arrow"/>
+    <rect x="440" y="34" width="140" height="30" rx="6" class="ok-soft"/><text x="510" y="54" text-anchor="middle">RAID-1 镜像</text>
+    <rect x="370" y="90" width="120" height="26" rx="6" class="accent-soft"/><text x="430" y="108" text-anchor="middle">条带阵列 X</text>
+    <rect x="530" y="90" width="120" height="26" rx="6" class="accent-soft"/><text x="590" y="108" text-anchor="middle">条带阵列 Y（副本）</text>
+    <rect x="370" y="140" width="56" height="54" rx="6" class="box-strong"/><text x="398" y="162" text-anchor="middle">盘0</text><text x="398" y="180" text-anchor="middle" class="t-muted">0 2 4</text>
+    <rect x="434" y="140" width="56" height="54" rx="6" class="box-strong"/><text x="462" y="162" text-anchor="middle">盘1</text><text x="462" y="180" text-anchor="middle" class="t-muted">1 3 5</text>
+    <rect x="530" y="140" width="56" height="54" rx="6" class="box-strong"/><text x="558" y="162" text-anchor="middle">盘2</text><text x="558" y="180" text-anchor="middle" class="t-muted">0 2 4</text>
+    <rect x="594" y="140" width="56" height="54" rx="6" class="box-strong"/><text x="622" y="162" text-anchor="middle">盘3</text><text x="622" y="180" text-anchor="middle" class="t-muted">1 3 5</text>
+    <path d="M470 64 L430 90 M550 64 L590 90" class="arrow"/>
+    <path d="M398 116 L398 140 M462 116 L462 140 M558 116 L558 140 M622 116 L622 140" class="arrow"/>
+  </g>
+</svg>
+<figcaption>原书 Figure 38.3 的布局是 RAID-10：先组成镜像对，再在镜像对上条带化；RAID-01 则是两个大条带阵列互为镜像</figcaption>
+</figure>
+<p><strong>读</strong>时 RAID 有选择：可以读任意一份副本。例如读逻辑块 5，可以去盘 2 也可以去盘 3。<strong>写</strong>时没有选择：两份都必须更新才能保持可靠性——不过这两次写可以<strong>并行</strong>，比如写块 5 可以同时发给盘 2 和盘 3。</p>
+
+<div class="aside" data-title="旁注 · RAID 的一致更新问题">
+<p>任何一次逻辑操作要改多块盘的 RAID 都会遇到<strong>一致更新问题（consistent-update problem）</strong>。以镜像为例：RAID 决定把某块写到盘 0 和盘 1，先给盘 0 发了写请求，还没来得及给盘 1 发，断电了。结果盘 0 是新版本、盘 1 是旧版本——两份副本<strong>不一致</strong>。我们希望两块盘的状态<strong>原子地</strong>改变：要么都是新的，要么都是旧的。</p>
+<p>通用解法是某种<strong>预写日志（write-ahead log）</strong>：先记下"我要用这些数据更新这两块盘"，再去做。崩溃后运行恢复程序重放所有未完成的事务，就能保证镜像不会不同步。每次写都往磁盘上记日志代价太高，所以大多数 RAID 硬件带一小块<strong>非易失内存（NVRAM，如电池供电的 RAM）</strong>来记日志，这样既一致又不贵。第 42 章的文件系统日志会把这个思想发扬光大。</p>
+</div>
+
+<h3>RAID-1 分析</h3>
+<ul>
+<li><strong>容量</strong>：昂贵，镜像级别为 2 时只有 N·B/2。</li>
+<li><strong>可靠性</strong>：一定能容忍<strong>任意一块</strong>盘故障；运气好能容忍更多——在上图中盘 0 和盘 2 同时坏了也不丢数据，最多可容忍 N/2 块。但实践中不愿靠运气，一般认为镜像能处理单盘故障。</li>
+<li><strong>延迟</strong>：读和单盘相同；写要等两个并行的物理写都完成，承受两者中更差的寻道和旋转，平均比单盘略高。</li>
+<li><strong>顺序写</strong>：每次逻辑写变成两次物理写，最大带宽 (N/2)·S，峰值的一半。</li>
+<li><strong>顺序读</strong>：也只有 (N/2)·S！见下图。</li>
+<li><strong>随机读</strong>：最好的情况，把读分散到所有盘上，N·R。</li>
+<li><strong>随机写</strong>：(N/2)·R——每次逻辑写两次物理写，所有盘都在忙，但客户只感受到一半带宽。</li>
+</ul>
+<figure class="fig">
+<svg viewBox="0 0 680 190" width="680" role="img" aria-label="镜像顺序读为什么只有一半带宽">
+  <text x="20" y="22" font-size="12.5" font-weight="600">顺序读块 0–7：0→盘0，1→盘2，2→盘1，3→盘3，4→盘0，5→盘2，6→盘1，7→盘3</text>
+  <text x="20" y="54" font-size="12">盘 0 的磁道：</text>
+  <g font-family="var(--mono)" font-size="12">
+    <rect x="120" y="36" width="60" height="28" rx="4" class="accent-soft"/><text x="150" y="55" text-anchor="middle">0 读</text>
+    <rect x="182" y="36" width="60" height="28" rx="4" class="box"/><text x="212" y="55" text-anchor="middle" class="t-muted">2 转过</text>
+    <rect x="244" y="36" width="60" height="28" rx="4" class="accent-soft"/><text x="274" y="55" text-anchor="middle">4 读</text>
+    <rect x="306" y="36" width="60" height="28" rx="4" class="box"/><text x="336" y="55" text-anchor="middle" class="t-muted">6 转过</text>
+  </g>
+  <text x="20" y="104" font-size="12">盘 1 的磁道：</text>
+  <g font-family="var(--mono)" font-size="12">
+    <rect x="120" y="86" width="60" height="28" rx="4" class="box"/><text x="150" y="105" text-anchor="middle" class="t-muted">0 转过</text>
+    <rect x="182" y="86" width="60" height="28" rx="4" class="accent-soft"/><text x="212" y="105" text-anchor="middle">2 读</text>
+    <rect x="244" y="86" width="60" height="28" rx="4" class="box"/><text x="274" y="105" text-anchor="middle" class="t-muted">4 转过</text>
+    <rect x="306" y="86" width="60" height="28" rx="4" class="accent-soft"/><text x="336" y="105" text-anchor="middle">6 读</text>
+  </g>
+  <text x="390" y="62" font-size="12">盘 0 和盘 1 内容相同（0 2 4 6）。</text>
+  <text x="390" y="82" font-size="12">每块盘只读"每隔一块"，但磁头</text>
+  <text x="390" y="102" font-size="12">仍要转过被跳过的块——转过的时间</text>
+  <text x="390" y="122" font-size="12">不产生有用带宽。</text>
+  <text x="20" y="160" font-size="12.5">⇒ 每块盘只交付一半峰值带宽，顺序读合计 (N/2)·S，而不是 N·S。</text>
+  <text x="20" y="180" font-size="11.5" class="t-muted">（原书脚注：更聪明的做法是向两个镜像分别发大块、不同区域的请求，可能拿到全带宽。）</text>
+</svg>
+<figcaption>镜像顺序读的"半带宽"陷阱</figcaption>
+</figure>
+
+<h2><span class="num">7</span>RAID-4：用奇偶校验省空间</h2>
+<p>镜像太费空间。<strong>基于奇偶校验（parity）</strong>的方法用更少的容量换取冗余，代价是性能。原书 Figure 38.4 是一个 5 盘 RAID-4：每个条带加一个<strong>校验块</strong>，比如 P1 由块 4、5、6、7 算出。</p>
+<p>用什么函数算校验？需要它能在条带丢失任意一块时把那块算回来。<strong>XOR（异或）</strong>正好可以：一组比特中 1 的个数为偶数时 XOR 为 0，为奇数时为 1。</p>
+<div class="table-wrap"><table style="width:auto;margin:0 auto">
+<thead><tr><th>C0</th><th>C1</th><th>C2</th><th>C3</th><th>P</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>0</td><td>1</td><td>1</td><td>XOR(0,0,1,1) = <strong>0</strong></td></tr>
+<tr><td>0</td><td>1</td><td>0</td><td>0</td><td>XOR(0,1,0,0) = <strong>1</strong></td></tr>
+</tbody></table></div>
+<p>好记的说法：<strong>每一行（包括校验位）里 1 的个数必须是偶数</strong>——这是 RAID 为保证校验正确必须维护的<strong>不变量</strong>。恢复也就很自然：假设 C2 那一列丢了，第一行读出其余的 0（C0）、0（C1）、1（C3）、0（P），1 的个数是奇数，所以丢失的必定是 1。重建值的算法和算校验一模一样：<strong>把剩下的所有块（含校验）XOR 起来</strong>。</p>
+<p>块是 4KB 不是 1 比特怎么办？逐比特做 XOR，结果放进校验块对应的比特位。原书用 2 比特的"块"举例：Block0..3 = 00 10 11 10 → Parity = 11；10 01 00 01 → 10。在下面自己试：点比特翻转，选一块"丢失"，看 XOR 怎样把它算回来。</p>
+
+<figure class="fig" id="fig-xor">
+  <div class="controls" style="justify-content:center">
+    <label>丢失的块 <select id="xo-lost"><option value="-1">无</option><option value="0">Block0</option><option value="1">Block1</option><option value="2" selected>Block2</option><option value="3">Block3</option><option value="4">Parity</option></select></label>
+    <button id="xo-book">原书示例（2 比特块）</button>
+  </div>
+  <div class="xorgrid" id="xo-grid"></div>
+  <div class="readout" id="xo-out"></div>
+  <figcaption>XOR 校验：逐比特计算；丢失任意一块，都能用其余块 XOR 重建</figcaption>
+</figure>
+
+<h3>RAID-4 分析</h3>
+<ul>
+<li><strong>容量</strong>：每组盘用 1 块盘存校验，(N−1)·B。</li>
+<li><strong>可靠性</strong>：容忍 1 块盘故障，不能更多——丢两块就没法重建了。</li>
+<li><strong>顺序读</strong>：除校验盘外的所有盘，(N−1)·S。</li>
+<li><strong>顺序写</strong>：用<strong>全条带写（full-stripe write）</strong>——例如块 0、1、2、3 一起写来（Figure 38.5），直接算出新 P0，然后 5 块盘（含校验）<strong>并行</strong>写。这是 RAID-4 写盘最高效的方式，带宽 (N−1)·S；校验盘虽然一直在忙，但不给客户增加带宽。</li>
+<li><strong>随机读</strong>：分散在数据盘上，(N−1)·R。</li>
+<li><strong>随机写</strong>：最有意思，见下。</li>
+</ul>
+
+<h3>小写：加法校验 vs 减法校验</h3>
+<p>假设要覆盖写块 1。直接写的话 P0 就不对了，必须同时更新 P0。两种方法：</p>
+<ol>
+<li><strong>加法校验（additive parity）</strong>：并行读入条带里其他所有数据块（块 0、2、3），和新的块 1 XOR，得到新校验；再并行写新数据和新校验。问题是读的次数随盘数增长，大阵列要读很多块。</li>
+<li><strong>减法校验（subtractive parity）</strong>：只读旧数据 C<sub>old</sub> 和旧校验 P<sub>old</sub>。新旧数据相同则校验不变；不同则把旧校验对应位翻转。用 XOR 一句话写完：</li>
+</ol>
+<pre><code>P_new = (C_old ⊕ C_new) ⊕ P_old          (38.1)</code></pre>
+<p>以一个比特为例：原来 C2 = 1、P = 0，要写 C2<sub>new</sub> = 0：(1 ⊕ 0) ⊕ 0 = 1，校验翻转；若写 C2<sub>new</sub> = 1：(1 ⊕ 1) ⊕ 0 = 0，不变。对块来说就是 4096 × 8 个比特一起算，一般新旧块总会有不同，所以新校验块也会变。</p>
+<p>原书的思考题：<strong>盘数多少时加法比减法 I/O 更少？</strong>拖动下面的参数自己算：</p>
+<figure class="fig" id="fig-sw">
+  <div class="controls" style="justify-content:center">
+    <label>磁盘数 N <input type="range" id="sw-n" min="3" max="12" value="5"> <output id="sw-no">5</output></label>
+    <label>同一条带写 k 块 <input type="range" id="sw-k" min="1" max="4" value="1"> <output id="sw-ko">1</output></label>
+  </div>
+  <div id="sw-svg"></div>
+  <div class="readout" id="sw-out"></div>
+  <figcaption>加法：读其余 N−1−k 块 + 写 k 块 + 写校验 = N 次；减法：读 k 块旧数据与旧校验 + 写回 = 2(k+1) 次</figcaption>
+</figure>
+<p>下面的分析都假设用减法：每次小写 <strong>4 次物理 I/O（2 读 2 写）</strong>。现在有大量写同时到来，RAID-4 能并行几个？看原书 Figure 38.6：同时写块 4 和块 13（标 *），它们分别在盘 0 和盘 1，数据的读写可以并行；但两者都要读写各自的校验块 P1 和 P3（标 +），而它们<strong>都在盘 4 上</strong>。</p>
+<div class="table-wrap"><table class="rt" style="margin:12px auto">
+<thead><tr><th></th><th>盘 0</th><th>盘 1</th><th>盘 2</th><th>盘 3</th><th>盘 4</th></tr></thead>
+<tbody>
+<tr><td class="off">0</td><td>0</td><td>1</td><td>2</td><td>3</td><td class="par">P0</td></tr>
+<tr><td class="off">1</td><td class="wr">*4</td><td>5</td><td>6</td><td>7</td><td class="rw">+P1</td></tr>
+<tr><td class="off">2</td><td>8</td><td>9</td><td>10</td><td>11</td><td class="par">P2</td></tr>
+<tr><td class="off">3</td><td>12</td><td class="wr">*13</td><td>14</td><td>15</td><td class="rw">+P3</td></tr>
+</tbody></table></div>
+<p class="small muted" style="text-align:center">原书 Figure 38.6：写 4 和 13 时，数据盘 0、1 可并行，但两个请求都要读写盘 4</p>
+<p>这就是基于校验的 RAID 的<strong>小写问题（small-write problem）</strong>：数据盘本可并行访问，校验盘却让所有写<strong>串行化</strong>。校验盘每次逻辑写要做 2 次 I/O（读一次、写一次），所以 RAID-4 的随机小写吞吐量只有 <strong>R/2 MB/s</strong>——而且加盘也不会变好。</p>
+<p><strong>延迟</strong>：单次读映射到单盘，延迟同单盘；单次写要两读（并行）再两写（并行），总延迟约为单盘的两倍（读要等两个里较慢的；写回时磁头已就位，不需要寻道，可能比平均快些）。</p>
+
+<h2><span class="num">8</span>RAID-5：旋转校验</h2>
+<p>为了（部分地）解决小写问题，Patterson、Gibson 和 Katz 提出了 RAID-5：和 RAID-4 几乎一样，只是把校验块<strong>轮流放在各块盘上</strong>（原书 Figure 38.7），消除单一校验盘的瓶颈。</p>
+<div class="table-wrap"><table class="rt" style="margin:12px auto" id="r5-static"></table></div>
+<p class="small muted" style="text-align:center">原书 Figure 38.7：5 盘 RAID-5（左对称布局）。每个条带的校验向左移一块盘，数据从校验盘右边开始排</p>
+<ul>
+<li><strong>与 RAID-4 相同</strong>：容量 (N−1)·B、容忍 1 块盘故障、顺序读写 (N−1)·S、单请求延迟（读 T，写 2T）。</li>
+<li><strong>随机读</strong>略好：所有盘都能用上，N·R。</li>
+<li><strong>随机写</strong>明显变好：请求之间可以并行了。例如写块 1 和写块 10：前者访问盘 1（数据）和盘 4（P0），后者访问盘 0（数据）和盘 2（P2），互不冲突。大量随机请求下所有盘大致均匀地忙，总带宽 <strong>(N/4)·R</strong>——4 倍的损失来自每次写仍然要 4 次 I/O，这是基于校验的 RAID 的固有代价。</li>
+</ul>
+<p>因为 RAID-5 除了少数更好的地方外与 RAID-4 相同，它几乎完全取代了 RAID-4。唯一例外是明确知道只会做大块写、根本不会有小写的系统（如 NetApp 的 WAFL），那里用 RAID-4 更简单一些。</p>
+<p class="small">布局的细节：raid.py 支持两种 RAID-5 布局。<strong>左对称（left-symmetric）</strong>就是 Figure 38.7：第 r 个条带的校验在盘 N−1−(r mod N)，数据从校验盘右边一块开始、绕回排列，这样顺序读时连续的块依次落在所有盘上。<strong>左非对称（left-asymmetric）</strong>的校验位置相同，但数据按盘号从小到大排、跳过校验盘（第二行是 4 5 6 P1 7）。在下面的模拟器里切换两者对比。</p>
+
+<h2><span class="num">9</span>模拟器：仿 raid.py 看每个逻辑请求变成哪些物理 I/O</h2>
+<p>这个模拟器重现了原书作业工具 <code>raid.py</code> 的核心：选 RAID 级别、盘数、chunk 大小，输入一串逻辑请求，逐步看每个请求被映射到哪块盘哪个偏移、产生哪些物理读写。每个块里存 1 字节的真实数据（十六进制小字），所以你能看到校验是怎样 XOR 出来的；还可以<strong>拔掉一块盘</strong>，看降级读如何用 XOR 重建数据，最后换盘重建。</p>
+<section class="sim" id="sim-raid">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>RAID 映射与物理 I/O</h3>
+    <div class="desc">请求语法（分号或换行分隔）：<code>r 14</code> 读块 14；<code>w 4</code> 写块 4；<code>w 0 4</code> 从块 0 开始写 4 块；<code>fail 2</code> 拔掉盘 2；<code>replace</code> 换新盘并重建。蓝框 = 物理读，红框 = 物理写，黄框 = 逻辑目标。点任意格子做"反向映射"。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>级别 <select id="rs-level"><option value="0">RAID-0</option><option value="1">RAID-1</option><option value="4">RAID-4</option><option value="5" selected>RAID-5</option></select></label>
+      <label>磁盘数 <input type="number" id="rs-n" value="5" min="2" max="8"></label>
+      <label>chunk <select id="rs-c"><option>1</option><option>2</option><option>4</option></select> 块</label>
+      <label id="rs-r5w">RAID-5 布局 <select id="rs-r5"><option value="LS">左对称</option><option value="LA">左非对称</option></select></label>
+      <label>小写校验 <select id="rs-pm"><option value="sub">减法</option><option value="add">加法</option><option value="auto">自动取少</option></select></label>
+    </div>
+    <textarea id="rs-reqs" spellcheck="false" aria-label="请求序列">r 14; w 1; w 10; w 0 4</textarea>
+    <div class="controls" style="margin-top:8px">
+      <button class="primary" id="rs-load">载入这个序列</button>
+      <label><input type="checkbox" id="rs-hide"> 反向模式：隐藏逻辑请求（raid.py -r）</label>
+    </div>
+    <div class="controls">
+      <span class="muted small">原书示例：</span>
+      <button data-preset="f1">38.1 块 14</button><button data-preset="f2">38.2 chunk=2</button><button data-preset="f3">38.3 镜像</button><button data-preset="f4">38.4/38.5 全条带写</button><button data-preset="f6">38.6 写 4、13</button><button data-preset="f7">38.7 写 1、10</button><button data-preset="fail">拔盘→降级读→重建</button>
+    </div>
+    <div class="controls">
+      <label>随机种子 <input type="number" id="rs-seed" value="10"></label>
+      <label>请求数 <input type="number" id="rs-cnt" value="8" min="1" max="40"></label>
+      <label>写比例 <input type="number" id="rs-wp" value="50" min="0" max="100">%</label>
+      <label>大小 <input type="number" id="rs-sz" value="1" min="1" max="8">块</label>
+      <button id="rs-rand">随机生成</button>
+    </div>
+    <div id="rs-step"></div>
+    <div class="stage">
+      <div class="reqline" id="rs-line"></div>
+      <div class="table-wrap" style="margin:0"><table class="rt" id="rs-table"></table></div>
+      <div class="legend"><span><i style="background:var(--accent-soft);border-color:var(--accent)"></i>物理读</span><span><i style="background:var(--bad-soft);border-color:var(--bad)"></i>物理写</span><span><i style="background:var(--warn-soft);border-color:var(--warn)"></i>逻辑目标</span><span><i style="background:color-mix(in srgb, var(--c4) 16%, var(--surface))"></i>校验块</span><span><i class="dead" style="background:var(--bad-soft)"></i>故障盘</span></div>
+      <div class="load" id="rs-load-bars"></div>
+      <p class="small muted" id="rs-click" style="margin:8px 0 0"></p>
+    </div>
+    <div class="narrate" id="rs-narr"></div>
+    <div class="readout" id="rs-ios"></div>
+    <div class="stats" id="rs-stats"></div>
+  </div>
+</section>
+<div class="tip">
+<p>建议的玩法：① 用"38.6 写 4、13"看 RAID-4 的校验盘（盘 4）负载条是怎样一枝独秀的，再把级别换成 RAID-5 重新载入同一序列；② 在 RAID-5 下把"小写校验"切成加法，比较同一个写请求的 I/O 数；③ 试 <code>w 0 4</code>（整条带）和 <code>w 1 2</code>（半条带）的区别；④ 运行"拔盘"预设，核对降级读算出的值是否等于原值。</p>
+</div>
+
+<h2><span class="num">10</span>对比总结：Figure 38.8 计算器</h2>
+<p>把前面的分析汇总成一张表（原书 Figure 38.8）。这里省略了不少细节：镜像写时寻道时间是两次寻道的最大值，比单盘略高；RAID-4/5 更新校验时第一次读旧校验多半要完整寻道和旋转，但第二次写校验只需旋转。改下面的参数，表格里的数值会实时更新（绿色 = 该行最优）：</p>
+<section class="sim" id="sim-cmp">
+  <div class="sim-head"><span class="tag">计算器</span><h3>RAID 容量、可靠性与性能对比</h3>
+    <div class="desc">N = 磁盘数，B = 每盘块数，S / R = 单盘顺序 / 随机带宽，T = 单盘单次请求时间。S、R 也可以由下面一行的磁盘参数算出。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>N <input type="number" id="cm-n" value="4" min="2" max="64"></label>
+      <label>B <input type="number" id="cm-b" value="1000" min="1"></label>
+      <label>S <input type="number" id="cm-s" value="47.62" step="0.01"> MB/s</label>
+      <label>R <input type="number" id="cm-r" value="0.981" step="0.001"> MB/s</label>
+      <label>T <input type="number" id="cm-t" value="10" step="0.1"> ms</label>
+    </div>
+    <div class="controls">
+      <label>寻道 <input type="number" id="dk-seek" value="7" step="0.1"> ms</label>
+      <label>旋转 <input type="number" id="dk-rot" value="3" step="0.1"> ms</label>
+      <label>传输 <input type="number" id="dk-rate" value="50"> MB/s</label>
+      <label>顺序请求 <input type="number" id="dk-seq" value="10"> MB</label>
+      <label>随机请求 <input type="number" id="dk-rand" value="10"> KB</label>
+      <button id="dk-go">由磁盘参数算 S、R、T</button>
+    </div>
+    <div class="table-wrap" style="margin:0"><table class="cmp" id="cm-table"></table></div>
+    <div class="readout" id="cm-note"></div>
+  </div>
+</section>
+<p>结论（原书原话的意思）：</p>
+<ul>
+<li>只要性能、不在乎可靠性：<strong>条带化（RAID-0）</strong>显然最好。</li>
+<li>要随机 I/O 性能又要可靠性：<strong>镜像（RAID-1）</strong>最好，代价是容量。</li>
+<li>容量和可靠性是主要目标：<strong>RAID-5</strong> 胜出，代价是小写性能。</li>
+<li>总是做顺序 I/O、又想最大化容量：也选 <strong>RAID-5</strong>。</li>
+</ul>
+
+<h2><span class="num">11</span>其他有趣的 RAID 话题</h2>
+<ul>
+<li>原始分类里还有 <strong>RAID-2、RAID-3</strong>，以及能容忍<strong>多盘故障</strong>的 <strong>RAID-6</strong>（例如行-对角线校验，用两块盘的容量存两种校验）。</li>
+<li>磁盘坏了怎么办？很多阵列有<strong>热备盘（hot spare）</strong>随时顶上。故障期间（降级模式）和重建期间的性能如何？在上面的模拟器里，降级读一个块要读 N−1 块盘，重建整块盘要读完其余所有盘——这段时间既慢又没有冗余。</li>
+<li>更真实的故障模型：<strong>潜在扇区错误</strong>、<strong>块损坏</strong>，以及对应的检测与处理技术（第 45 章）。</li>
+<li>RAID 也可以做成软件层：<strong>软件 RAID</strong> 更便宜，但有自己的问题，包括前面说的一致更新问题（没有 NVRAM 可用）。</li>
+</ul>
+
+<h2><span class="num">12</span>先预测，再验证</h2>
+<div class="exercise"><div class="q">（作业 1）5 盘 RAID-5 左对称、chunk=1：逻辑块 <strong>9、16、23</strong> 分别在哪块盘、哪个偏移？各自条带的校验在哪块盘？先对照 Figure 38.7 的规律手算，再在模拟器里输入 <code>r 9; r 16; r 23</code> 验证。换成左非对称呢？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>每条带 4 个数据块。块 9：条带 2（偏移 2），条带内第 1 个；校验盘 = 4 − 2 = 2；左对称数据从盘 3 开始 → 块 8 在盘 3、块 9 在<strong>盘 4</strong>。块 16：条带 4，校验盘 0，块 16 在<strong>盘 1</strong>、偏移 4。块 23：条带 5，校验盘 4 − (5 mod 5) = 4，第 3 个 → <strong>盘 3</strong>、偏移 5。</p>
+<p>左非对称：块 9 → 数据按盘号跳过校验盘 2 排：8 在盘 0、9 在<strong>盘 1</strong>；块 16 → 盘 1（条带 4 校验在盘 0，第 0 个数据在盘 1）；块 23 → 盘 3。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（作业 2）4 盘 RAID-0，chunk 从 1 改成 2 再改成 4，逻辑块 <strong>14</strong> 的位置怎么变？先用公式 chunk = A / C、Disk = chunk % N、Offset = (chunk / N)·C + A % C 手算。</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>C=1：盘 2，偏移 3。C=2：chunk 7 → 盘 3，偏移 (7/4)·2 + 0 = 2。C=4：chunk 3 → 盘 3，偏移 0·4 + 2 = 2。chunk 越大，相邻的逻辑块越倾向于待在同一块盘上。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（作业 3，反向问题）勾选"反向模式"，载入 5 盘 RAID-4 下的一个请求，你只看到物理 I/O：<code>读 盘1 偏移2、读 盘4 偏移2、写 盘1 偏移2、写 盘4 偏移2</code>。逻辑请求是什么？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>两读两写、且涉及校验盘 4 → 这是一次<strong>减法小写</strong>。数据在盘 1 偏移 2 → 条带 2 的第 1 个数据块 → 逻辑块 2·4 + 1 = <strong>9</strong>，即 <code>w 9</code>。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（作业 4）5 盘 RAID-5、chunk=1，请求 <code>w 0 1</code>、<code>w 0 2</code>、<code>w 0 3</code>、<code>w 0 4</code> 分别产生多少次物理 I/O（减法）？什么请求大小对 RAID-4/5 最高效？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>1 块：4 次（2 读 2 写）。2 块：6 次（读 2 块旧数据 + 旧校验，写回 3 块；加法只要 5 次）。3 块：8 次（加法仍只要 5 次——"自动取少"模式会选它）。加法恒为 N 次，所以写的块越多越划算。4 块：整条带写，<strong>5 次写、0 次读</strong>。所以应该按<strong>完整条带的整数倍</strong>写（这里是 4 块 = 16KB），并且对齐条带边界。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（作业 5-7，粗略估算）4 块盘，100 个随机单块写，每次物理 I/O 约耗时 T。假设负载均匀，最忙的那块盘要做多少次 I/O（≈ 完成时间）？分别估算 RAID-0/1/4/5，再用"随机生成"（100 个请求、写比例 100%）看"最忙磁盘 I/O 数"统计是否吻合。</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>RAID-0：100 次 I/O 平摊到 4 盘 ≈ <strong>25T</strong>。RAID-1：200 次物理写 / 4 ≈ <strong>50T</strong>。RAID-4：数据盘各 ~67 次，但校验盘要做全部 200 次 ≈ <strong>200T</strong>（R/2 的由来）。RAID-5：400 次 I/O 平摊到 4 盘 ≈ <strong>100T</strong>（N·R/4 的由来）。随机抽样会有波动，但量级一致。读请求呢？RAID-0 与 RAID-1 都 ≈ 25T，RAID-4 ≈ 33T（校验盘闲着），RAID-5 ≈ 25T。</p>
+</div></details></div>
+
+<h2><span class="num">13</span>动手实验</h2>
+<div class="lab">
+<p>用 C 在内存里模拟 N 块盘，实现 Figure 38.7 同款的左对称 RAID-5：全条带写填满阵列 → 拔掉磁盘 2 → 逐块 XOR 重建并与原数据比对 → 对 1000 次随机小写分别用加法和减法更新校验，比较 I/O 次数、确认两种方法得到的校验块一致。</p>
+<pre><code class="cmd">cd labs/38-raid &amp;&amp; make &amp;&amp; ./raid</code></pre>
+<p class="small muted">也可以 <code>./raid 3 512</code> 改盘数和块大小。示例输出（你的机器上数字会相同，因为这是确定性的计算；不同参数会不同）：</p>
+<pre><code id="lab-out">== RAID-5（左对称），5 块盘，每块 4096 字节，每盘 64 块，可用 256 个逻辑块 ==
+前 3 行布局（与原书 Figure 38.7 相同的规则）：
+      0     1     2     3   P0  
+      5     6     7   P1      4 
+     10    11   P2      8     9 
+
+[1] 全条带写填满阵列：0 次读，320 次写（每行 5 写、0 读）
+[2] 磁盘 2 故障 → 重建它的 64 个块（51 个数据块 + 13 个校验块）：64/64 与原数据完全一致，共 256 次读
+    例：第 0 行第 0 字节：0xA2 ⊕ 0x68 ⊕ 0xF5 ⊕ 0x10 = 0x2F（盘 2 上原本是 0x2F）
+
+[3] 1000 次随机单块小写：加法 vs 减法（N 从 3 到 8）
+    N | 加法 I/O/次 | 减法 I/O/次 | 两种方法的校验块是否相同 | 更省的方法
+    3 |         3.0 |         4.0 | 相同 ✓               | 加法
+    4 |         4.0 |         4.0 | 相同 ✓               | 一样多
+    5 |         5.0 |         4.0 | 相同 ✓               | 减法
+    6 |         6.0 |         4.0 | 相同 ✓               | 减法
+    7 |         7.0 |         4.0 | 相同 ✓               | 减法
+    8 |         8.0 |         4.0 | 相同 ✓               | 减法</code></pre>
+<p>该观察到：重建的 64 个块全部与原数据一致；每重建一个块要读 N−1 块盘；加法每次 N 次 I/O、减法固定 4 次，<strong>N=4 是交叉点</strong>。两种方法算出的校验完全相同——XOR 满足交换律、结合律，且 x ⊕ x = 0，所以 C<sub>old</sub> ⊕ C<sub>new</sub> 恰好"标出了"哪些位需要翻转。</p>
+</div>
+
+<h2><span class="num">14</span>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="0"><div class="q">1. 4 盘 RAID-0，chunk = 1 块，逻辑块 14 在哪里？</div>
+<div class="opts"><button>A. 盘 2，偏移 3</button><button>B. 盘 2，偏移 14</button><button>C. 盘 3，偏移 2</button><button>D. 盘 1，偏移 3</button></div>
+<div class="explain">Disk = 14 % 4 = 2，Offset = 14 / 4 = 3。C 是 chunk = 2 时的答案。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">2. 为什么镜像 RAID（RAID-1）的顺序读带宽只有 (N/2)·S？</div>
+<div class="opts"><button>A. 每次读都必须读两份副本并比较</button><button>B. 读的时候也要更新另一份副本</button><button>C. 每块盘只读每隔一个块，转过被跳过的块时不产生有用带宽</button><button>D. 镜像盘必须串行访问</button></div>
+<div class="explain">读只需一份副本，但若轮流分配，每块盘拿到的是 0、4、8… 这样隔一块的请求，磁头要转过中间的块，一半时间在"空转"。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">3. 4 比特的块 0011、0101、1001 的 XOR 校验块是？若丢了第二块，怎么恢复？</div>
+<div class="opts"><button>A. 1111；把第一块、第三块和校验块 XOR：0011 ⊕ 1001 ⊕ 1111 = 0101</button><button>B. 1100；取反校验块</button><button>C. 0001；把剩下两块相加</button><button>D. 1111；无法恢复</button></div>
+<div class="explain">0011 ⊕ 0101 = 0110，再 ⊕ 1001 = 1111。重建用的是同一个运算：其余所有块（含校验）XOR。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">4. 5 盘 RAID-4 用减法校验做一次单块随机写，需要几次物理 I/O？</div>
+<div class="opts"><button>A. 8</button><button>B. 2</button><button>C. 5</button><button>D. 4</button></div>
+<div class="explain">读旧数据、读旧校验、写新数据、写新校验，共 4 次，与盘数无关。加法校验则要 N = 5 次（读 3 块其他数据 + 写 2 块）。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">5. RAID-4 的随机小写吞吐量为什么只有 R/2，而且加盘也没用？</div>
+<div class="opts"><button>A. 因为每次写都要在同一块校验盘上做一读一写，校验盘成了瓶颈</button><button>B. 因为数据盘必须串行访问</button><button>C. 因为全条带写不能并行</button><button>D. 因为 XOR 计算太慢</button></div>
+<div class="explain">所有写都要访问唯一的校验盘，每次 2 次 I/O，于是校验盘的随机带宽 R 被一分为二，所有写被它串行化。RAID-5 把校验分散开才解决。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">6. 关于 RAID-5 相对 RAID-4，下列说法正确的是：</div>
+<div class="opts"><button>A. 能容忍两块盘故障</button><button>B. 顺序写性能是 N·S</button><button>C. 容量和可靠性相同，随机读写更好，随机写约为 (N/4)·R</button><button>D. 每次小写只需 2 次 I/O</button></div>
+<div class="explain">RAID-5 只是把校验块旋转分布：容量 (N−1)·B、容忍 1 块盘、顺序 (N−1)·S 都与 RAID-4 相同；每次小写仍是 4 次 I/O，但能在各盘间并行，得到 N·R/4。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">7. 镜像 RAID 写到一半断电，两份副本一新一旧。这叫什么问题？常见的硬件解决办法是？</div>
+<div class="opts"><button>A. 潜在扇区错误；定期擦洗</button><button>B. 一致更新问题；用 NVRAM 做预写日志，崩溃后重放</button><button>C. 小写问题；改用 RAID-5</button><button>D. 映射问题；换更大的 chunk</button></div>
+<div class="explain">多盘更新需要原子性。先把"要做什么"记到非易失 RAM 的日志里，崩溃后恢复程序重放未完成的更新，避免每次写都往磁盘记日志的高代价。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">8. 同一个 5 盘 RAID-5，写 4 个连续且与条带对齐的块（整条带），和分 4 次各写 1 块，物理 I/O 各多少？</div>
+<div class="opts"><button>A. 8 和 16</button><button>B. 5 和 16</button><button>C. 4 和 4</button><button>D. 5 和 5</button></div>
+<div class="explain">整条带写：4 个数据块 + 1 个新校验，全部并行写，0 次读 = 5 次。4 次小写：每次 4 次 I/O = 16 次。所以应当按条带大小对齐地写大块。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">9. 在 fail-stop 模型里，下面哪种情况<strong>不在</strong>本章的考虑范围内？</div>
+<div class="opts"><button>A. 控制器立刻发现某块盘故障</button><button>B. 故障盘永久丢失</button><button>C. 一整块盘突然坏掉</button><button>D. 某个扇区的数据被悄悄改坏，读出来的是错误内容</button></div>
+<div class="explain">fail-stop 只考虑整盘故障且易于检测。静默损坏（silent corruption）和潜在扇区错误要到"数据完整性"一章用校验和等技术处理。</div></div>
+
+<h2><span class="num">15</span>常见误区与小结</h2>
+<div class="warn">
+<ul>
+<li><strong>"RAID 就是备份"</strong>——不是。RAID 只防整盘故障；误删文件、软件 bug、病毒写坏数据，会被忠实地镜像 / 更新校验到所有盘上。</li>
+<li><strong>"RAID-0 的 0 表示零风险"</strong>——恰恰相反，它没有任何冗余，N 块盘里任意一块坏都会丢数据，盘越多越危险。</li>
+<li><strong>"镜像读可以拿到 N·S"</strong>——朴素的顺序读只有 (N/2)·S；随机读才是 N·R。</li>
+<li><strong>"加盘能提高 RAID-4 的随机写"</strong>——不能，校验盘瓶颈让它固定在 R/2。</li>
+<li><strong>"减法校验总比加法好"</strong>——N=3 时加法 3 次 I/O 比减法 4 次少；N=4 时相等。</li>
+<li><strong>"坏盘后阵列照常工作，不急"</strong>——降级模式下读慢、而且已无冗余，再坏一块就全丢了；应尽快用热备盘重建。</li>
+</ul>
+</div>
+<div class="key">
+<p><strong>本章要点</strong></p>
+<ul>
+<li>RAID 把多块独立的盘<strong>透明地</strong>变成一个更大、更快、更可靠的"盘"；映射问题用简单的整数运算解决。</li>
+<li>RAID-0：容量 N·B、无冗余、性能上限。RAID-1：容量减半，可靠，随机读好；写要两份。</li>
+<li>XOR 校验以一块盘的容量换取单盘容错：丢了哪块，就把其余的全部 XOR 起来。</li>
+<li>全条带写最有效；小写需要读-改-写（加法 N 次或减法 4 次 I/O）。RAID-4 的校验盘是瓶颈（R/2），RAID-5 旋转校验改善到 N·R/4。</li>
+<li>选哪种 RAID、chunk 设多大，取决于负载——与其说是科学，不如说是艺术。</li>
+</ul>
+</div>
+<p><strong>和后续章节的联系：</strong>从下一章开始我们回到"一块盘"的视角，学习文件系统的 API（第 39 章）和实现（第 40 章）。RAID 里的一致更新问题会在第 42 章以"崩溃一致性"的形式卷土重来，日志（journaling）正是 RAID 用 NVRAM 记日志这一思想的推广；而 fail-stop 之外的静默错误，则留给第 45 章的校验和与数据完整性。</p>
+
+</main>
+<script>
+(function () {
+"use strict";
+// ===== CORE BEGIN（纯函数，无 DOM；node 可单独测试） =====
+// 逻辑块 A → 物理位置。level: 0/1/4/5；N: 磁盘数；C: chunk 大小（块）；r5: 'LS' 左对称 | 'LA' 左非对称
+// 返回 {disks:[数据所在磁盘（RAID-1 为两份副本）], off, pdisk(校验盘或 -1), row(条带号), col(条带内第几个 chunk)}
+function raidMap(level, N, C, A, r5) {
+  const chunk = Math.floor(A / C), inC = A % C;
+  if (level === 0) {
+    const row = Math.floor(chunk / N);
+    return { disks: [chunk % N], off: row * C + inC, pdisk: -1, row, col: chunk % N };
+  }
+  if (level === 1) {
+    const pairs = Math.floor(N / 2), row = Math.floor(chunk / pairs), p = chunk % pairs;
+    return { disks: [2 * p, 2 * p + 1], off: row * C + inC, pdisk: -1, row, col: p };
+  }
+  const D = N - 1, row = Math.floor(chunk / D), col = chunk % D;
+  if (level === 4) return { disks: [col], off: row * C + inC, pdisk: N - 1, row, col };
+  const pdisk = N - 1 - (row % N);                       // 校验块从最后一块盘开始，逐条带左移
+  const disk = r5 === "LA" ? (col < pdisk ? col : col + 1) // 左非对称：数据按盘号顺序排，跳过校验盘
+    : (pdisk + 1 + col) % N;                               // 左对称：数据从校验盘右边一块开始，绕回
+  return { disks: [disk], off: row * C + inC, pdisk, row, col };
+}
+// 数据盘数 / 条带里的数据块数
+function dataDisks(level, N) { return level === 0 ? N : level === 1 ? Math.floor(N / 2) : N - 1; }
+// 反向映射：磁盘 d、偏移 o → 逻辑块（或 'P'），在前 limit 个逻辑块里搜索（布局是周期性的，足够用）
+function raidReverse(level, N, C, d, o, r5, limit) {
+  for (let A = 0; A < limit; A++) {
+    const m = raidMap(level, N, C, A, r5);
+    if (m.off === o && m.disks.includes(d)) return { A, copy: m.disks.indexOf(d) };
+  }
+  const r = Math.floor(o / C);
+  if (level === 4 && d === N - 1) return { P: r };
+  if (level === 5 && d === N - 1 - (r % N)) return { P: r };
+  return null;
+}
+// 布局表：rows 行 × N 列，每格 {A} 或 {P} 或 null
+function raidLayout(level, N, C, r5, rows) {
+  const grid = Array.from({ length: rows }, () => Array(N).fill(null));
+  const per = dataDisks(level, N) * C;
+  const total = Math.ceil(rows / C) * per;
+  for (let A = 0; A < total; A++) {
+    const m = raidMap(level, N, C, A, r5);
+    if (m.off >= rows) continue;
+    m.disks.forEach((d, k) => { grid[m.off][d] = { A, copy: k }; });
+    if (m.pdisk >= 0) grid[m.off][m.pdisk] = { P: m.row };
+  }
+  return grid;
+}
+
+// ---- 带真实字节的 RAID 阵列（每个物理块存 1 字节，便于展示 XOR） ----
+const hex2 = (v) => "0x" + (v & 255).toString(16).toUpperCase().padStart(2, "0");
+function initValue(A) { return (A * 37 + 0x5b) & 255; }
+class Raid {
+  constructor(level, N, C, r5, rows) {
+    Object.assign(this, { level, N, C, r5, rows });
+    this.cap = Math.ceil(rows / C) * dataDisks(level, N) * C; // 显示范围内的逻辑块数
+    this.v = Array.from({ length: N }, () => Array(rows).fill(0));
+    this.failed = -1;
+    this.lost = false;
+    for (let A = 0; A < this.cap; A++) {
+      const m = raidMap(level, N, C, A, r5);
+      m.disks.forEach((d) => (this.v[d][m.off] = initValue(A)));
+    }
+    if (level >= 4) for (let o = 0; o < rows; o++) this.v[this.pdiskAt(o)][o] = this.parityOf(o);
+    this.wcount = 0;
+  }
+  pdiskAt(o) { return this.level === 4 ? this.N - 1 : this.N - 1 - (Math.floor(o / this.C) % this.N); }
+  parityOf(o, except) { // 对偏移 o 这一"行"的所有数据盘做 XOR
+    const p = this.pdiskAt(o);
+    let x = 0;
+    for (let d = 0; d < this.N; d++) if (d !== p && d !== except) x ^= this.v[d][o];
+    return x;
+  }
+  clone() { const c = Object.create(Raid.prototype); Object.assign(c, this); c.v = this.v.map((a) => a.slice()); return c; }
+  // 执行一个逻辑请求，返回 {ios:[{d,o,t:'R'|'W',why}], notes:[], err}
+  // req: {op:'r'|'w', A, n} 或 {op:'fail', d} / {op:'replace'}；pm: 'sub' | 'add' | 'auto'
+  exec(req, pm) {
+    const ios = [], notes = [];
+    const R = (d, o, why) => ios.push({ d, o, t: "R", why });
+    const W = (d, o, why) => ios.push({ d, o, t: "W", why });
+    const { level, N, C, failed } = this;
+    if (req.op === "fail") {
+      this.failed = req.d;
+      notes.push(`磁盘 ${req.d} 故障（fail-stop）：它整块不可访问，控制器立刻知道。` + (level === 0 ? "RAID-0 没有冗余，这块盘上的数据永久丢失！" : level === 1 ? "它的镜像盘还有一份完整副本。" : "每个条带只丢了一个块，可以用同条带其余块 XOR 算回来。"));
+      return { ios, notes };
+    }
+    if (req.op === "replace") {
+      if (failed < 0) return { ios, notes, err: "没有故障盘，无需重建" };
+      const d = failed;
+      for (let o = 0; o < this.rows; o++) {
+        if (level === 0) break;
+        if (level === 1) { const mate = d ^ 1; R(mate, o, "读镜像副本"); W(d, o, "写到新盘"); continue; }
+        let x = 0; const parts = [];
+        for (let e = 0; e < N; e++) if (e !== d) { R(e, o, "读同行其余块"); x ^= this.v[e][o]; parts.push(hex2(this.v[e][o])); }
+        W(d, o, "写入 XOR 重建值");
+        if (o < 3) notes.push(`偏移 ${o}：${parts.join(" ⊕ ")} = ${hex2(x)}${x === this.v[d][o] ? "（与原值一致 ✓）" : "（不一致 ✗）"}`);
+      }
+      if (level === 0) return { ios, notes, err: "RAID-0 无冗余，无法重建——只能从备份恢复" };
+      notes.unshift(`换上新盘，把磁盘 ${d} 的全部 ${this.rows} 个块逐一${level === 1 ? "从镜像拷贝" : "用 XOR 重建"}回来：共 ${ios.length} 次物理 I/O。`);
+      if (this.rows > 3 && level >= 4) notes.push("……其余偏移同理。");
+      this.failed = -1;
+      return { ios, notes };
+    }
+    const { A, n } = req;
+    if (A < 0 || A + n > this.cap) return { ios, notes, err: `逻辑块 ${A}${n > 1 ? "–" + (A + n - 1) : ""} 超出显示范围（0–${this.cap - 1}）` };
+    if (req.op === "r") {
+      for (let a = A; a < A + n; a++) {
+        const m = raidMap(level, N, C, a, this.r5);
+        if (level === 0) {
+          if (m.disks[0] === failed) { notes.push(`块 ${a} 在故障盘 ${failed} 上：数据丢失，读失败！`); continue; }
+          R(m.disks[0], m.off, `读块 ${a}`); notes.push(`块 ${a} → 磁盘 ${m.disks[0]}，偏移 ${m.off}，值 ${hex2(this.v[m.disks[0]][m.off])}`);
+        } else if (level === 1) {
+          let d = m.disks[m.row % 2];          // 按条带号奇偶轮流选副本，分摊读负载
+          if (d === failed) d = m.disks[0] === failed ? m.disks[1] : m.disks[0];
+          R(d, m.off, `读块 ${a}`);
+          notes.push(`块 ${a} 有两份：磁盘 ${m.disks[0]} 与 ${m.disks[1]} 的偏移 ${m.off}；读磁盘 ${d}${failed === (d ^ 1) ? "（另一份在故障盘上）" : ""}，值 ${hex2(this.v[d][m.off])}`);
+        } else {
+          const d = m.disks[0];
+          if (d !== failed) { R(d, m.off, `读块 ${a}`); notes.push(`块 ${a} → 磁盘 ${d}，偏移 ${m.off}（条带 ${m.row}，校验在磁盘 ${this.pdiskAt(m.off)}），值 ${hex2(this.v[d][m.off])}`); }
+          else {
+            let x = 0; const parts = [];
+            for (let e = 0; e < N; e++) if (e !== d) { R(e, m.off, "重建：读同行其余块"); x ^= this.v[e][m.off]; parts.push(`${hex2(this.v[e][m.off])}(盘${e}${e === this.pdiskAt(m.off) ? "·P" : ""})`); }
+            notes.push(`块 ${a} 在故障盘 ${d} 上 → 降级读（degraded read）：读同一行其余 ${N - 1} 块并 XOR：${parts.join(" ⊕ ")} = <b>${hex2(x)}</b>` + (x === this.v[d][m.off] ? "，正是丢失的值 ✓" : " ✗"));
+          }
+        }
+      }
+      return { ios, notes };
+    }
+    // ---- 写 ----
+    const nv = {};
+    for (let a = A; a < A + n; a++) nv[a] = (0xa7 * (++this.wcount) + a * 13) & 255;
+    if (level === 0 || level === 1) {
+      for (let a = A; a < A + n; a++) {
+        const m = raidMap(level, N, C, a, this.r5);
+        const alive = m.disks.filter((d) => d !== failed);
+        if (!alive.length) { notes.push(`块 ${a} 所在盘已故障，写失败（数据丢失）`); continue; }
+        alive.forEach((d) => { W(d, m.off, `写块 ${a}`); this.v[d][m.off] = nv[a]; });
+        m.disks.filter((d) => d === failed).forEach((d) => (this.v[d][m.off] = nv[a]));
+        notes.push(level === 0 ? `块 ${a} → 磁盘 ${m.disks[0]} 偏移 ${m.off}：写入 ${hex2(nv[a])}` : `块 ${a} 必须写两份：磁盘 ${m.disks.join(" 和 ")} 的偏移 ${m.off}（可并行）${alive.length < 2 ? "；其中一份在故障盘上，只写了幸存副本" : ""}`);
+      }
+      return { ios, notes };
+    }
+    // RAID-4/5：按"行"（同一偏移）分组，决定全条带写 / 减法 / 加法
+    const byOff = new Map();
+    for (let a = A; a < A + n; a++) { const m = raidMap(level, N, C, a, this.r5); if (!byOff.has(m.off)) byOff.set(m.off, []); byOff.get(m.off).push({ a, d: m.disks[0] }); }
+    const Dn = N - 1;
+    for (const [o, list] of byOff) {
+      const p = this.pdiskAt(o), k = list.length;
+      const dataDisksRow = [...Array(N).keys()].filter((d) => d !== p);
+      const others = dataDisksRow.filter((d) => !list.some((x) => x.d === d));
+      const pOld = this.v[p][o];
+      let method;
+      if (k === Dn) method = "full";
+      else if (failed >= 0 && failed !== p && list.some((x) => x.d === failed)) method = "add";   // 要写的盘坏了：只能加法
+      else if (failed >= 0 && others.includes(failed)) method = "sub";                            // 需要读的其他盘坏了：只能减法
+      else if (pm === "auto") method = N < 2 * (k + 1) ? "add" : "sub";   // 加法 N 次 I/O vs 减法 2(k+1) 次，取少者
+      else method = pm;
+      if (failed === p) method = "nop";                                                           // 校验盘坏了：只写数据
+      const newRow = this.v.map((col) => col[o]);
+      list.forEach((x) => (newRow[x.d] = nv[x.a]));
+      let pNew = 0; dataDisksRow.forEach((d) => (pNew ^= newRow[d]));
+      const blocks = list.map((x) => x.a).join("、");
+      if (method === "full") {
+        list.forEach((x) => { if (x.d !== failed) W(x.d, o, `写块 ${x.a}`); }); W(p, o, "写新校验");
+        notes.push(`偏移 ${o} 这一行的 ${Dn} 个数据块（${blocks}）全部被写 → <b>全条带写</b>：直接算 P = ${list.map((x) => hex2(nv[x.a])).join(" ⊕ ")} = ${hex2(pNew)}，${N} 个写并行，无需任何读。`);
+      } else if (method === "nop") {
+        list.forEach((x) => W(x.d, o, `写块 ${x.a}`));
+        notes.push(`校验盘 ${p} 已故障：块 ${blocks} 直接写入数据盘，不再维护校验（此时阵列已无冗余）。`);
+      } else if (method === "sub") {
+        list.forEach((x) => { if (x.d !== failed) R(x.d, o, `读旧块 ${x.a}`); }); R(p, o, "读旧校验");
+        list.forEach((x) => { if (x.d !== failed) W(x.d, o, `写新块 ${x.a}`); }); W(p, o, "写新校验");
+        const terms = list.map((x) => `(${hex2(this.v[x.d][o])}⊕${hex2(nv[x.a])})`).join(" ⊕ ");
+        notes.push(`块 ${blocks} 是<b>小写</b>，用<b>减法校验（subtractive）</b>：读旧数据与旧校验，P<sub>new</sub> = ${terms} ⊕ ${hex2(pOld)} = <b>${hex2(pNew)}</b>。${2 * (k + 1)} 次 I/O（${k + 1} 读 + ${k + 1} 写），与盘数无关。`);
+      } else {
+        others.forEach((d) => R(d, o, "读同行其他数据块")); list.forEach((x) => { if (x.d !== failed) W(x.d, o, `写新块 ${x.a}`); }); W(p, o, "写新校验");
+        const terms = dataDisksRow.map((d) => hex2(newRow[d])).join(" ⊕ ");
+        notes.push(`块 ${blocks} 用<b>加法校验（additive）</b>：读同行其他 ${others.length} 个数据块，P<sub>new</sub> = ${terms} = <b>${hex2(pNew)}</b>${list.some((x) => x.d === failed) ? "（目标盘已故障：新数据只「体现」在校验里，以后靠重建读出）" : ""}。共 ${others.length + k + 1} 次 I/O。`);
+      }
+      list.forEach((x) => (this.v[x.d][o] = nv[x.a]));
+      this.v[p][o] = pNew;
+    }
+    return { ios, notes };
+  }
+}
+// 解析请求序列："r 14; w 4; w 0 4; fail 2; replace"
+function parseReqs(text) {
+  const out = [];
+  for (const raw of text.split(/[;\n,]+/)) {
+    const t = raw.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (!t.length) continue;
+    if (t[0] === "fail" || t[0] === "pull") out.push({ op: "fail", d: +t[1] || 0 });
+    else if (t[0] === "replace" || t[0] === "rebuild") out.push({ op: "replace" });
+    else if ((t[0] === "r" || t[0] === "w") && t.length >= 2 && /^\d+$/.test(t[1])) out.push({ op: t[0], A: +t[1], n: t[2] && /^\d+$/.test(t[2]) ? Math.max(1, +t[2]) : 1 });
+    else if (/^\d+$/.test(t[0])) out.push({ op: "r", A: +t[0], n: 1 });
+    else out.push({ op: "bad", raw: raw.trim() });
+  }
+  return out;
+}
+// 依次执行，产生每一步的快照
+function runRaid(level, N, C, r5, rows, reqs, pm) {
+  let r = new Raid(level, N, C, r5, rows);
+  const steps = [{ raid: r.clone(), req: null, res: null }];
+  for (const q of reqs) {
+    r = r.clone();
+    const res = q.op === "bad" ? { ios: [], notes: [], err: "无法解析：" + q.raw } : r.exec(q, pm);
+    steps.push({ raid: r.clone(), req: q, res });
+  }
+  return steps;
+}
+// 物理 I/O 合并：同一盘、同类型、偏移连续的合并成一次（raid.py 也会这样打印）
+function mergeIOs(ios) {
+  const out = [];
+  for (const io of ios) {
+    const last = out.find((x) => x.d === io.d && x.t === io.t && x.o + x.n === io.o);
+    if (last) last.n++; else out.push({ d: io.d, t: io.t, o: io.o, n: 1 });
+  }
+  return out;
+}
+// Figure 38.8：给定 N、B、S、R、T 算各级别指标
+function raidCompare(N, B, S, R, T) {
+  return {
+    0: { cap: N * B, rel: "0", sr: N * S, sw: N * S, rr: N * R, rw: N * R, lr: T, lw: T },
+    1: { cap: (N * B) / 2, rel: `1（运气好 ${N / 2}）`, sr: (N / 2) * S, sw: (N / 2) * S, rr: N * R, rw: (N / 2) * R, lr: T, lw: T },
+    4: { cap: (N - 1) * B, rel: "1", sr: (N - 1) * S, sw: (N - 1) * S, rr: (N - 1) * R, rw: R / 2, lr: T, lw: 2 * T },
+    5: { cap: (N - 1) * B, rel: "1", sr: (N - 1) * S, sw: (N - 1) * S, rr: N * R, rw: (N / 4) * R, lr: T, lw: 2 * T },
+  };
+}
+// 由磁盘参数算 S、R（原书 38.4 节的例子）；原书把 KB/ms 近似记作 MB/s
+function diskSR(seekMs, rotMs, rateMBs, seqMB, randKB) {
+  const tSeq = seekMs + rotMs + (seqMB / rateMBs) * 1000;
+  const tRand = seekMs + rotMs + (randKB / 1024 / rateMBs) * 1000;
+  return { tSeq, tRand, S: (seqMB * 1000) / tSeq, R: randKB / tRand };
+}
+// 加法/减法单次小写（同一行写 k 块）的 I/O 数
+function smallWriteIOs(N, k) { return { add: N - 1 - k + k + 1, sub: 2 * (k + 1) }; }
+// ===== CORE END =====
+
+// ===== 页面交互 =====
+const { h, s } = OSTEP;
+const $ = (id) => document.getElementById(id);
+const stat = (v, l) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+const cellLabel = (c, level) => (!c ? "" : c.P !== undefined ? "P" + c.P : level === 1 && c.copy ? c.A + "′" : String(c.A));
+
+// ---------- 图：RAID-0 条带布局 ----------
+(function stripeFig() {
+  const nIn = $("st-n"), cIn = $("st-c"), aIn = $("st-a");
+  function render() {
+    const N = Math.max(2, Math.min(8, Math.floor(+nIn.value || 4))), C = +cIn.value;
+    const A = Math.max(0, Math.floor(+aIn.value || 0));
+    const m = raidMap(0, N, C, A);
+    let rows = Math.max(4, m.off + 1);
+    rows = Math.min(24, Math.ceil(rows / C) * C);
+    const grid = raidLayout(0, N, C, "LS", rows);
+    const tb = grid.map((row, o) => h("tr", {}, h("td", { class: "off" }, o), ...row.map((c, d) => h("td", { class: `c${Math.floor(o / C) % 4}` + (c && c.A === A ? " q" : "") }, cellLabel(c, 0)))));
+    $("st-table").replaceChildren(h("div", { class: "table-wrap", style: "margin:0" }, h("table", { class: "rt" }, h("thead", {}, h("tr", {}, h("th", {}, "偏移"), ...Array.from({ length: N }, (_, d) => h("th", {}, "盘 " + d)))), h("tbody", {}, tb))));
+    const chunk = Math.floor(A / C);
+    $("st-out").textContent =
+      `块 ${A}：chunk = ${A} / ${C} = ${chunk}\n` +
+      `      Disk   = chunk % N = ${chunk} % ${N} = ${m.disks[0]}\n` +
+      `      Offset = (chunk / N) × C + A % C = (${chunk} / ${N}) × ${C} + ${A % C} = ${m.off}\n` +
+      `条带（stripe）= ${N} 个 chunk = ${N * C} 块 = ${N * C * 4}KB（每块 4KB，chunk = ${C * 4}KB）`;
+  }
+  [nIn, cIn, aIn].forEach((el) => el.addEventListener("input", render));
+  $("st-b1").onclick = () => { nIn.value = 4; cIn.value = 1; aIn.value = 14; render(); };
+  $("st-b2").onclick = () => { nIn.value = 4; cIn.value = 2; aIn.value = 14; render(); };
+  render();
+})();
+
+// ---------- 图：XOR 校验与重建 ----------
+(function xorFig() {
+  const BOOK = [[0, 0, 1, 0], [1, 0, 0, 1], [1, 1, 0, 0], [1, 0, 0, 1]]; // 每块 4 比特：上行 2 位 + 下行 2 位
+  let blocks = BOOK.map((b) => b.slice());
+  const lostSel = $("xo-lost");
+  const par = () => [0, 1, 2, 3].map((i) => blocks.reduce((x, b) => x ^ b[i], 0));
+  function render() {
+    const lost = +lostSel.value, P = par();
+    const cols = [...blocks, P];
+    const kids = [h("div", {}), ...["Block0", "Block1", "Block2", "Block3", "Parity"].map((t, j) => h("div", { class: "hd" + (j === lost ? " lost" : "") }, t))];
+    for (let r = 0; r < 2; r++) {
+      kids.push(h("div", { class: "hd" }, r === 0 ? "第 1 行" : "第 2 行"));
+      cols.forEach((b, j) => {
+        const cell = h("div", { class: j === lost ? "lost" : "", style: { textAlign: "center" } });
+        for (let k = 0; k < 2; k++) {
+          const i = r * 2 + k;
+          if (j === lost) cell.append(h("span", { class: "bitbtn", style: { display: "inline-block", border: "1px dashed var(--bad)", borderRadius: "6px", margin: "0 2px" } }, "?"));
+          else if (j < 4) cell.append(h("button", { class: "bitbtn" + (b[i] ? " one" : ""), onclick: () => { blocks[j][i] ^= 1; render(); }, title: "点击翻转" }, b[i]));
+          else cell.append(h("span", { class: "bitbtn one", style: { display: "inline-block", border: "1px solid var(--border)", borderRadius: "6px", margin: "0 2px", background: "color-mix(in srgb, var(--c4) 18%, var(--surface))" } }, b[i]));
+        }
+        kids.push(cell);
+      });
+    }
+    $("xo-grid").replaceChildren(...kids);
+    const bits = (b) => b.slice(0, 2).join("") + " " + b.slice(2).join("");
+    let out = `Parity = ${blocks.map(bits).join(" ⊕ ")} = ${bits(P)}\n每一位上（含校验位）1 的个数都是偶数：` + [0, 1, 2, 3].map((i) => cols.reduce((x, b) => x + b[i], 0)).join("、") + "。";
+    if (lost >= 0) {
+      const rest = cols.filter((_, j) => j !== lost);
+      const rec = [0, 1, 2, 3].map((i) => rest.reduce((x, b) => x ^ b[i], 0));
+      out += `\n\n丢失 ${lost < 4 ? "Block" + lost : "Parity"}！用其余 4 块重建：\n${rest.map(bits).join(" ⊕ ")} = ${bits(rec)}   ${rec.join("") === cols[lost].join("") ? "✓ 与丢失的内容完全相同" : "✗"}`;
+    }
+    $("xo-out").textContent = out;
+  }
+  lostSel.onchange = render;
+  $("xo-book").onclick = () => { blocks = BOOK.map((b) => b.slice()); lostSel.value = 2; render(); };
+  render();
+})();
+
+// ---------- 图：加法 vs 减法 ----------
+(function swFig() {
+  const nIn = $("sw-n"), kIn = $("sw-k");
+  function render() {
+    const N = +nIn.value;
+    kIn.max = N - 1;
+    const k = Math.min(+kIn.value, N - 1);
+    $("sw-no").textContent = N; $("sw-ko").textContent = k;
+    const full = k === N - 1;
+    const add = { r: N - 1 - k, w: k + 1 }, sub = { r: k + 1, w: k + 1 };
+    const px = 34, W = 120 + Math.max(N, 2 * (k + 1)) * px + 20;
+    const svg = s("svg", { viewBox: `0 0 ${W} 110`, width: W, role: "img", "aria-label": "加法与减法的 I/O 次数" });
+    const bar = (y, label, o) => {
+      svg.append(s("text", { x: 10, y: y + 17, "font-size": 12.5, text: label }));
+      for (let i = 0; i < o.r + o.w; i++) {
+        const isR = i < o.r;
+        svg.append(s("rect", { x: 110 + i * px, y, width: px - 3, height: 24, rx: 4, class: isR ? "accent-soft" : "bad-soft" }));
+        svg.append(s("text", { x: 110 + i * px + (px - 3) / 2, y: y + 16, "text-anchor": "middle", "font-size": 11, text: isR ? "读" : "写" }));
+      }
+      svg.append(s("text", { x: 116 + (o.r + o.w) * px, y: y + 17, "font-size": 12, "font-weight": 700, text: o.r + o.w }));
+    };
+    if (full) {
+      bar(20, "全条带写", { r: 0, w: N });
+      $("sw-out").textContent = `k = N−1 = ${k}：整条带都被覆盖，直接用新数据算校验，${N} 次写、0 次读——加法、减法都不需要。`;
+    } else {
+      bar(14, "加法 additive", add);
+      bar(62, "减法 subtractive", sub);
+      const a = add.r + add.w, b = sub.r + sub.w;
+      $("sw-out").textContent = `加法：读同行其他 ${add.r} 个数据块 + 写 ${k} 个新块 + 写校验 = ${a} 次（恒等于 N）\n减法：读 ${k} 个旧块 + 旧校验，写 ${k} 个新块 + 新校验 = ${b} 次（与 N 无关）\n→ ${a < b ? "加法更省" : a > b ? "减法更省" : "一样多"}。交叉点：N = 2(k+1) = ${2 * (k + 1)}；N 小于它时加法更省。`;
+    }
+    $("sw-svg").replaceChildren(svg);
+  }
+  nIn.oninput = kIn.oninput = render;
+  render();
+})();
+
+// ---------- 静态表：Figure 38.7 ----------
+(function r5Static() {
+  const g = raidLayout(5, 5, 1, "LS", 5);
+  $("r5-static").replaceChildren(h("thead", {}, h("tr", {}, h("th", {}), ...[0, 1, 2, 3, 4].map((d) => h("th", {}, "盘 " + d)))),
+    h("tbody", {}, g.map((row, o) => h("tr", {}, h("td", { class: "off" }, o), ...row.map((c) => h("td", { class: c && c.P !== undefined ? "par" : "" }, cellLabel(c, 5)))))));
+})();
+
+// ---------- 模拟器：仿 raid.py ----------
+(function raidSim() {
+  const lv = $("rs-level"), nIn = $("rs-n"), cIn = $("rs-c"), r5 = $("rs-r5"), pm = $("rs-pm"), ta = $("rs-reqs");
+  let P = null, steps = [], revealed = new Set();
+  function params() {
+    const level = +lv.value;
+    let N = Math.max(2, Math.min(8, Math.floor(+nIn.value || 4)));
+    const notes = [];
+    if (level >= 4 && N < 3) { N = 3; notes.push("RAID-4/5 至少需要 3 块盘"); }
+    if (level === 1 && N % 2) { N -= 1; notes.push("RAID-1 需要偶数块盘，已按 " + N + " 块处理"); }
+    nIn.value = N;
+    return { level, N, C: +cIn.value, r5: r5.value, pm: pm.value, notes };
+  }
+  function load() {
+    P = params();
+    $("rs-r5w").style.display = P.level === 5 ? "" : "none";
+    const reqs = parseReqs(ta.value);
+    const D = dataDisks(P.level, P.N);
+    let maxA = 0;
+    reqs.forEach((q) => { if (q.A !== undefined) maxA = Math.max(maxA, q.A + q.n - 1); });
+    let rows = P.C * Math.ceil((maxA + 1) / (D * P.C));
+    rows = Math.min(16, Math.max(rows, P.C * Math.ceil(4 / P.C)));
+    P.rows = rows;
+    steps = runRaid(P.level, P.N, P.C, P.r5, rows, reqs, P.pm);
+    revealed = new Set();
+    $("rs-click").textContent = P.notes.join("；");
+    stepper.reset();
+  }
+  function reqText(q) {
+    if (!q) return "";
+    if (q.op === "fail") return `fail ${q.d}    ← 拔掉磁盘 ${q.d}`;
+    if (q.op === "replace") return "replace    ← 换上新盘并重建";
+    if (q.op === "bad") return q.raw;
+    return `${q.op === "r" ? "READ " : "WRITE"} 逻辑块 ${q.A}${q.n > 1 ? `–${q.A + q.n - 1}（${q.n} 块）` : ""}`;
+  }
+  function render(i) {
+    if (!steps.length) return;
+    const st = steps[i], raid = st.raid, q = st.req, res = st.res;
+    const hidden = $("rs-hide").checked && i > 0 && !revealed.has(i) && q && (q.op === "r" || q.op === "w");
+    // 请求行
+    const line = $("rs-line");
+    line.className = "reqline" + (res && res.err ? " fail" : "");
+    if (i === 0) line.textContent = `初始状态：RAID-${P.level}，${P.N} 块盘，chunk = ${P.C}，显示前 ${P.rows} 行（逻辑块 0–${raid.cap - 1}）。共 ${steps.length - 1} 个请求。`;
+    else if (hidden) line.replaceChildren(h("span", { class: "muted" }, `第 ${i} 个逻辑请求已隐藏：根据下面的物理 I/O 反推它 `), h("button", { onclick: () => { revealed.add(i); render(i); } }, "显示答案"));
+    else line.textContent = `${i}. ${reqText(q)}` + (res.err ? `   ✗ ${res.err}` : "");
+    // 表格
+    const ioMap = new Map();
+    (res ? res.ios : []).forEach((io) => { const k = io.d + ":" + io.o; ioMap.set(k, (ioMap.get(k) || "") + io.t); });
+    const tgt = new Set();
+    if (q && q.A !== undefined && !hidden) for (let a = q.A; a < q.A + q.n && a < raid.cap; a++) { const m = raidMap(P.level, P.N, P.C, a, P.r5); m.disks.forEach((d) => tgt.add(d + ":" + m.off)); }
+    const grid = raidLayout(P.level, P.N, P.C, P.r5, P.rows);
+    const dead = raid.failed;
+    const head = h("tr", {}, h("th", {}, "偏移"), ...Array.from({ length: P.N }, (_, d) => h("th", { class: d === dead ? "dead" : "" }, `盘 ${d}${d === dead ? " ✗" : ""}`)));
+    const body = grid.map((row, o) => h("tr", {}, h("td", { class: "off" }, o), ...row.map((c, d) => {
+      const k = d + ":" + o, t = ioMap.get(k) || "";
+      let cls = c && c.P !== undefined ? "par" : c && c.copy ? "cp2" : "";
+      if (t.includes("R") && t.includes("W")) cls += " rw"; else if (t.includes("R")) cls += " rd"; else if (t.includes("W")) cls += " wr";
+      if (tgt.has(k)) cls += t ? " tgt" : " q";
+      if (d === dead) cls += " dead";
+      return h("td", { class: cls, title: "点击查看反向映射", onclick: () => clickCell(d, o, raid) }, cellLabel(c, P.level), h("span", { class: "val" }, d === dead ? "??" : hex2(raid.v[d][o])));
+    })));
+    $("rs-table").replaceChildren(h("thead", {}, head), h("tbody", {}, body));
+    // 负载条
+    const cum = Array(P.N).fill(0), now = Array(P.N).fill(0);
+    let cr = 0, cw = 0;
+    steps.slice(1, i + 1).forEach((x, j) => x.res.ios.forEach((io) => { cum[io.d]++; if (io.t === "R") cr++; else cw++; if (j === i - 1) now[io.d]++; }));
+    const mx = Math.max(1, ...cum);
+    $("rs-load-bars").replaceChildren(...cum.flatMap((c, d) => [h("span", { class: "n" }, `盘 ${d}`), h("div", { class: "bar" }, h("i", { style: { width: (100 * c) / mx + "%" } }), h("b", { style: { left: (100 * (c - now[d])) / mx + "%", width: (100 * now[d]) / mx + "%" } })), h("span", { class: "n" }, `${c} 次`)]));
+    // 解说与物理 I/O 列表
+    const narr = $("rs-narr");
+    if (i === 0) narr.innerHTML = "每格上面是逻辑块号（P = 校验块，′ = 镜像副本），下面小字是这个物理块当前存的 1 字节数据。点\"下一步\"执行第一个请求。";
+    else if (hidden) narr.innerHTML = "反向模式：只看蓝框（读）和红框（写）以及下面的物理 I/O 列表，推断逻辑请求是读还是写、哪个逻辑块。提示：两读两写且涉及校验块 = 减法小写。";
+    else if (res.err && !res.notes.length) narr.innerHTML = `<strong>${res.err}</strong>`;
+    else narr.innerHTML = res.notes.map((n) => "• " + n).join("<br>") + (res.err ? `<br><strong>${res.err}</strong>` : "");
+    const merged = res ? mergeIOs(res.ios) : [];
+    $("rs-ios").textContent = i === 0 ? "（尚无物理 I/O）" : merged.length ? `本步物理 I/O（同盘连续偏移已合并，共 ${res.ios.length} 个块操作、${merged.length} 个请求）：\n` + merged.map((x) => `  ${x.t === "R" ? "读" : "写"}  盘 ${x.d}  偏移 ${x.o}${x.n > 1 ? `  长度 ${x.n}` : ""}`).join("\n") : "本步没有物理 I/O";
+    const thisR = res ? res.ios.filter((x) => x.t === "R").length : 0, thisW = res ? res.ios.length - thisR : 0;
+    $("rs-stats").replaceChildren(stat(`${thisR} / ${thisW}`, "本步物理 读 / 写"), stat(`${cr} / ${cw}`, "累计物理 读 / 写"), stat(Math.max(0, ...cum), "最忙磁盘累计 I/O（≈ 完成时间）"), stat(steps.slice(1, i + 1).filter((x) => x.req && (x.req.op === "r" || x.req.op === "w")).length, "已完成逻辑请求"));
+  }
+  function clickCell(d, o, raid) {
+    const r = raidReverse(P.level, P.N, P.C, d, o, P.r5, raid.cap + P.N * P.C);
+    const el = $("rs-click");
+    if (!r) { el.textContent = `盘 ${d} 偏移 ${o}：未使用`; return; }
+    if (r.P !== undefined) {
+      const parts = []; let x = 0;
+      for (let e = 0; e < P.N; e++) if (e !== d) { parts.push(`${hex2(raid.v[e][o])}(盘${e})`); x ^= raid.v[e][o]; }
+      el.textContent = `反向映射：盘 ${d} 偏移 ${o} 是条带 ${r.P} 的校验块。它应当等于同一行数据的 XOR：${parts.join(" ⊕ ")} = ${hex2(x)}${d === raid.failed ? "（此盘故障，可由此重建）" : x === raid.v[d][o] ? " ✓" : ""}`;
+    } else el.textContent = `反向映射：盘 ${d} 偏移 ${o} → 逻辑块 ${r.A}${P.level === 1 ? `（第 ${r.copy + 1} 份副本）` : ""}`;
+  }
+  const stepper = OSTEP.stepper($("rs-step"), { steps: () => Math.max(1, steps.length), render, autoplayMs: 1500 });
+  [lv, nIn, cIn, r5, pm].forEach((el) => el.addEventListener("change", load));
+  $("rs-load").onclick = load;
+  $("rs-hide").onchange = () => stepper.refresh();
+  const PRE = {
+    f1: [0, 4, 1, "r 14"],
+    f2: [0, 4, 2, "r 14; r 5; r 0 8"],
+    f3: [1, 4, 1, "r 5; r 4; w 5; r 0 8"],
+    f4: [4, 5, 1, "w 0 4; w 1"],
+    f6: [4, 5, 1, "w 4; w 13"],
+    f7: [5, 5, 1, "w 1; w 10"],
+    fail: [5, 5, 1, "r 2; fail 2; r 2; r 6; w 2; r 2; replace; r 2"],
+  };
+  document.querySelectorAll("#sim-raid [data-preset]").forEach((b) => (b.onclick = () => {
+    const [l, n, c, t] = PRE[b.dataset.preset];
+    lv.value = l; nIn.value = n; cIn.value = c; r5.value = "LS"; pm.value = "sub"; ta.value = t; load();
+  }));
+  $("rs-rand").onclick = () => {
+    const p = params(), D = dataDisks(p.level, p.N), cap = D * 8;
+    const r = OSTEP.rng(+$("rs-seed").value || 1), cnt = Math.max(1, Math.min(40, +$("rs-cnt").value || 8));
+    const sz = Math.max(1, Math.min(cap, +$("rs-sz").value || 1)), wp = Math.max(0, Math.min(100, +$("rs-wp").value || 0)) / 100;
+    const out = [];
+    for (let k = 0; k < cnt; k++) { const A = r.int(0, cap - sz); out.push(`${r() < wp ? "w" : "r"} ${A}${sz > 1 ? " " + sz : ""}`); }
+    ta.value = out.join("; ");
+    load();
+  };
+  load();
+})();
+
+// ---------- 计算器：Figure 38.8 ----------
+(function cmpCalc() {
+  const ids = ["cm-n", "cm-b", "cm-s", "cm-r", "cm-t"];
+  const fmt = (x) => (Number.isInteger(x) ? String(x) : x >= 100 ? x.toFixed(1) : x.toFixed(3).replace(/0+$/, "").replace(/\.$/, ""));
+  function render() {
+    const [N, B, S, R, T] = ids.map((id) => +$(id).value || 0);
+    const c = raidCompare(N, B, S, R, T);
+    const rows = [
+      ["容量（块）", "cap", ["N·B", "(N·B)/2", "(N−1)·B", "(N−1)·B"], 1],
+      ["可靠性（可容忍故障盘数）", "rel", ["0", "1（运气好 N/2）", "1", "1"], 0],
+      ["顺序读（MB/s）", "sr", ["N·S", "(N/2)·S", "(N−1)·S", "(N−1)·S"], 1],
+      ["顺序写（MB/s）", "sw", ["N·S", "(N/2)·S", "(N−1)·S", "(N−1)·S"], 1],
+      ["随机读（MB/s）", "rr", ["N·R", "N·R", "(N−1)·R", "N·R"], 1],
+      ["随机写（MB/s）", "rw", ["N·R", "(N/2)·R", "½·R", "(N/4)·R"], 1],
+      ["读延迟（ms）", "lr", ["T", "T", "T", "T"], -1],
+      ["写延迟（ms）", "lw", ["T", "T", "2T", "2T"], -1],
+    ];
+    const lvls = [0, 1, 4, 5];
+    const body = rows.map(([name, key, f, dir]) => {
+      const vals = lvls.map((l) => c[l][key]);
+      let best = null;
+      if (dir === 1) best = Math.max(...vals); else if (dir === -1) best = Math.min(...vals);
+      return h("tr", {}, h("td", {}, name), ...lvls.map((l, j) => h("td", { class: "num" + (best !== null && vals[j] === best ? " best" : "") }, key === "rel" ? String(vals[j]).replace("（运气好", "（运气好最多") : fmt(vals[j]), h("span", { class: "f" }, f[j]))));
+    });
+    $("cm-table").replaceChildren(h("thead", {}, h("tr", {}, h("th", {}, "指标"), ...lvls.map((l) => h("th", { class: "num" }, "RAID-" + l)))), h("tbody", {}, body));
+    $("cm-note").textContent = `随机写对比：RAID-0 ${fmt(N * R)}、RAID-1 ${fmt((N / 2) * R)}、RAID-4 ${fmt(R / 2)}、RAID-5 ${fmt((N / 4) * R)} MB/s。` +
+      `\nRAID-4 的随机写不随 N 增长（校验盘瓶颈）；RAID-5 随 N 线性增长，但只有 RAID-0 的 1/4。` + (N % 2 ? "\n注意：N 为奇数时 RAID-1 实际只能用 N−1 块盘组成镜像对。" : "");
+  }
+  ids.forEach((id) => $(id).addEventListener("input", render));
+  $("dk-go").onclick = () => {
+    const r = diskSR(+$("dk-seek").value, +$("dk-rot").value, +$("dk-rate").value, +$("dk-seq").value, +$("dk-rand").value);
+    $("cm-s").value = r.S.toFixed(2); $("cm-r").value = r.R.toFixed(3); $("cm-t").value = r.tRand.toFixed(3);
+    render();
+    $("cm-note").textContent = `顺序：${$("dk-seek").value} + ${$("dk-rot").value} + 传输 ${(r.tSeq - +$("dk-seek").value - +$("dk-rot").value).toFixed(1)} = ${r.tSeq.toFixed(1)} ms → S = ${r.S.toFixed(2)} MB/s\n随机：${$("dk-seek").value} + ${$("dk-rot").value} + 传输 ${(r.tRand - +$("dk-seek").value - +$("dk-rot").value).toFixed(3)} = ${r.tRand.toFixed(3)} ms → R = ${r.R.toFixed(3)} MB/s（T 取随机请求时间）\n` + $("cm-note").textContent;
+  };
+  render();
+})();
+})();
+</script>
+</body>
+</html>

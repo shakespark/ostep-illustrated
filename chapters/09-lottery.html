@@ -1,0 +1,769 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 9 章 · 调度：比例份额</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+svg.tl { max-width: none; }
+.jobtable input[type="number"] { width: 5em; }
+.jobtable td, .jobtable th { padding: 5px 8px; vertical-align: middle; }
+.sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 6px; }
+.presets { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+.presets button { font-size: 13px; padding: 4px 10px; }
+.presets .lbl { font-size: 13px; color: var(--muted); align-self: center; margin-right: 4px; }
+.hist { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 10px; }
+.hist span { width: 26px; height: 26px; border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; font: 600 11px var(--mono); color: #fff; }
+.hist span.fut { background: var(--surface-2) !important; color: var(--faint); border: 1px dashed var(--border); }
+.hist span.cur { outline: 2px solid var(--fg); outline-offset: 1px; }
+.codebox { font: 13px/1.7 var(--mono); background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 0; margin: 0; overflow-x: auto; }
+.codebox div { padding: 0 12px; white-space: pre; }
+.codebox div.on { background: color-mix(in srgb, var(--warn) 25%, transparent); }
+.passtbl td, .passtbl th { text-align: right; font-variant-numeric: tabular-nums; }
+.passtbl tr.cur td { background: var(--accent-soft); }
+.passtbl td.min { font-weight: 700; color: var(--accent); }
+.passtbl td.fut { color: var(--faint); }
+.wtbl td { font: 12.5px var(--mono); text-align: right; padding: 4px 8px; }
+.wtbl td.sel { background: var(--accent-soft); font-weight: 700; }
+.wtbl th { font-size: 12px; text-align: right; }
+.tree-list { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-top: 10px; font-size: 13.5px; }
+.cell.run { color: #fff; border-color: transparent; font-weight: 600; }
+.cell small { margin-left: 4px; font-size: 11px; opacity: .8; }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px; color: var(--muted); margin-top: 8px; }
+.legend i { display: inline-block; width: 14px; height: 3px; margin-right: 5px; vertical-align: 3px; }
+</style>
+</head>
+<body data-chapter="9">
+<main>
+
+<h2>一句话 + 关键问题</h2>
+<div class="crux">
+  <p><strong>如何按比例分享 CPU？</strong>如何设计调度器来按比例分享 CPU？关键的机制是什么？它们效果如何？</p>
+  <p class="muted small">CRUX: HOW TO SHARE THE CPU PROPORTIONALLY — How can we design a scheduler to share the CPU proportionally? What are the key mechanisms for doing so? How effective are they?</p>
+</div>
+<p>前两章的调度器都在优化周转时间或响应时间。本章换一个目标：<strong>比例份额（proportional-share）</strong>调度器，也叫<strong>公平份额（fair-share）</strong>调度器，它试图保证每个作业获得<strong>一定百分比</strong>的 CPU 时间。</p>
+<p>我们会看三种做法：用随机数"抽签"的<strong>彩票调度（lottery scheduling）</strong>（Waldspurger 与 Weihl），确定性的<strong>步长调度（stride scheduling）</strong>，以及曾经最广泛使用的真实调度器——Linux 的<strong>完全公平调度器（CFS）</strong>。这些思想在虚拟化数据中心里特别有用（比如给 Windows 虚拟机分 1/4 的 CPU），下一章讨论多处理器时也会再次遇到 CFS。</p>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>彩票（ticket）</h4><p>代表一个进程应得的资源份额：持有的彩票占总数的百分比 = 应得的 CPU 百分比。</p></div>
+  <div class="card"><h4>彩票调度</h4><p>每个时间片抽一次奖，中奖彩票的持有者运行。概率上正确，但不保证短期精确。</p></div>
+  <div class="card"><h4>彩票货币 / 转让 / 通胀</h4><p>货币（currency）：用户用自己的"币种"分配，系统换算成全局值；转让（transfer）：临时把彩票交给别的进程；通胀（inflation）：临时增减自己的彩票。</p></div>
+  <div class="card"><h4>公平指标 F</h4><p>两个相同作业中，先完成者的完成时刻 ÷ 后完成者的完成时刻。越接近 1 越公平。</p></div>
+  <div class="card"><h4>步长调度（stride）</h4><p>步长 = 大数 ÷ 票数；每次运行 pass 值最小的进程，并让它的 pass 加上步长。确定性地精确按比例。</p></div>
+  <div class="card"><h4>虚拟运行时间（vruntime）</h4><p>CFS 为每个进程累计 vruntime，每次挑 vruntime 最小的运行；权重越大，vruntime 涨得越慢。</p></div>
+  <div class="card"><h4>sched_latency / min_granularity</h4><p>时间片 = sched_latency（如 48ms）按权重分给 n 个进程，但不小于 min_granularity（如 6ms）。</p></div>
+  <div class="card"><h4>nice 与红黑树</h4><p>nice 值 −20…+19 映射为权重；可运行进程按 vruntime 放在红黑树中，插入/删除都是 O(log n)。</p></div>
+</div>
+
+<h2>图解讲解</h2>
+
+<h3>9.1 基本概念：彩票代表份额</h3>
+<p>彩票调度的核心概念就是<strong>彩票（ticket）</strong>。例如 A 有 75 张、B 有 25 张，我们希望 A 获得 75% 的 CPU、B 获得 25%。调度器每隔一段时间（比如每个时间片）抽一次奖：知道总共 100 张，从 0–99 中随机选一个<strong>中奖号码</strong>；A 持有 0–74 号，B 持有 75–99 号，中奖号码落在谁的区间就运行谁。（计算机科学家总是从 0 开始数。）</p>
+<figure class="fig"><div id="fig-draws"></div>
+<figcaption>原书的 20 次中奖号码：63 85 70 39 76 17 29 41 36 39 10 99 68 83 63 62 43 0 49 12。上方数轴：每个号码落在哪个区间；下方：得到的调度序列。B 只运行了 20 个时间片中的 4 个（20%），而不是期望的 25%。</figcaption></figure>
+<p>这就是随机性带来的<strong>概率正确（probabilistic correctness）</strong>：能在期望上满足比例，但不保证。两个作业竞争的时间越长，越可能接近期望的比例。</p>
+<div class="tip"><p><strong>使用随机性。</strong>随机方法相比传统决策至少有三个优点：① 常常能避免奇怪的边角情况——例如 LRU 替换策略在某些循环顺序访问的负载下表现最差，随机则没有这种最坏情况；② 轻量，几乎不需要状态——传统公平份额算法要为每个进程记账，每次运行后都要更新，而随机方法只需要最少的每进程状态（比如票数）；③ 很快，只要生成随机数快，决策就快。当然，需求越快，随机数就越趋向于伪随机。</p></div>
+
+<h3>9.2 彩票机制</h3>
+<p>彩票调度还提供了几种操纵彩票的机制：</p>
+<figure class="fig">
+<svg viewBox="0 0 700 210" width="700" role="img" aria-label="彩票货币换算：用户 A 与用户 B 各 100 张全局彩票">
+  <g font-size="13">
+    <rect class="box-strong" x="20" y="30" width="140" height="44" rx="6"/><text x="90" y="50" text-anchor="middle">用户 A</text><text x="90" y="66" text-anchor="middle" class="t-muted" font-size="11.5">100 张全局彩票</text>
+    <rect class="box-strong" x="20" y="136" width="140" height="44" rx="6"/><text x="90" y="156" text-anchor="middle">用户 B</text><text x="90" y="172" text-anchor="middle" class="t-muted" font-size="11.5">100 张全局彩票</text>
+    <path class="arrow" d="M160 45 C 200 45, 200 20, 240 20"/><path class="arrow" d="M160 60 C 200 60, 200 84, 240 84"/><path class="arrow" d="M160 158 L 240 158"/>
+    <rect class="accent-soft" x="240" y="4" width="200" height="32" rx="6"/><text x="250" y="25">A1：500（A 的货币，共 1000）</text>
+    <rect class="accent-soft" x="240" y="68" width="200" height="32" rx="6"/><text x="250" y="89">A2：500（A 的货币，共 1000）</text>
+    <rect class="accent-soft" x="240" y="142" width="200" height="32" rx="6"/><text x="250" y="163">B1：10（B 的货币，共 10）</text>
+    <line class="arrow" x1="440" y1="20" x2="490" y2="20"/><line class="arrow" x1="440" y1="84" x2="490" y2="84"/><line class="arrow" x1="440" y1="158" x2="490" y2="158"/>
+    <rect x="490" y="4" width="190" height="32" rx="6" style="fill:var(--c1)"/><text x="585" y="25" text-anchor="middle" style="fill:#fff;font-weight:600">A1 → 50（全局）</text>
+    <rect x="490" y="68" width="190" height="32" rx="6" style="fill:var(--c1)"/><text x="585" y="89" text-anchor="middle" style="fill:#fff;font-weight:600">A2 → 50（全局）</text>
+    <rect x="490" y="142" width="190" height="32" rx="6" style="fill:var(--c2)"/><text x="585" y="163" text-anchor="middle" style="fill:#fff;font-weight:600">B1 → 100（全局）</text>
+    <text x="585" y="200" text-anchor="middle" class="t-muted" font-size="12">抽奖在全局货币上进行（共 200 张）</text>
+  </g>
+</svg>
+<figcaption>彩票货币（ticket currency）：用户在自己的"币种"里任意分配，系统自动换算成全局彩票。A1、A2 各得 50，B1 得 100。</figcaption>
+</figure>
+<ul>
+  <li><strong>彩票转让（ticket transfer）</strong>：进程可以临时把自己的彩票交给另一个进程。这在客户端/服务器场景特别有用：客户端请求服务器替它做事时，把彩票交给服务器，让服务器更快地处理自己的请求；完成后服务器再把彩票还回来。</li>
+  <li><strong>彩票通胀（ticket inflation）</strong>：进程可以临时增加或减少自己持有的彩票数。在互不信任的竞争环境中这没有意义（贪婪的进程会给自己发大量彩票，占领机器）；但在一组相互信任的进程之间，某个进程需要更多 CPU 时可以提高自己的票值来反映这个需求，而无需与其他进程通信。</li>
+</ul>
+<div class="tip"><p><strong>用彩票表示份额。</strong>彩票是彩票调度和步长调度设计中最强大（也最基本）的机制。它不仅可以表示 CPU 份额，还能用得更广：Waldspurger 在后来关于虚拟机监视器内存管理的工作中，用彩票表示客户操作系统的内存份额。需要表示"所有权比例"时，这个概念可能正是你要的……彩票。</p></div>
+
+<h3>9.3 实现</h3>
+<p>彩票调度最惊人的地方是实现简单：一个好的随机数生成器选中奖号码，一个记录进程的数据结构（例如链表），以及彩票总数。假设三个进程 A、B、C 分别有 100、50、250 张彩票（共 400 张），在链表中按顺序排列。抽到中奖号码后，遍历链表，用计数器累加票数，直到计数器<strong>大于</strong>中奖号码：</p>
+<figure class="fig">
+  <div class="controls">
+    <label>中奖号码 <input type="number" id="walk-win" min="0" max="399" value="300"></label>
+    <label><input type="checkbox" id="walk-sort"> 按票数从多到少排列链表</label>
+  </div>
+  <div id="walk-step"></div>
+  <div id="walk-list"></div>
+  <div class="codebox" id="walk-code" style="margin-top:8px"></div>
+  <div class="narrate" id="walk-nar"></div>
+  <figcaption>图 9.1　彩票调度的决策代码（逐行执行）。中奖号码 300：counter 依次变为 100（A，小于 300 继续）、150（B，继续）、400（C，大于 300，C 中奖）。</figcaption>
+</figure>
+<p>为了让这个过程最高效，通常最好把链表按票数<strong>从多到少</strong>排序。顺序不影响正确性，但能保证总体上遍历次数最少，尤其是少数进程持有大部分彩票时。勾选上面的选项试试：同样的中奖号码，C 排在最前，一步就找到了（注意：换了顺序后，每个号码对应的中奖者会变，但每个进程中奖的<strong>概率</strong>不变）。</p>
+<p class="small muted">书中脚注提醒：从一个范围里正确地生成均匀随机数并不容易（例如用 <code>rand() % n</code> 会有偏差）。</p>
+
+<h3>9.4 一个例子：公平性研究</h3>
+<p>两个作业竞争 CPU，彩票数相同（各 100 张），运行时间相同（都是 R，我们会改变它）。我们希望它们大致同时完成，但由于随机性，有时一个会先完成。定义一个简单的<strong>公平指标 F</strong>：第一个作业完成的时刻除以第二个作业完成的时刻。例如 R = 10，第一个作业在 10 完成、第二个在 20 完成，则 F = 10/20 = 0.5。两个作业几乎同时完成时 F 接近 1——完美公平的调度器应当达到 F = 1。（旧版原书把这个指标称为不公平指标 U，定义相同。）</p>
+<figure class="fig"><div id="fig-fair"></div>
+<figcaption>图 9.2　彩票调度公平性研究：R 从 1 变到 1000（对数横轴），每个点是 30 次试验的平均 F。作业短时平均公平性很低，只有运行足够多个时间片后才接近公平。（本图由本页模拟器实时计算，随机种子不同曲线会略有不同。）</figcaption></figure>
+
+<h3>9.5 如何分配彩票？</h3>
+<p>一个我们还没解决的问题是：怎么给作业分配彩票？这是个难题，因为系统的行为强烈依赖于彩票的分配方式。一种做法是假设用户最清楚：给每个用户一些彩票，由用户分给自己运行的作业。但这其实是个"非解决方案"——它并没有告诉你该怎么做。所以给定一组作业，"彩票分配问题"仍然没有答案。</p>
+
+<h3>9.6 步长调度（stride scheduling）</h3>
+<p>你可能会问：为什么要用随机数？随机让调度器简单（且近似正确），但偶尔不能准确地达到比例，特别是在短时间尺度上。因此 Waldspurger 发明了<strong>步长调度</strong>——一个<strong>确定性</strong>的公平份额调度器。</p>
+<p>每个作业有一个<strong>步长（stride）</strong>，与票数成反比：用一个大数除以票数。A、B、C 有 100、50、250 张票，用 10000 去除，得到步长 100、200、40。每个进程还有一个计数器，称为<strong>行程值（pass）</strong>，记录它的全局进度：每次运行，就把 pass 加上它的步长。调度时总是挑 pass 最小的进程运行：</p>
+<pre><code>curr = remove_min(queue);   // 选 pass 最小的客户
+schedule(curr);             // 运行一个时间片
+curr-&gt;pass += curr-&gt;stride; // 用步长更新 pass
+insert(queue, curr);        // 放回队列</code></pre>
+<figure class="fig"><div class="table-wrap" style="margin:0"><table class="passtbl" id="fig-stride"></table></div>
+<figcaption>图 9.3　步长调度的一个轨迹（pass 值相同时任选一个，这里按 A、B、C 的顺序）。一个周期内 C 运行 5 次、A 2 次、B 1 次，恰好与票数 250 : 100 : 50 成比例。</figcaption></figure>
+<p>彩票调度在时间上按概率达到比例；步长调度在每个调度周期结束时<strong>精确</strong>达到比例。那为什么还要用彩票调度？因为它有一个步长调度没有的好性质：<strong>没有全局状态</strong>。想象在上面的例子中途加入一个新作业，它的 pass 该设为多少？设为 0 的话，它会独占 CPU 很久。而彩票调度没有每进程的全局状态，只需加入新进程、更新一个全局变量（总票数）即可，因此更容易以合理的方式加入新进程。（在下方步长模拟器里可以试试"中途加入"。）</p>
+
+<h3>9.7 Linux 完全公平调度器（CFS）</h3>
+<p>Linux 的 CFS 以另一种方式实现公平份额，而且<strong>高效、可扩展</strong>。效率很重要：Google 数据中心的研究发现，即使经过积极优化，调度仍然占用了整个数据中心约 5% 的 CPU 时间。</p>
+<h4>基本操作</h4>
+<p>大多数调度器基于固定的时间片，CFS 不同。它的目标很简单：在所有竞争进程之间公平地平分 CPU。它用一种计数方法——<strong>虚拟运行时间（virtual runtime, vruntime）</strong>来做到这一点：每个进程运行时累积 vruntime；最基本的情况下，所有进程的 vruntime 以相同速率随物理时间增长。需要调度时，CFS 选 vruntime <strong>最小</strong>的进程运行。</p>
+<p>那什么时候停下当前进程？这里有张力：切换太频繁，公平性提高（即使在很短的时间窗口内每个进程也能得到自己的份额），但性能下降（上下文切换太多）；切换不频繁则相反。CFS 用几个参数管理这种张力：</p>
+<ul>
+  <li><strong><code>sched_latency</code></strong>（典型值 48ms）：CFS 用它除以 CPU 上运行的进程数 n，得到每个进程的时间片，从而保证在这段时间内完全公平。例如 n = 4 时时间片为 12ms。</li>
+  <li><strong><code>min_granularity</code></strong>（通常约 6ms）：时间片永远不会小于它。例如 10 个进程时 48/10 = 4.8ms，但 CFS 会把时间片设为 6ms——在 48ms 的目标延迟内不再完全公平，但接近，同时保持了较高的 CPU 效率。</li>
+</ul>
+<figure class="fig"><div id="fig-cfs"></div><figcaption>图 9.4　CFS 简单例子：4 个作业（A、B、C、D）各运行两个 12ms 时间片；C、D 完成后只剩两个作业，各以 24ms 时间片轮转</figcaption></figure>
+<p>CFS 使用周期性时钟中断（例如每 1ms 一次），因此只能在固定时间间隔做决策。如果时间片不是中断间隔的整数倍也没关系：CFS 精确地跟踪 vruntime，长期来看会逼近理想的 CPU 共享。（本页模拟器为清晰起见按精确时间片运行。）</p>
+
+<h4>权重（niceness）</h4>
+<p>CFS 也允许控制进程优先级。它不用彩票，而是用经典的 UNIX 机制——进程的 <strong>nice 值</strong>：可以设为 −20 到 +19，默认 0。正的 nice 值意味着低优先级，负值意味着高优先级（太 nice 了，就得不到那么多调度关注）。CFS 把 nice 值映射为权重：</p>
+<div class="table-wrap"><table class="wtbl" id="wtbl"></table></div>
+<p>有了权重，就可以计算每个进程的有效时间片（n 个进程）：</p>
+<p style="text-align:center"><code>time_slice<sub>k</sub> = weight<sub>k</sub> / (Σ<sub>i=0</sub><sup>n−1</sup> weight<sub>i</sub>) · sched_latency</code>　（式 9.1）</p>
+<p>vruntime 的计算也要调整：把进程 i 实际运行的时间 runtime<sub>i</sub> 按权重反比缩放，即乘以默认权重 1024（weight<sub>0</sub>）除以它的权重：</p>
+<p style="text-align:center"><code>vruntime<sub>i</sub> = vruntime<sub>i</sub> + (weight<sub>0</sub> / weight<sub>i</sub>) · runtime<sub>i</sub></code>　（式 9.2）</p>
+<div class="aside" data-title="算一算：nice 值 → 时间片">
+  <div class="controls" style="margin-bottom:6px">
+    <label>A 的 nice <input type="number" id="nc-a" min="-20" max="19" value="-5"></label>
+    <label>B 的 nice <input type="number" id="nc-b" min="-20" max="19" value="0"></label>
+    <label>sched_latency <input type="number" id="nc-lat" min="1" max="1000" value="48"> ms</label>
+  </div>
+  <div id="nc-out" class="small"></div>
+</div>
+<p>书中的例子：A 很宝贵，nice = −5；B 讨人厌（"we hates it"，致敬《指环王》里的咕噜），nice = 0。权重分别是 3121 和 1024，A 的时间片约为 sched_latency 的 3/4（36ms），B 约 1/4（12ms）；A 的 vruntime 以 B 的约三分之一的速率累积。</p>
+<p>权重表的构造很巧妙：<strong>nice 值之差恒定时，CPU 比例保持不变</strong>。例如 A 的 nice 改为 5、B 改为 10，CFS 的调度方式与之前完全相同（上面的计算器里试试）。原因是表中相邻两项之比大约恒为 1.25，所以权重之比只取决于 nice 值之差。</p>
+
+<h4>使用红黑树</h4>
+<p>CFS 的一个重点是效率。调度器需要尽快找到下一个要运行的作业。链表这种简单结构无法扩展：现代系统有时有上千个进程，每隔几毫秒就遍历一次长链表太浪费了。CFS 把进程放在<strong>红黑树（red-black tree）</strong>中——一种平衡树，它多做一点工作来保持较低的深度，保证操作是对数时间而不是线性时间。</p>
+<figure class="fig">
+<svg viewBox="0 0 560 250" width="560" role="img" aria-label="按 vruntime 排序的红黑树">
+  <g class="stroke" stroke-width="1.5">
+    <line x1="280" y1="30" x2="150" y2="90"/><line x1="280" y1="30" x2="410" y2="90"/>
+    <line x1="150" y1="90" x2="85" y2="150"/><line x1="150" y1="90" x2="215" y2="150"/>
+    <line x1="410" y1="90" x2="345" y2="150"/><line x1="410" y1="90" x2="475" y2="150"/>
+    <line x1="85" y1="150" x2="120" y2="210"/><line x1="475" y1="150" x2="440" y2="210"/><line x1="475" y1="150" x2="510" y2="210"/>
+  </g>
+  <g font-size="14" font-weight="700" text-anchor="middle">
+    <g><circle cx="280" cy="30" r="19" style="fill:var(--fg)"/><text x="280" y="35" style="fill:var(--bg)">14</text></g>
+    <g><circle cx="150" cy="90" r="19" style="fill:var(--fg)"/><text x="150" y="95" style="fill:var(--bg)">9</text></g>
+    <g><circle cx="410" cy="90" r="19" style="fill:var(--fg)"/><text x="410" y="95" style="fill:var(--bg)">18</text></g>
+    <g><circle cx="85" cy="150" r="19" style="fill:var(--fg)"/><text x="85" y="155" style="fill:var(--bg)">1</text></g>
+    <g><circle cx="215" cy="150" r="19" style="fill:var(--fg)"/><text x="215" y="155" style="fill:var(--bg)">10</text></g>
+    <g><circle cx="345" cy="150" r="19" style="fill:var(--fg)"/><text x="345" y="155" style="fill:var(--bg)">17</text></g>
+    <g><circle cx="475" cy="150" r="19" style="fill:var(--bad)"/><text x="475" y="155" style="fill:#fff">22</text></g>
+    <g><circle cx="120" cy="210" r="19" style="fill:var(--bad)"/><text x="120" y="215" style="fill:#fff">5</text></g>
+    <g><circle cx="440" cy="210" r="19" style="fill:var(--fg)"/><text x="440" y="215" style="fill:var(--bg)">21</text></g>
+    <g><circle cx="510" cy="210" r="19" style="fill:var(--fg)"/><text x="510" y="215" style="fill:var(--bg)">24</text></g>
+  </g>
+  <text x="85" y="243" text-anchor="middle" font-size="11.5" style="fill:var(--accent)">↑ 最左节点 = 下一个运行</text>
+</svg>
+<figcaption>图 9.5　CFS 红黑树：10 个作业的 vruntime 为 1、5、9、10、14、18、17、21、22、24，按 vruntime 组织（树形与原书一致；节点红黑着色是本页补充的一种合法着色）</figcaption>
+</figure>
+<p>如果用有序链表，找下一个作业很简单（取第一个元素），但把作业按顺序放回链表需要扫描，是 O(n)；查找平均也是线性的。而红黑树的插入、删除等大多数操作都是 O(log n)。n 上千时，对数比线性明显高效。CFS 并不把所有进程都放在树中，只放<strong>正在运行或可运行</strong>的进程；进程睡眠（比如等待 I/O 完成或网络包到达）时会从树中移除，在别处记录。</p>
+<div class="tip"><p><strong>在合适的时候使用高效的数据结构。</strong>很多时候链表就够了，很多时候不够。早期调度器用的简单链表在现代系统上表现不好，特别是在数据中心里负载很重、有上千个活跃进程的服务器上。选择数据结构时，要仔细考虑它的访问模式和使用频率。</p></div>
+
+<h4>处理 I/O 和睡眠的进程</h4>
+<p>选 vruntime 最小者运行，对长时间睡眠的作业会出问题。设 A 一直运行，B 睡了很久（比如 10 秒）。B 醒来时，它的 vruntime 比 A 落后 10 秒；如果不小心，B 会在接下来的 10 秒里独占 CPU 追赶，A 就饿死了。CFS 的办法是：作业醒来时，把它的 vruntime 设为树中的<strong>最小值</strong>（树里只有正在运行的作业）。这样避免了饥饿，但有代价：频繁短暂睡眠的作业往往永远得不到公平的份额。（下方 CFS 模拟器的"睡眠者"预设可以对比两种做法。）</p>
+<p>CFS 还有很多其他特性：提高缓存性能的各种启发式方法、有效处理多 CPU 的策略（下一章讨论）、能以大的进程组为单位调度等。</p>
+
+<h3>9.8 小结</h3>
+<p>彩票调度巧妙地用随机性实现比例份额；步长调度确定性地实现它；CFS 是本章唯一"真实"的调度器，有点像带动态时间片的加权轮转，但为在负载下扩展良好而构建，多年来一直是使用最广泛的公平份额调度器。</p>
+<p>没有哪个调度器是万能药。公平份额调度器也有自己的问题：一是与 I/O 配合得不太好——偶尔做 I/O 的作业可能得不到公平的 CPU 份额；二是彩票或优先级分配这个难题仍悬而未决——你的浏览器该分多少票？文本编辑器的 nice 值该设多少？MLFQ 等通用调度器能自动处理这些问题，因此更容易部署。不过在很多领域里这些问题不是主要矛盾，比例份额调度器用得很成功，例如虚拟化数据中心。最后，Linux 一直在变：从 Linux 6.6 起，<strong>最早合格虚拟截止时间优先（EEVDF）</strong>调度器（另一种公平共享方法）成为默认调度器。</p>
+
+<h2>交互模拟器</h2>
+
+<section class="sim" id="sim-lottery">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>彩票调度：每次抽奖落在哪里？份额如何收敛？</h3>
+    <div class="desc">调整每个作业的票数和随机种子，逐次抽奖：数轴上显示中奖号码落在哪个作业的区间；折线图显示每个作业的实际 CPU 份额如何随抽奖次数逐渐收敛到理论比例（虚线）。</div></div>
+  <div class="sim-body">
+    <div class="presets"><span class="lbl">预设：</span><button id="lt-book">原书 20 个中奖号码（75 : 25）</button><button id="lt-3">三个作业 100 : 50 : 250</button><button id="lt-hw2">课后题 2：1 : 100</button></div>
+    <div class="controls">
+      <span id="lt-tix"></span>
+      <button id="lt-add">＋ 作业</button>
+      <label>种子 <input type="number" id="lt-seed" value="1"></label>
+      <label>抽奖次数 <select id="lt-n"><option>20</option><option selected>100</option><option>500</option><option>2000</option></select></label>
+    </div>
+    <div id="lt-step"></div>
+    <div class="stage">
+      <div id="lt-line"></div>
+      <div class="hist" id="lt-hist"></div>
+      <div id="lt-chart" style="margin-top:10px"></div>
+    </div>
+    <div class="narrate" id="lt-nar"></div>
+    <div class="stats" id="lt-stats"></div>
+  </div>
+</section>
+
+<section class="sim" id="sim-fair">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>公平性 F 与作业长度（图 9.2）</h3>
+    <div class="desc">两个票数相同的作业，长度都是 R。每个 R 做若干次试验，画平均 F。加上步长调度的曲线对比（课后题 5），改变时间片大小观察变化（课后题 4）。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>每点试验次数 <input type="number" id="fr-trials" min="1" max="200" value="30"></label>
+      <label>时间片 <input type="number" id="fr-q" min="1" max="100" value="1"></label>
+      <label>种子 <input type="number" id="fr-seed" value="1"></label>
+      <label><input type="checkbox" id="fr-stride" checked> 显示步长调度</label>
+    </div>
+    <div class="stage"><div id="fr-chart"></div></div>
+    <div class="legend"><span><i style="background:var(--c1)"></i>彩票调度（平均 F）</span><span><i style="background:var(--c3)"></i>步长调度</span><span><i style="background:var(--muted);height:1px"></i>单次试验（彩票）的最小 F</span></div>
+    <div class="narrate" id="fr-nar"></div>
+  </div>
+</section>
+
+<section class="sim" id="sim-stride">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>步长调度：pass 值表逐步推进（图 9.3）</h3>
+    <div class="desc">每一步选 pass 最小的作业运行（相同时选靠前的），它的 pass 加上步长。可以设置在第 k 步中途加入一个新作业，比较它的 pass 初值设为 0 与设为当前最小 pass 的区别。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <span id="sd-tix"></span>
+      <label>大数 <input type="number" id="sd-big" min="100" max="1000000" value="10000"></label>
+      <label>步数 <input type="number" id="sd-n" min="1" max="60" value="16"></label>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="sd-join"> 在第 <input type="number" id="sd-at" min="1" max="60" value="8"> 步前加入 D，票数 <input type="number" id="sd-dt" min="1" max="1000" value="100"></label>
+      <label>D 的 pass 初值 <select id="sd-mode"><option value="zero">0</option><option value="min">当前最小 pass</option></select></label>
+    </div>
+    <div id="sd-step"></div>
+    <div class="stage"><div class="table-wrap" style="margin:0"><table class="passtbl" id="sd-table"></table></div></div>
+    <div class="narrate" id="sd-nar"></div>
+    <div class="stats" id="sd-stats"></div>
+  </div>
+</section>
+
+<section class="sim" id="sim-cfs">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>Linux CFS：vruntime、动态时间片与 nice 权重</h3>
+    <div class="desc">每一步是一次调度决策：可运行作业按 vruntime 排成有序列表（红黑树的中序遍历），CFS 取最左边的作业，按式 9.1 计算它的时间片。改 nice 值、sched_latency、min_granularity 观察时间片和份额的变化。</div></div>
+  <div class="sim-body">
+    <div class="presets"><span class="lbl">预设：</span></div>
+    <div class="controls">
+      <label>sched_latency <input type="number" id="cf-lat" min="1" max="500" value="48"> ms</label>
+      <label>min_granularity <input type="number" id="cf-gran" min="0" max="100" value="6"> ms</label>
+      <label>加入/唤醒时 vruntime <select id="cf-join"><option value="min">设为树中最小值（CFS）</option><option value="keep">保持原值</option></select></label>
+      <button id="cf-add">＋ 作业</button>
+    </div>
+    <div class="table-wrap"><table class="jobtable"><thead><tr><th>作业</th><th>nice</th><th>权重</th><th>到达（醒来）</th><th>运行时长</th><th></th></tr></thead><tbody id="cf-jobs"></tbody></table></div>
+    <div id="cf-step"></div>
+    <div class="stage"><div id="cf-gantt"></div><div class="tree-list" id="cf-tree"></div></div>
+    <div class="narrate" id="cf-nar"></div>
+    <div class="stats" id="cf-stats"></div>
+  </div>
+</section>
+
+<h2>先预测再验证</h2>
+<div class="exercise"><div class="q">（课后题 2）两个长度都是 10 的作业，作业 0 只有 1 张票，作业 1 有 100 张。作业 0 会在作业 1 完成前运行吗？频率多高？这种票数失衡对彩票调度有什么影响？</div>
+<details class="reveal"><summary>看答案</summary><div>每次抽奖作业 0 只有 1/101 ≈ 1% 的概率中奖。作业 1 需要 10 个时间片，在此期间作业 0 至少运行一次的概率约为 1 − (100/101)<sup>10</sup> ≈ 9.4%。所以大多数情况下作业 0 要等作业 1 完成后才运行——严重的票数失衡使彩票调度的行为接近"严格优先级"。用"课后题 2"预设换几个种子看看。</div></details></div>
+<div class="exercise"><div class="q">（课后题 3）两个长度为 100、各 100 张票的作业，调度器有多不公平？用不同种子试试（用 F 或"先完成者早了多少"衡量）。</div>
+<details class="reveal"><summary>看答案</summary><div>在公平性模拟器里看 R = 100 的点：平均 F 大约在 0.93–0.95（先完成的作业平均早完成约 5%–7% 的时间），而 30 次试验中最差的一次 F 可能只有 0.82–0.86（见图中灰色的“最小 F”曲线）。作业越长，这个差距（相对）越小。</div></details></div>
+<div class="exercise"><div class="q">（课后题 4）时间片变大时，公平性会怎样变化？</div>
+<details class="reveal"><summary>看答案</summary><div>作业长度固定时，时间片越大，完成所需的抽奖次数越少，随机波动相对越大，F 下降。例如 R = 100、时间片 10 时相当于只抽约 10 次签（每个作业各需 10 次），平均 F 从约 0.94 降到约 0.8–0.85，接近 R = 10、时间片 1 的情形（约 0.85）。把公平性模拟器的时间片改成 10 对比。</div></details></div>
+<div class="exercise"><div class="q">（课后题 5）步长调度下，图 9.2 会是什么样子？</div>
+<details class="reveal"><summary>看答案</summary><div>两个票数相同的作业在步长调度下严格交替，先完成者在 2R−1 完成、后完成者在 2R 完成，F = (2R−1)/(2R)：R = 1 时 F = 0.5，R = 10 时已是 0.95，之后迅速逼近 1，而且没有任何随机波动（模拟器中的绿色曲线）。</div></details></div>
+<div class="exercise"><div class="q">在步长模拟器里勾选"在第 8 步前加入 D"，D 的 pass 初值设为 0，预测接下来谁会运行多少次？再改成"当前最小 pass"。</div>
+<details class="reveal"><summary>看答案</summary><div>初值为 0 时，D 的 pass 远低于其他作业（它们已经到了几百），D 会连续运行很多次直到追上——这就是书中说的"独占 CPU"。设为当前最小 pass 时，D 立刻与其他作业公平竞争。CFS 对新加入和醒来的进程做的正是类似的事（设为最小 vruntime）。</div></details></div>
+
+<h2>动手实验：nice 值真的决定 CPU 份额吗？</h2>
+<div class="lab">
+<p><code>labs/09-lottery/nice_share.c</code> 创建两个子进程，把它们<strong>绑定到同一个 CPU</strong>（<code>sched_setaffinity</code>），给其中一个设置 nice 值（<code>setpriority</code>），然后两个进程都拼命做空循环计数若干秒。最后比较两者完成的循环次数之比，与 CFS 权重表算出的理论比例对照。</p>
+<pre><code><span class="cmd">cd labs/09-lottery && make</span>
+<span class="cmd">./nice_share 0 5 3</span>     # 子进程 1 nice=0，子进程 2 nice=5，运行 3 秒
+<span class="cmd">./nice_share 5 10 3</span>    # nice 差值同样是 5：比例应当几乎不变
+<span class="cmd">sudo ./nice_share -5 0 3</span>  # 负的 nice 需要 root 权限</code></pre>
+<p class="small muted">示例输出（本机 WSL2 实测，你的机器上数字会不同）：</p>
+<pre><code id="lab9-out">$ ./nice_share 0 5 3
+both children pinned to CPU 0, running 3 s
+child 1: nice   0  weight  1024  loops  5841542322  share 75.5%  (expected 75.3%)
+child 2: nice   5  weight   335  loops  1894193102  share 24.5%  (expected 24.7%)
+$ ./nice_share 5 10 3
+both children pinned to CPU 0, running 3 s
+child 1: nice   5  weight   335  loops  3099903477  share 74.7%  (expected 75.3%)
+child 2: nice  10  weight   110  loops  1052312924  share 25.3%  (expected 24.7%)</code></pre>
+<p>要观察的点：两个 CPU 密集型进程争同一个 CPU 时，份额非常接近 1024 : 335 ≈ 3 : 1。再试 <code>./nice_share 5 10 3</code>，比例几乎一样——这正是"nice 差值恒定则比例不变"。注意：Linux 6.6 起默认调度器已换成 EEVDF，但它沿用了同一张 nice→权重表，按权重分配 CPU 的比例行为不变。</p>
+</div>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="2"><div class="q">1. A 有 100 张、B 有 50 张、C 有 250 张彩票，按 A、B、C 的顺序存在链表中。中奖号码为 120 时谁运行？</div>
+  <div class="opts"><button>A. C</button><button>B. A</button><button>C. B</button><button>D. 无法确定</button></div>
+  <div class="explain">counter 先变为 100（不大于 120，继续），再变为 150（大于 120），所以是 B。中奖号码 0–99 → A，100–149 → B，150–399 → C。</div></div>
+<div class="mcq" data-answer="1"><div class="q">2. 相比步长调度，彩票调度的主要优势是？</div>
+  <div class="opts"><button>A. 在短时间尺度上比例更精确</button><button>B. 没有每进程的全局状态，新进程加入时很容易处理</button><button>C. 不需要随机数</button><button>D. 能自动为作业分配合适的票数</button></div>
+  <div class="explain">步长调度在每个周期结束时精确，但新作业的 pass 初值不好定；彩票调度只需更新总票数。票数分配问题两者都没有解决。</div></div>
+<div class="mcq" data-answer="2"><div class="q">3. 步长调度中 A、B、C 的票数为 100、50、250，大数取 10000。它们的步长分别是？</div>
+  <div class="opts"><button>A. 1、0.5、2.5</button><button>B. 40、200、100</button><button>C. 100、200、40</button><button>D. 100、50、250</button></div>
+  <div class="explain">步长 = 10000 / 票数：10000/100 = 100，10000/50 = 200，10000/250 = 40。票数越多，步长越小，pass 涨得越慢，运行得越频繁。</div></div>
+<div class="mcq" data-answer="0"><div class="q">4. sched_latency = 48ms、min_granularity = 6ms，有 10 个 nice 值都为 0 的进程。CFS 给每个进程的时间片是？</div>
+  <div class="opts"><button>A. 6ms</button><button>B. 4.8ms</button><button>C. 48ms</button><button>D. 12ms</button></div>
+  <div class="explain">48/10 = 4.8 小于 min_granularity，所以取 6ms。代价是在 48ms 窗口内不再完全公平（10 × 6 = 60ms 才轮完一圈）。</div></div>
+<div class="mcq" data-answer="1"><div class="q">5. A 的 nice = −5（权重 3121），B 的 nice = 0（权重 1024）。以下哪个说法正确？</div>
+  <div class="opts"><button>A. B 会饿死</button><button>B. A 的时间片约 36ms，B 约 12ms；A 的 vruntime 以 B 约 1/3 的速率增长</button><button>C. 两者时间片相同，只是 A 被选中得更频繁</button><button>D. A 的 vruntime 增长速度是 B 的 3 倍</button></div>
+  <div class="explain">time_slice 按权重比例分 sched_latency；vruntime 增量 = runtime × 1024 / weight，A 的系数 ≈ 0.33。</div></div>
+<div class="mcq" data-answer="3"><div class="q">6. nice 值从（−5, 0）改为（5, 10），CPU 比例会怎样？</div>
+  <div class="opts"><button>A. 反过来，B 得到更多</button><button>B. 差距变得更大</button><button>C. 两者平分</button><button>D. 几乎不变，因为权重表中相邻项之比约为常数，比例只取决于 nice 差值</button></div>
+  <div class="explain">3121/1024 ≈ 3.05，335/110 ≈ 3.05。权重表是按几何级数（约 1.25 倍）构造的。</div></div>
+<div class="mcq" data-answer="0"><div class="q">7. CFS 为什么在进程醒来时把它的 vruntime 设为树中的最小值？代价是什么？</div>
+  <div class="opts"><button>A. 防止长时间睡眠的进程醒来后凭借很小的 vruntime 独占 CPU；代价是频繁短暂睡眠的作业往往得不到公平份额</button><button>B. 为了让睡眠的进程优先运行；没有代价</button><button>C. 为了减少红黑树的高度；代价是查找变慢</button><button>D. 为了实现彩票转让；代价是需要全局状态</button></div>
+  <div class="explain">这正是书中"Dealing With I/O And Sleeping Processes"一节的内容。</div></div>
+<div class="mcq" data-answer="3"><div class="q">8. CFS 为什么用红黑树而不是有序链表保存可运行进程？</div>
+  <div class="opts"><button>A. 红黑树让时间片计算更精确</button><button>B. 红黑树可以同时保存睡眠的进程</button><button>C. 红黑树能保证绝对公平</button><button>D. 插入、删除等操作是 O(log n)，而有序链表的插入是 O(n)，进程成千上万时差距明显</button></div>
+  <div class="explain">取最小值两者都快，但把运行完的进程按新 vruntime 放回去时，链表要线性扫描。睡眠的进程不在树中。</div></div>
+
+<h2>常见误区</h2>
+<div class="warn">
+<ul>
+<li><strong>"彩票调度保证每个作业恰好得到它的比例。"</strong>它只在概率上（长期期望上）正确；短时间内可能明显偏离，如原书例子中 B 只得到 20% 而不是 25%。</li>
+<li><strong>"步长 = 票数。"</strong>步长与票数<em>成反比</em>：票越多，步长越小，pass 增长越慢，越常被选中。</li>
+<li><strong>"CFS 有固定的时间片。"</strong>CFS 的时间片是动态的：sched_latency 按权重分给当前可运行的进程，并受 min_granularity 下限约束，进程数一变时间片就变。</li>
+<li><strong>"nice 值越大优先级越高。"</strong>相反，nice 越大（越"客气"），权重越小，得到的 CPU 越少。</li>
+<li><strong>"比例份额调度器能解决所有调度问题。"</strong>它们与 I/O 配合不佳，并且把"该给多少票 / 设什么 nice"这个难题留给了用户。</li>
+</ul>
+</div>
+
+<h2>本章小结</h2>
+<ul>
+  <li>比例份额调度的目标是让每个作业获得一定百分比的 CPU，而不是优化周转或响应时间。</li>
+  <li>彩票调度：票数代表份额，随机抽奖决定谁运行；实现极简、无全局状态，但只是概率正确，短作业的公平性较差（图 9.2）。还有货币、转让、通胀等机制。</li>
+  <li>步长调度：步长 = 大数 / 票数，总是运行 pass 最小者；确定性且精确，但新作业的 pass 初值是个问题。</li>
+  <li>Linux CFS：按 vruntime 选最小者，时间片由 sched_latency 与权重动态决定（不小于 min_granularity），nice 值通过权重表影响时间片和 vruntime 增速，用红黑树保证 O(log n)，醒来的进程 vruntime 设为最小值以防饥饿。</li>
+  <li>下一章讨论多处理器调度：多个 CPU、缓存亲和性、单队列与多队列——Linux 的 O(1)、CFS、BFS 分别采用了哪种方式。</li>
+</ul>
+
+</main>
+<script>
+(function () {
+"use strict";
+const { h, s, color, letter } = OSTEP;
+
+/* CORE-BEGIN */
+// 与 OSTEP.rng 相同的 mulberry32，放在这里便于在 node 中单独验证
+function mulberry(seed) {
+  let a = (seed >>> 0) || 1;
+  return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+// 图 9.1 的链表遍历：返回中奖者下标以及每一步的 counter
+function lotteryWalk(tickets, winner, order) {
+  order = order || tickets.map((_, i) => i);
+  let counter = 0; const steps = [];
+  for (const i of order) { counter += tickets[i]; steps.push({ i, counter }); if (counter > winner) return { who: i, steps }; }
+  return { who: -1, steps };
+}
+// 连续抽奖 n 次；fixed 给定时按给定号码抽（复刻原书）
+function lotteryDraws(tickets, n, seed, fixed) {
+  const total = tickets.reduce((a, b) => a + b, 0), r = mulberry(seed), out = [];
+  for (let k = 0; k < n; k++) {
+    const w = fixed ? fixed[k % fixed.length] : Math.floor(r() * total);
+    out.push({ w, who: lotteryWalk(tickets, w).who });
+  }
+  return { total, draws: out };
+}
+// 两个长度为 R、票数相同的作业；时间片 q；返回 F = 先完成时刻 / 后完成时刻
+function lotteryF(R, q, r) {
+  const rem = [R, R], done = [0, 0]; let t = 0;
+  while (rem[0] > 0 || rem[1] > 0) {
+    let who;
+    if (rem[0] > 0 && rem[1] > 0) who = r() < 0.5 ? 0 : 1; else who = rem[0] > 0 ? 0 : 1;
+    const d = Math.min(q, rem[who]); rem[who] -= d; t += d;
+    if (rem[who] === 0) done[who] = t;
+  }
+  return Math.min(done[0], done[1]) / Math.max(done[0], done[1]);
+}
+function fairnessCurve(Rs, trials, q, seed) {
+  const r = mulberry(seed);
+  return Rs.map((R) => { let sum = 0, min = 1; for (let k = 0; k < trials; k++) { const f = lotteryF(R, q, r); sum += f; min = Math.min(min, f); } return { R, avg: sum / trials, min }; });
+}
+function strideF(R, q) { // 两个相同作业严格交替
+  const rem = [R, R], pass = [0, 0], done = [0, 0]; let t = 0;
+  while (rem[0] > 0 || rem[1] > 0) {
+    let who = rem[0] > 0 && (rem[1] === 0 || pass[0] <= pass[1]) ? 0 : 1;
+    const d = Math.min(q, rem[who]); rem[who] -= d; t += d; pass[who] += 100; if (rem[who] === 0) done[who] = t;
+  }
+  return Math.min(done[0], done[1]) / Math.max(done[0], done[1]);
+}
+// 步长调度：返回每一步的 pass 表与运行者；join = {at, tickets, mode:'zero'|'min'}
+function strideRun(tickets, n, big, join) {
+  const jobs = tickets.map((tk) => ({ tk, stride: big / tk, pass: 0 }));
+  const rows = [];
+  for (let k = 0; k < n; k++) {
+    let joined = false;
+    if (join && k === join.at && jobs.length === tickets.length) {
+      const minPass = Math.min(...jobs.map((j) => j.pass));
+      jobs.push({ tk: join.tickets, stride: big / join.tickets, pass: join.mode === "min" ? minPass : 0 }); joined = true;
+    }
+    let who = 0; for (let i = 1; i < jobs.length; i++) if (jobs[i].pass < jobs[who].pass) who = i;
+    rows.push({ pass: jobs.map((j) => j.pass), who, joined, strides: jobs.map((j) => j.stride) });
+    jobs[who].pass += jobs[who].stride;
+  }
+  rows.push({ pass: jobs.map((j) => j.pass), who: -1, strides: jobs.map((j) => j.stride) });
+  return rows;
+}
+const PRIO_TO_WEIGHT = [88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904, 3906,
+  3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15];
+const weightOf = (nice) => PRIO_TO_WEIGHT[Math.max(-20, Math.min(19, nice)) + 20];
+// CFS（事件驱动、精确时间片）：jobs = [{nice, length, arrival}]；join = 'min' | 'keep'
+function cfsRun(jobsIn, lat, gran, join, maxT) {
+  maxT = maxT || 100000;
+  const EPS = 1e-9;
+  const jobs = jobsIn.map((j, i) => ({ i, w: weightOf(+j.nice || 0), len: +j.length, arr: +j.arrival || 0, rem: +j.length, vr: 0, inTree: false, done: null, first: null, cpu: 0 }));
+  const segs = [], dec = [];
+  let t = 0;
+  for (let guard = 0; guard < 100000 && t < maxT; guard++) {
+    const joined = [];
+    for (const j of jobs) if (!j.inTree && j.done === null && j.arr <= t + EPS) {
+      const tree = jobs.filter((x) => x.inTree);
+      if (join === "min" && tree.length) j.vr = Math.min(...tree.map((x) => x.vr));
+      j.inTree = true; joined.push(j.i);
+    }
+    const tree = jobs.filter((x) => x.inTree);
+    if (!tree.length) {
+      const next = jobs.filter((x) => x.done === null).map((x) => x.arr);
+      if (!next.length) break;
+      const na = Math.min(...next);
+      segs.push({ who: -1, start: t, end: na }); t = na; continue;
+    }
+    let cur = tree[0]; for (const x of tree) if (x.vr < cur.vr - EPS) cur = x;
+    const sumW = tree.reduce((a, x) => a + x.w, 0);
+    const ideal = (cur.w / sumW) * lat, slice = Math.max(gran, ideal);
+    const d = Math.min(slice, cur.rem, maxT - t);
+    dec.push({ t, pick: cur.i, joined, n: tree.length, sumW, ideal, slice, run: d,
+      list: tree.slice().sort((a, b) => a.vr - b.vr || a.i - b.i).map((x) => ({ i: x.i, vr: x.vr })) });
+    if (cur.first === null) cur.first = t;
+    const L = segs[segs.length - 1];
+    if (L && L.who === cur.i && Math.abs(L.end - t) < EPS) L.end = t + d; else segs.push({ who: cur.i, start: t, end: t + d });
+    t += d; cur.rem -= d; cur.cpu += d; cur.vr += (d * 1024) / cur.w;
+    if (cur.rem <= EPS) { cur.rem = 0; cur.done = t; cur.inTree = false; }
+  }
+  return { segs, dec, end: t, per: jobs.map((j) => ({ w: j.w, done: j.done, cpu: j.cpu, vr: j.vr, first: j.first })) };
+}
+/* CORE-END */
+
+function fmt(x, d = 2) { if (x == null) return "—"; return Math.abs(x - Math.round(x)) < 1e-9 ? String(Math.round(x)) : x.toFixed(d); }
+function niceUnit(end) { for (const u of [1, 2, 5, 10, 20, 24, 25, 50, 100, 200, 250, 500, 1000, 2000]) if (end / u <= 12) return u; return 5000; }
+function timeline(host, segs, o = {}) {
+  const end = o.end || Math.max(1, ...segs.map((g) => g.end));
+  const pxPer = o.pxPer || Math.max(0.5, Math.min(30, 700 / end)), L = 12, rowH = 28;
+  const W = L + end * pxPer + 24, H = rowH + 34;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, class: "tl", role: "img", "aria-label": o.aria || "时间线" });
+  const X = (t) => L + t * pxPer;
+  for (const g of segs) {
+    const parts = o.cursor == null ? [[g.start, g.end, 1]] : [[g.start, Math.min(g.end, o.cursor), 1], [Math.max(g.start, o.cursor), g.end, 0.2]];
+    for (const [a, b, op] of parts) if (b - a > 1e-9) svg.append(s("rect", { x: X(a) + 0.5, y: 4, width: Math.max(1, (b - a) * pxPer - 1), height: rowH, rx: 3, opacity: op,
+      style: g.who < 0 ? "fill:var(--surface-2);stroke:var(--border)" : `fill:${color(g.who)}` }));
+    const w = (g.end - g.start) * pxPer;
+    if (w > 14 && g.who >= 0) svg.append(s("text", { x: X(g.start) + w / 2, y: 4 + rowH / 2 + 4.5, "text-anchor": "middle", "font-size": 12, style: "fill:#fff;font-weight:600", opacity: o.cursor != null && g.start >= o.cursor ? 0.35 : 1, text: letter(g.who) }));
+  }
+  const unit = o.unit || niceUnit(end);
+  for (let t = 0; t <= end + 1e-9; t += unit) {
+    svg.append(s("line", { x1: X(t), x2: X(t), y1: rowH + 6, y2: rowH + 11, class: "stroke" }));
+    svg.append(s("text", { x: X(t), y: rowH + 25, "text-anchor": "middle", "font-size": 11, class: "t-muted mono", text: fmt(t, 1) }));
+  }
+  if (o.cursor != null) svg.append(s("line", { x1: X(o.cursor), x2: X(o.cursor), y1: 0, y2: rowH + 10, style: "stroke:var(--accent);stroke-width:2" }));
+  host.replaceChildren(svg);
+}
+// 票号数轴：各作业区间 + 中奖号码标记
+function ticketLine(host, tickets, marks, o = {}) {
+  const total = tickets.reduce((a, b) => a + b, 0), W = 700, L = 10, bw = W - 2 * L;
+  const H = 70 + (o.rows ? 16 : 0);
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "彩票号码区间" });
+  let acc = 0;
+  tickets.forEach((tk, i) => {
+    const x = L + (acc / total) * bw, w = (tk / total) * bw;
+    svg.append(s("rect", { x, y: 26, width: w, height: 24, style: `fill:${color(i)}`, opacity: 0.85 }));
+    if (w > 40) svg.append(s("text", { x: x + w / 2, y: 43, "text-anchor": "middle", "font-size": 12, style: "fill:#fff;font-weight:600", text: `${letter(i)}：${acc}–${acc + tk - 1}` }));
+    svg.append(s("text", { x, y: 64, "font-size": 10.5, class: "t-muted mono", text: acc }));
+    acc += tk;
+  });
+  svg.append(s("text", { x: L + bw, y: 64, "text-anchor": "end", "font-size": 10.5, class: "t-muted mono", text: total }));
+  marks.forEach((m) => {
+    const x = L + ((m.w + 0.5) / total) * bw;
+    svg.append(s("path", { d: `M${x} 24 l-5 -8 h10 z`, style: m.cur ? "fill:var(--fg)" : "fill:var(--muted)", opacity: m.cur ? 1 : 0.55 }));
+    if (m.cur) svg.append(s("text", { x, y: 12, "text-anchor": "middle", "font-size": 12, style: "font-weight:700", text: m.w }));
+  });
+  host.replaceChildren(svg);
+}
+function lineChart(host, series, o) {
+  const W = o.W || 700, H = o.H || 240, L = 44, R = 14, T = 12, B = 34, iw = W - L - R, ih = H - T - B;
+  const xmin = o.xmin, xmax = o.xmax, ymin = o.ymin ?? 0, ymax = o.ymax ?? 1;
+  const X = o.log ? (x) => L + ((Math.log10(x) - Math.log10(xmin)) / (Math.log10(xmax) - Math.log10(xmin))) * iw : (x) => L + ((x - xmin) / (xmax - xmin || 1)) * iw;
+  const Y = (y) => T + ih - ((y - ymin) / (ymax - ymin)) * ih;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": o.aria });
+  for (const yv of o.yticks) { svg.append(s("line", { x1: L, x2: W - R, y1: Y(yv), y2: Y(yv), style: "stroke:var(--border)" })); svg.append(s("text", { x: L - 6, y: Y(yv) + 4, "text-anchor": "end", "font-size": 10.5, class: "t-muted mono", text: yv })); }
+  for (const xv of o.xticks) svg.append(s("text", { x: X(xv), y: H - B + 16, "text-anchor": "middle", "font-size": 10.5, class: "t-muted mono", text: xv }));
+  for (const sr of series) {
+    if (sr.hline != null) { svg.append(s("line", { x1: L, x2: W - R, y1: Y(sr.hline), y2: Y(sr.hline), style: `stroke:${sr.color};stroke-width:1.3`, "stroke-dasharray": "5 4" })); continue; }
+    svg.append(s("path", { d: sr.pts.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""), style: `fill:none;stroke:${sr.color};stroke-width:${sr.w || 2}`, opacity: sr.op || 1 }));
+    if (sr.dots) sr.pts.forEach((p) => svg.append(s("circle", { cx: X(p[0]), cy: Y(p[1]), r: 2.8, style: `fill:${sr.color}` })));
+  }
+  if (o.cursorX != null) svg.append(s("line", { x1: X(o.cursorX), x2: X(o.cursorX), y1: T, y2: T + ih, style: "stroke:var(--accent)" }));
+  svg.append(s("text", { x: L + iw / 2, y: H - 4, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", text: o.xlabel }));
+  svg.append(s("text", { x: 12, y: T + ih / 2, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", transform: `rotate(-90 12 ${T + ih / 2})`, text: o.ylabel }));
+  host.replaceChildren(svg);
+}
+const $ = (id) => document.getElementById(id);
+const stat = (v, l) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+const BOOK = [63, 85, 70, 39, 76, 17, 29, 41, 36, 39, 10, 99, 68, 83, 63, 62, 43, 0, 49, 12];
+
+// ---------- 图：原书 20 次抽奖 ----------
+(function () {
+  const r = lotteryDraws([75, 25], 20, 1, BOOK);
+  const host = $("fig-draws");
+  const lineHost = h("div"), sched = h("div", { class: "hist" });
+  host.append(lineHost, sched);
+  ticketLine(lineHost, [75, 25], r.draws.map((d) => ({ w: d.w })));
+  r.draws.forEach((d) => sched.append(h("span", { style: { background: color(d.who) }, title: "号码 " + d.w }, letter(d.who))));
+})();
+
+// ---------- 图 9.1 遍历 ----------
+(function () {
+  const T = [100, 50, 250];
+  const code = ["// counter: 用来判断是否已找到中奖者", "int counter = 0;", "", "// winner: 调用随机数生成器", "// 得到 0 … totaltickets-1 之间的值", "int winner = getrandom(0, totaltickets);", "",
+    "// current: 用它遍历作业链表", "node_t *current = head;", "while (current) {", "    counter = counter + current->tickets;", "    if (counter > winner)", "        break; // 找到中奖者", "    current = current->next;", "}", "// 'current' 就是中奖者：调度它……"];
+  const box = $("walk-code");
+  box.replaceChildren(...code.map((l) => h("div", {}, l || " ")));
+  let steps = [];
+  function build() {
+    const w = Math.max(0, Math.min(399, +$("walk-win").value | 0));
+    const order = $("walk-sort").checked ? [2, 0, 1] : [0, 1, 2];
+    const res = lotteryWalk(T, w, order);
+    steps = [{ line: [1, 5], txt: `counter = 0，抽到中奖号码 winner = ${w}（共 400 张）。`, cur: -1, counter: 0 }, { line: [8], txt: "current 指向链表头。", cur: order[0], counter: 0 }];
+    res.steps.forEach((st, k) => {
+      steps.push({ line: [10], txt: `counter += ${letter(st.i)} 的 ${T[st.i]} 张 → counter = ${st.counter}。`, cur: st.i, counter: st.counter });
+      const hit = st.counter > w;
+      steps.push({ line: [11, hit ? 12 : 13], txt: hit ? `${st.counter} &gt; ${w}：跳出循环，<b>${letter(st.i)} 中奖</b>！共访问 ${k + 1} 个节点。` : `${st.counter} ≤ ${w}：没找到，current 移到下一个节点。`, cur: hit ? st.i : order[k + 1], counter: st.counter, win: hit ? st.i : -1 });
+    });
+    steps.order = order; steps.w = w;
+  }
+  function render(i) {
+    const st = steps[i];
+    [...box.children].forEach((el, k) => el.classList.toggle("on", st.line.includes(k)));
+    const order = steps.order;
+    const W = 520, svg = s("svg", { viewBox: `0 0 ${W} 90`, width: W, role: "img", "aria-label": "进程链表" });
+    svg.append(s("text", { x: 4, y: 45, "font-size": 12, class: "mono", text: "head" }));
+    order.forEach((j, k) => {
+      const x = 50 + k * 140;
+      svg.append(s("line", { class: "arrow", x1: x - 18, y1: 40, x2: x - 2, y2: 40 }));
+      svg.append(s("rect", { x, y: 18, width: 100, height: 44, rx: 6, style: st.cur === j ? `fill:${color(j)}` : "fill:var(--surface);stroke:var(--border)", "stroke-width": 1.5 }));
+      svg.append(s("text", { x: x + 50, y: 36, "text-anchor": "middle", "font-size": 12.5, style: st.cur === j ? "fill:#fff;font-weight:700" : "", text: `Job:${letter(j)}` }));
+      svg.append(s("text", { x: x + 50, y: 53, "text-anchor": "middle", "font-size": 12, style: st.cur === j ? "fill:#fff" : "", class: st.cur === j ? null : "t-muted", text: `Tix:${T[j]}` }));
+      if (st.win === j) svg.append(s("text", { x: x + 50, y: 80, "text-anchor": "middle", "font-size": 12, style: "fill:var(--ok);font-weight:700", text: "★ 中奖" }));
+    });
+    svg.append(s("text", { x: 50 + 3 * 140 - 16, y: 45, "font-size": 12, class: "mono t-muted", text: "NULL" }));
+    $("walk-list").replaceChildren(svg);
+    $("walk-nar").innerHTML = `counter = <b>${st.counter}</b>，winner = <b>${steps.w}</b>。` + st.txt;
+  }
+  build();
+  const stp = OSTEP.stepper($("walk-step"), { steps: () => steps.length, render, autoplayMs: 1100 });
+  $("walk-win").oninput = $("walk-sort").onchange = () => { build(); stp.reset(); };
+})();
+
+// ---------- 图 9.2 与公平性模拟器 ----------
+const RS = [1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 70, 100, 150, 200, 300, 500, 700, 1000];
+function drawFair(host, trials, q, seed, showStride, narr) {
+  const cur = fairnessCurve(RS, trials, q, seed);
+  const series = [{ pts: cur.map((c) => [c.R, c.min]), color: "var(--muted)", w: 1, op: 0.7 }, { pts: cur.map((c) => [c.R, c.avg]), color: "var(--c1)", dots: true }];
+  if (showStride) series.push({ pts: RS.map((R) => [R, strideF(R, q)]), color: "var(--c3)", dots: true });
+  lineChart(host, series, { xmin: 1, xmax: 1000, log: true, xticks: [1, 10, 100, 1000], yticks: [0, 0.2, 0.4, 0.6, 0.8, 1], xlabel: "作业长度 R（对数坐标）", ylabel: "公平性 F", aria: "公平性与作业长度" });
+  if (narr) {
+    const at = (R) => cur.find((c) => c.R === R);
+    narr.innerHTML = `彩票调度：R = 1 时平均 F = <b>${at(1).avg.toFixed(2)}</b>，R = 10 时 <b>${at(10).avg.toFixed(2)}</b>，R = 100 时 <b>${at(100).avg.toFixed(2)}</b>，R = 1000 时 <b>${at(1000).avg.toFixed(3)}</b>。` +
+      (showStride ? ` 步长调度严格交替，F = (2R−1)/2R${q > 1 ? "（时间片 > 1 时按时间片交替）" : ""}，没有随机波动。` : "") + (q > 1 ? ` 时间片 = ${q}：同样长度下抽签次数变少，彩票调度的公平性下降。` : "");
+  }
+}
+drawFair($("fig-fair"), 30, 1, 1, false, null);
+(function () {
+  const upd = () => drawFair($("fr-chart"), Math.max(1, Math.min(200, +$("fr-trials").value | 0)), Math.max(1, +$("fr-q").value | 0), +$("fr-seed").value | 0, $("fr-stride").checked, $("fr-nar"));
+  ["fr-trials", "fr-q", "fr-seed"].forEach((id) => ($(id).oninput = upd)); $("fr-stride").onchange = upd; upd();
+})();
+
+// ---------- 图 9.3 步长表 ----------
+function passTable(tbl, rows, names, cur, o = {}) {
+  const ncol = Math.max(...rows.map((r) => r.pass.length));
+  const head = h("tr", {}, h("th", {}, "#"), Array.from({ length: ncol }, (_, i) => h("th", {}, `Pass(${names[i]})`, h("br"), h("small", { class: "muted" }, `stride=${fmt(rows[rows.length - 1].strides[i] ?? 0)}`))), h("th", {}, "谁运行？"));
+  const body = (cur != null ? rows.slice(0, cur + 1) : rows).map((r, k) => {
+    const fut = cur != null && k > cur;
+    return h("tr", { class: k === cur ? "cur" : "" }, h("td", { class: fut ? "fut" : "" }, k < rows.length - 1 ? k + 1 : ""),
+      Array.from({ length: ncol }, (_, i) => r.pass[i] == null ? h("td", { class: "fut" }, "") : h("td", { class: fut ? "fut" : r.who === i ? "min" : "" }, fmt(r.pass[i]) + (r.joined && i === ncol - 1 ? " ←加入" : ""))),
+      h("td", { class: fut ? "fut" : "", style: { textAlign: "center" } }, r.who >= 0 ? h("span", { class: "pill", style: fut ? null : { background: color(r.who), color: "#fff", borderColor: "transparent" } }, names[r.who]) : "…"));
+  });
+  tbl.replaceChildren(h("thead", {}, head), h("tbody", {}, body));
+}
+passTable($("fig-stride"), strideRun([100, 50, 250], 8, 10000), ["A", "B", "C"]);
+
+// ---------- nice 权重表与计算器 ----------
+function drawWeights(sel) {
+  const rows = [];
+  for (let r = 0; r < 8; r++) {
+    const base = -20 + r * 5;
+    rows.push(h("tr", {}, h("th", {}, `/* ${base} */`), Array.from({ length: 5 }, (_, k) => h("td", { class: sel.includes(base + k) ? "sel" : "", title: `nice ${base + k}` }, PRIO_TO_WEIGHT[r * 5 + k]))));
+  }
+  $("wtbl").replaceChildren(h("thead", {}, h("tr", {}, h("th", {}, "nice"), ["+0", "+1", "+2", "+3", "+4"].map((x) => h("th", {}, x)))), h("tbody", {}, rows));
+}
+(function () {
+  const upd = () => {
+    const a = Math.max(-20, Math.min(19, +$("nc-a").value | 0)), b = Math.max(-20, Math.min(19, +$("nc-b").value | 0)), lat = Math.max(1, +$("nc-lat").value || 48);
+    const wa = weightOf(a), wb = weightOf(b), sa = (wa / (wa + wb)) * lat, sb = (wb / (wa + wb)) * lat;
+    drawWeights([a, b]);
+    $("nc-out").innerHTML = `weight<sub>A</sub> = ${wa}，weight<sub>B</sub> = ${wb}。<br>time_slice<sub>A</sub> = ${wa}/(${wa}+${wb}) × ${lat} = <b>${sa.toFixed(2)} ms</b>；time_slice<sub>B</sub> = <b>${sb.toFixed(2)} ms</b>。<br>` +
+      `A 每运行 1ms，vruntime 增加 1024/${wa} = <b>${(1024 / wa).toFixed(3)}</b>；B 增加 <b>${(1024 / wb).toFixed(3)}</b>。CPU 份额 A : B = <b>${((100 * wa) / (wa + wb)).toFixed(1)}% : ${((100 * wb) / (wa + wb)).toFixed(1)}%</b>（权重比 ${(wa / wb).toFixed(3)}）。`;
+  };
+  ["nc-a", "nc-b", "nc-lat"].forEach((id) => ($(id).oninput = upd)); upd();
+})();
+
+// ---------- 图 9.4 CFS ----------
+(function () {
+  const r = cfsRun([{ nice: 0, length: 96 }, { nice: 0, length: 96 }, { nice: 0, length: 24 }, { nice: 0, length: 24 }], 48, 6, "min");
+  timeline($("fig-cfs"), r.segs, { end: 250, pxPer: 2.6, unit: 50 });
+})();
+
+// ---------- 彩票模拟器 ----------
+(function () {
+  let tix = [75, 25], fixed = BOOK, res = null;
+  function drawTix() {
+    $("lt-tix").replaceChildren(...tix.map((t, i) => h("label", {}, h("span", { class: "sw", style: { background: color(i) } }), letter(i),
+      h("input", { type: "number", min: 1, max: 10000, value: t, oninput: (e) => { tix[i] = Math.max(1, +e.target.value | 0); fixed = null; recompute(); } }),
+      tix.length > 2 ? h("button", { title: "删除", onclick: () => { tix.splice(i, 1); fixed = null; drawTix(); recompute(); } }, "✕") : null)));
+  }
+  function recompute() {
+    const n = fixed ? 20 : +$("lt-n").value;
+    res = lotteryDraws(tix, n, +$("lt-seed").value | 0, fixed);
+    let cnt = tix.map(() => 0);
+    res.cum = res.draws.map((d) => { cnt[d.who]++; return cnt.slice(); });
+    stp.reset();
+  }
+  function render(i) {
+    if (!res) return;
+    const total = res.total, d = res.draws[i], N = res.draws.length;
+    ticketLine($("lt-line"), tix, res.draws.slice(Math.max(0, i - 30), i + 1).map((x, k, arr) => ({ w: x.w, cur: k === arr.length - 1 })));
+    const show = Math.min(N, 100), from = Math.max(0, Math.min(i - 50, N - show));
+    $("lt-hist").replaceChildren(...res.draws.slice(from, from + show).map((x, k) => h("span", { class: (from + k > i ? "fut" : "") + (from + k === i ? " cur" : ""), style: { background: color(x.who) }, title: `第 ${from + k + 1} 次：${x.w}` }, letter(x.who))));
+    const series = [];
+    tix.forEach((t, j) => series.push({ hline: t / total, color: color(j) }));
+    tix.forEach((t, j) => series.push({ pts: res.cum.slice(0, i + 1).map((c, k) => [k + 1, c[j] / (k + 1)]), color: color(j) }));
+    lineChart($("lt-chart"), series, { xmin: 1, xmax: N, xticks: [1, Math.round(N / 4), Math.round(N / 2), Math.round((3 * N) / 4), N], yticks: [0, 0.25, 0.5, 0.75, 1], xlabel: "抽奖次数", ylabel: "实际份额", aria: "实际份额收敛曲线" });
+    const c = res.cum[i];
+    $("lt-nar").innerHTML = `第 <b>${i + 1}</b> 次抽奖：中奖号码 <b>${d.w}</b>（0–${total - 1}），落在 <b>${letter(d.who)}</b> 的区间 → ${letter(d.who)} 运行一个时间片。目前：` +
+      tix.map((t, j) => `${letter(j)} 运行 ${c[j]} 次（${((100 * c[j]) / (i + 1)).toFixed(1)}%，应为 ${((100 * t) / total).toFixed(1)}%）`).join("；") + "。";
+    $("lt-stats").replaceChildren(...tix.map((t, j) => stat(((100 * c[j]) / (i + 1)).toFixed(1) + "%", `${letter(j)} 实际份额（目标 ${((100 * t) / total).toFixed(1)}%）`)),
+      stat((tix.reduce((m, t, j) => Math.max(m, Math.abs(c[j] / (i + 1) - t / total)), 0) * 100).toFixed(1) + "%", "最大偏差"));
+  }
+  const stp = OSTEP.stepper($("lt-step"), { steps: () => (res ? res.draws.length : 1), render, autoplayMs: 250 });
+  $("lt-add").onclick = () => { if (tix.length < 6) { tix.push(50); fixed = null; drawTix(); recompute(); } };
+  $("lt-seed").oninput = $("lt-n").onchange = () => { fixed = null; recompute(); };
+  $("lt-book").onclick = () => { tix = [75, 25]; fixed = BOOK; drawTix(); recompute(); stp.go(19); };
+  $("lt-3").onclick = () => { tix = [100, 50, 250]; fixed = null; $("lt-n").value = "500"; drawTix(); recompute(); };
+  $("lt-hw2").onclick = () => { tix = [1, 100]; fixed = null; $("lt-n").value = "100"; drawTix(); recompute(); };
+  drawTix(); recompute();
+})();
+
+// ---------- 步长模拟器 ----------
+(function () {
+  let tix = [100, 50, 250], rows = null;
+  const names = ["A", "B", "C", "D", "E"];
+  function drawTix() {
+    $("sd-tix").replaceChildren(...tix.map((t, i) => h("label", {}, h("span", { class: "sw", style: { background: color(i) } }), `${names[i]} 票数`,
+      h("input", { type: "number", min: 1, max: 10000, value: t, oninput: (e) => { tix[i] = Math.max(1, +e.target.value | 0); recompute(); } }))));
+  }
+  function recompute() {
+    const n = Math.max(1, Math.min(60, +$("sd-n").value | 0)), big = Math.max(1, +$("sd-big").value || 10000);
+    const join = $("sd-join").checked ? { at: Math.max(0, Math.min(n - 1, (+$("sd-at").value | 0) - 1)), tickets: Math.max(1, +$("sd-dt").value | 0), mode: $("sd-mode").value } : null;
+    rows = strideRun(tix, n, big, join);
+    stp.reset();
+  }
+  function render(i) {
+    if (!rows) return;
+    passTable($("sd-table"), rows, names, i);
+    const r = rows[i];
+    const nar = $("sd-nar");
+    if (r.who < 0) nar.innerHTML = `结束：最终 pass 值 ${r.pass.map((p, k) => `${names[k]}=${fmt(p)}`).join("，")}。`;
+    else {
+      const minv = Math.min(...r.pass), ties = r.pass.map((p, k) => (p === minv ? names[k] : null)).filter(Boolean);
+      nar.innerHTML = (r.joined ? `<b>D 加入</b>，pass 初值 = ${fmt(r.pass[r.pass.length - 1])}。` : "") +
+        `第 ${i + 1} 步：最小 pass = ${fmt(minv)}（${ties.join("、")}${ties.length > 1 ? "，相同时选靠前的" : ""}）→ <b>${names[r.who]}</b> 运行，pass ${fmt(r.pass[r.who])} + ${fmt(r.strides[r.who])} = ${fmt(r.pass[r.who] + r.strides[r.who])}。`;
+    }
+    const cnt = Array(Math.max(...rows.map((x) => x.pass.length))).fill(0);
+    rows.slice(0, i).forEach((x) => { if (x.who >= 0) cnt[x.who]++; }); // 第 i 步之前已完成的运行
+    $("sd-stats").replaceChildren(...cnt.map((c, k) => stat(c, `${names[k]} 已运行次数`)));
+  }
+  const stp = OSTEP.stepper($("sd-step"), { steps: () => (rows ? rows.length : 1), render, autoplayMs: 800 });
+  ["sd-big", "sd-n", "sd-at", "sd-dt"].forEach((id) => ($(id).oninput = recompute));
+  $("sd-join").onchange = $("sd-mode").onchange = recompute;
+  drawTix(); recompute();
+})();
+
+// ---------- CFS 模拟器 ----------
+(function () {
+  const J = (nice, length, arrival = 0) => ({ nice, length, arrival });
+  const PRE = [
+    { name: "图 9.4（4 个作业）", jobs: [J(0, 96), J(0, 96), J(0, 24), J(0, 24)], lat: 48, gran: 6, join: "min" },
+    { name: "nice −5 vs 0", jobs: [J(-5, 144), J(0, 48)], lat: 48, gran: 6, join: "min" },
+    { name: "nice 5 vs 10", jobs: [J(5, 144), J(10, 48)], lat: 48, gran: 6, join: "min" },
+    { name: "10 个作业（min_granularity）", jobs: Array.from({ length: 10 }, () => J(0, 12)), lat: 48, gran: 6, join: "min" },
+    { name: "睡眠者：B 在 t=500 醒来（保持原 vruntime）", jobs: [J(0, 1000), J(0, 200, 500)], lat: 48, gran: 6, join: "keep" },
+  ];
+  let jobs = PRE[0].jobs.map((j) => ({ ...j })), res = null;
+  const box = document.querySelector("#sim-cfs .presets");
+  PRE.forEach((p) => box.append(h("button", { onclick: () => { jobs = p.jobs.map((j) => ({ ...j })); $("cf-lat").value = p.lat; $("cf-gran").value = p.gran; $("cf-join").value = p.join; drawJobs(); recompute(); } }, p.name)));
+  function drawJobs() {
+    $("cf-jobs").replaceChildren(...jobs.map((j, i) => h("tr", {}, h("td", {}, h("span", { class: "sw", style: { background: color(i) } }), h("b", {}, letter(i))),
+      h("td", {}, h("input", { type: "number", min: -20, max: 19, value: j.nice, oninput: (e) => { j.nice = Math.max(-20, Math.min(19, +e.target.value | 0)); e.target.closest("tr").children[2].textContent = weightOf(j.nice); recompute(); } })),
+      h("td", { class: "mono" }, weightOf(j.nice)),
+      h("td", {}, h("input", { type: "number", min: 0, max: 5000, value: j.arrival, oninput: (e) => { j.arrival = Math.max(0, +e.target.value | 0); recompute(); } })),
+      h("td", {}, h("input", { type: "number", min: 1, max: 5000, value: j.length, oninput: (e) => { j.length = Math.max(1, +e.target.value | 0); recompute(); } })),
+      h("td", {}, jobs.length > 1 ? h("button", { title: "删除", onclick: () => { jobs.splice(i, 1); drawJobs(); recompute(); } }, "✕") : ""))));
+  }
+  $("cf-add").onclick = () => { if (jobs.length < 10) { jobs.push(J(0, 48)); drawJobs(); recompute(); } };
+  ["cf-lat", "cf-gran"].forEach((id) => ($(id).oninput = recompute)); $("cf-join").onchange = recompute;
+  function recompute() {
+    res = cfsRun(jobs, Math.max(1, +$("cf-lat").value || 48), Math.max(0, +$("cf-gran").value || 0), $("cf-join").value);
+    $("cf-stats").replaceChildren(...res.per.map((p, i) => stat(fmt(p.done, 1), `${letter(i)} 完成时刻`)),
+      stat(res.dec.length, "调度决策次数"));
+    stp.reset();
+  }
+  function render(i) {
+    if (!res) return;
+    const fin = i >= res.dec.length;
+    const d = fin ? null : res.dec[i];
+    timeline($("cf-gantt"), res.segs, { cursor: fin ? null : d.t });
+    if (fin) {
+      $("cf-tree").replaceChildren(h("span", { class: "muted small" }, "全部完成"));
+      const tot = res.per.reduce((a, p) => a + p.cpu, 0);
+      $("cf-nar").innerHTML = `<b>结束</b>（t = ${fmt(res.end, 1)}）。各作业完成时刻：` + res.per.map((p, k) => `${letter(k)}=${fmt(p.done, 1)}`).join("，") + `。总 CPU 时间 ${fmt(tot, 1)} ms。`;
+      return;
+    }
+    $("cf-tree").replaceChildren(h("span", { class: "muted small", style: { marginRight: "6px" } }, "按 vruntime 排序（红黑树中序）："),
+      ...d.list.map((x) => h("span", { class: "cell" + (x.i === d.pick ? " run" : " on"), style: x.i === d.pick ? { background: color(x.i) } : null }, letter(x.i), h("small", {}, fmt(x.vr, 2)))));
+    const j = res.per[d.pick];
+    const joinTxt = d.joined.length ? `${d.joined.map(letter).join("、")} 加入树中${$("cf-join").value === "min" ? "，vruntime 设为树中最小值" : "，保留原 vruntime"}。` : "";
+    $("cf-nar").innerHTML = `<b>t = ${fmt(d.t, 2)}</b>：${joinTxt}取最左边（vruntime 最小）的 <b>${letter(d.pick)}</b>。` +
+      `时间片 = max(min_granularity, ${j.w}/${d.sumW} × ${$("cf-lat").value}) = max(${$("cf-gran").value}, ${d.ideal.toFixed(2)}) = <b>${d.slice.toFixed(2)} ms</b>` +
+      (d.run < d.slice - 1e-9 ? `，但它只剩 ${d.run.toFixed(2)} ms 就完成了` : "") + `。运行后 vruntime 增加 ${d.run.toFixed(2)} × 1024/${j.w} = ${((d.run * 1024) / j.w).toFixed(2)}。`;
+  }
+  const stp = OSTEP.stepper($("cf-step"), { steps: () => (res ? res.dec.length + 1 : 1), render, autoplayMs: 900 });
+  drawJobs(); recompute();
+})();
+})();
+</script>
+</body></html>

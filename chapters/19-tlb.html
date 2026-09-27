@@ -1,0 +1,884 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 19 章 · 分页：快速地址转换（TLB）</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+@media (max-width: 700px) { .two { grid-template-columns: 1fr; } }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; min-width: 0; }
+.panel h5 { margin: 0 0 6px; font-size: 13px; color: var(--muted); font-weight: 600; }
+/* 地址空间网格（仿图 19.2） */
+.asgrid { font: 11.5px var(--mono); border-collapse: separate; border-spacing: 2px; background: none; width: auto; }
+.asgrid td { border: 1px solid var(--border); background: var(--surface-2); padding: 0; min-width: 34px; height: 22px; text-align: center; border-radius: 3px; vertical-align: middle; }
+.asgrid td.rl { border: 0; background: none; color: var(--muted); min-width: 58px; text-align: right; padding-right: 6px; }
+.asgrid tr.intlb td.rl { color: var(--ok); font-weight: 700; }
+.asgrid td.el { background: color-mix(in srgb, var(--c1) 14%, var(--surface)); border-color: var(--c1); }
+.asgrid td.now.hit { background: var(--ok); color: #fff; border-color: var(--ok); }
+.asgrid td.now.miss { background: var(--bad); color: #fff; border-color: var(--bad); }
+.asgrid td.done { opacity: .55; }
+.asgrid th { background: none; border: 0; font: 10.5px var(--mono); color: var(--faint); padding: 0; text-align: center; }
+.tlbtab { font: 12.5px var(--mono); width: 100%; }
+.tlbtab td, .tlbtab th { padding: 3px 8px; }
+.tlbtab tr.hit td { background: var(--ok-soft); }
+.tlbtab tr.ins td { background: var(--bad-soft); }
+.tlbtab tr.wrong td { background: var(--bad); color: #fff; }
+.tlbtab tr.empty td { color: var(--faint); }
+.hist { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 10px; }
+.hist .cell { min-width: 30px; height: 26px; font-size: 11px; flex-direction: column; line-height: 1.05; }
+.hist .cell small { font-size: 9px; color: var(--muted); }
+.hist .cell.cur { outline: 2px solid var(--fg); }
+.hist .cell.sw { min-width: 14px; background: var(--warn-soft); border-color: var(--warn); }
+/* 控制流对比 */
+.code { font: 12.5px/1.6 var(--mono); background: var(--code-bg); border-radius: 8px; padding: 8px 0; overflow-x: auto; }
+.code div { padding: 0 10px; white-space: pre; }
+.code div.on { background: color-mix(in srgb, var(--warn) 28%, transparent); }
+.code div.done { color: var(--muted); }
+.code.off { opacity: .45; }
+.lanes { margin-top: 10px; }
+.lane { display: grid; grid-template-columns: 92px 1fr; align-items: center; gap: 8px; margin: 3px 0; }
+.lane .nm { font-size: 12.5px; color: var(--muted); text-align: right; }
+.lane .track { display: flex; gap: 3px; min-height: 22px; align-items: center; flex-wrap: nowrap; overflow-x: auto; }
+.lane .dot { width: 18px; height: 18px; border-radius: 4px; flex: none; background: var(--surface-2); border: 1px solid var(--border); }
+.lane .dot.x { background: var(--c1); border-color: var(--c1); }
+.lane.os .dot.x { background: var(--c2); border-color: var(--c2); }
+.lane.user .dot.x { background: var(--c3); border-color: var(--c3); }
+.lane .dot.cur { outline: 2px solid var(--fg); }
+.calc { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; font-size: 14px; }
+.calc label { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); }
+textarea.seq { min-height: 44px; font-size: 13px; }
+.err { color: var(--bad); font-weight: 600; }
+</style>
+</head>
+<body data-chapter="19">
+<main>
+
+<h2 id="crux">一句话 + 关键问题</h2>
+<p><strong>一句话：</strong>在 MMU 里放一个很小但极快的<strong>地址转换缓存（TLB）</strong>，把最近用过的 VPN→PFN 转换存起来；
+绝大多数访存都能在 TLB 里<strong>命中</strong>，从而省掉那次去内存查页表的额外访问——TLB 在真正意义上让虚拟内存变得可行。</p>
+<div class="crux">
+<p><strong>如何加速地址转换？</strong>如何才能加速地址转换，并避免分页似乎必需的那次额外内存访问？需要什么硬件支持？操作系统又需要做什么？</p>
+<p class="small muted">How can we speed up address translation, and generally avoid the extra memory reference that paging seems to require? What hardware support is required? What OS involvement is needed?</p>
+</div>
+<p>第 18 章留下两个问题：页表<strong>太慢</strong>、页表<strong>太大</strong>。本章解决"慢"：因为映射信息存放在物理内存中，分页在逻辑上要求每次取指、每次显式的 load/store 之前，
+都先访问一次内存去读页表项。要让它变快，操作系统需要老朋友——<strong>硬件</strong>的帮助。本章之后，第 20 章再解决"大"。</p>
+
+<h2 id="concepts">核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>TLB</h4><p>地址转换旁路缓冲存储器（translation-lookaside buffer），MMU 的一部分，是热门虚拟到物理地址转换的硬件缓存。更贴切的名字是"地址转换缓存"。</p></div>
+  <div class="card"><h4>命中 / 未命中</h4><p>TLB 里有这个 VPN 的转换叫命中（hit），直接得到 PFN；没有叫未命中（miss），必须去查页表。</p></div>
+  <div class="card"><h4>命中率（hit rate）</h4><p>命中次数 ÷ 访问总次数。只要命中率接近 100%，程序就几乎像没被虚拟化一样快。</p></div>
+  <div class="card"><h4>空间 / 时间局部性</h4><p>访问了 x，很快会访问 x 附近（空间）；刚访问过的，很快会再访问（时间）。TLB 依靠两者取得高命中率。</p></div>
+  <div class="card"><h4>硬件 vs 软件管理</h4><p>未命中时由硬件遍历页表（x86，CISC）或抛出异常交给 OS 处理（MIPS、SPARC，RISC）。</p></div>
+  <div class="card"><h4>全相联（fully associative）</h4><p>一个转换可以放在 TLB 的任意位置，硬件并行比较所有项，所以每项必须同时存 VPN 和 PFN。</p></div>
+  <div class="card"><h4>ASID</h4><p>地址空间标识符（address space identifier），让 TLB 能同时存多个进程的转换，切换进程时不必清空 TLB。</p></div>
+  <div class="card"><h4>TLB 覆盖范围</h4><p>TLB 项数 × 页大小。程序短时间访问的页数超过它，就会大量未命中（exceeding the TLB coverage）。</p></div>
+</div>
+
+<h2 id="algo">TLB 基本算法</h2>
+<p>假设使用简单的线性页表，并且由<strong>硬件</strong>处理 TLB 未命中。每次虚拟内存引用，硬件的动作如下（原书图 19.1）：</p>
+<pre><code> 1  VPN = (VirtualAddress &amp; VPN_MASK) &gt;&gt; SHIFT
+ 2  (Success, TlbEntry) = TLB_Lookup(VPN)
+ 3  if (Success == True)    // TLB 命中
+ 4      if (CanAccess(TlbEntry.ProtectBits) == True)
+ 5          Offset   = VirtualAddress &amp; OFFSET_MASK
+ 6          PhysAddr = (TlbEntry.PFN &lt;&lt; SHIFT) | Offset
+ 7          Register = AccessMemory(PhysAddr)
+ 8      else
+ 9          RaiseException(PROTECTION_FAULT)
+10  else                    // TLB 未命中
+11      PTEAddr = PTBR + (VPN * sizeof(PTE))
+12      PTE = AccessMemory(PTEAddr)
+13      if (PTE.Valid == False)
+14          RaiseException(SEGMENTATION_FAULT)
+15      else if (CanAccess(PTE.ProtectBits) == False)
+16          RaiseException(PROTECTION_FAULT)
+17      else
+18          TLB_Insert(VPN, PTE.PFN, PTE.ProtectBits)
+19          RetryInstruction()</code></pre>
+<ul>
+  <li><strong>第 1～2 行</strong>：取出 VPN，查 TLB。</li>
+  <li><strong>第 3～7 行（命中）</strong>：从 TLB 项中取出 PFN，与偏移拼成物理地址，访问内存。<strong>全程不碰页表</strong>。</li>
+  <li><strong>第 11～12 行（未命中）</strong>：代价就在这里——额外的一次内存访问去读 PTE（页表更复杂时还不止一次）。</li>
+  <li><strong>第 18～19 行</strong>：把转换装进 TLB，然后<strong>重新执行这条指令</strong>；这一次就会命中。</li>
+</ul>
+
+<figure class="fig">
+<svg viewBox="0 0 700 250" width="700" role="img" aria-label="TLB 命中与未命中的路径">
+  <defs>
+    <marker id="a19" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker>
+    <marker id="a19g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ok)"/></marker>
+    <marker id="a19r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--bad)"/></marker>
+  </defs>
+  <rect x="10" y="20" width="360" height="150" rx="12" style="fill:none;stroke:var(--border);stroke-dasharray:5 4"/>
+  <text x="20" y="38" font-size="12" class="t-muted">CPU 芯片</text>
+  <rect x="30" y="70" width="90" height="46" rx="8" class="accent-soft"/><text x="75" y="98" text-anchor="middle" font-size="13">CPU 核</text>
+  <rect x="190" y="52" width="160" height="84" rx="8" class="ok-soft"/>
+  <text x="270" y="72" text-anchor="middle" font-size="13" font-weight="600">MMU 中的 TLB</text>
+  <g class="mono" font-size="11">
+    <text x="210" y="92">VPN 6 → PFN 23</text><text x="210" y="108">VPN 7 → PFN 91</text><text x="210" y="124" class="t-muted">……（几十项）</text>
+  </g>
+  <path d="M120,93 L188,93" class="arrow" marker-end="url(#a19)"/>
+  <text x="154" y="86" text-anchor="middle" font-size="11" class="t-muted">VA</text>
+  <rect x="470" y="30" width="210" height="190" rx="10" class="box"/>
+  <text x="575" y="50" text-anchor="middle" font-size="13" font-weight="600">物理内存（很慢）</text>
+  <rect x="490" y="64" width="170" height="54" rx="6" class="warn-soft"/><text x="575" y="86" text-anchor="middle" font-size="12.5">页表（全部转换）</text><text x="575" y="104" text-anchor="middle" font-size="11" class="t-muted">未命中才来这里</text>
+  <rect x="490" y="140" width="170" height="60" rx="6" class="box-strong"/><text x="575" y="166" text-anchor="middle" font-size="12.5">程序的数据 / 代码</text><text x="575" y="184" text-anchor="middle" font-size="11" class="t-muted">每次都要来</text>
+  <path d="M352,72 C420,72 430,86 488,90" style="stroke:var(--bad);fill:none;stroke-width:1.6;stroke-dasharray:5 3" marker-end="url(#a19r)"/>
+  <text x="420" y="64" font-size="11.5" style="fill:var(--bad)">① 未命中：读 PTE</text>
+  <path d="M352,120 C420,120 430,168 488,168" style="stroke:var(--ok);fill:none;stroke-width:1.8" marker-end="url(#a19g)"/>
+  <text x="372" y="150" font-size="11.5" style="fill:var(--ok)">② PA：访问数据</text>
+  <text x="20" y="200" font-size="12">命中：1 次访存（只有 ②）。未命中：2 次（① + 重试后的 ②），还要加上装入 TLB 的开销。</text>
+  <text x="20" y="220" font-size="12" class="t-muted">TLB 离处理核很近，设计得非常快；访存相对大多数 CPU 指令代价高得多。</text>
+</svg>
+<figcaption>TLB 是位于 MMU 中的一个小缓存。命中的访问不需要碰页表；只有未命中才付出查页表的代价。</figcaption>
+</figure>
+
+<h2 id="array">例子：访问一个数组</h2>
+<p>原书的例子：一个有 10 个 4 字节整数的数组，从虚拟地址 <strong>100</strong> 开始。地址空间是很小的 <strong>8 位</strong>，页大小 <strong>16 字节</strong>，
+于是虚拟地址 = 4 位 VPN（16 个虚拟页）+ 4 位偏移（每页 16 字节）。a[0] 位于（VPN=06，偏移=04），这一页只放得下 3 个整数；
+a[3]～a[6] 在 VPN 07；最后三个 a[7]～a[9] 在 VPN 08。循环如下（只考虑对数组的访问，忽略 <code>i</code>、<code>sum</code> 和指令本身）：</p>
+<pre><code>int i, sum = 0;
+for (i = 0; i &lt; 10; i++) {
+    sum += a[i];
+}</code></pre>
+<p>结果：<strong>miss, hit, hit, miss, hit, hit, hit, miss, hit, hit</strong>，命中率 <strong>70%</strong>。即使这是程序第一次访问这个数组，TLB 也能凭<strong>空间局部性</strong>提高性能：
+元素紧挨着，只有每页的第一次访问才会未命中。在下面的模拟器里亲自走一遍，再试试把页大小改成 32 字节、把数组访问两遍、换一种替换策略。</p>
+
+<section class="sim" id="sim-tlb">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>TLB + 页表：逐次访问</h3>
+    <div class="desc">输入一串虚拟地址，逐次观察：拆出 VPN → 在 TLB 中查找 → 命中直接得到 PFN；未命中去页表取 PTE，按替换策略装入 TLB 后重试。左边的网格仿照原书图 19.2，绿色行 = 当前 TLB 里有其转换的页。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>地址位数 <input type="number" id="tl-bits" value="8" min="4" max="16"></label>
+      <label>页大小 <select id="tl-ps"><option>8</option><option selected>16</option><option>32</option><option>64</option><option>128</option><option>256</option></select> 字节</label>
+      <label>TLB 项数 <input type="number" id="tl-n" value="4" min="1" max="32"></label>
+      <label>替换策略 <select id="tl-pol"><option value="LRU">LRU（最近最少使用）</option><option value="FIFO">FIFO（先进先出）</option><option value="RAND">随机</option></select></label>
+      <label>种子 <input type="number" id="tl-seed" value="1" min="0"></label>
+    </div>
+    <div class="controls" style="width:100%"><label style="flex:1;min-width:260px">访问序列（虚拟地址，逗号或空格分隔）<textarea class="seq" id="tl-seq">100, 104, 108, 112, 116, 120, 124, 128, 132, 136</textarea></label></div>
+    <div class="controls">
+      <button id="tl-p1">原书图 19.2：a[0..9]</button>
+      <button id="tl-p2">把数组访问两遍（时间局部性）</button>
+      <button id="tl-p3">页大小改成 32 字节</button>
+      <button id="tl-p4">LRU 的坏情况：4 项 TLB 循环 5 页</button>
+    </div>
+    <div class="controls">
+      <span class="muted">数组生成器：</span>
+      <label>起始 <input type="number" id="ag-base" value="100" min="0"></label>
+      <label>元素数 <input type="number" id="ag-n" value="10" min="1" max="200"></label>
+      <label>元素大小 <input type="number" id="ag-sz" value="4" min="1" max="64"></label>
+      <label>遍数 <input type="number" id="ag-pass" value="1" min="1" max="5"></label>
+      <button id="ag-go">生成序列</button>
+    </div>
+    <div id="tl-step"></div>
+    <div class="stage">
+      <div class="two">
+        <div class="panel"><h5 id="tl-as-title">虚拟地址空间</h5><div id="tl-as" style="overflow-x:auto"></div></div>
+        <div class="panel"><h5 id="tl-tlb-title">TLB</h5><div id="tl-tlb"></div><h5 style="margin-top:10px">页表（内存中，所有页有效）</h5><div id="tl-pt" class="small mono muted"></div></div>
+      </div>
+      <div class="hist" id="tl-hist"></div>
+    </div>
+    <div class="narrate" id="tl-nar"></div>
+    <div class="stats" id="tl-stats"></div>
+  </div>
+</section>
+
+<p>再看两件事：</p>
+<ul>
+  <li><strong>页大小的作用</strong>：页大小翻倍到 32 字节，这个数组的未命中会更少。典型页大小是 4KB，这种密集的数组访问性能极好，每页只遇到一次未命中。</li>
+  <li><strong>时间局部性</strong>：如果循环结束后程序很快再访问一遍这个数组，只要 TLB 大到能装下所需的转换，第二遍全部命中：hit ×10。</li>
+</ul>
+
+<div class="aside" data-title="提示：尽可能利用缓存">
+<p>缓存是计算机系统中最基本的性能技术之一，用来"让常见情况更快"。硬件缓存利用指令和数据引用的局部性：时间局部性（循环变量、循环里的指令被反复访问）和空间局部性（顺序扫过一个数组）。
+它们是经验法则而不是铁律，取决于程序本身。</p>
+<p>既然缓存这么好，为什么不做一个超大的缓存把所有数据都放进去？因为物理定律：想要快，缓存就必须小——光速之类的物理约束会起作用，任何大缓存必然慢，也就失去了意义。
+我们只能用小而快的缓存，剩下的问题是如何用好它们。</p>
+</div>
+
+<h2 id="who">谁来处理 TLB 未命中？</h2>
+<p>两种答案：硬件，或软件（OS）。</p>
+<ul>
+  <li><strong>硬件管理的 TLB</strong>：在过去，复杂指令集计算机（CISC）的设计者不太信任"那些狡猾的 OS 开发者"，于是由硬件全权处理未命中。
+  硬件必须确切知道页表在内存中的位置（通过<strong>页表基址寄存器</strong>，图 19.1 第 11 行）以及页表的<strong>确切格式</strong>；未命中时硬件"遍历"页表，找到正确的 PTE，更新 TLB，重试指令。
+  例子：Intel x86，使用固定格式的多级页表（见下一章），当前页表由 <strong>CR3</strong> 寄存器指向。</li>
+  <li><strong>软件管理的 TLB</strong>：更现代的精简指令集计算机（RISC），如 MIPS R10k、Sun SPARC v9。未命中时硬件只是<strong>抛出异常</strong>（图 19.3 第 11 行）：暂停当前指令流，提升到内核态，跳转到陷阱处理程序。
+  这段 OS 代码查页表，用特殊的<strong>特权指令</strong>更新 TLB，然后从陷阱返回，硬件重试指令（这次命中）。</li>
+</ul>
+<pre><code> 1  VPN = (VirtualAddress &amp; VPN_MASK) &gt;&gt; SHIFT
+ 2  (Success, TlbEntry) = TLB_Lookup(VPN)
+ 3  if (Success == True)    // TLB 命中
+ 4      if (CanAccess(TlbEntry.ProtectBits) == True)
+ 5          Offset   = VirtualAddress &amp; OFFSET_MASK
+ 6          PhysAddr = (TlbEntry.PFN &lt;&lt; SHIFT) | Offset
+ 7          Register = AccessMemory(PhysAddr)
+ 8      else
+ 9          RaiseException(PROTECTION_FAULT)
+10  else                    // TLB 未命中
+11      RaiseException(TLB_MISS)</code></pre>
+<p class="small muted">原书图 19.3：OS 处理未命中时的硬件控制流。和图 19.1 相比，第 11～19 行缩成了一行——硬件在未命中时几乎什么都不做。</p>
+
+<section class="sim" id="sim-flow">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>硬件管理 vs 软件管理：一次访存的控制流</h3>
+    <div class="desc">选择管理方式和场景，逐步走一遍。高亮的是正在执行的代码行；下方泳道显示每一步由谁完成（用户程序、硬件、OS 内核）。重点观察：软件管理时，从陷阱返回要回到<strong>引发异常的那条指令</strong>重新执行。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>管理方式 <select id="fl-mode"><option value="hw">硬件管理（x86 风格，图 19.1）</option><option value="sw">软件管理（MIPS 风格，图 19.3）</option></select></label>
+      <label>场景 <select id="fl-sc"><option value="miss">TLB 未命中，页有效</option><option value="hit">TLB 命中</option><option value="seg">TLB 未命中，页无效（段错误）</option><option value="prot">TLB 命中，但权限不允许（如写只读页）</option></select></label>
+    </div>
+    <div id="fl-step"></div>
+    <div class="stage">
+      <div class="two">
+        <div class="panel"><h5 id="fl-hw-title">硬件（MMU）</h5><div class="code" id="fl-hw"></div></div>
+        <div class="panel"><h5>OS：TLB 未命中处理程序（示意）</h5><div class="code" id="fl-os"></div></div>
+      </div>
+      <div class="lanes" id="fl-lanes"></div>
+    </div>
+    <div class="narrate" id="fl-nar"></div>
+    <div class="stats" id="fl-stats"></div>
+  </div>
+</section>
+
+<p>软件管理有两个重要细节：</p>
+<ol>
+  <li><strong>从陷阱返回的位置不同</strong>。系统调用的"从陷阱返回"应回到陷入 OS 那条指令的<em>下一条</em>，就像过程调用返回到调用点之后；
+  而 TLB 未命中处理完后，硬件必须回到<strong>引发陷阱的那条指令</strong>，让它重新执行并命中。所以根据陷阱或异常的原因不同，硬件陷入 OS 时必须保存不同的 PC。</li>
+  <li><strong>避免无限的 TLB 未命中链</strong>。如果未命中处理程序本身的代码或数据也需要地址转换且不在 TLB 中，就会再次未命中……解决办法很多：把处理程序放在物理内存中
+  （不做地址转换），或者在 TLB 中保留一些永久有效的项给处理程序本身用——这些<strong>固定（wired）</strong>的转换总是命中。</li>
+</ol>
+<p>软件管理的主要优点是<strong>灵活</strong>：OS 可以用任意数据结构实现页表，不需要改硬件。另一个优点是<strong>简单</strong>：硬件在未命中时几乎不做事，只抛出异常。</p>
+
+<div class="aside" data-title="RISC 与 CISC">
+<p>20 世纪 80 年代，计算机体系结构界有过一场大战。CISC（复杂指令集）一方认为指令应是高级原语（比如一条指令完成字符串拷贝），让汇编更好用、代码更紧凑；
+RISC（精简指令集，由伯克利的 David Patterson 和斯坦福的 John Hennessy 引领，John Cocke 因最早的 RISC 工作获得图灵奖）认为指令集其实是编译器的目标，
+编译器只需要少数简单原语——那就把硬件（尤其是微代码）尽量剥掉，让剩下的部分简单、统一、快速。</p>
+<p>早期 RISC 芯片明显更快；但 Intel 等 CISC 厂商把许多 RISC 技术吸收进处理器核心（比如在流水线前端把复杂指令转换成微指令，再以类似 RISC 的方式处理），
+加上每个芯片上的晶体管越来越多，CISC 保持了竞争力。争论最终平息，今天两类处理器都能做得很快。</p>
+</div>
+
+<div class="warn">
+<p><strong>TLB 的有效位 ≠ 页表的有效位。</strong>PTE 被标记为无效，意味着这一页没有被进程分配，正确的程序不应该访问它，访问会陷入 OS、进程通常被杀死。
+TLB 的有效位只表示"这个 TLB 项里有没有一个有效的转换"：系统启动时所有 TLB 项通常都是无效的，因为还没有缓存任何转换；
+上下文切换时把所有 TLB 项设为无效，也能保证即将运行的进程不会误用上一个进程的转换。</p>
+</div>
+
+<h2 id="contents">TLB 里有什么？</h2>
+<p>典型的 TLB 有 32、64 或 128 项，并且是<strong>全相联（fully associative）</strong>的：任何转换都可以放在 TLB 的任何位置，硬件<strong>并行</strong>搜索所有项。
+所以每项必须同时保存 VPN 和 PFN：</p>
+<figure class="fig">
+<svg viewBox="0 0 620 210" width="620" role="img" aria-label="全相联 TLB 的并行查找">
+  <defs><marker id="a19b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <rect x="10" y="80" width="100" height="40" rx="6" class="accent-soft"/><text x="60" y="98" text-anchor="middle" font-size="12">要查的</text><text x="60" y="113" text-anchor="middle" font-size="12" class="mono">VPN = 7</text>
+  <g font-size="12" class="mono">
+    <text x="190" y="22" class="t-muted">VPN</text><text x="270" y="22" class="t-muted">PFN</text><text x="340" y="22" class="t-muted">其他位（valid、prot、ASID、dirty…）</text>
+    <rect x="180" y="30" width="420" height="30" rx="4" class="box"/><text x="195" y="50">6</text><text x="275" y="50">23</text><text x="340" y="50">1 rw-</text>
+    <rect x="180" y="64" width="420" height="30" rx="4" class="ok-soft"/><text x="195" y="84">7</text><text x="275" y="84">91</text><text x="340" y="84">1 rw-</text>
+    <rect x="180" y="98" width="420" height="30" rx="4" class="box"/><text x="195" y="118">12</text><text x="275" y="118">5</text><text x="340" y="118">1 r-x</text>
+    <rect x="180" y="132" width="420" height="30" rx="4" class="box"/><text x="195" y="152" class="t-muted">—</text><text x="275" y="152" class="t-muted">—</text><text x="340" y="152" class="t-muted">0（无效）</text>
+  </g>
+  <path d="M112,95 L176,45" class="arrow" marker-end="url(#a19b)"/><path d="M112,98 L176,79" class="arrow" marker-end="url(#a19b)"/>
+  <path d="M112,102 L176,113" class="arrow" marker-end="url(#a19b)"/><path d="M112,105 L176,147" class="arrow" marker-end="url(#a19b)"/>
+  <text x="310" y="190" text-anchor="middle" font-size="12">同时和所有项的 VPN 比较（每项一个比较器），命中的那一项给出 PFN</text>
+</svg>
+<figcaption>全相联 TLB：VPN 不能当下标（任何转换都可能在任何位置），所以要存下 VPN 并在所有项上并行比较。</figcaption>
+</figure>
+<p>"其他位"中常见的有：<strong>有效位</strong>（这一项是否有有效转换）、<strong>保护位</strong>（代码页可能是读和执行，堆页是读和写）、
+以及地址空间标识符、脏位等。</p>
+
+<h2 id="ctx">TLB 与上下文切换</h2>
+<p>TLB 里的转换只对当前运行的进程有意义。例如：进程 P1 的第 10 个虚拟页映射到物理帧 100；P2 的第 10 个虚拟页映射到物理帧 170。如果两者的转换都在 TLB 里：</p>
+<div class="table-wrap"><table style="max-width:420px">
+<tr><th>VPN</th><th>PFN</th><th>valid</th><th>prot</th></tr>
+<tr><td>10</td><td>100</td><td>1</td><td>rwx</td></tr>
+<tr><td>—</td><td>—</td><td>0</td><td>—</td></tr>
+<tr><td>10</td><td>170</td><td>1</td><td>rwx</td></tr>
+<tr><td>—</td><td>—</td><td>0</td><td>—</td></tr>
+</table></div>
+<p>问题来了：VPN 10 到底转换成 PFN 100（P1）还是 170（P2）？硬件无法区分。</p>
+<div class="crux">
+<p><strong>上下文切换时如何管理 TLB 的内容？</strong>进程间切换时，上一个进程在 TLB 中的转换对即将运行的进程没有意义。硬件或操作系统应该怎么做？</p>
+<p class="small muted">When context-switching between processes, the translations in the TLB for the last process are not meaningful to the about-to-be-run process. What should the hardware or OS do in order to solve this problem?</p>
+</div>
+<ul>
+  <li><strong>方案一：切换时清空（flush）TLB</strong>。软件管理的系统用一条显式的特权指令完成；硬件管理的系统可以在页表基址寄存器被改写时清空（OS 反正要在切换时改 PTBR）。清空就是把所有有效位置 0。
+  正确，但有代价：每次进程运行都要重新经历 TLB 未命中；切换频繁时代价很高。</li>
+  <li><strong>方案二：地址空间标识符（ASID）</strong>。在 TLB 中增加一个 ASID 字段，可以把它看作 PID，但位数通常更少（例如 8 位，而 PID 是 32 位）。
+  有了 ASID，TLB 就能同时保存多个进程的转换而不混淆；OS 在切换时把当前进程的 ASID 写入某个特权寄存器，硬件查 TLB 时同时比较 VPN 和 ASID。</li>
+</ul>
+
+<section class="sim" id="sim-asid">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>上下文切换：不处理 / 清空 / ASID</h3>
+    <div class="desc">两个进程的页表：P1 的 VPN 10→100、11→101；P2 的 VPN 10→170、11→171。访问序列中进程号变化即表示一次上下文切换。比较三种策略：哪种会给出<strong>错误的转换</strong>？哪种未命中最多？</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>策略 <select id="as-pol"><option value="none">什么都不做（错误示范）</option><option value="flush">切换时清空 TLB</option><option value="asid" selected>使用 ASID</option></select></label>
+      <label>TLB 项数 <input type="number" id="as-n" value="4" min="2" max="8"></label>
+    </div>
+    <div class="controls" style="width:100%"><label style="flex:1;min-width:260px">访问序列（进程:VPN）<textarea class="seq" id="as-seq">P1:10 P1:11 P1:10 P2:10 P2:11 P2:10 P1:10 P1:11 P2:10 P2:11 P1:10 P1:11</textarea></label></div>
+    <div id="as-step"></div>
+    <div class="stage">
+      <div class="two">
+        <div class="panel"><h5>TLB</h5><div id="as-tlb"></div></div>
+        <div class="panel"><h5>页表（每进程一份）</h5>
+          <div class="table-wrap" style="margin:0"><table class="tlbtab"><tr><th>进程</th><th>VPN</th><th>PFN</th></tr>
+          <tr><td>P1（ASID 1）</td><td>10</td><td>100</td></tr><tr><td>P1（ASID 1）</td><td>11</td><td>101</td></tr>
+          <tr><td>P2（ASID 2）</td><td>10</td><td>170</td></tr><tr><td>P2（ASID 2）</td><td>11</td><td>171</td></tr></table></div></div>
+      </div>
+      <div class="hist" id="as-hist"></div>
+    </div>
+    <div class="narrate" id="as-nar"></div>
+    <div class="stats" id="as-stats"></div>
+  </div>
+</section>
+
+<p>还有一种情况：两个<strong>不同进程的不同 VPN</strong> 指向同一个物理页。原书的例子：</p>
+<div class="table-wrap"><table style="max-width:480px">
+<tr><th>VPN</th><th>PFN</th><th>valid</th><th>prot</th><th>ASID</th></tr>
+<tr><td>10</td><td>101</td><td>1</td><td>r-x</td><td>1</td></tr>
+<tr><td>—</td><td>—</td><td>0</td><td>—</td><td>—</td></tr>
+<tr><td>50</td><td>101</td><td>1</td><td>r-x</td><td>2</td></tr>
+<tr><td>—</td><td>—</td><td>0</td><td>—</td><td>—</td></tr>
+</table></div>
+<p>进程 1 和进程 2 共享物理页 101（比如一个代码页）：P1 把它映射到自己地址空间的第 10 页，P2 映射到第 50 页。共享二进制代码或共享库的代码页很有用，可以减少物理页的使用，降低内存开销。</p>
+
+<h2 id="replace">替换策略</h2>
+<div class="crux">
+<p><strong>如何设计 TLB 替换策略？</strong>向 TLB 添加新项时，应该替换哪一个旧项？目标当然是减小未命中率（提高命中率），从而改进性能。</p>
+<p class="small muted">Which TLB entry should be replaced when we add a new TLB entry? The goal, of course, being to minimize the miss rate (or increase hit rate) and thus improve performance.</p>
+</div>
+<ul>
+  <li><strong>LRU（least-recently-used）</strong>：替换最近最少使用的项，试图利用访问流中的局部性。</li>
+  <li><strong>随机（random）</strong>：随机挑一项替换。简单，而且能避免一些极端情况。例如：程序循环访问 n + 1 个页，而 TLB 只有 n 项——"合理"的 LRU 每一次都未命中（它总是恰好踢掉马上要用的那一页），随机反而好得多。</li>
+</ul>
+<div class="tip"><p>在上面的 TLB 模拟器中点"LRU 的坏情况"，分别用 LRU 和随机跑一遍，比较命中率。第 22 章会详细研究这类替换策略。</p></div>
+
+<h2 id="mips">真实的 TLB 表项：MIPS R4000</h2>
+<p>MIPS R4000 使用软件管理的 TLB，支持 32 位地址空间和 4KB 页。按理 VPN 应有 20 位，但表项里只有 <strong>19 位</strong>：用户地址只占地址空间的一半（另一半留给内核），所以 19 位就够了。
+VPN 转换成最多 <strong>24 位</strong>的 PFN，因此可以支持最多 64GB 的物理内存（2<sup>24</sup> 个 4KB 页）。</p>
+<figure class="fig">
+<svg viewBox="0 0 740 130" width="740" role="img" aria-label="MIPS TLB 表项">
+  <g font-size="10" class="mono t-muted" text-anchor="middle" id="mips-ticks"></g>
+  <!-- 第一行：VPN(31..13) G(12) 空(11..8) ASID(7..0) -->
+  <rect x="20" y="22" width="418" height="34" style="fill:color-mix(in srgb, var(--c1) 22%, var(--surface));stroke:var(--c1)"/><text x="229" y="44" text-anchor="middle" font-size="13" font-weight="600">VPN（19 位）</text>
+  <rect x="438" y="22" width="22" height="34" class="warn-soft"/><text x="449" y="44" text-anchor="middle" font-size="12" font-weight="700">G</text>
+  <rect x="460" y="22" width="88" height="34" style="fill:var(--border);stroke:var(--border)"/>
+  <rect x="548" y="22" width="176" height="34" style="fill:color-mix(in srgb, var(--c4) 22%, var(--surface));stroke:var(--c4)"/><text x="636" y="44" text-anchor="middle" font-size="13" font-weight="600">ASID（8 位）</text>
+  <!-- 第二行：空(31..30) PFN(29..6) C(5..3) D(2) V(1) 空(0) -->
+  <rect x="20" y="62" width="44" height="34" style="fill:var(--border);stroke:var(--border)"/>
+  <rect x="64" y="62" width="528" height="34" style="fill:color-mix(in srgb, var(--c2) 22%, var(--surface));stroke:var(--c2)"/><text x="328" y="84" text-anchor="middle" font-size="13" font-weight="600">PFN（24 位）</text>
+  <rect x="592" y="62" width="66" height="34" class="box-strong"/><text x="625" y="84" text-anchor="middle" font-size="12" font-weight="700">C</text>
+  <rect x="658" y="62" width="22" height="34" class="warn-soft"/><text x="669" y="84" text-anchor="middle" font-size="12" font-weight="700">D</text>
+  <rect x="680" y="62" width="22" height="34" class="ok-soft"/><text x="691" y="84" text-anchor="middle" font-size="12" font-weight="700">V</text>
+  <rect x="702" y="62" width="22" height="34" style="fill:var(--border);stroke:var(--border)"/>
+  <text x="20" y="120" font-size="12" class="t-muted">灰色 = 未使用的位。每行 32 位，一个表项共 64 位（简化版，省略了 page mask 字段）。</text>
+</svg>
+<figcaption>图 19.4：一个 MIPS TLB 表项。G：全局位；ASID：8 位地址空间标识符；C：3 位一致性位；D：脏位；V：有效位。</figcaption>
+</figure>
+<div class="table-wrap"><table>
+<tr><th>字段</th><th>作用</th></tr>
+<tr><td>G（global）</td><td>全局共享的页（所有进程都能用，比如内核页）。G 置位时<strong>忽略 ASID</strong>。</td></tr>
+<tr><td>ASID（8 位）</td><td>区分地址空间。只有 8 位，最多 256 个——如果同时运行的进程超过 256 个，OS 该怎么办？（提示：回收 ASID 时必须清掉 TLB 中带这个 ASID 的项。）</td></tr>
+<tr><td>C（3 位）</td><td>一致性（coherence）位，决定硬件如何缓存这一页（超出本书范围）。</td></tr>
+<tr><td>D / V</td><td>脏位：页被写过时置位；有效位：这一项里有没有有效的转换。</td></tr>
+<tr><td>page mask（图中未画）</td><td>支持多种页大小——后面会看到大页为什么有用。</td></tr>
+</table></div>
+<p>MIPS 的 TLB 通常有 32 或 64 项，大部分给用户进程使用，少数保留给 OS：OS 通过 <strong>wired 寄存器</strong>告诉硬件保留几个槽，用于关键时刻（例如 TLB 未命中处理程序中）绝不能未命中的代码和数据。
+因为是软件管理，MIPS 提供 4 条更新 TLB 的指令：<code>TLBP</code>（探测某个转换是否在 TLB 中）、<code>TLBR</code>（把某项读到寄存器）、<code>TLBWI</code>（替换指定项）、<code>TLBWR</code>（替换随机一项）。
+这些指令当然必须是<strong>特权指令</strong>——想想用户进程如果能改 TLB 会发生什么：几乎可以做任何事，包括接管机器、运行自己的恶意"OS"。</p>
+
+<div class="aside" data-title="提示：RAM 不总是 RAM（Culler 定律）">
+<p>"随机存取存储器"这个名字暗示访问 RAM 的任何位置都一样快。通常这样想没错，但由于 TLB 这类软硬件特性，访问某一页可能很昂贵——尤其是该页当前没有被 TLB 映射时。
+所以请记住：<strong>RAM 不总是 RAM</strong>。随机访问地址空间，特别是访问的页数超过了 TLB 覆盖范围时，可能导致严重的性能损失。原书作者以他们的导师 David Culler 的名字命名这条定律，因为他总把 TLB 指为许多性能问题的根源。</p>
+</div>
+
+<div class="panel" style="margin:14px 0">
+  <h5>TLB 覆盖范围计算器</h5>
+  <div class="calc">
+    <label>TLB 项数 <input type="number" id="cv-n" value="64" min="1"></label>
+    <label>页大小 <select id="cv-ps"><option value="4096" selected>4KB</option><option value="16384">16KB</option><option value="2097152">2MB（大页）</option><option value="1073741824">1GB（大页）</option></select></label>
+    <label>工作集大小 <input type="number" id="cv-ws" value="8" min="1"> MB</label>
+  </div>
+  <div class="readout" id="cv-out"></div>
+</div>
+
+<h2 id="lab">动手实验：测量 TLB 的大小和未命中代价</h2>
+<p>原书的作业借鉴了 Saavedra-Barrera 的方法：在一个大数组中，每页只访问一个整数，访问 <code>NUMPAGES</code> 个页，并把这个循环重复很多次来计时：</p>
+<pre><code>int jump = PAGESIZE / sizeof(int);
+for (i = 0; i &lt; NUMPAGES * jump; i += jump)
+    a[i] += 1;</code></pre>
+<p>页数不超过 TLB 项数时，每次访问都命中，很快；一旦超过，每次访问的代价会突然跳高到 TLB 未命中的水平。原书图 19.5 中：8 页以内约 5ns，16 页以上跳到约 20ns，1024 页左右再跳到约 70ns——
+说明有两级 TLB：第一级很小（8～16 项），第二级更大但更慢（约 512 项）。</p>
+
+<div class="lab">
+<p><code>labs/19-tlb/</code> 里有三个文件：<code>timer.c</code> 回答作业第 1 题（计时器精度），<code>tlb.c</code> 是测量程序，<code>run.sh</code> 把页数从 1 扫到 24576。
+<code>tlb.c</code> 处理了作业里提到的所有陷阱：用 <code>volatile</code> 防止编译器删掉循环（第 5 题）、用 <code>sched_setaffinity</code> 绑定到一个 CPU（第 6 题）、
+计时前先把每页写一遍避免按需清零的开销（第 7 题）；此外还用 <code>madvise(MADV_NOHUGEPAGE)</code> 禁止透明大页，并让每页访问的位置错开一个缓存行，避免 L1 缓存组冲突干扰测量。</p>
+<pre><code><span class="cmd">cd labs/19-tlb &amp;&amp; make</span>
+<span class="cmd">./timer</span>
+<span class="cmd">./run.sh          # 原书的 a[i] += 1 循环</span>
+<span class="cmd">./run.sh -p       # 指针追逐模式：测延迟</span></code></pre>
+<p class="small muted">示例输出（AMD Ryzen 7 8745H，WSL2，gcc 14）。你的机器上数字会不同；WSL2 运行在虚拟机里，还有其他进程争抢 CPU，数字有噪声，所以每个点重复测 5 次并取最小值。</p>
+<pre><code id="lab-timer">$ ./timer
+clock_getres(CLOCK_MONOTONIC) = 1 ns
+clock_gettime 连续两次读数：最小差 10 ns，平均差 17.3 ns
+gettimeofday 能分辨的最小变化：1 us（= 1000 ns）
+结论：单次页访问只有几纳秒，必须把它重复成百万次，让总时间达到毫秒级再求平均。</code></pre>
+<figure class="fig" style="margin-top:10px">
+<div id="lab-chart"></div>
+<figcaption>每次访问的平均耗时 vs. 访问的页数（横轴对数刻度）。蓝色：原书的 <code>a[i] += 1</code> 循环；橙色：指针追逐（<code>-p</code>）。数据来自本机实际运行。</figcaption>
+</figure>
+<pre><code id="lab-table">$ ./run.sh -k 7            # a[i] += 1
+$ ./run.sh -p -k 7         # 指针追逐
+
+  页数   a[i]+=1 最小/中位(ns)   指针追逐 最小/中位(ns)
+     1     0.47 /   0.50          1.26 /   1.27
+     2     0.82 /   0.84          1.26 /   1.29
+     3     0.56 /   0.57          1.25 /   1.29
+     4     0.41 /   0.42          1.27 /   1.31
+     6     0.37 /   0.41          1.28 /   1.30
+     8     0.37 /   0.38          1.27 /   1.34
+    12     0.36 /   0.37          1.28 /   1.30
+    16     0.35 /   0.36          1.26 /   1.27
+    24     0.33 /   0.33          1.28 /   1.28
+    32     0.43 /   0.44          1.27 /   1.30
+    48     0.32 /   0.32          1.26 /   1.31
+    64     0.32 /   0.32          1.25 /   1.31
+    96     0.43 /   0.44          2.74 /   2.78
+   128     0.43 /   0.45          2.77 /   2.82
+   192     0.43 /   0.44          2.77 /   2.83
+   256     0.44 /   0.45          2.73 /   2.79
+   384     0.45 /   0.46          2.81 /   2.87
+   512     0.57 /   0.59          2.82 /   2.96
+   768     0.56 /   0.60          5.14 /   5.28
+  1024     0.56 /   0.58          5.18 /   5.31
+  1536     0.56 /   0.57          5.17 /   5.24
+  2048     0.53 /   0.55          5.17 /   5.32
+  3072     2.50 /   2.57         11.61 /  11.81
+  4096     4.04 /   4.10         16.95 /  18.24
+  6144     4.91 /   4.99         20.70 /  36.37
+  8192     5.22 /   5.35         26.75 /  40.20
+ 12288     5.38 /   5.54         31.83 /  33.13
+ 16384     5.46 /   5.83         33.92 /  41.80
+ 24576     5.45 /   5.75         37.62 /  43.11</code></pre>
+</div>
+<div id="lab-explain">
+<h3>怎么读这些数字</h3>
+<ol>
+  <li><strong>指针追逐（橙线）有清楚的台阶。</strong>
+    <ul>
+      <li><strong>≤ 64 页：约 1.26 ns</strong>，在约 4.5GHz 下是 5～6 个时钟周期：L1 TLB 命中 + L1 数据缓存命中。</li>
+      <li><strong>96～512 页：约 2.8 ns</strong>。拐点在 64 和 96 之间，与这颗 Zen 4 处理器的 L1 数据 TLB 为 72 项相吻合。多出来的约 1.5 ns（约 7 个周期）就是 L1 TLB 未命中、在第二级 TLB 命中的代价。</li>
+      <li><strong>768～2048 页：约 5.2 ns</strong>。这一跳<strong>不是 TLB 造成的</strong>：每页访问一个缓存行，512 页 × 64 字节 = 32KB，正好是 L1 数据缓存的大小，超过后数据要从 L2 缓存取。测量中混着缓存效应，解读时要小心。</li>
+      <li><strong>≥ 3072 页：12 → 38 ns</strong>。第二级 TLB（3072 项）也装不下了，每次访问都要遍历页表（page walk）；页数越多，页表项和数据本身也越难留在缓存中。
+      另外 WSL2 运行在 Hyper-V 虚拟机里，TLB 未命中时硬件要同时遍历客户机页表和宿主机的嵌套页表，比裸机更贵。</li>
+    </ul></li>
+  <li><strong>原书的 <code>a[i] += 1</code> 循环（蓝线）几乎看不出第一个拐点</strong>：64 → 96 页只从 0.32 涨到 0.43 ns。各次访问之间没有数据依赖，乱序执行的 CPU 可以同时处理多个 TLB 查找，把第二级 TLB 的延迟重叠掩盖掉了；
+  只有第二级 TLB 也未命中、要真正遍历页表时（3072 页以后）才明显变慢，从约 0.5 ns 涨到约 5 ns，慢了 10 倍。这个循环测的是<em>吞吐</em>，指针追逐测的是<em>延迟</em>。</li>
+  <li><strong>1～3 页时 <code>a[i] += 1</code> 反而更慢</strong>（2 页时 0.82 ns）：同一个整数在相邻两趟中被连续加 1，下一次读必须等上一次写完成，页数少时这条依赖链成了瓶颈，和 TLB 无关。</li>
+  <li><strong>和原书图 19.5 对比</strong>：结构相同，都是一个小而快的第一级 TLB 加一个大而慢的第二级 TLB；只是今天的 TLB 大得多（72 / 3072 项，原书的机器约 8～16 / 512 项）。
+  L1 TLB 命中和遍历页表之间差 10～30 倍——TLB 性能确实很重要。</li>
+  <li><strong>噪声</strong>：WSL2 里还有别的进程在抢 CPU，中位数有时比最小值大很多（例如 6144 页：20.7 vs 36.4 ns），所以每个点测 7 次取最小值。
+  另外 <code>tlb.c</code> 计时前会先热身 0.2 秒：最初没加热身时，前几个测量点都在 5 ns 左右，是正常值的 4 倍——CPU 刚从空闲的低频状态醒来。</li>
+</ol>
+</div>
+
+<h2 id="predict">先预测再验证</h2>
+<div class="exercise"><div class="q">在 TLB 模拟器中载入原书图 19.2，但把 TLB 项数改为 1。命中率会变吗？为什么？</div>
+<details class="reveal"><summary>看答案</summary><div>不变，仍是 70%。这个访问序列是按页连续的：一旦离开 VPN 6 就再也不回来，所以任何时刻只需要 1 个 TLB 项。TLB 大小只影响"以后还会回来的页"，也就是时间局部性。</div></details></div>
+<div class="exercise"><div class="q">点"把数组访问两遍"。TLB 为 4 项时命中率是多少？把 TLB 改成 2 项呢？</div>
+<details class="reveal"><summary>看答案</summary><div>4 项：第一遍 3 次未命中，第二遍全命中，17/20 = 85%。2 项（LRU）：第一遍结束时 TLB 里是 VPN 7、8，第二遍从 VPN 6 开始又未命中并踢掉 7，接着访问 7 又未命中……第二遍也是 3 次未命中，命中率回到 70%。时间局部性要求 TLB 装得下整个工作集。</div></details></div>
+<div class="exercise"><div class="q">"LRU 的坏情况"：4 项 TLB，循环访问 VPN 0～4 共 6 遍。先预测 LRU、FIFO、随机三种策略的命中率。</div>
+<details class="reveal"><summary>看答案</summary><div>LRU 和 FIFO 都是 0%：每次要访问的页恰好是刚被踢掉的那一页。随机策略有时会踢掉"不那么急需"的页，命中率明显大于 0（具体数值随种子变化，可以多换几个种子试试）。</div></details></div>
+<div class="exercise"><div class="q">上下文切换模拟器里选"什么都不做"：第一次出错发生在哪一步？再选"清空"和"ASID"，未命中各多少次？</div>
+<details class="reveal"><summary>看答案</summary><div>"什么都不做"时，P2 第一次访问 VPN 10 就命中了 P1 留下的项，得到 PFN 100——<strong>读到了别的进程的内存</strong>，这比性能问题严重得多。"清空"是正确的，但每次切换后都要重新未命中；ASID 在两个进程都热身完后几乎全部命中。</div></details></div>
+<div class="exercise"><div class="q">（作业第 3、6 题）运行 <code>./run.sh</code> 时不绑定 CPU（加 <code>-c -1</code>），结果会怎样？为什么要绑定？</div>
+<details class="reveal"><summary>看答案</summary><div>每个 CPU 有自己的 TLB 层次。线程若被调度器从一个核迁移到另一个核，新核的 TLB 是"冷"的，而且会与该核上的其他程序竞争，测量会出现随机的尖峰、波动变大。绑定到一个核（<code>sched_setaffinity</code>、<code>taskset</code>）才能测到一个 TLB 的行为。</div></details></div>
+
+<h2 id="quiz">自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="3"><div class="q">1. TLB 本质上是什么？</div>
+<div class="opts"><button>A. 数据的二级缓存</button><button>B. 存放整个页表的片上存储器</button><button>C. OS 中的一个链表</button><button>D. 缓存常用虚拟到物理地址转换的硬件缓存</button></div>
+<div class="explain">TLB 是 MMU 的一部分，只缓存热门的转换；完整的转换仍在内存中的页表里。</div></div>
+<div class="mcq" data-answer="3"><div class="q">2. 原书数组例子中（16 字节页、10 个 4 字节整数），如果 a[0] 改为从地址 96 开始，10 次访问中哪几次 TLB 未命中？</div>
+<div class="opts"><button>A. 第 1、5、8 次</button><button>B. 第 1、4、8 次</button><button>C. 第 1、4、7 次</button><button>D. 第 1、5、9 次</button></div>
+<div class="explain">96 正好是 VPN 6 的开头：a[0..3] 在 VPN 6，a[4..7] 在 VPN 7，a[8..9] 在 VPN 8。每页第一次访问未命中，即第 1、5、9 次，命中率仍是 70%——数组的对齐方式改变了未命中的位置。可以用模拟器的数组生成器（起始 96）验证。</div></div>
+<div class="mcq" data-answer="1"><div class="q">3. 软件管理的 TLB 未命中处理完毕后，从陷阱返回应该回到哪里？</div>
+<div class="opts"><button>A. 进程的第一条指令</button><button>B. 引发 TLB 未命中的那条指令，让它重新执行</button><button>C. 引发未命中的下一条指令</button><button>D. 调度器</button></div>
+<div class="explain">和系统调用不同：TLB 未命中时指令还没有完成，必须重试，所以硬件要保存引发异常的指令的 PC。</div></div>
+<div class="mcq" data-answer="0"><div class="q">4. 下列哪个是软件管理 TLB 的主要优点？</div>
+<div class="opts"><button>A. OS 可以用任意数据结构实现页表，不需要改硬件</button><button>B. 未命中处理更快</button><button>C. 不需要任何特权指令</button><button>D. 不会出现 TLB 未命中</button></div>
+<div class="explain">灵活性和硬件简单是它的优点。它恰恰需要特权指令（如 MIPS 的 TLBWR）来更新 TLB。</div></div>
+<div class="mcq" data-answer="1"><div class="q">5. 为什么 TLB 表项里既要存 VPN 也要存 PFN？</div>
+<div class="opts"><button>A. 为了计算脏位</button><button>B. TLB 是全相联的，转换可以放在任何位置，只能靠比较 VPN 找到它</button><button>C. 为了支持 ASID</button><button>D. 为了支持多种页大小</button></div>
+<div class="explain">线性页表用 VPN 作下标，不用存 VPN；全相联的 TLB 没有"下标"，必须存 VPN 并并行比较。</div></div>
+<div class="mcq" data-answer="2"><div class="q">6. 上下文切换时如果既不清空 TLB 也没有 ASID，最严重的后果是？</div>
+<div class="opts"><button>A. TLB 被写满</button><button>B. 进程运行变慢</button><button>C. 新进程可能用上一个进程的转换，访问到别人的物理内存</button><button>D. 命中率下降</button></div>
+<div class="explain">这是正确性（和安全）问题，而不仅是性能问题：同一个 VPN 在不同进程里映射到不同的 PFN。</div></div>
+<div class="mcq" data-answer="2"><div class="q">7. TLB 有 n 项，程序循环访问 n + 1 个页。哪种替换策略的命中率最低？</div>
+<div class="opts"><button>A. 随机</button><button>B. 取决于页大小</button><button>C. LRU</button><button>D. 都一样</button></div>
+<div class="explain">LRU 总是踢掉最久没用的页，而它恰好就是下一个要用的页，于是每次都未命中。随机策略反而能命中一部分。</div></div>
+<div class="mcq" data-answer="0"><div class="q">8. MIPS R4000 的 TLB 表项中 PFN 有 24 位、页大小 4KB，能支持多大的物理内存？</div>
+<div class="opts"><button>A. 64GB</button><button>B. 16MB</button><button>C. 256GB</button><button>D. 4GB</button></div>
+<div class="explain">2<sup>24</sup> 个页 × 2<sup>12</sup> 字节 = 2<sup>36</sup> 字节 = 64GB。</div></div>
+
+<h2 id="summary">常见误区与本章小结</h2>
+<div class="warn">
+<ul>
+  <li><strong>"TLB 缓存的是数据"</strong>——TLB 只缓存<em>地址转换</em>。数据和指令由 CPU 的 L1/L2 缓存负责。</li>
+  <li><strong>"TLB 未命中 = 缺页"</strong>——TLB 未命中只是转换不在缓存里，页表里可能有有效的转换（很常见）；缺页是页不在物理内存中（第 21 章）。</li>
+  <li><strong>"TLB 的有效位和 PTE 的有效位一样"</strong>——前者表示这个槽有没有内容，后者表示这一页是否被分配。</li>
+  <li><strong>"有了 TLB 页表就不用了"</strong>——TLB 很小（几十到几千项），页表仍是转换的权威来源，每次未命中都要查它。</li>
+  <li><strong>"ASID 就是 PID"</strong>——ASID 通常只有几位（MIPS 是 8 位），数量有限，OS 必须回收重用。</li>
+</ul>
+</div>
+<div class="key">
+<ul>
+  <li>TLB 是 MMU 中很小的地址转换缓存；命中时转换几乎没有额外开销，未命中才去查页表，然后装入 TLB 并重试指令。</li>
+  <li>TLB 的高命中率来自程序的<strong>空间局部性和时间局部性</strong>；页越大，同一页里的访问越多，命中率越高。</li>
+  <li>未命中可由硬件处理（x86，需知道页表位置和格式）或软件处理（MIPS/SPARC，抛出异常，由 OS 用特权指令更新 TLB；返回时重试原指令，并要避免无限未命中链）。</li>
+  <li>上下文切换时要么清空 TLB，要么用 ASID 区分地址空间；替换策略常见 LRU 和随机。</li>
+  <li>TLB 不能拯救所有程序：短时间内访问的页数超过 <strong>TLB 覆盖范围</strong>会导致大量未命中。一个办法是支持<strong>更大的页</strong>，数据库之类大而随机访问的数据结构常这样做。</li>
+  <li>TLB 访问还可能成为 CPU 流水线的瓶颈，特别是<strong>物理索引缓存（physically-indexed cache）</strong>：必须先转换地址才能访问缓存。<strong>虚拟索引缓存（virtually-indexed cache）</strong>可以避开这一步，但会给硬件设计带来新问题。</li>
+  <li>下一章：页表<strong>太大</strong>的问题——多级页表、反向页表等。</li>
+</ul>
+</div>
+
+</main>
+
+<script>window.LAB_DATA = {"pages": [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576], "loop": [0.47, 0.82, 0.56, 0.41, 0.37, 0.37, 0.36, 0.35, 0.33, 0.43, 0.32, 0.32, 0.43, 0.43, 0.43, 0.44, 0.45, 0.57, 0.56, 0.56, 0.56, 0.53, 2.5, 4.04, 4.91, 5.22, 5.38, 5.46, 5.45], "chase": [1.26, 1.26, 1.25, 1.27, 1.28, 1.27, 1.28, 1.26, 1.28, 1.27, 1.26, 1.25, 2.74, 2.77, 2.77, 2.73, 2.81, 2.82, 5.14, 5.18, 5.17, 5.17, 11.61, 16.95, 20.7, 26.75, 31.83, 33.92, 37.62], "marks": [{"p": 72, "label": "L1 DTLB 72 项"}, {"p": 512, "label": "L1 缓存 32KB"}, {"p": 3072, "label": "L2 DTLB 3072 项"}]};</script>
+<script id="core">
+// ======================= 核心算法（纯函数，无 DOM；自检脚本会单独抽出来用 node 运行） =======================
+// 可复现随机数（与 OSTEP.rng 相同的 mulberry32），这里复制一份，便于在 node 中单独测试
+function mulberry(seed) {
+  let a = (seed >>> 0) || 1;
+  const f = () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  f.int = (lo, hi) => lo + Math.floor(f() * (hi - lo + 1));
+  return f;
+}
+// 为每个虚拟页随机分配一个不同的物理帧（物理内存 = 地址空间的 2 倍），所有页都有效
+function makePageTable(vpages, seed) {
+  const r = mulberry(seed * 7919 + 17), frames = [];
+  for (let i = 0; i < vpages * 2; i++) frames.push(i);
+  for (let i = frames.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [frames[i], frames[j]] = [frames[j], frames[i]]; }
+  return frames.slice(0, vpages);
+}
+// TLB 模拟：全相联，policy = LRU / FIFO / RAND。每次访问返回一个快照
+function tlbRun(o) {
+  const vpages = 2 ** o.vaBits / o.pageSize, pt = makePageTable(vpages, o.seed || 0);
+  const rnd = mulberry((o.seed || 0) + 1000);
+  const tlb = []; for (let k = 0; k < o.tlbSize; k++) tlb.push({ valid: false, vpn: -1, pfn: -1, last: -1, ins: -1 });
+  const steps = []; let hits = 0, misses = 0, bad = 0;
+  o.addrs.forEach((va, t) => {
+    const vpn = Math.floor(va / o.pageSize), off = va % o.pageSize;
+    if (!(va >= 0 && va < 2 ** o.vaBits)) { bad++; steps.push({ t, va, vpn, off, out: true, tlb: tlb.map((e) => ({ ...e })) }); return; }
+    let slot = tlb.findIndex((e) => e.valid && e.vpn === vpn), hit = slot >= 0, evicted = null;
+    if (hit) { hits++; tlb[slot].last = t; }
+    else {
+      misses++;
+      slot = tlb.findIndex((e) => !e.valid);
+      if (slot < 0) {
+        if (o.policy === "LRU") { slot = 0; for (let k = 1; k < tlb.length; k++) if (tlb[k].last < tlb[slot].last) slot = k; }
+        else if (o.policy === "FIFO") { slot = 0; for (let k = 1; k < tlb.length; k++) if (tlb[k].ins < tlb[slot].ins) slot = k; }
+        else slot = Math.floor(rnd() * tlb.length);
+        evicted = { ...tlb[slot] };
+      }
+      tlb[slot] = { valid: true, vpn, pfn: pt[vpn], last: t, ins: t };
+    }
+    steps.push({ t, va, vpn, off, hit, slot, evicted, pfn: pt[vpn], pa: pt[vpn] * o.pageSize + off, tlb: tlb.map((e) => ({ ...e })) });
+  });
+  return { vpages, pt, steps, hits, misses, bad };
+}
+// 数组访问序列：base 开始、n 个元素、每个 sz 字节、访问 passes 遍
+function arrayAddrs(base, n, sz, passes) { const a = []; for (let p = 0; p < passes; p++) for (let i = 0; i < n; i++) a.push(base + i * sz); return a; }
+// 上下文切换 + TLB：policy = none / flush / asid
+const ASID_PT = { 1: { 10: 100, 11: 101 }, 2: { 10: 170, 11: 171 } };
+function asidRun(seq, policy, size) {
+  const tlb = []; for (let k = 0; k < size; k++) tlb.push({ valid: false });
+  let curPid = null, t = 0; const steps = []; let hits = 0, misses = 0, wrong = 0, switches = 0;
+  for (const a of seq) {
+    let sw = false;
+    if (curPid !== null && a.pid !== curPid) { sw = true; switches++; if (policy === "flush") tlb.forEach((e) => (e.valid = false)); }
+    curPid = a.pid;
+    const correct = ASID_PT[a.pid] ? ASID_PT[a.pid][a.vpn] : undefined;
+    let slot = tlb.findIndex((e) => e.valid && e.vpn === a.vpn && (policy !== "asid" || e.asid === a.pid));
+    let hit = slot >= 0, got, isWrong = false;
+    if (hit) { hits++; tlb[slot].last = t; got = tlb[slot].pfn; if (got !== correct) { wrong++; isWrong = true; } }
+    else {
+      misses++; got = correct;
+      slot = tlb.findIndex((e) => !e.valid);
+      if (slot < 0) { slot = 0; for (let k = 1; k < tlb.length; k++) if (tlb[k].last < tlb[slot].last) slot = k; }
+      tlb[slot] = { valid: true, vpn: a.vpn, pfn: correct, asid: a.pid, last: t };
+    }
+    steps.push({ ...a, sw, hit, slot, got, correct, isWrong, tlb: tlb.map((e) => ({ ...e })) });
+    t++;
+  }
+  return { steps, hits, misses, wrong, switches };
+}
+function parseAsidSeq(text) {
+  const out = [];
+  for (const tok of String(text).trim().split(/[\s,;]+/)) {
+    if (!tok) continue;
+    const m = /^P?(\d+)\s*:\s*(\d+)$/i.exec(tok);
+    if (!m) return { error: "无法解析：" + tok + "（格式应为 P1:10）" };
+    out.push({ pid: +m[1], vpn: +m[2] });
+  }
+  return { seq: out };
+}
+</script>
+<script>
+(function () {
+  "use strict";
+  const { h, s, hex, bin } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  const parseNum = (t) => { t = String(t).trim().toLowerCase(); if (/^0x[0-9a-f]+$/.test(t)) return parseInt(t.slice(2), 16); if (/^\d+$/.test(t)) return parseInt(t, 10); return NaN; };
+  const stat = (box, v, l) => box.append(h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l)));
+
+  // ---------------- TLB 模拟器 ----------------
+  let R = null, cfg = null, perr = "";
+  function tlBuild() {
+    const vaBits = Math.max(4, Math.min(16, parseInt($("tl-bits").value, 10) || 8));
+    const pageSize = Number($("tl-ps").value), tlbSize = Math.max(1, Math.min(32, parseInt($("tl-n").value, 10) || 4));
+    const toks = $("tl-seq").value.split(/[\s,;]+/).filter(Boolean);
+    perr = "";
+    const addrs = [];
+    for (const t of toks) { const v = parseNum(t); if (isNaN(v)) { perr = "无法解析地址：" + t; break; } addrs.push(v); }
+    if (addrs.length > 400) { perr = "访问序列太长（最多 400 个）"; addrs.length = 400; }
+    if (pageSize >= 2 ** vaBits) perr = "页大小必须小于地址空间";
+    cfg = { vaBits, pageSize, tlbSize, policy: $("tl-pol").value, seed: parseInt($("tl-seed").value, 10) || 0, addrs };
+    R = perr && pageSize >= 2 ** vaBits ? null : tlbRun(cfg);
+    tlStep.reset();
+  }
+  function tlRender(i) {
+    const nar = $("tl-nar"), st = $("tl-stats"), asBox = $("tl-as"), tb = $("tl-tlb"), hist = $("tl-hist");
+    st.replaceChildren(); asBox.replaceChildren(); tb.replaceChildren(); hist.replaceChildren();
+    if (!R) { nar.innerHTML = '<span class="err">' + perr + "</span>"; return; }
+    if (!R.steps.length) { nar.innerHTML = (perr ? '<span class="err">' + perr + "</span> " : "") + "访问序列为空。"; return; }
+    const S = R.steps[i], P = cfg.pageSize, offBits = Math.log2(P), vpnBits = cfg.vaBits - offBits;
+    $("tl-as-title").textContent = `虚拟地址空间（${2 ** cfg.vaBits} 字节 = ${R.vpages} 页 × ${P} 字节）`;
+    $("tl-tlb-title").textContent = `TLB（${cfg.tlbSize} 项，全相联，${{ LRU: "LRU", FIFO: "FIFO", RAND: "随机" }[cfg.policy]}替换）`;
+    // 地址网格：行 = VPN（从大到小），列 = 每 4 字节一格
+    const inTlb = new Set(S.tlb.filter((e) => e.valid).map((e) => e.vpn));
+    const touched = new Map(); R.steps.forEach((x, k) => { if (!x.out) { const key = x.vpn + ":" + Math.floor(x.off / 4); if (!touched.has(key)) touched.set(key, []); touched.get(key).push(k); } });
+    const cols = Math.min(16, Math.max(1, P / 4)), colBytes = P / cols;
+    let rows = [];
+    if (R.vpages <= 32) { for (let v = R.vpages - 1; v >= 0; v--) rows.push(v); }
+    else { const set = new Set(); R.steps.forEach((x) => !x.out && set.add(x.vpn)); rows = [...set].sort((a, b) => b - a); }
+    const table = h("table", { class: "asgrid" });
+    const head = h("tr", {}, h("th", {}, ""));
+    for (let c = 0; c < cols; c++) head.append(h("th", {}, String(c * colBytes).padStart(2, "0")));
+    table.append(head);
+    for (const v of rows) {
+      const tr = h("tr", { class: inTlb.has(v) ? "intlb" : "" }, h("td", { class: "rl" }, "VPN " + String(v).padStart(2, "0")));
+      for (let c = 0; c < cols; c++) {
+        const ks = [];
+        for (let b = c * colBytes; b < (c + 1) * colBytes; b += 4) { const arr = touched.get(v + ":" + Math.floor(b / 4)); if (arr) ks.push(...arr); }
+        let cls = "", txt = "";
+        if (ks.length) {
+          cls = "el"; const k0 = ks[0]; txt = "#" + k0;
+          if (ks.includes(i)) { cls += " now " + (S.hit ? "hit" : "miss"); txt = "#" + i; }
+          else if (ks.every((k) => k < i)) cls += " done";
+        }
+        tr.append(h("td", { class: cls, title: ks.length ? "第 " + ks.map((k) => k).join("、") + " 次访问" : "" }, txt));
+      }
+      table.append(tr);
+    }
+    asBox.append(table);
+    if (R.vpages > 32) asBox.append(h("div", { class: "small muted" }, "页太多，只画出被访问的页。"));
+    // TLB 表
+    const tt = h("table", { class: "tlbtab" }, h("tr", {}, h("th", {}, "槽"), h("th", {}, "V"), h("th", {}, "VPN"), h("th", {}, "PFN"), h("th", {}, cfg.policy === "FIFO" ? "装入于" : "上次使用")));
+    S.tlb.forEach((e, k) => {
+      const cls = !e.valid ? "empty" : k === S.slot ? (S.hit ? "hit" : "ins") : "";
+      tt.append(h("tr", { class: cls }, h("td", {}, k), h("td", {}, e.valid ? 1 : 0), h("td", {}, e.valid ? e.vpn : "—"), h("td", {}, e.valid ? e.pfn : "—"), h("td", {}, e.valid ? "#" + (cfg.policy === "FIFO" ? e.ins : e.last) : "—")));
+    });
+    tb.append(tt);
+    $("tl-pt").textContent = R.vpages <= 64 ? R.pt.map((p, v) => v + "→" + p).join("  ") : "共 " + R.vpages + " 项（VPN → PFN 随种子生成）";
+    // 历史
+    R.steps.forEach((x, k) => {
+      const c = h("span", { class: "cell " + (x.out ? "" : x.hit ? "hit" : "miss") + (k === i ? " cur" : ""), title: "VA " + x.va }, k <= i ? (x.out ? "越界" : x.hit ? "H" : "M") : "·", h("small", {}, "#" + k));
+      if (k > i) c.className = "cell";
+      hist.append(c);
+    });
+    // 解说
+    if (S.out) nar.innerHTML = `<b>#${i}</b> 虚拟地址 ${S.va} 超出 ${cfg.vaBits} 位地址空间，跳过。`;
+    else {
+      const split = `VA ${S.va} = <code>${bin(S.vpn, vpnBits)}|${bin(S.off, offBits)}</code> → VPN ${S.vpn}，偏移 ${S.off}`;
+      if (S.hit) nar.innerHTML = `<b>#${i} TLB 命中</b>：${split}。槽 ${S.slot} 里就有 VPN ${S.vpn} → PFN ${S.pfn}，直接得到物理地址 ${S.pfn} × ${P} + ${S.off} = <b>${S.pa}</b>，<b>不访问页表</b>。`;
+      else nar.innerHTML = `<b style="color:var(--bad)">#${i} TLB 未命中</b>：${split}。TLB 中没有 VPN ${S.vpn}，硬件访问内存读取 PTE（额外 1 次访存），得到 PFN ${S.pfn}；` +
+        (S.evicted ? `TLB 已满，按 ${{ LRU: "LRU 踢掉最久未使用的", FIFO: "FIFO 踢掉最早装入的", RAND: "随机策略踢掉" }[cfg.policy]} VPN ${S.evicted.vpn}（槽 ${S.slot}）；` : `装入空闲的槽 ${S.slot}；`) +
+        `然后重试指令，这次命中，物理地址 = <b>${S.pa}</b>。`;
+      if (perr) nar.innerHTML += ` <span class="err">（${perr}）</span>`;
+    }
+    const upto = R.steps.slice(0, i + 1).filter((x) => !x.out), hh = upto.filter((x) => x.hit).length;
+    stat(st, hh + " / " + (upto.length - hh), "命中 / 未命中（到目前）");
+    stat(st, upto.length ? Math.round((hh / upto.length) * 1000) / 10 + "%" : "—", "命中率（到目前）");
+    stat(st, Math.round((R.hits / Math.max(1, R.hits + R.misses)) * 1000) / 10 + "%", "整个序列的命中率");
+    stat(st, (upto.length + (upto.length - hh)) + " vs " + upto.length * 2, "实际访存次数 vs 没有 TLB");
+  }
+  const tlStep = OSTEP.stepper($("tl-step"), { steps: () => (R && R.steps.length ? R.steps.length : 1), render: tlRender, autoplayMs: 800 });
+  ["tl-bits", "tl-ps", "tl-n", "tl-pol", "tl-seed", "tl-seq"].forEach((id) => $(id).addEventListener("change", tlBuild));
+  const setSeq = (a) => { $("tl-seq").value = a.join(", "); };
+  $("tl-p1").onclick = () => { $("tl-bits").value = 8; $("tl-ps").value = 16; $("tl-n").value = 4; $("tl-pol").value = "LRU"; setSeq(arrayAddrs(100, 10, 4, 1)); tlBuild(); };
+  $("tl-p2").onclick = () => { $("tl-bits").value = 8; $("tl-ps").value = 16; setSeq(arrayAddrs(100, 10, 4, 2)); tlBuild(); };
+  $("tl-p3").onclick = () => { $("tl-bits").value = 8; $("tl-ps").value = 32; setSeq(arrayAddrs(100, 10, 4, 1)); tlBuild(); };
+  $("tl-p4").onclick = () => { $("tl-bits").value = 8; $("tl-ps").value = 16; $("tl-n").value = 4; const a = []; for (let p = 0; p < 6; p++) for (let v = 0; v < 5; v++) a.push(v * 16); setSeq(a); tlBuild(); };
+  $("ag-go").onclick = () => { setSeq(arrayAddrs(+$("ag-base").value || 0, Math.min(200, +$("ag-n").value || 1), +$("ag-sz").value || 4, Math.min(5, +$("ag-pass").value || 1))); tlBuild(); };
+  tlBuild();
+
+  // ---------------- 控制流对比 ----------------
+  const HW = ["VPN = (VirtualAddress & VPN_MASK) >> SHIFT", "(Success, TlbEntry) = TLB_Lookup(VPN)", "if (Success == True)    // TLB 命中", "    if (CanAccess(TlbEntry.ProtectBits) == True)", "        Offset   = VirtualAddress & OFFSET_MASK", "        PhysAddr = (TlbEntry.PFN << SHIFT) | Offset", "        Register = AccessMemory(PhysAddr)", "    else", "        RaiseException(PROTECTION_FAULT)", "else                    // TLB 未命中", "    PTEAddr = PTBR + (VPN * sizeof(PTE))", "    PTE = AccessMemory(PTEAddr)", "    if (PTE.Valid == False)", "        RaiseException(SEGMENTATION_FAULT)", "    else if (CanAccess(PTE.ProtectBits) == False)", "        RaiseException(PROTECTION_FAULT)", "    else", "        TLB_Insert(VPN, PTE.PFN, PTE.ProtectBits)", "        RetryInstruction()"];
+  const SW = HW.slice(0, 10).concat(["    RaiseException(TLB_MISS)"]);
+  const OS = ["TLB_Miss_Handler:            // 已在内核态", "    VPN = BadVAddr >> SHIFT      // 硬件记下的出错地址", "    PTE = LookupPageTable(VPN)   // 任意数据结构都行", "    if (PTE.Valid == False)", "        KillProcess()            // 段错误", "    TLB_Write(VPN, PTE.PFN, PTE.ProtectBits)  // 特权指令，如 TLBWR", "    ReturnFromTrap()             // 回到引发异常的那条指令"];
+  // 每一步：{who: user/hw/os, hw: [行号(1 基)], os: [行号], text, mem: 本步访存次数}
+  function flowSteps(mode, sc) {
+    const S = [];
+    const U = (t) => S.push({ who: "user", hw: [], os: [], text: t });
+    const H = (lines, t, mem) => S.push({ who: "hw", hw: lines, os: [], text: t, mem: mem || 0 });
+    const O = (lines, t, mem) => S.push({ who: "os", hw: [], os: lines, text: t, mem: mem || 0 });
+    U("用户程序执行 <code>movl 100, %eax</code>，产生一个虚拟地址。");
+    H([1], "硬件用掩码和移位取出 VPN（纯位运算，很快）。");
+    H([2], "在 TLB 中并行查找这个 VPN。");
+    if (sc === "hit" || sc === "prot") {
+      H([3], "找到了：<b>TLB 命中</b>。");
+      if (sc === "hit") { H([4], "检查保护位：允许访问。"); H([5, 6], "取出 PFN，与偏移拼成物理地址。"); H([7], "访问内存取数据——这是整条指令<b>唯一一次</b>访存。", 1); U("指令完成，继续执行下一条。命中时，硬件管理和软件管理<b>完全一样</b>，OS 完全不参与。"); }
+      else { H([4], "检查保护位：<b>不允许</b>（例如向只读的代码页写）。"); H([8, 9], "抛出 PROTECTION_FAULT 异常，陷入 OS。"); O([], "OS 的异常处理程序接管（通常终止进程）。两种管理方式在这里也一样。"); }
+      return S;
+    }
+    H([3, 10], "没找到：<b>TLB 未命中</b>。");
+    if (mode === "hw") {
+      H([11], "硬件<b>自己</b>用页表基址寄存器（x86 上是 CR3）算出 PTE 的地址——它必须知道页表在哪、格式是什么。");
+      H([12], "硬件访问内存读 PTE：<b>额外的一次访存</b>。", 1);
+      if (sc === "seg") { H([13, 14], "PTE 无效：硬件抛出 SEGMENTATION_FAULT，陷入 OS。"); O([], "OS 的异常处理程序接管，通常终止进程（这一步 OS 才第一次出场）。"); return S; }
+      H([13, 15], "PTE 有效，权限检查通过。");
+      H([17, 18], "硬件把转换插入 TLB（可能要按替换策略踢掉一项）。");
+      H([19], "重试这条指令。");
+      H([1, 2, 3], "重试：再次查 TLB，这次<b>命中</b>。");
+      H([4, 5, 6, 7], "拼出物理地址并访问数据。", 1);
+      U("指令完成。整个未命中处理<b>OS 一行代码都没执行</b>，全部由硬件完成。");
+    } else {
+      H([11], "硬件什么也不查，直接抛出 <b>TLB_MISS</b> 异常：暂停指令流，提升到内核态，跳到陷阱处理程序；并保存<b>引发异常的这条指令</b>的 PC。");
+      O([1, 2], "OS 的 TLB 未命中处理程序开始运行。它自己的代码必须不会再引发 TLB 未命中（放在不做地址转换的物理内存里，或用 wired 的 TLB 项）。");
+      O([3], "OS 查页表。页表格式由 OS 自己决定（线性、多级、哈希……都可以）：读 PTE 是一次访存。", 1);
+      if (sc === "seg") { O([4, 5], "PTE 无效：OS 发现这是非法访问，终止进程（段错误）。"); return S; }
+      O([6], "PTE 有效：用<b>特权指令</b>把转换写入 TLB（MIPS 的 TLBWI / TLBWR）。");
+      O([7], "从陷阱返回。注意：返回到<b>引发 TLB 未命中的那条指令</b>，而不是下一条（和系统调用不同）。");
+      H([1, 2, 3], "硬件重新执行这条指令：这次 TLB <b>命中</b>。");
+      H([4, 5, 6, 7], "拼出物理地址并访问数据。", 1);
+      U("指令完成。代价：一次陷阱 + 内核态处理程序 + 一次页表访存；换来的是页表结构的完全自由。");
+    }
+    return S;
+  }
+  let FS = [];
+  function flBuild() { FS = flowSteps($("fl-mode").value, $("fl-sc").value); flStep.reset(); }
+  function flRender(i) {
+    const mode = $("fl-mode").value, hwCode = mode === "hw" ? HW : SW;
+    $("fl-hw-title").textContent = mode === "hw" ? "硬件（MMU）—— 原书图 19.1" : "硬件（MMU）—— 原书图 19.3";
+    const hwOn = new Set(FS[i].hw), osOn = new Set(FS[i].os);
+    const hwDone = new Set(), osDone = new Set(); FS.slice(0, i).forEach((x) => { x.hw.forEach((l) => hwDone.add(l)); x.os.forEach((l) => osDone.add(l)); });
+    const box = $("fl-hw"); box.replaceChildren();
+    hwCode.forEach((l, k) => box.append(h("div", { class: hwOn.has(k + 1) ? "on" : hwDone.has(k + 1) ? "done" : "" }, String(k + 1).padStart(2, " ") + "  " + l)));
+    const ob = $("fl-os"); ob.replaceChildren(); ob.classList.toggle("off", mode === "hw");
+    OS.forEach((l, k) => ob.append(h("div", { class: osOn.has(k + 1) ? "on" : osDone.has(k + 1) ? "done" : "" }, l)));
+    if (mode === "hw") ob.append(h("div", { class: "done" }, ""), h("div", {}, "（硬件管理：未命中由硬件处理，这段代码不存在）"));
+    const lanes = $("fl-lanes"); lanes.replaceChildren();
+    [["user", "用户程序"], ["hw", "硬件 MMU"], ["os", "OS 内核态"]].forEach(([k, nm]) => {
+      const tr = h("div", { class: "track" });
+      FS.forEach((x, j) => tr.append(h("span", { class: "dot" + (x.who === k && j <= i ? " x" : "") + (x.who === k && j === i ? " cur" : ""), title: "第 " + (j + 1) + " 步" })));
+      lanes.append(h("div", { class: "lane " + k }, h("span", { class: "nm" }, nm), tr));
+    });
+    $("fl-nar").innerHTML = FS[i].text;
+    const st = $("fl-stats"); st.replaceChildren();
+    const upto = FS.slice(0, i + 1);
+    stat(st, upto.reduce((a, x) => a + (x.mem || 0), 0) + " / " + FS.reduce((a, x) => a + (x.mem || 0), 0), "访存次数（到目前 / 总共）");
+    stat(st, FS.filter((x) => x.who === "os").length, "OS 参与的步数");
+    stat(st, FS.some((x) => x.who === "os") ? "是" : "否", "是否陷入内核");
+  }
+  const flStep = OSTEP.stepper($("fl-step"), { steps: () => Math.max(1, FS.length), render: flRender, autoplayMs: 1400 });
+  ["fl-mode", "fl-sc"].forEach((id) => $(id).addEventListener("change", flBuild));
+  flBuild();
+
+  // ---------------- ASID 模拟器 ----------------
+  let AR = null, aerr = "";
+  function asBuild() {
+    const p = parseAsidSeq($("as-seq").value);
+    aerr = p.error || "";
+    const seq = (p.seq || []).filter((a) => ASID_PT[a.pid] && ASID_PT[a.pid][a.vpn] != null);
+    if (!aerr && p.seq && seq.length < p.seq.length) aerr = "序列里有页表中不存在的进程或 VPN（只有 P1/P2 的 VPN 10、11），已忽略";
+    AR = asidRun(seq.slice(0, 60), $("as-pol").value, Math.max(2, Math.min(8, parseInt($("as-n").value, 10) || 4)));
+    asStep.reset();
+  }
+  function asRender(i) {
+    const nar = $("as-nar"), tb = $("as-tlb"), hist = $("as-hist"), st = $("as-stats");
+    tb.replaceChildren(); hist.replaceChildren(); st.replaceChildren();
+    if (!AR.steps.length) { nar.innerHTML = '<span class="err">' + (aerr || "序列为空") + "</span>"; return; }
+    const S = AR.steps[i], pol = $("as-pol").value;
+    const tt = h("table", { class: "tlbtab" }, h("tr", {}, h("th", {}, "VPN"), h("th", {}, "PFN"), h("th", {}, "valid"), h("th", {}, "prot"), pol === "asid" ? h("th", {}, "ASID") : null));
+    S.tlb.forEach((e, k) => {
+      const cls = !e.valid ? "empty" : k === S.slot ? (S.isWrong ? "wrong" : S.hit ? "hit" : "ins") : "";
+      tt.append(h("tr", { class: cls }, h("td", {}, e.valid ? e.vpn : "—"), h("td", {}, e.valid ? e.pfn : "—"), h("td", {}, e.valid ? 1 : 0), h("td", {}, e.valid ? "rwx" : "—"), pol === "asid" ? h("td", {}, e.valid ? e.asid : "—") : null));
+    });
+    tb.append(tt);
+    AR.steps.forEach((x, k) => {
+      if (x.sw) hist.append(h("span", { class: "cell sw", title: "上下文切换" }, "⇄"));
+      const c = h("span", { class: "cell" + (k <= i ? (x.isWrong ? " miss" : x.hit ? " hit" : " miss") : "") + (k === i ? " cur" : "") }, k <= i ? (x.isWrong ? "错!" : x.hit ? "H" : "M") : "·", h("small", {}, "P" + x.pid + ":" + x.vpn));
+      hist.append(c);
+    });
+    let t = "";
+    if (S.sw) t += `<b>上下文切换到 P${S.pid}</b>` + (pol === "flush" ? "：OS 清空 TLB（所有有效位置 0）。" : pol === "asid" ? `：OS 把 ASID 寄存器设为 ${S.pid}，TLB 不动。` : "：TLB 原封不动（也没有 ASID）。") + " ";
+    t += `P${S.pid} 访问 VPN ${S.vpn}：`;
+    if (S.isWrong) t += `<b style="color:var(--bad)">命中了一项 VPN ${S.vpn} → PFN ${S.got}，但那是另一个进程留下的！</b> P${S.pid} 的正确 PFN 是 ${S.correct}。它现在读写的是别人的物理内存——硬件无法区分两个进程的 VPN ${S.vpn}。`;
+    else if (S.hit) t += `TLB 命中` + (pol === "asid" ? `（VPN 和 ASID ${S.pid} 都匹配）` : "") + `，PFN = ${S.got}，正确。`;
+    else t += `TLB 未命中，查 P${S.pid} 的页表得到 PFN ${S.correct}，装入 TLB` + (pol === "asid" ? `并标上 ASID ${S.pid}` : "") + "。";
+    nar.innerHTML = t + (aerr ? ` <span class="err">（${aerr}）</span>` : "");
+    const upto = AR.steps.slice(0, i + 1);
+    stat(st, upto.filter((x) => x.hit && !x.isWrong).length, "正确命中");
+    stat(st, upto.filter((x) => !x.hit).length, "未命中");
+    stat(st, upto.filter((x) => x.isWrong).length, "错误的转换");
+    stat(st, upto.filter((x) => x.sw).length, "上下文切换次数");
+  }
+  const asStep = OSTEP.stepper($("as-step"), { steps: () => Math.max(1, AR ? AR.steps.length : 1), render: asRender, autoplayMs: 900 });
+  ["as-pol", "as-n", "as-seq"].forEach((id) => $(id).addEventListener("change", asBuild));
+  asBuild();
+
+  // ---------------- MIPS 位刻度 ----------------
+  (function () { const g = $("mips-ticks"); const x0 = 20, w = 22; for (const b of [31, 13, 12, 8, 7, 0]) g.append(s("text", { x: x0 + (31 - b) * w + w / 2, y: 16, text: b, class: "t-muted" })); })();
+
+  // ---------------- 覆盖范围计算器 ----------------
+  function cv() {
+    const n = Math.max(1, +$("cv-n").value || 1), ps = +$("cv-ps").value, ws = Math.max(1, +$("cv-ws").value || 1) * 1048576;
+    const cover = n * ps, fmt = (b) => b >= 1073741824 ? b / 1073741824 + " GB" : b >= 1048576 ? b / 1048576 + " MB" : b / 1024 + " KB";
+    $("cv-out").textContent = `覆盖范围 = ${n} 项 × ${fmt(ps)} = ${fmt(cover)}\n工作集 ${fmt(ws)}：` + (ws <= cover ? "放得下，热身之后几乎全部命中。" : `超出覆盖范围约 ${Math.round((ws / cover) * 10) / 10} 倍，随机访问时大部分访问都会 TLB 未命中。` + (ps < 2097152 ? "\n改用 2MB 大页试试：覆盖范围扩大 512 倍。" : ""));
+  }
+  ["cv-n", "cv-ps", "cv-ws"].forEach((id) => $(id).addEventListener("input", cv));
+  cv();
+
+  // ---------------- 实验数据图 ----------------
+  const LAB = window.LAB_DATA;
+  if (LAB) {
+    const W = 680, H = 300, L = 56, Rm = 20, T = 16, B = 44;
+    const xs = LAB.pages, maxY = Math.max(...LAB.loop, ...LAB.chase) * 1.08;
+    const lx = (p) => L + (Math.log2(p) / Math.log2(xs[xs.length - 1])) * (W - L - Rm);
+    const ly = (v) => T + (1 - v / maxY) * (H - T - B);
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "TLB 测量结果" });
+    const step = maxY > 40 ? 10 : 5;
+    for (let v = 0; v <= maxY; v += step) { svg.append(s("line", { x1: L, x2: W - Rm, y1: ly(v), y2: ly(v), style: "stroke:var(--border)" })); svg.append(s("text", { x: L - 6, y: ly(v) + 4, "text-anchor": "end", "font-size": 11, class: "mono t-muted", text: v })); }
+    for (const p of [1, 4, 16, 64, 256, 1024, 4096, 16384]) if (p <= xs[xs.length - 1]) { svg.append(s("line", { x1: lx(p), x2: lx(p), y1: T, y2: H - B, style: "stroke:var(--border);stroke-dasharray:2 3" })); svg.append(s("text", { x: lx(p), y: H - B + 16, "text-anchor": "middle", "font-size": 11, class: "mono t-muted", text: p })); }
+    svg.append(s("text", { x: (L + W - Rm) / 2, y: H - 8, "text-anchor": "middle", "font-size": 12, class: "t-muted", text: "访问的页数（对数刻度）" }));
+    svg.append(s("text", { x: 14, y: T + (H - T - B) / 2, "font-size": 12, class: "t-muted", transform: `rotate(-90 14 ${T + (H - T - B) / 2})`, "text-anchor": "middle", text: "每次访问 ns" }));
+    for (const m of LAB.marks || []) { svg.append(s("line", { x1: lx(m.p), x2: lx(m.p), y1: T, y2: H - B, style: "stroke:var(--warn);stroke-width:1.5" })); svg.append(s("text", { x: lx(m.p) + 4, y: T + 12, "font-size": 11, style: "fill:var(--warn)", text: m.label })); }
+    [["loop", "var(--c1)"], ["chase", "var(--c2)"]].forEach(([k, col]) => {
+      const d = xs.map((p, j) => (j ? "L" : "M") + lx(p).toFixed(1) + "," + ly(LAB[k][j]).toFixed(1)).join(" ");
+      svg.append(s("path", { d, style: `fill:none;stroke:${col};stroke-width:2` }));
+      xs.forEach((p, j) => svg.append(s("circle", { cx: lx(p), cy: ly(LAB[k][j]), r: 3, style: `fill:${col}` }, s("title", { text: `${p} 页：${LAB[k][j]} ns` }))));
+    });
+    svg.append(s("rect", { x: L + 10, y: T + 20, width: 150, height: 42, rx: 6, class: "box-strong" }));
+    svg.append(s("line", { x1: L + 20, x2: L + 44, y1: T + 34, y2: T + 34, style: "stroke:var(--c1);stroke-width:2" })); svg.append(s("text", { x: L + 50, y: T + 38, "font-size": 11.5, text: "a[i] += 1（原书）" }));
+    svg.append(s("line", { x1: L + 20, x2: L + 44, y1: T + 52, y2: T + 52, style: "stroke:var(--c2);stroke-width:2" })); svg.append(s("text", { x: L + 50, y: T + 56, "font-size": 11.5, text: "指针追逐 -p" }));
+    $("lab-chart").append(svg);
+  }
+})();
+</script>
+</body></html>

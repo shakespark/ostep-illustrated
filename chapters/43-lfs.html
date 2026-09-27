@@ -1,0 +1,1379 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 43 章 · 日志结构文件系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+/* 块类型配色：D 数据=c1，I inode=c2，imap=c3，CR=c4，SS=c5，目录块=c6 */
+svg .kb { stroke-width: 1.5; }
+svg .k-d { fill: color-mix(in srgb, var(--c1) 16%, var(--surface)); stroke: var(--c1); }
+svg .k-i { fill: color-mix(in srgb, var(--c2) 16%, var(--surface)); stroke: var(--c2); }
+svg .k-m { fill: color-mix(in srgb, var(--c3) 16%, var(--surface)); stroke: var(--c3); }
+svg .k-cr { fill: color-mix(in srgb, var(--c4) 16%, var(--surface)); stroke: var(--c4); }
+svg .k-ss { fill: color-mix(in srgb, var(--c5) 20%, var(--surface)); stroke: var(--c5); }
+svg .k-dir { fill: color-mix(in srgb, var(--c6) 16%, var(--surface)); stroke: var(--c6); }
+svg .k-free { fill: var(--surface); stroke: var(--border); stroke-dasharray: 4 3; }
+svg g.dead { opacity: .38; }
+svg g.dead .kb { stroke-dasharray: 4 3; }
+svg .ptr { stroke: var(--muted); fill: none; stroke-width: 1.4; }
+svg .ptr-bad { stroke: var(--bad); fill: none; stroke-width: 1.6; }
+svg .ptr-ok { stroke: var(--ok); fill: none; stroke-width: 1.6; }
+.legend-k { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; color: var(--muted); margin: 6px 0 10px; }
+.legend-k span { display: inline-flex; align-items: center; gap: 5px; }
+.legend-k i { width: 14px; height: 14px; border-radius: 3px; border: 1.5px solid; display: inline-block; }
+/* 模拟器里的磁盘块 */
+.disk { display: flex; flex-direction: column; gap: 6px; min-width: 700px; }
+.segrow { display: flex; align-items: center; gap: 4px; }
+.seglab { width: 92px; flex: none; font-size: 12px; color: var(--muted); line-height: 1.3; }
+.seglab b { color: var(--fg); font-weight: 600; }
+.ubar { height: 5px; background: var(--surface-2); border-radius: 3px; margin-top: 3px; overflow: hidden; }
+.ubar i { display: block; height: 100%; background: var(--ok); }
+.blk { position: relative; width: 72px; height: 60px; flex: none; border: 1.5px solid var(--border); border-radius: 6px; padding: 2px 4px; font: 10.5px/1.3 var(--mono); background: var(--surface); overflow: hidden; transition: opacity .2s, box-shadow .2s; }
+.blk .ad { color: var(--muted); font-size: 10px; }
+.blk .ty { font-weight: 700; font-size: 12px; font-family: var(--font); }
+.blk .dt { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 10px; }
+.blk.k-d { border-color: var(--c1); background: color-mix(in srgb, var(--c1) 13%, var(--surface)); }
+.blk.k-i { border-color: var(--c2); background: color-mix(in srgb, var(--c2) 13%, var(--surface)); }
+.blk.k-m { border-color: var(--c3); background: color-mix(in srgb, var(--c3) 13%, var(--surface)); }
+.blk.k-cr { border-color: var(--c4); background: color-mix(in srgb, var(--c4) 13%, var(--surface)); width: 150px; }
+.blk.k-ss { border-color: var(--c5); background: color-mix(in srgb, var(--c5) 18%, var(--surface)); }
+.blk.k-dir { border-color: var(--c6); background: color-mix(in srgb, var(--c6) 13%, var(--surface)); }
+.blk.free { border-style: dashed; color: var(--faint); background: transparent; }
+.blk.dead { opacity: .36; border-style: dashed; }
+.blk.new { box-shadow: 0 0 0 2.5px var(--accent); }
+.blk.focus { box-shadow: 0 0 0 3px var(--warn); opacity: 1; }
+.blk.onpath { box-shadow: 0 0 0 3px var(--c4); opacity: 1; }
+.blk .badge { position: absolute; top: 1px; right: 2px; font: 700 10px var(--font); color: #fff; background: var(--c4); border-radius: 8px; padding: 0 5px; }
+.blk .badge.ok { background: var(--c3); }
+.blk .badge.bad { background: var(--c2); }
+.blk .badge.nw { background: var(--c1); }
+.crline { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
+.mini-table td, .mini-table th { padding: 4px 10px; font-size: 13.5px; }
+.mini-table td { font-family: var(--mono); }
+.evlist { display: flex; flex-wrap: wrap; gap: 4px; }
+.evlist button { font-size: 12.5px; padding: 4px 8px; }
+.evlist button.done { background: var(--ok-soft); border-color: var(--ok); }
+.evlist button.crash { background: var(--bad-soft); border-color: var(--bad); font-weight: 700; }
+.evlist button.future { color: var(--faint); }
+.twocol { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.formula { font-family: var(--mono); background: var(--code-bg); border-radius: 8px; padding: 10px 14px; margin: 12px 0; overflow-x: auto; white-space: nowrap; }
+.good { color: var(--ok); font-weight: 600; } .badt { color: var(--bad); font-weight: 600; }
+</style>
+</head>
+<body data-chapter="43">
+<main>
+
+<h2>这一章要解决什么</h2>
+<div class="crux">
+  <p><strong>如何让所有的写都变成顺序写？</strong>文件系统怎样才能把所有写操作都变成顺序写？对读来说这不可能——要读的块可能在磁盘任何地方；但对写来说，文件系统<strong>总是有选择权</strong>（想写到哪儿就写到哪儿），我们要利用的正是这个选择权。</p>
+  <p class="small muted">HOW TO MAKE ALL WRITES SEQUENTIAL WRITES? … For reads, this task is impossible … For writes, however, the file system always has a choice, and it is exactly this choice we hope to exploit.</p>
+</div>
+<p>上一章（崩溃一致性）我们学会了用日志（journal）保证更新的原子性；上上章（FFS）我们学会了"按局部性放置数据"。20 世纪 90 年代初，伯克利的 Ousterhout 和 Rosenblum 走得更远：<strong>干脆把整个磁盘当成一条日志</strong>，所有更新（数据<em>和</em>元数据）先在内存里攒成一大段，再一口气顺序写到磁盘的空闲位置，<strong>从不原地覆盖</strong>。这就是日志结构文件系统（Log-structured File System，LFS）。</p>
+<p>他们的出发点是四个观察：</p>
+<ul>
+  <li><strong>内存越来越大</strong>：读请求越来越多地被缓存吸收，磁盘流量以写为主，文件系统性能主要取决于<strong>写性能</strong>。</li>
+  <li><strong>随机 I/O 与顺序 I/O 的差距越来越大</strong>：传输带宽涨得快，寻道和旋转延迟降得慢。能顺序使用磁盘，就能获得巨大优势。</li>
+  <li><strong>已有文件系统在常见负载下表现差</strong>：FFS 创建一个一块大小的文件要写 6 次（见下图），都是短寻道 + 旋转等待，远达不到峰值带宽。</li>
+  <li><strong>文件系统不感知 RAID</strong>：RAID-4/5 有"小写问题"，一次逻辑小写要 4 次物理 I/O。</li>
+</ul>
+<figure class="fig">
+<svg viewBox="0 0 770 262" width="770" role="img" aria-label="FFS 创建单块文件需要 6 次分散的写，LFS 把它们合成一次顺序写">
+  <text x="10" y="18" font-size="14" font-weight="700">FFS：在一个块组内创建一个单块文件 = 6 次分散的小写</text>
+  <rect x="10" y="30" width="54" height="36" class="box"/><text x="37" y="53" text-anchor="middle" font-size="12">超级块</text>
+  <rect x="64" y="30" width="76" height="36" class="box"/><text x="102" y="53" text-anchor="middle" font-size="12">inode 位图</text>
+  <rect x="140" y="30" width="76" height="36" class="box"/><text x="178" y="53" text-anchor="middle" font-size="12">数据位图</text>
+  <rect x="216" y="30" width="210" height="36" class="box"/><text x="321" y="53" text-anchor="middle" font-size="12">inode 表</text>
+  <rect x="426" y="30" width="334" height="36" class="box"/><text x="593" y="53" text-anchor="middle" font-size="12">数据块</text>
+  <g font-size="11" font-weight="700">
+    <circle cx="262" cy="82" r="9" style="fill:var(--c2)"/><text x="262" y="86" text-anchor="middle" style="fill:#fff">1</text>
+    <circle cx="102" cy="82" r="9" style="fill:var(--c2)"/><text x="102" y="86" text-anchor="middle" style="fill:#fff">2</text>
+    <circle cx="500" cy="82" r="9" style="fill:var(--c6)"/><text x="500" y="86" text-anchor="middle" style="fill:#fff">3</text>
+    <circle cx="370" cy="82" r="9" style="fill:var(--c2)"/><text x="370" y="86" text-anchor="middle" style="fill:#fff">4</text>
+    <circle cx="690" cy="82" r="9" style="fill:var(--c1)"/><text x="690" y="86" text-anchor="middle" style="fill:#fff">5</text>
+    <circle cx="178" cy="82" r="9" style="fill:var(--c1)"/><text x="178" y="86" text-anchor="middle" style="fill:#fff">6</text>
+  </g>
+  <polyline points="262,96 102,106 500,116 370,126 690,136 178,146" class="ptr" stroke-dasharray="5 3"/>
+  <text x="10" y="170" font-size="12" class="t-muted">① 新 inode　② inode 位图　③ 目录数据块　④ 目录 inode　⑤ 新数据块　⑥ 数据位图：磁头来回跳，每次都付寻道 + 旋转的代价</text>
+  <text x="10" y="200" font-size="14" font-weight="700">LFS：同样的更新先在内存里攒成一个段，再一次顺序写到空闲区域</text>
+  <g font-size="12" text-anchor="middle">
+    <rect x="10" y="212" width="70" height="30" class="kb k-d"/><text x="45" y="232">D</text>
+    <rect x="80" y="212" width="70" height="30" class="kb k-i"/><text x="115" y="232">I[k]</text>
+    <rect x="150" y="212" width="70" height="30" class="kb k-dir"/><text x="185" y="232">目录块</text>
+    <rect x="220" y="212" width="70" height="30" class="kb k-i"/><text x="255" y="232">I[dir]</text>
+    <rect x="290" y="212" width="70" height="30" class="kb k-m"/><text x="325" y="232">imap</text>
+    <rect x="360" y="212" width="400" height="30" class="k-free"/><text x="560" y="232" class="t-muted">……同一段里其他文件的更新……</text>
+  </g>
+  <line x1="12" y1="252" x2="752" y2="252" class="ptr" marker-end="url(#ah0)"/>
+  <defs><marker id="ah0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+</svg>
+<figcaption>图 43-A　FFS 虽然把相关块放在同一个块组，仍要 6 次小写；LFS 把它们（连同别的更新）合成一次大的顺序写。没有位图——LFS 不需要"就地找空闲块"。</figcaption>
+</figure>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>只追加的日志</h4><p>所有更新（数据块、inode、目录、imap）都写到日志末尾的空闲位置，从不原地覆盖旧版本。</p></div>
+  <div class="card"><h4>段（segment）与写缓冲</h4><p>先在内存里攒满一个几 MB 的段，再一次写下去，把定位开销摊薄到可以忽略。</p></div>
+  <div class="card"><h4>inode 映射（imap）</h4><p>inode 号 → inode 最新磁盘地址的间接层。inode 每次都搬家，靠 imap 找到它。</p></div>
+  <div class="card"><h4>检查点区域（CR）</h4><p>磁盘上唯一固定位置的结构，记录各 imap 片段的地址；每隔约 30 秒才更新一次。</p></div>
+  <div class="card"><h4>递归更新问题</h4><p>inode 搬家若要改目录、目录又搬家……会一路改到根。imap 让目录只存 inode 号，问题消失。</p></div>
+  <div class="card"><h4>段摘要块（SS）</h4><p>每段开头记录每个块属于"哪个 inode 的第几块"，清理器据此判断块是否还活着。</p></div>
+  <div class="card"><h4>清理（cleaning）</h4><p>读入 M 个半空的段，只把活块压缩写成 N 个新段（N &lt; M），腾出整段空闲空间。</p></div>
+  <div class="card"><h4>两个 CR + 前滚（roll forward）</h4><p>CR 交替写、头尾带时间戳保证原子性；重启后从检查点沿日志往后扫，找回之后写入的段。</p></div>
+</div>
+
+<h2>顺序写：把一切都追加到日志末尾</h2>
+<p>先看最简单的情况：往文件里写一个数据块 D。LFS 把 D 写在磁盘地址 A0；但光写数据不够，文件的 inode 也要更新、要指向 D。于是 LFS 把 <strong>inode 紧挨着 D 写下去</strong>（图中 inode 画得和数据块一样大，实际上 inode 通常只有约 128 字节，数据块是 4KB）：</p>
+<figure class="fig"><div class="logfig" data-fig="di"></div>
+<figcaption>图 43-B　数据块 D 写在 A0，紧接着写它的 inode，inode 的 b[0] 指向 A0。这就是 LFS 的核心想法：所有更新顺序写到磁盘上。</figcaption></figure>
+
+<h3>光"顺序"还不够：还得"一次写很多"</h3>
+<p>假设在时刻 T 往地址 A 写了一块，过了一会儿（T+δ）再写 A+1。地址是连续的，可在这 δ 里盘片已经转过去了：第二次写要等<strong>将近一整圈</strong>（T<sub>rotation</sub> − δ）才能落到盘面上。所以要达到峰值性能，必须<strong>一次发出大量连续的写</strong>（或一次大写）。</p>
+<figure class="fig">
+<svg viewBox="0 0 720 150" width="720" role="img" aria-label="两次间隔的顺序小写要等待将近一圈旋转">
+  <line x1="20" y1="40" x2="700" y2="40" class="stroke" stroke-width="1"/>
+  <text x="20" y="22" font-size="12" class="t-muted">小写、间隔着写（地址连续也没用）</text>
+  <rect x="30" y="30" width="40" height="20" class="kb k-d"/><text x="50" y="45" font-size="11" text-anchor="middle">A</text>
+  <text x="30" y="66" font-size="11" class="t-muted mono">T</text>
+  <line x1="70" y1="58" x2="130" y2="58" class="ptr"/><text x="100" y="74" font-size="11" text-anchor="middle">δ</text>
+  <text x="130" y="66" font-size="11" class="t-muted mono">T+δ 发出写 A+1</text>
+  <rect x="130" y="30" width="520" height="20" class="warn-soft"/><text x="390" y="45" font-size="12" text-anchor="middle">A+1 刚刚转过磁头，等待 T_rotation − δ</text>
+  <rect x="650" y="30" width="40" height="20" class="kb k-d"/><text x="670" y="45" font-size="11" text-anchor="middle">A+1</text>
+  <line x1="20" y1="118" x2="700" y2="118" class="stroke" stroke-width="1"/>
+  <text x="20" y="100" font-size="12" class="t-muted">写缓冲：攒够了一次写出（一次定位，然后全速传输）</text>
+  <rect x="30" y="108" width="70" height="20" class="warn-soft"/><text x="65" y="122" font-size="11" text-anchor="middle">定位</text>
+  <g font-size="10.5" text-anchor="middle">
+  <rect x="100" y="108" width="40" height="20" class="kb k-d"/><text x="120" y="122">A</text>
+  <rect x="140" y="108" width="40" height="20" class="kb k-d"/><text x="160" y="122">A+1</text>
+  <rect x="180" y="108" width="40" height="20" class="kb k-d"/><text x="200" y="122">A+2</text>
+  <rect x="220" y="108" width="40" height="20" class="kb k-i"/><text x="240" y="122">I</text>
+  <rect x="260" y="108" width="40" height="20" class="kb k-m"/><text x="280" y="122">imap</text>
+  <rect x="300" y="108" width="140" height="20" class="kb k-d"/><text x="370" y="122">……</text>
+  </g>
+  <text x="450" y="123" font-size="12" class="good">✓ 整段一次完成</text>
+</svg>
+<figcaption>图 43-C　"顺序"是必要条件而不是充分条件：必须把许多更新合成一次大的连续写。</figcaption></figure>
+<p>为此 LFS 使用一个古老的技术：<strong>写缓冲（write buffering）</strong>。更新先记在内存里，攒够了再一次写出。LFS 一次写出的这一大块叫做<strong>段（segment）</strong>（真实系统中是几 MB）。下例把两组更新攒进一个（很小的）段：对文件 j 的 4 个块写，以及给文件 k 追加 1 个块，然后把这 7 个块一次提交：</p>
+<figure class="fig"><div class="logfig" data-fig="seg"></div>
+<figcaption>图 43-D　一个段里的 7 个块：文件 j 的 4 个数据块 + inode j，文件 k 的 1 个数据块 + inode k，一次顺序写入。</figcaption></figure>
+
+<h2>该缓冲多少？</h2>
+<p>答案取决于磁盘：定位开销（寻道 + 旋转）相对传输速率有多大。设每次写之前的定位时间是 T<sub>position</sub>，峰值传输率是 R<sub>peak</sub>，一次写出 D MB：</p>
+<div class="formula">T<sub>write</sub> = T<sub>position</sub> + D / R<sub>peak</sub>　　　(43.1)<br>
+R<sub>effective</sub> = D / T<sub>write</sub> = D / (T<sub>position</sub> + D / R<sub>peak</sub>)　　　(43.2)</div>
+<p>我们希望有效带宽达到峰值的某个比例 F（0 &lt; F &lt; 1，比如 0.9），即 R<sub>effective</sub> = F × R<sub>peak</sub>，解出 D：</p>
+<div class="formula">D = F × R<sub>peak</sub> × (T<sub>position</sub> + D / R<sub>peak</sub>)　⇒　<strong>D = F / (1 − F) × R<sub>peak</sub> × T<sub>position</sub></strong>　　　(43.6)</div>
+<p>原书的例子：T<sub>position</sub> = 10 ms，R<sub>peak</sub> = 100 MB/s，F = 0.9，则 D = 0.9/0.1 × 100 MB/s × 0.01 s = <strong>9 MB</strong>。注意 F/(1−F) 这一项：F 越接近 1，它涨得越猛——这就是"最后那几个百分点最贵"。</p>
+
+<section class="sim" id="sim-buf">
+  <div class="sim-head"><span class="tag">计算器</span><h3>写多少才能接近峰值带宽</h3>
+    <div class="desc">改定位时间、峰值带宽和目标比例 F，看需要的缓冲量 D 以及有效带宽曲线。原书还问：95% 和 99% 需要多少？</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>T<sub>position</sub> (ms) <input type="number" id="buf-t" value="10" min="0.01" step="0.1"></label>
+      <label>R<sub>peak</sub> (MB/s) <input type="number" id="buf-r" value="100" min="1" step="10"></label>
+      <label>F <input type="range" id="buf-f" min="0.5" max="0.995" step="0.005" value="0.9"> <b id="buf-fv" class="mono">0.900</b></label>
+      <span class="sep"></span>
+      <button data-p="10,100,0.9">原书例子</button>
+      <button data-p="8,200,0.9">较新的机械盘</button>
+      <button data-p="1,500,0.9">本机实验（约 1ms / 500MB/s）</button>
+    </div>
+    <div class="stage"><div id="buf-plot"></div></div>
+    <div class="narrate" id="buf-nar"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="buf-d">9 MB</div><div class="l">需要的缓冲 D</div></div>
+      <div class="stat"><div class="v" id="buf-e">90 MB/s</div><div class="l">有效带宽 R<sub>eff</sub></div></div>
+      <div class="stat"><div class="v" id="buf-x">9×</div><div class="l">F/(1−F) 放大系数</div></div>
+    </div>
+    <div class="table-wrap"><table class="mini-table" id="buf-tab"></table></div>
+  </div>
+</section>
+
+<h2>找到 inode：inode 映射（imap）</h2>
+<p>在传统 UNIX 文件系统里找 inode 很容易：inode 放在磁盘固定位置的数组里，<code>地址 = inode 表起始地址 + inode 号 × inode 大小</code>。FFS 稍复杂一点——inode 表被切成块分到各个柱面组——但仍然是简单的算术。</p>
+<p>LFS 就麻烦了：inode 被<strong>撒满了整个磁盘</strong>，而且因为从不原地覆盖，<strong>最新版本的 inode 一直在搬家</strong>。算术失效了。</p>
+<p>解决办法是加一层间接：<strong>inode 映射（inode map，imap）</strong>，输入 inode 号，输出该 inode <em>最新版本</em>的磁盘地址。可以把它想成一个简单数组，每项 4 字节（一个磁盘指针）。每当 inode 被写到磁盘，imap 就更新为新位置。</p>
+<div class="aside" data-title="技巧：使用一层间接">
+<p>"计算机科学中的所有问题都可以通过增加一层间接来解决"——当然有点夸张，但确实能解决<em>大多数</em>问题。虚拟内存、文件本身都是间接；imap 则是 inode 号的虚拟化，让 inode 可以随便搬家而不必改所有引用它的地方。代价是额外开销，Wheeler 补了一句："……除了间接层太多这个问题。"</p>
+</div>
+<p>imap 必须持久化（否则崩溃后找不到 inode）。放在磁盘固定位置？那每次更新文件后都要跑去固定位置写 imap，又回到了寻道地狱。LFS 的做法是：<strong>把 imap 切成片段（chunk），和其他新数据一起写进日志</strong>。于是给文件 k 追加一个数据块时，实际写下的是：</p>
+<figure class="fig"><div class="logfig" data-fig="imap"></div>
+<figcaption>图 43-E　数据块、它的 inode、以及一片 imap 一起写出：imap 片段说"inode k 在 A1"，inode 说"数据块在 A0"。</figcaption></figure>
+
+<h3>最后一块拼图：检查点区域（CR）</h3>
+<p>imap 片段也撒在磁盘上了，那怎么找 imap？没有魔法：文件系统必须在磁盘上有一个<strong>固定且已知</strong>的起点。LFS 的这个起点叫<strong>检查点区域（checkpoint region，CR）</strong>，它保存所有最新 imap 片段的地址。CR 只是<strong>定期</strong>更新（比如每 30 秒），所以不影响性能。</p>
+<figure class="fig"><div class="logfig" data-fig="cr"></div>
+<figcaption>图 43-F　完整的指针链：CR（地址 0，固定）→ imap 片段 → inode → 数据块。真实系统有两个 CR、许多 imap 片段。</figcaption></figure>
+
+<h3>回顾：从磁盘读一个文件</h3>
+<ol>
+  <li>挂载时先读 CR，得到所有 imap 片段的地址，把<strong>整个 imap 读进内存缓存</strong>。</li>
+  <li>给定 inode 号，在内存 imap 里查到 inode 的最新地址，读 inode。</li>
+  <li>之后与普通 UNIX 文件系统完全一样：用直接/间接/双重间接指针找数据块。</li>
+</ol>
+<p>常见情况下，LFS 读文件的 I/O 次数与传统文件系统<strong>相同</strong>——imap 整个缓存在内存里，额外的工作只是一次内存查表。</p>
+
+<h2>目录与递归更新问题</h2>
+<p>目录在 LFS 里和经典 UNIX 一样：就是一组 (名字, inode 号) 映射。在目录 dir 中创建文件 foo 并写入数据，会在日志里（攒成段后）顺序写下：</p>
+<figure class="fig"><div class="logfig" data-fig="dir"></div>
+<figcaption>图 43-G　创建 foo：文件数据 Dk、inode k、目录数据（含 (foo, k)）、目录 inode、一片 imap（同时记录 k 和 dir 的新位置）。</figcaption></figure>
+<p>访问 foo（inode 号 k）的过程：查 imap（在内存）得到目录 dir 的 inode 在 A3 → 读目录 inode 得到目录数据在 A2 → 读目录数据得到 (foo, k) → 再查 imap 得到 inode k 在 A1 → 读数据块 A0。</p>
+<p>imap 还顺手解决了一个严重问题：<strong>递归更新问题（recursive update problem）</strong>。任何"从不原地更新"的文件系统都会遇到它：inode 一更新就换了位置；如果目录里存的是 inode 的<em>地址</em>，目录就得跟着改（于是目录也搬家），目录的父目录又得改……一直改到根。</p>
+<figure class="fig">
+<svg viewBox="0 0 760 270" width="760" role="img" aria-label="递归更新问题：没有 imap 时一路改到根；有 imap 时只改 imap">
+  <defs><marker id="ah1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--bad)"/></marker>
+  <marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ok)"/></marker></defs>
+  <text x="10" y="20" font-size="14" font-weight="700">假如目录里存的是 inode 地址</text>
+  <g font-size="12">
+    <rect x="10" y="34" width="340" height="30" rx="5" class="kb k-i"/><text x="20" y="54">① 改 /home/remzi/foo → foo 的 inode 写到新地址</text>
+    <rect x="10" y="80" width="340" height="30" rx="5" class="kb k-dir"/><text x="20" y="100">② remzi 目录要记新地址 → 目录块搬家</text>
+    <rect x="10" y="126" width="340" height="30" rx="5" class="kb k-i"/><text x="20" y="146">③ remzi 的 inode 要改 → 它也搬家</text>
+    <rect x="10" y="172" width="340" height="30" rx="5" class="kb k-dir"/><text x="20" y="192">④ home 目录块、home 的 inode ……</text>
+    <rect x="10" y="218" width="340" height="30" rx="5" class="kb k-i"/><text x="20" y="238">⑤ …… 一直改到根目录</text>
+  </g>
+  <g class="ptr-bad"><line x1="180" y1="64" x2="180" y2="78" marker-end="url(#ah1)"/><line x1="180" y1="110" x2="180" y2="124" marker-end="url(#ah1)"/><line x1="180" y1="156" x2="180" y2="170" marker-end="url(#ah1)"/><line x1="180" y1="202" x2="180" y2="216" marker-end="url(#ah1)"/></g>
+  <text x="400" y="20" font-size="14" font-weight="700">LFS：目录里存 inode 号，位置交给 imap</text>
+  <g font-size="12">
+    <rect x="400" y="34" width="350" height="30" rx="5" class="kb k-i"/><text x="410" y="54">① foo 的 inode（号 k）写到新地址 A9</text>
+    <rect x="400" y="80" width="350" height="30" rx="5" class="kb k-m"/><text x="410" y="100">② 只改 imap[k] = A9（imap 片段随段写出）</text>
+    <rect x="400" y="140" width="350" height="54" rx="5" class="kb k-dir" style="opacity:.8"/><text x="410" y="160">remzi 目录块：(foo, k) —— 一个字节都不用改</text><text x="410" y="182" class="t-muted">home、根目录同样不受影响</text>
+  </g>
+  <line x1="575" y1="64" x2="575" y2="78" class="ptr-ok" marker-end="url(#ah2)"/>
+  <text x="410" y="222" font-size="13" class="good">✓ 递归在第一层就被截断</text>
+</svg>
+<figcaption>图 43-H　递归更新问题。通过间接层，inode 的位置变化只反映在 imap 里，目录保持同样的名字→inode 号映射。</figcaption></figure>
+
+<h2>模拟器：LFS 的日志（仿 lfs.py）</h2>
+<p>下面这个模拟器按 <code>lfs.py</code> 的思路实现了一个迷你 LFS：地址 0 是 CR，其余地址按段排列（每行一段，8 块）。命令格式与 <code>lfs.py -L</code> 相同：<code>c,/foo</code> 创建文件，<code>d,/dir</code> 创建目录，<code>w,/foo,起始块,块数</code> 写文件，<code>r,/foo</code> 删除，<code>l,/foo,/bar</code> 建硬链接；用冒号分隔。每条命令执行完都会更新 CR（和 lfs.py 默认行为一样）。</p>
+<div class="legend-k">
+  <span><i style="border-color:var(--c1);background:color-mix(in srgb,var(--c1) 16%,var(--surface))"></i>数据块 D</span>
+  <span><i style="border-color:var(--c6);background:color-mix(in srgb,var(--c6) 16%,var(--surface))"></i>目录数据块</span>
+  <span><i style="border-color:var(--c2);background:color-mix(in srgb,var(--c2) 16%,var(--surface))"></i>inode I</span>
+  <span><i style="border-color:var(--c3);background:color-mix(in srgb,var(--c3) 16%,var(--surface))"></i>imap 片段</span>
+  <span><i style="border-color:var(--c4);background:color-mix(in srgb,var(--c4) 16%,var(--surface))"></i>检查点区域 CR</span>
+  <span><i style="border-color:var(--c5);background:color-mix(in srgb,var(--c5) 20%,var(--surface))"></i>段摘要 SS</span>
+  <span><i style="border-color:var(--border);border-style:dashed"></i>虚线半透明 = 垃圾（不可达）</span>
+</div>
+<section class="sim" id="sim-log">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>写入被顺序追加到日志末尾</h3>
+    <div class="desc">单步执行命令，蓝框是这一步新写的块。观察：每条命令写了哪些块、以什么顺序；哪些旧块变成了垃圾；读一个路径要经过哪些块。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>预设 <select id="log-preset"></select></label>
+      <label>inode 号分配 <select id="log-alloc"><option value="seq">顺序（最小空闲号）</option><option value="random">随机</option></select></label>
+      <label><input type="checkbox" id="log-live" checked> 显示存活性（-c）</label>
+    </div>
+    <div class="controls">
+      <input type="text" id="log-cmds" style="flex:1;min-width:220px" value="c,/foo:w,/foo,0,1">
+      <button class="primary" id="log-run">载入命令</button>
+    </div>
+    <div id="log-step"></div>
+    <div class="stage" id="log-stage"></div>
+    <div class="narrate" id="log-nar"></div>
+    <div class="controls" style="margin-top:12px">
+      <label>读路径 <select id="log-path"></select></label>
+      <button id="log-read">演示读取路径</button>
+      <button id="log-clear">清除高亮</button>
+    </div>
+    <div class="readout" id="log-out"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="log-s1">0</div><div class="l">日志中已写的块（不含 CR）</div></div>
+      <div class="stat"><div class="v" id="log-s2">0</div><div class="l">其中存活块</div></div>
+      <div class="stat"><div class="v" id="log-s3">0</div><div class="l">其中垃圾块</div></div>
+      <div class="stat"><div class="v" id="log-s4">0</div><div class="l">本步写入块数</div></div>
+    </div>
+  </div>
+</section>
+
+<h2>新问题：垃圾回收</h2>
+<p>LFS 总是把文件的最新版本（数据 + inode）写到新位置，于是磁盘上到处散落着<strong>旧版本</strong>，我们（很不客气地）称之为<strong>垃圾（garbage）</strong>。例如文件 k 只有一个数据块 D0，我们<strong>覆盖</strong>它：</p>
+<figure class="fig"><div class="logfig" data-fig="gc1"></div>
+<figcaption>图 43-I　覆盖写：新的 D0 和新的 inode 写在 A4 附近，左边的旧 D0 和旧 inode 都成了垃圾。</figcaption></figure>
+<p>如果是给文件 k <strong>追加</strong>一个块，旧 inode 变成垃圾，但旧数据块 D0 仍被新 inode 指着，<strong>依然存活</strong>：</p>
+<figure class="fig"><div class="logfig" data-fig="gc2"></div>
+<figcaption>图 43-J　追加写：只有旧 inode 是垃圾，D0 仍是文件的一部分。</figcaption></figure>
+<p>旧版本可以保留下来，让用户恢复误删、误改的文件——这叫<strong>版本化文件系统（versioning file system）</strong>。LFS 则只保留最新的存活版本，于是必须在后台定期<strong>清理（cleaning）</strong>这些旧版本，让空间可以重新写入——这是一种垃圾回收（garbage collection）。</p>
+<p>关键在于<strong>按段清理</strong>。如果清理器只是零星地释放单个块，磁盘上会满是小空洞，LFS 再也找不到大片连续空间来顺序写，性能就崩了。所以清理器周期性地：读入 M 个旧的（部分使用的）段，找出其中的活块，把它们压缩写成 N 个新段（N &lt; M），然后释放那 M 个旧段。</p>
+<figure class="fig">
+<svg viewBox="0 0 760 190" width="760" role="img" aria-label="清理：把 3 个半空的段压缩成 1 个满段">
+  <defs><marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="10" y="18" font-size="13" font-weight="700">读入 M = 3 个旧段</text>
+  <g id="cleanfig-old"></g>
+  <line x1="330" y1="95" x2="420" y2="95" class="ptr" marker-end="url(#ah3)"/>
+  <text x="375" y="84" font-size="12" text-anchor="middle">判断存活</text><text x="375" y="114" font-size="12" text-anchor="middle">只搬活块</text>
+  <text x="430" y="18" font-size="13" font-weight="700">写出 N = 1 个新段</text>
+  <g id="cleanfig-new"></g>
+  <text x="430" y="140" font-size="12" class="good">旧的 3 个段整段变成空闲，可再次顺序写</text>
+  <text x="430" y="160" font-size="12" class="t-muted">（真实系统里搬家后还要重写相关 inode 和 imap）</text>
+</svg>
+<figcaption>图 43-K　清理以段为单位：M 个旧段 → N 个新段（N &lt; M），腾出大片连续空闲空间。</figcaption></figure>
+<p>这留下两个问题：<strong>机制</strong>——怎么知道段里哪个块是活的？<strong>策略</strong>——多久清理一次、清理哪些段？</p>
+
+<h3>机制：用段摘要块判断存活</h3>
+<p>LFS 在每个段的开头放一个<strong>段摘要块（segment summary block，SS）</strong>，为段中每个数据块记录它的 <strong>inode 号 N</strong>（属于哪个文件）和<strong>偏移 T</strong>（是文件的第几块）。判断地址 A 上的块 D 是否存活：</p>
+<pre><code>(N, T) = SegmentSummary[A];   // 1. 从段摘要查出：A 是 inode N 的第 T 块
+inode  = Read(imap[N]);       // 2. 用 imap 找到 inode N 的最新版本
+if (inode[T] == A)            // 3. 最新 inode 认为第 T 块在哪？
+    // block D is alive       //    正好是 A → 活
+else
+    // block D is garbage     //    指向别处（或文件已删）→ 死</code></pre>
+<p>第 3 行是关键：<strong>"活"的定义就是"最新的元数据还指向我"</strong>。一个块被覆盖后，新 inode 指向新位置，旧块自然判定为死。</p>
+<figure class="fig"><div class="logfig" data-fig="ss"></div>
+<figcaption>图 43-L　SS 记录"A0: (k, 0)"。查 imap 得到 inode k 在 A1，inode k 的 b[0] 正是 A0 → 该块存活。</figcaption></figure>
+<p>LFS 还有捷径：文件被截断或删除时，LFS 增加它的<strong>版本号（version number）</strong>并记在 imap 里；段中也记录版本号。清理时先比较版本号，不一致就直接判死，省掉读 inode 的 I/O。</p>
+
+<h2>模拟器：段清理器</h2>
+<p>这里的磁盘每段 8 个槽位，第 0 槽是段摘要 SS，其余 7 个放块。先用预设负载把日志写出一堆垃圾，再勾选要清理的段（第二个负载里，试着比较清理"全是热文件旧版本的段"和"冷文件所在的段"各要搬多少块），单步看清理器逐块查 SS、查 imap、查 inode，决定搬还是丢；最后看它写出新段、重写 inode 与 imap、释放旧段。</p>
+<section class="sim" id="sim-clean">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>用段摘要判断存活，压缩 M 个段</h3>
+    <div class="desc">段左侧显示"活块/已用块"和利用率条。注意：搬走数据块后，指向它的 inode 必须重写，于是<em>其他段</em>里的旧 inode 也会变成垃圾。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>负载 <select id="cl-preset"></select></label>
+    </div>
+    <div class="controls">
+      <input type="text" id="cl-cmds" style="flex:1;min-width:220px">
+      <button id="cl-load">载入负载</button>
+    </div>
+    <div class="controls" id="cl-segs"></div>
+    <div id="cl-step"></div>
+    <div class="stage" id="cl-stage"></div>
+    <div class="narrate" id="cl-nar"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="cl-s1">0</div><div class="l">读入段数 M</div></div>
+      <div class="stat"><div class="v" id="cl-s2">0</div><div class="l">检查的块 / 其中存活</div></div>
+      <div class="stat"><div class="v" id="cl-s3">0</div><div class="l">清理器写出的块</div></div>
+      <div class="stat"><div class="v" id="cl-s4">0</div><div class="l">空闲段：清理前 → 后</div></div>
+    </div>
+  </div>
+</section>
+
+<h2>策略：何时清理、清理哪些段</h2>
+<p><strong>何时</strong>比较简单：周期性地、空闲时、或者磁盘满了不得不清理时。<strong>清理哪些段</strong>更难，是许多论文的主题。原始 LFS 论文尝试区分<strong>热段（hot segment）</strong>和<strong>冷段（cold segment）</strong>：</p>
+<figure class="fig">
+<svg viewBox="0 0 740 170" width="740" role="img" aria-label="热段的活块随时间快速减少，冷段基本不变">
+  <text x="10" y="18" font-size="13" font-weight="700">热段：内容频繁被覆盖</text>
+  <text x="380" y="18" font-size="13" font-weight="700">冷段：内容基本稳定</text>
+  <g id="hotcold"></g>
+  <text x="10" y="160" font-size="12" class="t-muted">→ 热段先等等：死块会越来越多，将来清理时要搬的活块更少</text>
+  <text x="380" y="160" font-size="12" class="t-muted">→ 冷段早点清：它的空闲空间不会自己变多</text>
+</svg>
+<figcaption>图 43-M　原论文的启发式：先清理冷段，晚清理热段。这个策略并不完美，后来的工作（如 Matthews 等人的自适应方法）做得更好。</figcaption></figure>
+
+<h2>崩溃恢复</h2>
+<p>LFS 正常运行时把写攒在内存段里，段满（或过了一段时间）就写到磁盘。这些写组织成一条<strong>日志</strong>：CR 指向日志的头段和尾段，每个段指向下一个要写的段。LFS 还会定期更新 CR。崩溃可能发生在这两类写中的任何一个时刻。</p>
+<h3>写 CR 时崩溃：两个 CR + 头尾时间戳</h3>
+<p>为了让 CR 更新是原子的，LFS <strong>维护两个 CR</strong>，分别在磁盘两端，<strong>交替写</strong>。写 CR 时的协议：先写一个带时间戳的<strong>头部</strong>，再写 CR <strong>主体</strong>，最后写一个同样带时间戳的<strong>尾块</strong>。如果在更新 CR 期间崩溃，头尾时间戳就会不一致；LFS 总是选择<strong>时间戳一致且最新</strong>的那个 CR。</p>
+<h3>写段时崩溃：前滚（roll forward）</h3>
+<p>CR 大约 30 秒才写一次，所以最后一个一致的快照可能已经很旧了。只读 CR 恢复的话，最后那几十秒的更新会丢失。LFS 借用数据库里<strong>前滚（roll forward）</strong>的技术：从最后一个 CR 出发，找到其中记录的日志末尾，继续往后读后续的段，看里面有没有<strong>有效的</strong>更新；有就应用到文件系统上，从而找回检查点之后写入的大部分数据和元数据（细节见 Rosenblum 的博士论文）。</p>
+<figure class="fig">
+<svg viewBox="0 0 760 200" width="760" role="img" aria-label="两个 CR 交替写，从有效 CR 记录的日志尾往后前滚">
+  <defs><marker id="ah4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <g font-size="11" text-anchor="middle">
+    <rect x="10" y="40" width="30" height="40" class="bad-soft"/><text x="25" y="64">头3</text>
+    <rect x="40" y="40" width="40" height="40" class="kb k-cr"/><text x="60" y="58">CR-A</text><text x="60" y="72">主体</text>
+    <rect x="80" y="40" width="30" height="40" class="bad-soft"/><text x="95" y="64">尾1</text>
+    <text x="60" y="30" font-weight="700" class="badt">✗ 头尾不一致</text>
+    <rect x="130" y="40" width="80" height="40" class="kb k-d"/><text x="170" y="64">段 S1…S3</text>
+    <rect x="210" y="40" width="80" height="40" class="kb k-d"/><text x="250" y="64">S4</text>
+    <rect x="290" y="40" width="80" height="40" class="kb k-d"/><text x="330" y="64">S5</text>
+    <rect x="370" y="40" width="80" height="40" class="bad-soft" stroke-dasharray="4 3"/><text x="410" y="58">S6</text><text x="410" y="72">写了一半</text>
+    <rect x="450" y="40" width="160" height="40" class="k-free"/><text x="530" y="64" class="t-muted">空闲</text>
+    <rect x="630" y="40" width="30" height="40" class="ok-soft"/><text x="645" y="64">头2</text>
+    <rect x="660" y="40" width="40" height="40" class="kb k-cr"/><text x="680" y="58">CR-B</text><text x="680" y="72">主体</text>
+    <rect x="700" y="40" width="30" height="40" class="ok-soft"/><text x="715" y="64">尾2</text>
+    <text x="680" y="30" font-weight="700" class="good">✓ 一致且最新</text>
+  </g>
+  <path d="M680,82 C680,150 200,150 200,84" class="ptr" marker-end="url(#ah4)"/>
+  <text x="440" y="140" font-size="12" text-anchor="middle">CR-B 记录：检查点时日志尾在 S3 → 从 S4 开始前滚</text>
+  <g font-size="12">
+    <text x="210" y="176" class="good">S4 ✓ 应用</text><text x="300" y="176" class="good">S5 ✓ 应用</text><text x="380" y="176" class="badt">S6 校验失败 → 停止</text>
+  </g>
+  <text x="10" y="196" font-size="12" class="t-muted">CR-A 正在被写成 ts=3 时断电（头=3、尾=1），于是用 CR-B（ts=2），再前滚找回 S4、S5。</text>
+</svg>
+<figcaption>图 43-N　两个 CR 交替写 + 头尾时间戳，保证总有一个完整的 CR；前滚则把检查点之后写入的完整段重新应用。</figcaption></figure>
+
+<section class="sim" id="sim-crash">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>在任意时刻拔电源，然后恢复</h3>
+    <div class="desc">上排是 LFS 按时间顺序做的写操作（写段、分三步写 CR）。点任意一个按钮表示"做完这一步后崩溃"，然后单步观看恢复过程；切换是否前滚，比较丢了哪些更新。</div></div>
+  <div class="sim-body">
+    <div class="controls"><span class="muted small">崩溃点：</span></div>
+    <div class="evlist" id="cr-ev"></div>
+    <div class="controls" style="margin-top:12px">
+      <label><input type="checkbox" id="cr-roll" checked> 恢复时做前滚（roll forward）</label>
+      <button data-k="14">预设：写 CR-A 主体后崩溃</button>
+      <button data-k="11">预设：写段 S5 到一半崩溃</button>
+      <button data-k="8">预设：写 CR-B 主体后崩溃</button>
+    </div>
+    <div id="cr-step"></div>
+    <div class="stage" id="cr-stage"></div>
+    <div class="narrate" id="cr-nar"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="cr-s1">-</div><div class="l">选用的 CR</div></div>
+      <div class="stat"><div class="v" id="cr-s2">-</div><div class="l">前滚应用的段</div></div>
+      <div class="stat"><div class="v" id="cr-s3">-</div><div class="l">丢失的已完成更新</div></div>
+    </div>
+  </div>
+</section>
+
+<h2>总结：LFS 的遗产</h2>
+<p>LFS 引入了一种新的更新磁盘的方法：不原地覆盖文件，而是总写到磁盘的未使用部分，之后再通过清理回收旧空间。这种方法在数据库里叫<strong>影子分页（shadow paging）</strong>，在文件系统里常叫<strong>写时复制（copy-on-write，COW）</strong>。</p>
+<ul>
+  <li>大块写对很多设备都好：机械盘上把定位时间降到最低；RAID-4/5 上完全避开小写问题；研究表明闪存 SSD 也需要大 I/O 才能跑出高性能（下一章 SSD 的 FTL 正是日志结构的）。</li>
+  <li>缺点是产生垃圾，清理的开销曾是 LFS 最大的争议（Seltzer 等人的对比研究），也许限制了它最初的影响力。</li>
+  <li>但它的思想活在 NetApp WAFL、Sun ZFS、Linux btrfs 以及闪存 SSD 里。WAFL 甚至<strong>把缺陷变成了特性</strong>：保留旧版本作为<strong>快照（snapshot）</strong>，用户误删文件时可以找回，同时也不必那么频繁地清理。</li>
+</ul>
+<div class="aside" data-title="技巧：细节决定成败 / 化缺陷为特性">
+<p>LFS 的大思路一句话就能说完，但真要做出能用的系统，必须想清楚所有棘手情况：imap 放哪、CR 如何原子更新、如何判断存活、何时清理。另一方面，当系统有根本缺陷时，想想能不能把它反过来变成有用的功能——WAFL 的快照就是范例。</p>
+</div>
+
+<h2>先预测，再验证</h2>
+<div class="exercise"><div class="q">（作业 Q5/Q6）在日志模拟器里分别载入"逐块写 4 次"和"一次写 4 块"两个预设。先预测：两者最终的<strong>存活块</strong>是否一样多？日志中各写了多少块？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>存活块一样多：都是 8 个（根目录块、根 inode、foo 的 inode、4 个数据块、1 个 imap 片段），加上 CR。但逐块写 4 次日志里写了 19 块（11 块是垃圾），一次写 4 块只写了 13 块（5 块垃圾）。每次单块写都会多写一个 inode 和一个 imap 片段，前一次的就作废了。这正说明<strong>在内存里缓冲更新</strong>有多重要：真实 LFS 会把这 4 次写合并成一次。</p>
+</div></details></div>
+<div class="exercise"><div class="q">（作业 Q7）对比 <code>c,/foo:w,/foo,0,1</code> 与 <code>c,/foo:w,/foo,7,1</code>。第二种情况下 inode 的 size 字段是多少？ptrs 长什么样？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>两者都只写 1 个数据块、1 个 inode、1 个 imap 片段。但 <code>w,/foo,7,1</code> 之后 inode 的 <code>size = 8</code>，<code>ptrs[0..6]</code> 全空，只有 <code>ptrs[7]</code> 指向数据块——size 表示"逻辑长度（块数）"，是最大偏移 + 1，而不是真正分配的块数。中间是一个"空洞"（hole），不占磁盘空间。</p>
+</div></details></div>
+<div class="exercise"><div class="q">（作业 Q8/Q9）预设"文件 vs 目录"和"硬链接"：<code>c</code> 和 <code>d</code> 分别写几个块？<code>l</code>（硬链接）写了哪些块？会分配新 inode 号吗？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p><code>c,/foo</code> 写 4 块：新 inode、父目录的新数据块、父目录的新 inode、imap 片段。<code>d,/bar</code> 写 5 块：多一个新目录自己的数据块（含 <code>.</code> 和 <code>..</code>），且父目录 inode 的 refs 加 1（子目录的 <code>..</code> 指向它）。硬链接写 4 块：父目录数据块、父目录 inode、<strong>被链接文件的 inode（refs + 1）</strong>、imap 片段；不分配新 inode 号——目录里多了一个指向同一 inode 号的名字而已。</p>
+</div></details></div>
+<div class="exercise"><div class="q">（作业 Q10）把"inode 号分配"改成"随机"，载入"作业 Q10"预设（连续创建多个文件）。imap 片段的写入有什么变化？这说明选择 inode 号为什么重要？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>本模拟器每个 imap 片段覆盖 16 个 inode 号。顺序分配时新文件的 inode 号都集中在 0～15，每次创建只写 1 个 imap 片段；随机分配时新文件的 inode 号常落在另一个片段，而父目录（inode 0）在片段 0，于是一次创建要写<strong>两个</strong> imap 片段，日志里的元数据更多。真实 LFS 中，让相关 inode 的号码聚集，就能让 imap 更新更紧凑。</p>
+</div></details></div>
+<div class="exercise"><div class="q">在清理模拟器里用第一个负载，勾选段 2 和段 4 清理。先预测：哪些块是活的？清理结束后，段 5 的利用率会怎么变？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>活的是：/a 的第 0 块（版本 v3）、/c 的第 0、1 块、最新的根目录数据块和根目录 inode，共 5 个。清理器要搬走 4 个数据/目录块，然后重写 inode 0、1、3 和 imap 片段——而 inode 1、3 与 imap 片段原本在段 5 里，于是段 5 从 5/7 降到 2/7。清理不只是"搬活块"，还会让别处的元数据作废：这就是清理的隐性成本。</p>
+</div></details></div>
+<div class="exercise"><div class="q">在崩溃模拟器里，选"写 CR-A 主体后崩溃"。预测：恢复时用哪个 CR？不前滚会丢什么？前滚之后呢？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>CR-A 的头部已写成 ts=3，尾部还是 ts=1，头尾不一致，作废；用 CR-B（ts=2）。CR-B 的检查点只包含 S1～S3，所以不前滚会丢掉 S4、S5 里的更新（/c 的创建、b=v2、a=v3、删除 /b）。前滚从 S4 开始读，S4、S5 都完整有效，全部找回，丢失为 0。</p>
+</div></details></div>
+
+<h2>动手实验</h2>
+<div class="lab">
+<p><strong>实验 1：写缓冲到底值多少？</strong><code>seqbuf.c</code> 在真实磁盘上比较三种写法：随机原地 4KB 写、顺序但每块立刻 <code>fdatasync()</code>、把数据攒成 16KB～8MB 的"段"再顺序写并落盘。</p>
+<pre><code><span class="cmd">cd labs/43-lfs && make && ./seqbuf</span></code></pre>
+<p>示例输出（WSL2 + 虚拟磁盘，你的机器上数字会不同）：</p>
+<pre><code>mode                   write       total   syncs   time(s)      MB/s   ms/sync
+1 rand-inplace          4 KB     2000 KB     500     0.485      4.03     0.969
+2 seq-sync-each         4 KB     2000 KB     500     0.420      4.65     0.840
+3 seg-buffered         16 KB    65536 KB    4096     4.945     12.94     1.207
+3 seg-buffered         64 KB    65536 KB    1024     1.121     57.12     1.094
+3 seg-buffered        256 KB    65536 KB     256     0.436    146.72     1.704
+3 seg-buffered       1024 KB    65536 KB      64     0.301    212.95     4.696
+3 seg-buffered       4096 KB    65536 KB      16     0.138    463.15     8.637
+3 seg-buffered       8192 KB    65536 KB       8     0.145    442.38    18.084</code></pre>
+<p>怎么读：每次落盘有约 1ms 的固定开销（相当于 T<sub>position</sub>）。只写 4KB 就落盘，不论随机还是顺序都只有几 MB/s——"顺序但不缓冲"没用。段越大带宽越高，到 4MB 左右趋于饱和。代入式 (43.6)：T<sub>position</sub>≈1ms、R<sub>peak</sub>≈500MB/s、F=0.9 时 D≈4.5MB，与实测吻合。（虚拟磁盘底层多是 SSD，所以随机和顺序的 4KB 写差别不大；在机械盘上随机写会慢得多。）</p>
+<p><strong>实验 2：迷你 LFS 模拟器。</strong><code>lfs_mini.py</code> 是本页模拟器的 Python 版（带段摘要块），命令格式同 <code>lfs.py -L</code>：</p>
+<pre><code><span class="cmd">python3 lfs_mini.py -L "c,/foo:w,/foo,0,1" -c</span>
+<span class="cmd">python3 lfs_mini.py --demo-clean</span></code></pre>
+<p>示例输出（节选，确定性结果）：</p>
+<pre><code>[  0] live checkpoint: 12 --
+[  1]      segment summary: 2:(dir,0,0) 3:(inode,0,-) 4:(imap,0) 5:(inode,1,-) 6:(dir,0,0) 7:(inode,0,-) 8:(imap,0)
+...
+[  9]      segment summary: 10:(data,1,0) 11:(inode,1,-) 12:(imap,0)
+[ 10] live data (inode 1, off 0) v1
+[ 11] live inode 1 type:reg size:1 refs:1 ptrs: 10 -- -- -- -- -- -- --
+[ 12] live chunk(imap 0): 7 11 -- -- -- -- -- -- -- -- -- -- -- -- -- --
+
+第二轮：选利用率最低、但还有活块的两个段 [2, 4] 清理
+  检查 [ 22] SS=('data', 1, 0) -> 活
+  检查 [ 34] SS=('data', 3, 0) -> 活
+  ...
+搬走 5 个活块后： S0:0/0 S1:0/0 S2:0/0 S3:0/0 S4:0/0 S5:2/7 S6:7/7 S7:1/1
+文件内容（清理后应不变）： ['/a[v3,v6]', '/c[v5,v5,v7]']</code></pre>
+<p>该观察到：写一个块依次追加数据块 → inode → imap 片段，CR 指向最新 imap；清理前后每个文件的内容（块版本号）完全不变，但段 5 的利用率因为 inode 被重写而下降。详见 <code>labs/43-lfs/README.md</code>。</p>
+</div>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="1"><div class="q">1. imap 已经整个缓存在内存里时，LFS 读一个文件的数据块，与 FFS 相比额外的开销主要是？</div>
+<div class="opts"><button>A. 每次都要从磁盘读一个 imap 片段</button><button>B. 一次内存里的 imap 查表，磁盘 I/O 次数基本相同</button><button>C. 每次都要先读一次 CR</button><button>D. 需要扫描日志找到最新的 inode</button></div>
+<div class="explain">CR 只在挂载时读一次，之后整个 imap 缓存在内存。原书：常见情况下 LFS 读文件的 I/O 次数与典型文件系统相同，额外的只是在 imap 里查 inode 地址。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">2. 为什么 LFS 不把 imap 放在磁盘的固定位置？</div>
+<div class="opts"><button>A. imap 更新很频繁，固定位置意味着每次更新后都要寻道过去写 imap，破坏顺序写</button><button>B. imap 太大，固定区域放不下</button><button>C. 固定位置的 imap 无法在崩溃后恢复</button><button>D. 固定位置不能被缓存</button></div>
+<div class="explain">原书 43.5：放在固定位置，每次文件结构更新后都要再写一次 imap，引入更多寻道。LFS 把 imap 片段和其他新数据一起写进日志。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">3. 在目录 dir 中创建文件 foo 并写入一个块，这次写出的 imap 片段需要记录哪些 inode 的新位置？</div>
+<div class="opts"><button>A. 所有 inode</button><button>B. 只有 foo</button><button>C. foo 和 dir</button><button>D. 只有 dir</button></div>
+<div class="explain">foo 的 inode 是新的，dir 的数据块变了所以 dir 的 inode 也被重写到新位置——两个都搬了家，imap 要同时记录 m[k] 和 m[dir]（图 43-G）。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">4. "递归更新问题"指的是什么？</div>
+<div class="opts"><button>A. CR 更新需要递归写所有 imap 片段</button><button>B. 目录嵌套太深导致路径查找递归太多</button><button>C. 清理器搬动块后要递归清理其他段</button><button>D. 若目录存 inode 地址，inode 搬家会迫使目录搬家、父目录搬家……一直到根</button></div>
+<div class="explain">任何从不原地更新的文件系统都会遇到它。LFS 让目录只存 inode 号，位置变化只反映在 imap 中，递归被截断。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">5. 清理器检查地址 A 上的数据块：SS 说它是 (inode N, 偏移 T)；imap[N] 指向的 inode 中 ptrs[T] = A'，A' ≠ A。结论是？</div>
+<div class="opts"><button>A. 块是垃圾——文件的第 T 块已经被写到 A' 了</button><button>B. SS 损坏，需要 fsck</button><button>C. 需要再比较版本号才能决定</button><button>D. 块存活，但需要更新 inode</button></div>
+<div class="explain">存活的定义就是"最新 inode 的第 T 个指针正好指向 A"。指向别处说明这是被覆盖掉的旧版本。版本号只是省 I/O 的捷径，不是必要条件。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">6. 按原始 LFS 论文的启发式，热段与冷段应该如何清理？</div>
+<div class="opts"><button>A. 先清理热段，因为它的死块多</button><button>B. 先清理冷段，热段多等一会儿再清</button><button>C. 永远不清理冷段</button><button>D. 两者同等对待，只看利用率</button></div>
+<div class="explain">热段里的块还在不断被覆盖，等得越久死块越多、要搬的越少；冷段的空闲空间不会自己增长，早清早受益。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">7. LFS 如何发现 CR 更新到一半就崩溃了？</div>
+<div class="opts"><button>A. 看 CR 的校验和字段</button><button>B. 比较两个 CR 的内容是否相同</button><button>C. 扫描整个日志</button><button>D. CR 头部和尾块各带时间戳，二者不一致即说明更新不完整</button></div>
+<div class="explain">写 CR 的协议：头（时间戳）→ 主体 → 尾块（时间戳）。头尾不一致即不完整；LFS 选时间戳一致且最新的那个 CR。两个 CR 交替写保证总有一个完整的。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">8. T<sub>position</sub> = 10 ms，R<sub>peak</sub> = 100 MB/s，想达到峰值带宽的 99%，每次至少要写多少？</div>
+<div class="opts"><button>A. 99 MB</button><button>B. 19 MB</button><button>C. 9.9 MB</button><button>D. 990 MB</button></div>
+<div class="explain">D = F/(1−F) × R<sub>peak</sub> × T<sub>position</sub> = 0.99/0.01 × 100 × 0.01 = 99 MB。对比 90% 只需 9 MB、95% 需 19 MB。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">9. 前滚（roll forward）解决的是什么问题？</div>
+<div class="opts"><button>A. 把旧版本文件恢复给用户</button><button>B. CR 头尾时间戳不一致</button><button>C. CR 很久才写一次，只靠 CR 恢复会丢掉检查点之后写入的更新</button><button>D. 清理时判断块是否存活</button></div>
+<div class="explain">从最后一个一致 CR 记录的日志尾开始，往后读后续的段，把其中有效的更新应用上去，找回检查点之后的大部分数据和元数据。</div></div>
+
+<h2>常见误区与小结</h2>
+<div class="warn">
+<ul>
+  <li><strong>"LFS 读也是顺序的"</strong>——不是。LFS 只优化写；读依赖内存缓存，读到的块可能散在磁盘各处。</li>
+  <li><strong>"imap 每次读都要访问磁盘"</strong>——imap 在挂载时整体读入内存；写 imap 片段只是为了持久化。</li>
+  <li><strong>"CR 每次写操作都会更新"</strong>——真实 LFS 大约每 30 秒更新一次（本页日志模拟器为了便于观察，每条命令都更新）。</li>
+  <li><strong>"覆盖写只让旧数据块变垃圾"</strong>——旧 inode 和旧 imap 片段也都成了垃圾；追加写时旧数据块反而仍然存活。</li>
+  <li><strong>"清理只是释放死块"</strong>——清理要把活块<em>搬家</em>并重写 inode/imap，本身也在消耗写带宽，还可能让其他段里的元数据作废。</li>
+  <li><strong>"只要按地址顺序写就能跑满带宽"</strong>——两次间隔的小写之间盘片已经转走，必须一次写一大段。</li>
+</ul>
+</div>
+<div class="key">
+<p><strong>本章小结</strong></p>
+<ul>
+  <li>LFS 把所有更新（数据 + 元数据）缓冲成段，顺序写到空闲位置，从不原地覆盖；段大小由 D = F/(1−F) × R<sub>peak</sub> × T<sub>position</sub> 决定。</li>
+  <li>inode 位置不固定，用 <strong>imap</strong>（inode 号 → 地址）间接定位；imap 片段也写进日志；固定位置的 <strong>CR</strong> 记录 imap 片段地址。</li>
+  <li>imap 同时解决了<strong>递归更新问题</strong>：目录只存 inode 号。</li>
+  <li>旧版本成为垃圾，需要按段<strong>清理</strong>：<strong>段摘要块</strong>记录 (inode 号, 偏移)，"最新 inode 还指着我"即存活；策略上先清冷段、后清热段。</li>
+  <li>崩溃恢复：两个 CR 交替写 + 头尾时间戳保证 CR 原子更新；<strong>前滚</strong>找回检查点之后的段。</li>
+  <li>承上启下：写时复制的思想延续到 WAFL、ZFS、btrfs；下一章的<strong>闪存 SSD</strong> 内部的 FTL 就是一个日志结构系统，同样要面对垃圾回收和写放大。</li>
+</ul>
+</div>
+
+</main>
+<script>
+// ENGINE-BEGIN
+// 迷你 LFS 引擎（思路仿 ostep-homework 的 lfs.py）：
+// 地址 0 是检查点区域 CR；其余地址按段（segment）划分；日志只追加，从不原地覆盖。
+function makeLFS(opt) {
+  opt = opt || {};
+  const SEG = opt.segSize || 8;          // 每段块数（含段摘要 SS 槽位）
+  const NSEG = opt.nSeg || 8;            // 段数
+  const USE_SS = !!opt.useSS;            // 是否在每段第 0 槽放段摘要块
+  const IPC = opt.inodesPerChunk || 16;  // 每个 imap 片段覆盖多少个 inode 号
+  const NINODE = opt.maxInodes || 32;
+  const NPTR = 8, DIRMAX = 8;
+  const st = {
+    disk: new Array(1 + SEG * NSEG).fill(null),
+    imap: new Array(NINODE).fill(-1),    // 内存中的 imap（inode 号 → inode 的磁盘地址）
+    segUsed: new Array(NSEG).fill(false),
+    head: 1, curSeg: 0, opNo: 0, wver: 0,
+  };
+  const segOf = (a) => (a <= 0 ? -1 : Math.floor((a - 1) / SEG));
+  const segStart = (s) => 1 + s * SEG;
+  const clone = (x) => JSON.parse(JSON.stringify(x));
+
+  function nextFreeSeg() {
+    for (let k = 1; k <= NSEG; k++) {
+      const s = (st.curSeg + k) % NSEG;
+      if (!st.segUsed[s]) return s;
+    }
+    return -1;
+  }
+  function append(b) {
+    if (st.head >= segStart(st.curSeg) + SEG) {
+      const s = nextFreeSeg();
+      if (s < 0) throw new Error("磁盘已满：没有空闲段了，需要先清理（cleaning）");
+      st.curSeg = s; st.head = segStart(s);
+    }
+    st.segUsed[st.curSeg] = true;
+    if (USE_SS && st.head === segStart(st.curSeg)) {
+      st.disk[st.head] = { kind: "ss", seg: st.curSeg, entries: {}, op: st.opNo };
+      st.head++;
+    }
+    const a = st.head++;
+    b.addr = a; b.op = st.opNo;
+    st.disk[a] = b;
+    if (USE_SS) {
+      const ss = st.disk[segStart(st.curSeg)];
+      ss.entries[a] = b.kind === "imap" ? ["imap", b.chunk] : [b.kind, b.inum, b.off == null ? null : b.off];
+    }
+    return a;
+  }
+  function writeCR() {
+    st.disk[0] = { kind: "cr", addr: 0, imap: st.crChunks.slice(), op: st.opNo };
+  }
+  function writeChunks(chunks) {
+    for (const c of [...chunks].sort((x, y) => x - y)) {
+      const a = append({ kind: "imap", chunk: c, map: st.imap.slice(c * IPC, (c + 1) * IPC) });
+      st.crChunks[c] = a;
+    }
+    writeCR();
+  }
+  const inodeAt = (n) => (st.imap[n] >= 0 ? st.disk[st.imap[n]] : null);
+  const chunkOf = (n) => Math.floor(n / IPC);
+
+  // 初始文件系统：根目录（inode 0）
+  st.crChunks = new Array(NINODE / IPC).fill(-1);
+  (function init() {
+    const d = append({ kind: "dir", inum: 0, off: 0, entries: [[".", 0], ["..", 0]] });
+    const i = append({ kind: "inode", inum: 0, type: "dir", size: 1, refs: 2, ptrs: [d, -1, -1, -1, -1, -1, -1, -1] });
+    st.imap[0] = i;
+    writeChunks([0]);
+  })();
+
+  function split(path) {
+    const parts = path.split("/").filter(Boolean);
+    if (!parts.length) throw new Error("路径不合法：" + path);
+    return { dir: "/" + parts.slice(0, -1).join("/"), name: parts[parts.length - 1] };
+  }
+  // 路径查找，同时记录“读路径”：CR → imap → inode → 目录块 → …
+  function lookup(path, trace) {
+    const parts = path.split("/").filter(Boolean);
+    let cur = 0;
+    const step = (n) => {
+      const c = chunkOf(n);
+      if (trace) trace.push({ what: "imap", addr: st.crChunks[c], text: `imap 片段 #${c}（地址 ${st.crChunks[c]}）：inode ${n} 在地址 ${st.imap[n]}` });
+      const ino = inodeAt(n);
+      if (trace) trace.push({ what: "inode", addr: st.imap[n], text: `读 inode ${n}（地址 ${st.imap[n]}）：类型 ${ino.type}，ptrs[0]=${ino.ptrs[0]}` });
+      return ino;
+    };
+    if (trace) trace.push({ what: "cr", addr: 0, text: `读检查点区域 CR（地址 0）：imap 片段地址 = [${st.crChunks.join(", ")}]` });
+    let ino = step(0);
+    for (const p of parts) {
+      if (ino.type !== "dir") return null;
+      const d = st.disk[ino.ptrs[0]];
+      const e = d.entries.find((x) => x[0] === p);
+      if (trace) trace.push({ what: "dir", addr: ino.ptrs[0], text: `读目录数据块（地址 ${ino.ptrs[0]}）：` + (e ? `找到 (${p}, ${e[1]})` : `没有 ${p}`) });
+      if (!e) return null;
+      cur = e[1];
+      ino = step(cur);
+    }
+    return cur;
+  }
+  function allocInum() {
+    const free = [];
+    for (let n = 0; n < NINODE; n++) if (st.imap[n] < 0) free.push(n);
+    if (!free.length) throw new Error("inode 号用完了");
+    if (opt.alloc === "random") { st.seed = ((st.seed || 7) * 1103515245 + 12345) & 0x7fffffff; return free[st.seed % free.length]; }
+    return free[0];
+  }
+  // 父目录加/删一项：写新的目录块 + 新的父目录 inode
+  function rewriteParent(pn, mutate, refDelta) {
+    const pino = clone(inodeAt(pn));
+    const d = clone(st.disk[pino.ptrs[0]]);
+    mutate(d.entries);
+    delete d.addr;
+    const da = append({ kind: "dir", inum: pn, off: 0, entries: d.entries });
+    pino.ptrs[0] = da; pino.refs += refDelta || 0;
+    delete pino.addr;
+    st.imap[pn] = append(pino);
+  }
+  const ops = {
+    create(path) {
+      const { dir, name } = split(path);
+      const pn = lookup(dir);
+      if (pn == null || inodeAt(pn).type !== "dir") throw new Error("父目录不存在：" + dir);
+      const dd = st.disk[inodeAt(pn).ptrs[0]];
+      if (dd.entries.some((e) => e[0] === name)) throw new Error("已存在：" + path);
+      if (dd.entries.length >= DIRMAX) throw new Error("目录已满：" + dir);
+      const n = allocInum();
+      st.imap[n] = append({ kind: "inode", inum: n, type: "reg", size: 0, refs: 1, ptrs: new Array(NPTR).fill(-1) });
+      rewriteParent(pn, (es) => es.push([name, n]));
+      writeChunks(new Set([chunkOf(n), chunkOf(pn)]));
+      return n;
+    },
+    mkdir(path) {
+      const { dir, name } = split(path);
+      const pn = lookup(dir);
+      if (pn == null || inodeAt(pn).type !== "dir") throw new Error("父目录不存在：" + dir);
+      const dd = st.disk[inodeAt(pn).ptrs[0]];
+      if (dd.entries.some((e) => e[0] === name)) throw new Error("已存在：" + path);
+      if (dd.entries.length >= DIRMAX) throw new Error("目录已满：" + dir);
+      const n = allocInum();
+      const da = append({ kind: "dir", inum: n, off: 0, entries: [[".", n], ["..", pn]] });
+      const p = new Array(NPTR).fill(-1); p[0] = da;
+      st.imap[n] = append({ kind: "inode", inum: n, type: "dir", size: 1, refs: 2, ptrs: p });
+      rewriteParent(pn, (es) => es.push([name, n]), 1);
+      writeChunks(new Set([chunkOf(n), chunkOf(pn)]));
+      return n;
+    },
+    write(path, off, cnt) {
+      const n = lookup(path);
+      if (n == null) throw new Error("文件不存在：" + path);
+      const ino = clone(inodeAt(n));
+      if (ino.type !== "reg") throw new Error("不能对目录做 write：" + path);
+      if (off < 0 || cnt < 1 || off + cnt > NPTR) throw new Error(`偏移/块数越界（每个文件最多 ${NPTR} 块）`);
+      st.wver++;
+      for (let k = off; k < off + cnt; k++) ino.ptrs[k] = append({ kind: "data", inum: n, off: k, ver: st.wver });
+      ino.size = Math.max(ino.size, off + cnt);
+      delete ino.addr;
+      st.imap[n] = append(ino);
+      writeChunks([chunkOf(n)]);
+      return n;
+    },
+    unlink(path) {
+      const { dir, name } = split(path);
+      const pn = lookup(dir), n = lookup(path);
+      if (n == null) throw new Error("不存在：" + path);
+      const ino = clone(inodeAt(n));
+      if (ino.type === "dir" && st.disk[ino.ptrs[0]].entries.length > 2) throw new Error("目录非空：" + path);
+      rewriteParent(pn, (es) => es.splice(es.findIndex((e) => e[0] === name), 1), ino.type === "dir" ? -1 : 0);
+      if (ino.type === "dir" || ino.refs <= 1) st.imap[n] = -1;          // inode 释放：imap 项清空即可
+      else { ino.refs--; delete ino.addr; st.imap[n] = append(ino); }
+      writeChunks(new Set([chunkOf(n), chunkOf(pn)]));
+      return n;
+    },
+    link(src, dst) {
+      const n = lookup(src);
+      if (n == null) throw new Error("不存在：" + src);
+      const ino = clone(inodeAt(n));
+      if (ino.type !== "reg") throw new Error("只能对普通文件建硬链接");
+      const { dir, name } = split(dst);
+      const pn = lookup(dir);
+      if (pn == null) throw new Error("父目录不存在：" + dir);
+      if (st.disk[inodeAt(pn).ptrs[0]].entries.some((e) => e[0] === name)) throw new Error("已存在：" + dst);
+      rewriteParent(pn, (es) => es.push([name, n]));
+      ino.refs++; delete ino.addr;
+      st.imap[n] = append(ino);
+      writeChunks(new Set([chunkOf(n), chunkOf(pn)]));
+      return n;
+    },
+  };
+  // 解析 lfs.py 风格命令：c,/foo  d,/dir  w,/foo,off,n  r,/foo  l,/foo,/bar
+  function run(cmd) {
+    const f = cmd.trim().split(",").map((x) => x.trim());
+    const saved = clone(st);
+    st.opNo++;
+    let res;
+    try {
+    switch (f[0]) {
+      case "c": res = ops.create(f[1]); break;
+      case "d": res = ops.mkdir(f[1]); break;
+      case "w": res = ops.write(f[1], Number(f[2]), Number(f[3])); break;
+      case "r": res = ops.unlink(f[1]); break;
+      case "l": res = ops.link(f[1], f[2]); break;
+      default: throw new Error("不认识的命令：" + cmd);
+    }
+    } catch (e) { Object.assign(st, saved); throw e; }
+    const written = [];
+    st.disk.forEach((b, a) => { if (a > 0 && b && b.op === st.opNo && b.kind !== "ss") written.push(a); });
+    return { inum: res, written };
+  }
+  // 全局存活分析（从 CR 出发可达即存活，等价于 lfs.py -c）
+  function liveSet() {
+    const live = new Set([0]);
+    const cr = st.disk[0];
+    for (const ca of cr.imap) {
+      if (ca < 0) continue;
+      live.add(ca);
+      for (const ia of st.disk[ca].map) {
+        if (ia < 0) continue;
+        live.add(ia);
+        for (const p of st.disk[ia].ptrs) if (p >= 0) live.add(p);
+      }
+    }
+    if (USE_SS) for (let s = 0; s < NSEG; s++) {
+      const a = segStart(s);
+      if (st.disk[a] && st.disk[a].kind === "ss") {
+        for (let k = a + 1; k < a + SEG; k++) if (live.has(k)) { live.add(a); break; }
+      }
+    }
+    return live;
+  }
+  // 按书中伪代码，用段摘要 + imap 判断单个块是否存活
+  //   (N, T) = SegmentSummary[A]; inode = Read(imap[N]); if (inode[T] == A) live
+  function checkLive(a) {
+    const s = segOf(a), ss = st.disk[segStart(s)];
+    const e = ss && ss.entries[a];
+    if (!e) return { live: false, why: "段摘要里没有这个地址" };
+    if (e[0] === "imap") {
+      const cur = st.disk[0].imap[e[1]];
+      return { live: cur === a, e, why: `SS：imap 片段 #${e[1]}；CR 说该片段最新在 ${cur}` + (cur === a ? " = A → 存活" : ` ≠ ${a} → 垃圾`) };
+    }
+    const [kind, N, T] = e;
+    const ia = st.imap[N];
+    if (kind === "inode") return { live: ia === a, e, why: `SS：inode ${N}；imap[${N}] = ${ia < 0 ? "空（已删除）" : ia}` + (ia === a ? " = A → 存活" : " ≠ A → 垃圾") };
+    if (ia < 0) return { live: false, e, why: `SS：(${N}, ${T})；imap[${N}] 为空，文件已删除 → 垃圾` };
+    const p = st.disk[ia].ptrs[T];
+    return { live: p === a, e, why: `SS：(inode ${N}, 偏移 ${T})；imap[${N}] = ${ia}，该 inode 的 ptrs[${T}] = ${p}` + (p === a ? " = A → 存活" : ` ≠ ${a} → 垃圾`) };
+  }
+  // 清理（压缩）若干段。upto: "copy" 只搬数据；"meta" 再写 inode/imap/CR；"free" 最后释放旧段
+  function clean(segs, upto) {
+    upto = upto || "free";
+    if (!st.segUsed.some((u, s) => !u && !segs.includes(s))) throw new Error("清理也需要至少一个空闲段来写出存活块");
+    const checks = [], live = [];
+    for (const s of segs) for (let a = segStart(s) + (USE_SS ? 1 : 0); a < segStart(s) + SEG; a++) {
+      if (!st.disk[a]) continue;
+      const c = checkLive(a);
+      checks.push({ addr: a, ...c });
+      if (c.live) live.push(a);
+    }
+    // 被清理的段在释放前不能再写入：写头必须离开它们
+    if (segs.includes(st.curSeg)) st.head = segStart(st.curSeg) + SEG;
+    st.opNo++;
+    const pend = {}, chunks = new Set(), moved = {};
+    const getIno = (n) => (pend[n] = pend[n] || clone(inodeAt(n)));
+    for (const a of live) {
+      const b = st.disk[a];
+      if (b.kind === "data" || b.kind === "dir") {
+        const nb = clone(b); delete nb.addr;
+        const na = append(nb); moved[a] = na;
+        getIno(b.inum).ptrs[b.off] = na;
+      } else if (b.kind === "inode") getIno(b.inum);
+      else if (b.kind === "imap") chunks.add(b.chunk);
+    }
+    if (upto !== "copy") {
+      for (const n of Object.keys(pend).map(Number).sort((x, y) => x - y)) {
+        const ino = pend[n]; delete ino.addr;
+        const na = append(ino); moved["i" + n] = na;
+        st.imap[n] = na; chunks.add(chunkOf(n));
+      }
+      writeChunks(chunks);
+    }
+    if (upto === "free") for (const s of segs) {
+      for (let a = segStart(s); a < segStart(s) + SEG; a++) st.disk[a] = null;
+      st.segUsed[s] = false;
+    }
+    return { checks, live, moved };
+  }
+  function segInfo() {
+    const live = liveSet(), out = [];
+    for (let s = 0; s < NSEG; s++) {
+      let used = 0, l = 0;
+      for (let a = segStart(s) + (USE_SS ? 1 : 0); a < segStart(s) + SEG; a++) if (st.disk[a]) { used++; if (live.has(a)) l++; }
+      out.push({ seg: s, used, live: l, cap: SEG - (USE_SS ? 1 : 0), inUse: st.segUsed[s], cur: s === st.curSeg });
+    }
+    return out;
+  }
+  function listPaths() {
+    const out = [];
+    (function walk(n, p) {
+      const ino = inodeAt(n);
+      if (ino.type !== "dir") return;
+      for (const [name, c] of st.disk[ino.ptrs[0]].entries) {
+        if (name === "." || name === "..") continue;
+        const cp = p + "/" + name;
+        out.push({ path: cp, inum: c, type: inodeAt(c).type });
+        walk(c, cp);
+      }
+    })(0, "");
+    return out;
+  }
+  return {
+    st, run, lookup, liveSet, checkLive, clean, segInfo, listPaths, segOf, segStart,
+    SEG, NSEG, USE_SS, IPC,
+    snapshot: () => clone(st),
+    restore: (x) => { Object.assign(st, clone(x)); },
+  };
+}
+// 顺序写需要缓冲多少：D = F/(1-F) × R_peak × T_position（原书式 43.6）
+function bufferSize(F, Rpeak, Tpos) { return (F / (1 - F)) * Rpeak * Tpos; }
+function effRate(D, Rpeak, Tpos) { return D / (Tpos + D / Rpeak); }
+// ENGINE-END
+
+// ================= 书中示意图：块序列 + 指针 =================
+(function () {
+  const { s: S } = OSTEP;
+  let mk = 10;
+  function logFig(host, spec) {
+    const W = spec.w || 84, H = 60, G = 12, top = 48;
+    let x = 10;
+    const pos = spec.blocks.map((b) => { x += b.gap || 0; const p = x; x += W + G; return p; });
+    const width = x, height = top + H + 32;
+    const id = "lf" + mk++;
+    const svg = S("svg", { viewBox: `0 0 ${width} ${height}`, width, role: "img", "aria-label": spec.aria || "磁盘块示意" });
+    svg.append(S("defs", {}, S("marker", { id, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, S("path", { d: "M0,0 L10,5 L0,10 z", style: "fill:var(--muted)" }))));
+    spec.blocks.forEach((b, i) => {
+      const g = S("g", { class: b.dead ? "dead" : "" });
+      const px = pos[i];
+      g.append(S("rect", { x: px, y: top, width: W, height: H, rx: 5, class: "kb k-" + b.k }));
+      g.append(S("text", { x: px + W / 2, y: top + 17, "text-anchor": "middle", "font-size": 13, "font-weight": 700, text: b.t }));
+      (b.sub || []).forEach((line, j) => g.append(S("text", { x: px + W / 2, y: top + 33 + j * 13, "text-anchor": "middle", "font-size": 10.5, class: "mono", text: line })));
+      if (b.a) g.append(S("text", { x: px + W / 2, y: top + H + 16, "text-anchor": "middle", "font-size": 11.5, class: "mono t-muted", text: b.a }));
+      if (b.dead) g.append(S("text", { x: px + W / 2, y: top + H + 29, "text-anchor": "middle", "font-size": 11, class: "t-muted", text: "（垃圾）" }));
+      svg.append(g);
+    });
+    (spec.arrows || []).forEach(([i, j]) => {
+      const x1 = pos[i] + W / 2, x2 = pos[j] + W / 2 + (x1 > pos[j] + W / 2 ? 8 : -8);
+      const hgt = Math.min(40, 14 + Math.abs(x2 - x1) / 12);
+      svg.append(S("path", { d: `M${x1},${top} C${x1},${top - hgt} ${x2},${top - hgt} ${x2},${top}`, class: "ptr", "marker-end": `url(#${id})`, style: spec.blocks[i].dead ? "opacity:.38" : "" }));
+    });
+    host.replaceChildren(svg);
+  }
+  const F = {
+    di: { blocks: [{ k: "d", t: "D", a: "A0" }, { k: "i", t: "I", sub: ["b[0]:A0"] }], arrows: [[1, 0]] },
+    seg: { w: 104, blocks: [
+      { k: "d", t: "Dj,0", a: "A0" }, { k: "d", t: "Dj,1", a: "A1" }, { k: "d", t: "Dj,2", a: "A2" }, { k: "d", t: "Dj,3", a: "A3" },
+      { k: "i", t: "Inode j", sub: ["b[0]:A0 b[1]:A1", "b[2]:A2 b[3]:A3"], a: "A4" }, { k: "d", t: "Dk,0", a: "A5" }, { k: "i", t: "Inode k", sub: ["b[0]:A5"], a: "A6" }],
+      arrows: [[4, 0], [4, 1], [4, 2], [4, 3], [6, 5]] },
+    imap: { blocks: [{ k: "d", t: "D", a: "A0" }, { k: "i", t: "I[k]", sub: ["b[0]:A0"], a: "A1" }, { k: "m", t: "imap", sub: ["m[k]:A1"], a: "A2" }], arrows: [[1, 0], [2, 1]] },
+    cr: { w: 96, blocks: [{ k: "cr", t: "CR", sub: ["imap[k..k+N]:", "A2"], a: "0" }, { k: "d", t: "D", a: "A0", gap: 70 }, { k: "i", t: "I[k]", sub: ["b[0]:A0"], a: "A1" }, { k: "m", t: "imap", sub: ["m[k]:A1"], a: "A2" }], arrows: [[0, 3], [3, 2], [2, 1]] },
+    dir: { blocks: [{ k: "d", t: "Dk", a: "A0" }, { k: "i", t: "I[k]", sub: ["b[0]:A0"], a: "A1" }, { k: "dir", t: "Ddir", sub: ["(foo, k)"], a: "A2" }, { k: "i", t: "I[dir]", sub: ["b[0]:A2"], a: "A3" }, { k: "m", t: "imap", sub: ["m[k]:A1", "m[dir]:A3"], a: "A4" }], arrows: [[1, 0], [3, 2], [4, 1], [4, 3]] },
+    gc1: { blocks: [{ k: "d", t: "D0", a: "A0", dead: 1 }, { k: "i", t: "I[k]", sub: ["b[0]:A0"], dead: 1 }, { k: "d", t: "D0", a: "A4", gap: 60 }, { k: "i", t: "I[k]", sub: ["b[0]:A4"] }], arrows: [[1, 0], [3, 2]] },
+    gc2: { blocks: [{ k: "d", t: "D0", a: "A0" }, { k: "i", t: "I[k]", sub: ["b[0]:A0"], dead: 1 }, { k: "d", t: "D1", a: "A4", gap: 60 }, { k: "i", t: "I[k]", sub: ["b[0]:A0", "b[1]:A4"] }], arrows: [[1, 0], [3, 2], [3, 0]] },
+    ss: { blocks: [{ k: "ss", t: "SS", sub: ["A0:(k,0)"] }, { k: "d", t: "D", a: "A0" }, { k: "i", t: "I[k]", sub: ["b[0]:A0"], a: "A1" }, { k: "m", t: "imap", sub: ["m[k]:A1"] }], arrows: [[0, 1], [2, 1], [3, 2]] },
+  };
+  document.querySelectorAll(".logfig").forEach((el) => logFig(el, F[el.dataset.fig]));
+
+  // 清理示意（图 43-K）
+  const old = document.getElementById("cleanfig-old"), neu = document.getElementById("cleanfig-new");
+  const pat = ["LDDLDLDD", "DLDDDLLD", "DDLDDDLD"];
+  let n = 0;
+  pat.forEach((p, r) => [...p].forEach((c, k) => {
+    const live = c === "L";
+    old.append(S("rect", { x: 10 + k * 36, y: 30 + r * 40, width: 32, height: 30, rx: 4, class: "kb " + (live ? "k-d" : "k-free") }));
+    old.append(S("text", { x: 26 + k * 36, y: 50 + r * 40, "text-anchor": "middle", "font-size": 11, class: live ? "" : "t-muted", text: live ? "活" : "死" }));
+    if (live) {
+      neu.append(S("rect", { x: 430 + n * 36, y: 70, width: 32, height: 30, rx: 4, class: "kb k-d" }));
+      neu.append(S("text", { x: 446 + n * 36, y: 90, "text-anchor": "middle", "font-size": 11, text: "活" }));
+      n++;
+    }
+  }));
+  // 冷热段示意（图 43-M）
+  const hc = document.getElementById("hotcold");
+  const rows = [["t1", 6, 6], ["t2", 3, 6], ["t3", 1, 6]];
+  rows.forEach(([t, hot, cold], r) => {
+    hc.append(S("text", { x: 10, y: 50 + r * 34, "font-size": 12, class: "t-muted mono", text: t }));
+    hc.append(S("text", { x: 380, y: 50 + r * 34, "font-size": 12, class: "t-muted mono", text: t }));
+    for (let k = 0; k < 8; k++) {
+      hc.append(S("rect", { x: 36 + k * 34, y: 32 + r * 34, width: 30, height: 26, rx: 4, class: "kb " + (k < hot ? "k-d" : "k-free") }));
+      hc.append(S("rect", { x: 406 + k * 34, y: 32 + r * 34, width: 30, height: 26, rx: 4, class: "kb " + (k < cold ? "k-d" : "k-free") }));
+    }
+    hc.append(S("text", { x: 316, y: 50 + r * 34, "font-size": 12, text: hot + "/8" }));
+    hc.append(S("text", { x: 686, y: 50 + r * 34, "font-size": 12, text: cold + "/8" }));
+  });
+})();
+
+// ================= 计算器：该缓冲多少 =================
+(function () {
+  const { s: S } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  const fmtMB = (d) => (d >= 100 ? d.toFixed(0) : d >= 10 ? d.toFixed(1) : d >= 1 ? d.toFixed(2) : d.toFixed(3)) + " MB";
+  function draw() {
+    const T = Math.max(1e-5, Number($("buf-t").value) / 1000), R = Math.max(1, Number($("buf-r").value)), F = Number($("buf-f").value);
+    $("buf-fv").textContent = F.toFixed(3);
+    const D = bufferSize(F, R, T);
+    $("buf-d").textContent = fmtMB(D);
+    $("buf-e").textContent = effRate(D, R, T).toFixed(1) + " MB/s";
+    $("buf-x").textContent = (F / (1 - F)).toFixed(F > 0.98 ? 0 : 1) + "×";
+    $("buf-nar").innerHTML = `D = ${F.toFixed(3)} / ${(1 - F).toFixed(3)} × ${R} MB/s × ${(T * 1000).toFixed(2)} ms = <b>${fmtMB(D)}</b>。` +
+      `每次定位 ${(T * 1000).toFixed(2)} ms 期间本可以传输 R<sub>peak</sub>×T<sub>position</sub> = ${fmtMB(R * T)}；要让定位只占总时间的 ${((1 - F) * 100).toFixed(1)}%，一次写入量就得是它的 ${(F / (1 - F)).toFixed(1)} 倍。`;
+    const rows = [0.5, 0.9, 0.95, 0.99].map((f) => `<tr><td>${(f * 100).toFixed(0)}%</td><td class="num">${fmtMB(bufferSize(f, R, T))}</td><td class="num">${effRate(bufferSize(f, R, T), R, T).toFixed(1)} MB/s</td></tr>`).join("");
+    $("buf-tab").innerHTML = `<tr><th>目标 F</th><th class="num">需要写 D</th><th class="num">有效带宽</th></tr>` + rows;
+    // 曲线：x 轴 D（对数，0.01MB～10GB），y 轴 R_eff / R_peak
+    const Wd = 700, Hd = 250, L = 50, B = 36, Tp = 14, Rt = 16;
+    const lo = -2, hi = 4;
+    const X = (d) => L + ((Math.log10(d) - lo) / (hi - lo)) * (Wd - L - Rt);
+    const Y = (f) => Tp + (1 - f) * (Hd - Tp - B);
+    const svg = S("svg", { viewBox: `0 0 ${Wd} ${Hd}`, width: Wd, role: "img", "aria-label": "有效带宽随每次写入量变化的曲线" });
+    for (let e = lo; e <= hi; e++) {
+      svg.append(S("line", { x1: X(10 ** e), x2: X(10 ** e), y1: Tp, y2: Hd - B, style: "stroke:var(--border)" }));
+      svg.append(S("text", { x: X(10 ** e), y: Hd - B + 16, "text-anchor": "middle", "font-size": 11, class: "t-muted mono", text: e < 0 ? 10 ** e + "MB" : e < 3 ? 10 ** e + "MB" : 10 ** (e - 3) + "GB" }));
+    }
+    [0, 0.25, 0.5, 0.75, 1].forEach((f) => {
+      svg.append(S("line", { x1: L, x2: Wd - Rt, y1: Y(f), y2: Y(f), style: "stroke:var(--border)" }));
+      svg.append(S("text", { x: L - 6, y: Y(f) + 4, "text-anchor": "end", "font-size": 11, class: "t-muted mono", text: f * 100 + "%" }));
+    });
+    svg.append(S("text", { x: Wd - Rt, y: Hd - 4, "text-anchor": "end", "font-size": 11.5, class: "t-muted", text: "每次写入量 D（对数刻度）" }));
+    svg.append(S("text", { x: L + 4, y: Tp + 12, "font-size": 11.5, class: "t-muted", text: "R_eff / R_peak" }));
+    let d = "";
+    for (let k = 0; k <= 240; k++) { const dd = 10 ** (lo + ((hi - lo) * k) / 240); d += (k ? "L" : "M") + X(dd).toFixed(1) + "," + Y(effRate(dd, R, T) / R).toFixed(1); }
+    svg.append(S("path", { d, style: "fill:none;stroke:var(--accent);stroke-width:2.2" }));
+    svg.append(S("line", { x1: L, x2: Wd - Rt, y1: Y(F), y2: Y(F), style: "stroke:var(--warn);stroke-dasharray:5 4" }));
+    if (D >= 10 ** lo && D <= 10 ** hi) {
+      svg.append(S("line", { x1: X(D), x2: X(D), y1: Y(F), y2: Hd - B, style: "stroke:var(--warn);stroke-dasharray:5 4" }));
+      svg.append(S("circle", { cx: X(D), cy: Y(F), r: 5, style: "fill:var(--warn)" }));
+      svg.append(S("text", { x: X(D) + (X(D) > Wd - 150 ? -8 : 8), y: Y(F) + 18, "text-anchor": X(D) > Wd - 150 ? "end" : "start", "font-size": 12, "font-weight": 700, text: `D = ${fmtMB(D)}` }));
+    }
+    $("buf-plot").replaceChildren(svg);
+  }
+  ["buf-t", "buf-r", "buf-f"].forEach((id) => $(id).addEventListener("input", draw));
+  document.querySelectorAll("#sim-buf button[data-p]").forEach((b) => b.addEventListener("click", () => {
+    const [t, r, f] = b.dataset.p.split(",");
+    $("buf-t").value = t; $("buf-r").value = r; $("buf-f").value = f; draw();
+  }));
+  draw();
+})();
+
+// ================= 共用：画一个磁盘块 =================
+const KCLS = { data: "k-d", dir: "k-dir", inode: "k-i", imap: "k-m", cr: "k-cr", ss: "k-ss" };
+function blkLabel(b) {
+  const p = (xs) => xs.map((x) => (x < 0 ? "-" : x)).join(" ");
+  switch (b.kind) {
+    case "data": return ["D", `i${b.inum}[${b.off}] v${b.ver}`];
+    case "dir": return ["目录", b.entries.filter((e) => e[0] !== "." && e[0] !== "..").map((e) => `${e[0]}:${e[1]}`).join(" ") || "(空)"];
+    case "inode": return [`I[${b.inum}]`, (b.type === "dir" ? "dir " : "") + `s${b.size} r${b.refs} ` + p(b.ptrs.filter((x, k) => x >= 0 || k < b.size))];
+    case "imap": return [`imap#${b.chunk}`, b.map.map((x, k) => (x >= 0 ? `${b.chunk * 16 + k}→${x}` : "")).filter(Boolean).join(" ")];
+    case "ss": return ["SS", Object.entries(b.entries).map(([a, e]) => e[0] === "imap" ? `${a}:m` : `${a}:(${e[1]},${e[2] == null ? "i" : e[2]})`).join(" ")];
+    case "cr": return ["CR（地址 0）", "imap 片段 → " + b.imap.map((x) => (x < 0 ? "-" : x)).join(", ")];
+  }
+  return ["?", ""];
+}
+function blkEl(b, a, cls, badge, badgeCls) {
+  const { h } = OSTEP;
+  if (!b) return h("div", { class: "blk free", title: "空闲" }, h("div", { class: "ad" }, a), h("div", { class: "ty" }, "·"));
+  const [t, d] = blkLabel(b);
+  return h("div", { class: `blk ${KCLS[b.kind]} ${cls || ""}`, title: `地址 ${a}：${t} ${d}` },
+    h("div", { class: "ad" }, a), h("div", { class: "ty" }, t), h("div", { class: "dt" }, d),
+    badge != null ? h("span", { class: "badge " + (badgeCls || "") }, badge) : null);
+}
+function describeBlk(b) {
+  switch (b.kind) {
+    case "data": return `数据块 D（inode ${b.inum} 的第 ${b.off} 块）@${b.addr}`;
+    case "dir": return `目录数据块（inode ${b.inum}）@${b.addr}`;
+    case "inode": return `inode I[${b.inum}]@${b.addr}`;
+    case "imap": return `imap 片段 #${b.chunk}@${b.addr}`;
+  }
+  return b.kind;
+}
+
+// ================= 模拟器 1：日志 =================
+(function () {
+  const { h } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  const PRESETS = [
+    ["书例：创建 /foo 并写 1 块", "c,/foo:w,/foo,0,1"],
+    ["作业 Q5：逐块写 4 次", "c,/foo:w,/foo,0,1:w,/foo,1,1:w,/foo,2,1:w,/foo,3,1"],
+    ["作业 Q6：一次写 4 块", "c,/foo:w,/foo,0,4"],
+    ["作业 Q7：写到偏移 7", "c,/foo:w,/foo,7,1"],
+    ["作业 Q8：文件 vs 目录", "c,/foo:d,/bar"],
+    ["作业 Q9：硬链接", "c,/foo:l,/foo,/bar:l,/foo,/goo"],
+    ["作业 Q10：连续创建文件", "c,/a:c,/b:c,/c:c,/d:c,/e"],
+    ["综合：目录、覆盖写、删除", "d,/home:c,/home/foo:w,/home/foo,0,2:w,/home/foo,0,1:c,/bar:w,/bar,0,1:r,/home/foo"],
+  ];
+  PRESETS.forEach(([n, c], i) => $("log-preset").append(h("option", { value: i }, n)));
+  let snaps = [], trace = null;
+  const mkE = () => makeLFS({ segSize: 8, nSeg: 8, alloc: $("log-alloc").value });
+  function build() {
+    const E = mkE();
+    snaps = [{ snap: E.snapshot(), cmd: null, written: [1, 2, 3] }];
+    for (const c of $("log-cmds").value.split(":").map((x) => x.trim()).filter(Boolean)) {
+      try {
+        const r = E.run(c);
+        snaps.push({ snap: E.snapshot(), cmd: c, written: r.written, inum: r.inum });
+      } catch (e) {
+        snaps.push({ snap: E.snapshot(), cmd: c, written: [], err: e.message });
+        break;
+      }
+    }
+    trace = null;
+    stepper.reset();
+  }
+  function explain(sn, V) {
+    if (!sn.cmd) return "初始文件系统：根目录（inode 0）的数据块在地址 1，根 inode 在 2，imap 片段在 3；CR（地址 0）记录 imap 片段 #0 在地址 3。";
+    if (sn.err) return `<b>命令 ${sn.cmd} 失败：</b>${sn.err}`;
+    const f = sn.cmd.split(","), st = V.st;
+    const list = sn.written.map((a) => describeBlk(st.disk[a])).join(" → ");
+    let why = "";
+    const ino = st.imap[sn.inum] >= 0 ? st.disk[st.imap[sn.inum]] : null;
+    switch (f[0]) {
+      case "c": why = `创建文件 <code>${f[1]}</code>，分配 inode 号 ${sn.inum}。LFS 不原地修改任何东西：新 inode、加了新目录项的父目录数据块、指向新目录块的父目录 inode、记录它们新位置的 imap 片段，全部追加到日志末尾。`; break;
+      case "d": why = `创建目录 <code>${f[1]}</code>（inode ${sn.inum}）：比创建文件多写一个新目录自己的数据块（含 <code>.</code> 和 <code>..</code>），父目录 inode 的 refs 加 1。`; break;
+      case "w": why = `写 <code>${f[1]}</code> 的第 ${f[2]}～${Number(f[2]) + Number(f[3]) - 1} 块：先追加数据块，再追加指向它们的新 inode（size=${ino && ino.size}），最后追加 imap 片段。被取代的旧数据块、旧 inode、旧 imap 片段都成了垃圾。`; break;
+      case "r": why = `删除 <code>${f[1]}</code>：重写父目录数据块和父目录 inode。` + (ino ? `inode ${sn.inum} 还有 ${ino.refs} 个链接，只把 refs 减 1 后重写。` : `inode ${sn.inum} 的引用数降到 0：只需把 imap 中这一项清空，它的 inode 和数据块全部变成垃圾（不用写任何"释放"标记）。`); break;
+      case "l": why = `建立硬链接 <code>${f[2]}</code> → inode ${sn.inum}：不分配新 inode 号，只重写父目录（多一个名字）和该文件的 inode（refs=${ino && ino.refs}）。`; break;
+    }
+    return `<b>${sn.cmd}</b>：${why}<br>本步依次写入：${list}；然后 CR 更新为指向最新的 imap 片段。`;
+  }
+  function render(i) {
+    const sn = snaps[i];
+    const V = mkE();
+    V.restore(sn.snap);
+    const st = V.st, live = V.liveSet(), showLive = $("log-live").checked;
+    const onpath = new Map();
+    if (trace) trace.forEach((t, k) => { if (!onpath.has(t.addr)) onpath.set(t.addr, k + 1); });
+    const newSet = new Set(sn.written);
+    const disk = h("div", { class: "disk" });
+    disk.append(h("div", { class: "crline" }, blkEl(st.disk[0], 0, onpath.has(0) ? "onpath" : (sn.cmd && !sn.err ? "new" : ""), onpath.get(0)),
+      h("span", { class: "small muted" }, "CR 在固定位置，原地更新；其余所有块只追加。")));
+    let last = 0;
+    st.disk.forEach((b, a) => { if (b && a > 0) last = a; });
+    const nrows = Math.min(V.NSEG, Math.floor((last - 1) / 8) + 2);
+    for (let s = 0; s < nrows; s++) {
+      const row = h("div", { class: "segrow" }, h("div", { class: "seglab" }, h("b", {}, `段 ${s}`), h("br"), `地址 ${1 + s * 8}–${8 + s * 8}`));
+      for (let a = 1 + s * 8; a < 9 + s * 8; a++) {
+        const b = st.disk[a];
+        let cls = "";
+        if (b && showLive && !live.has(a)) cls += " dead";
+        if (newSet.has(a)) cls += " new";
+        if (onpath.has(a)) cls += " onpath";
+        row.append(blkEl(b, a, cls, onpath.has(a) ? onpath.get(a) : newSet.has(a) ? "新" : null, onpath.has(a) ? "" : "nw"));
+      }
+      disk.append(row);
+    }
+    $("log-stage").replaceChildren(disk);
+    $("log-nar").innerHTML = explain(sn, V);
+    // 读路径下拉
+    const paths = V.listPaths();
+    const cur = $("log-path").value;
+    $("log-path").replaceChildren(...paths.map((p) => h("option", { value: p.path }, p.path + (p.type === "dir" ? "/" : ""))));
+    if (paths.some((p) => p.path === cur)) $("log-path").value = cur;
+    // readout
+    const im = st.imap.map((x, n) => (x >= 0 ? `${n}→${x}` : null)).filter(Boolean).join("  ");
+    let out = `内存中的 imap（inode 号→地址）：${im}\n文件树：/ (inode 0)` + paths.map((p) => `  ${p.path}${p.type === "dir" ? "/" : ""} (inode ${p.inum})`).join("");
+    if (trace) out += "\n\n读取路径：\n" + trace.map((t, k) => `  ${k + 1}. ${t.text}`).join("\n");
+    $("log-out").textContent = out;
+    let used = 0, lv = 0;
+    st.disk.forEach((b, a) => { if (b && a > 0) { used++; if (live.has(a)) lv++; } });
+    $("log-s1").textContent = used; $("log-s2").textContent = lv; $("log-s3").textContent = used - lv;
+    $("log-s4").textContent = sn.cmd ? sn.written.length : "-";
+  }
+  const stepper = OSTEP.stepper($("log-step"), { steps: () => Math.max(1, snaps.length), render: (i) => snaps.length && render(i), autoplayMs: 1400 });
+  $("log-preset").addEventListener("change", () => { $("log-cmds").value = PRESETS[$("log-preset").value][1]; build(); });
+  $("log-run").addEventListener("click", build);
+  $("log-alloc").addEventListener("change", build);
+  $("log-live").addEventListener("change", () => stepper.refresh());
+  $("log-read").addEventListener("click", () => {
+    const sn = snaps[stepper.index], V = mkE();
+    V.restore(sn.snap);
+    const t = [], path = $("log-path").value;
+    if (!path) return;
+    const n = V.lookup(path, t);
+    const ino = V.st.disk[V.st.imap[n]];
+    if (ino.type === "reg") ino.ptrs.forEach((p, k) => { if (p >= 0) t.push({ addr: p, text: `读数据块 ptrs[${k}]（地址 ${p}）` }); });
+    trace = t;
+    stepper.refresh();
+  });
+  $("log-clear").addEventListener("click", () => { trace = null; stepper.refresh(); });
+  build();
+})();
+
+// ================= 模拟器 2：清理 =================
+(function () {
+  const { h } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  const PRESETS = [
+    ["覆盖写 + 删除（同实验 lfs_mini.py）", "c,/a:w,/a,0,2:c,/b:w,/b,0,1:w,/a,0,1:w,/b,0,1:c,/c:w,/c,0,3:r,/b:w,/a,1,1:w,/c,2,1", [2, 4]],
+    ["一个冷文件 + 一个热文件反复覆盖", "c,/cold:w,/cold,0,5:c,/hot:w,/hot,0,1:w,/hot,0,1:w,/hot,0,1:w,/hot,0,1:w,/hot,0,1:w,/hot,0,1:w,/hot,0,1:w,/hot,0,1", null],
+    ["目录树 + 删除", "d,/d:c,/d/x:w,/d/x,0,3:c,/d/y:w,/d/y,0,2:w,/d/x,1,1:r,/d/y:c,/z:w,/z,0,2:w,/d/x,0,1", null],
+  ];
+  PRESETS.forEach(([n], i) => $("cl-preset").append(h("option", { value: i }, n)));
+  const mkE = () => makeLFS({ segSize: 8, nSeg: 8, useSS: true });
+  let base = null, chosen = [], steps = [], info = null;
+  function load(defaultSegs) {
+    const E = mkE();
+    let err = null;
+    for (const c of $("cl-cmds").value.split(":").map((x) => x.trim()).filter(Boolean)) {
+      try { E.run(c); } catch (e) { err = `命令 ${c} 失败：${e.message}`; break; }
+    }
+    base = { snap: E.snapshot(), err };
+    const segs = E.segInfo();
+    chosen = (defaultSegs || []).filter((s) => segs[s].inUse && !segs[s].cur);
+    if (!defaultSegs) chosen = segs.filter((x) => x.inUse && !x.cur).sort((a, b) => a.live - b.live || a.seg - b.seg).slice(0, 2).map((x) => x.seg);
+    drawBoxes(segs);
+    plan();
+  }
+  function drawBoxes(segs) {
+    const box = $("cl-segs");
+    box.replaceChildren(h("span", { class: "muted small" }, "清理哪些段："));
+    segs.forEach((x) => {
+      const cb = h("input", { type: "checkbox", disabled: !x.inUse || x.cur ? true : null });
+      cb.checked = chosen.includes(x.seg);
+      cb.addEventListener("change", () => { chosen = cb.checked ? [...chosen, x.seg].sort((a, b) => a - b) : chosen.filter((s) => s !== x.seg); plan(); });
+      box.append(h("label", { title: x.cur ? "当前正在写的段不参与清理" : "" }, cb, `段 ${x.seg}` + (x.inUse ? ` (${x.live}/${x.used})` : " 空") + (x.cur ? " 写头" : "")));
+    });
+    const g = h("button", {}, "选利用率最低的 2 段");
+    g.addEventListener("click", () => {
+      chosen = segs.filter((x) => x.inUse && !x.cur).sort((a, b) => a.live - b.live || a.seg - b.seg).slice(0, 2).map((x) => x.seg).sort((a, b) => a - b);
+      drawBoxes(segs); plan();
+    });
+    box.append(g);
+  }
+  function plan() {
+    const run = (upto) => { const E = mkE(); E.restore(base.snap); try { const r = E.clean(chosen, upto); return { E, r }; } catch (e) { return { E, err: e.message }; } };
+    const pre = mkE(); pre.restore(base.snap);
+    steps = [{ phase: "init", E: pre }];
+    info = null;
+    if (chosen.length && !base.err) {
+      const c = run("copy"), m = run("meta"), f = run("free");
+      if (c.err) steps.push({ phase: "err", E: pre, err: c.err });
+      else {
+        let w = 0;
+        f.E.st.disk.forEach((b, a) => { if (a > 0 && b && b.op === f.E.st.opNo && b.kind !== "ss") w++; });
+        info = { r: f.r, written: w, preFree: pre.segInfo().filter((x) => !x.inUse).length, postFree: f.E.segInfo().filter((x) => !x.inUse).length };
+        c.r.checks.forEach((ck, k) => steps.push({ phase: "check", E: pre, k, ck, done: c.r.checks.slice(0, k + 1) }));
+        steps.push({ phase: "copy", E: c.E, r: c.r, done: c.r.checks, pre });
+        steps.push({ phase: "meta", E: m.E, r: m.r, done: c.r.checks, pre });
+        steps.push({ phase: "free", E: f.E, r: f.r });
+      }
+    }
+    stepper.reset();
+  }
+  function render(i) {
+    const S = steps[i], E = S.E, st = E.st, live = E.liveSet(), segs = E.segInfo();
+    const checked = new Map((S.done || []).map((c) => [c.addr, c.live]));
+    const newAddrs = new Set();
+    if (S.phase === "copy" || S.phase === "meta") st.disk.forEach((b, a) => { if (b && b.op === st.opNo && b.kind !== "ss") newAddrs.add(a); });
+    const disk = h("div", { class: "disk" });
+    disk.append(h("div", { class: "crline" }, blkEl(st.disk[0], 0, S.phase === "meta" ? "new" : ""), h("span", { class: "small muted" }, "每段第 0 槽是段摘要 SS：地址:(inode 号, 偏移)，i 表示 inode，m 表示 imap 片段")));
+    segs.forEach((x) => {
+      const inClean = chosen.includes(x.seg) && S.phase !== "free";
+      const lab = h("div", { class: "seglab" }, h("b", {}, `段 ${x.seg}`), inClean ? h("span", { class: "badt" }, " 清理中") : null, h("br"),
+        x.inUse ? `活 ${x.live}/${x.used}` : "空闲", h("div", { class: "ubar" }, h("i", { style: { width: (x.live / x.cap) * 100 + "%" } })));
+      const row = h("div", { class: "segrow" }, lab);
+      for (let a = E.segStart(x.seg); a < E.segStart(x.seg) + 8; a++) {
+        const b = st.disk[a];
+        let cls = "", badge = null, bc = "";
+        if (b && b.kind !== "ss" && !live.has(a)) cls += " dead";
+        if (checked.has(a) && S.phase === "check") { badge = checked.get(a) ? "活" : "死"; bc = checked.get(a) ? "ok" : "bad"; }
+        if (S.phase === "check" && S.ck.addr === a) cls += " focus";
+        if (newAddrs.has(a)) { cls += " new"; badge = "新"; bc = "nw"; }
+        row.append(blkEl(b, a, cls, badge, bc));
+      }
+      disk.append(row);
+    });
+    $("cl-stage").replaceChildren(disk);
+    let msg = "";
+    if (base.err) msg = `<b>负载出错：</b>${base.err}`;
+    else if (S.phase === "init") msg = chosen.length ? `初始状态：日志里已有不少垃圾（虚线半透明）。准备清理段 ${chosen.join("、")}：逐块读段摘要判断存活。点"下一步"。` : "请在上方勾选至少一个要清理的段（不能选当前写头所在的段）。";
+    else if (S.phase === "err") msg = `<b>无法清理：</b>${S.err}`;
+    else if (S.phase === "check") msg = `检查地址 <b>${S.ck.addr}</b>：${S.ck.why}。` + (S.ck.live ? " <span class='good'>要搬走。</span>" : " <span class='badt'>直接丢弃。</span>");
+    else if (S.phase === "copy") msg = `把 ${S.r.live.length} 个活块中的数据块/目录块复制到写头所在的空闲段（蓝框）：` + Object.entries(S.r.moved).map(([a, b]) => `${a}→${b}`).join("，") + `。它们的地址变了，所以指向它们的 inode 必须重写——但此刻 inode/imap 还没写，CR 仍指向旧位置，新块暂时"不可达"。`;
+    else if (S.phase === "meta") msg = `重写受影响的 inode（数据被搬走的，以及本身是活块的 inode）和 imap 片段，再更新 CR。现在新块全部可达，被清理段里的所有块都成了垃圾；注意其他段里的旧 inode/imap 也可能因此作废。`;
+    else if (S.phase === "free") msg = `释放被清理的 ${chosen.length} 个段：它们整段变为空闲，可以再被顺序写入。读入 M=${chosen.length} 段，写出了 ${info.written} 个块（搬走的数据/目录块 + 重写的 inode + imap 片段，不含新段的 SS）。` + (info.written ? "清理本身也要消耗写带宽。" : "这些段里全是垃圾，一个块都不用搬——这是最划算的清理。");
+    $("cl-nar").innerHTML = msg;
+    if (info) {
+      const r = info.r;
+      $("cl-s1").textContent = chosen.length;
+      $("cl-s2").textContent = `${r.checks.length} / ${r.live.length}`;
+      $("cl-s3").textContent = info.written;
+      $("cl-s4").textContent = `${info.preFree} → ${info.postFree}`;
+    } else { ["cl-s1", "cl-s2", "cl-s3", "cl-s4"].forEach((id) => ($(id).textContent = "-")); }
+  }
+  const stepper = OSTEP.stepper($("cl-step"), { steps: () => Math.max(1, steps.length), render: (i) => steps.length && render(i), autoplayMs: 1100 });
+  $("cl-preset").addEventListener("change", () => { const p = PRESETS[$("cl-preset").value]; $("cl-cmds").value = p[1]; load(p[2]); });
+  $("cl-load").addEventListener("click", () => load(null));
+  $("cl-cmds").value = PRESETS[0][1];
+  load(PRESETS[0][2]);
+})();
+
+// CRASH-BEGIN
+// ================= 崩溃恢复模型 =================
+// 事件：写段（可能写一半），或分三步写 CR（头 → 主体 → 尾）。两个 CR 交替写。
+const CRASH_EVENTS = [
+  { k: "seg", s: 1, upd: { "/a": "v1" }, desc: "创建 /a，写 a=v1" },
+  { k: "cr", part: "h", cr: "A", ts: 1 }, { k: "cr", part: "b", cr: "A", ts: 1 }, { k: "cr", part: "t", cr: "A", ts: 1 },
+  { k: "seg", s: 2, upd: { "/b": "v1" }, desc: "创建 /b，写 b=v1" },
+  { k: "seg", s: 3, upd: { "/a": "v2" }, desc: "覆盖写 a=v2" },
+  { k: "cr", part: "h", cr: "B", ts: 2 }, { k: "cr", part: "b", cr: "B", ts: 2 }, { k: "cr", part: "t", cr: "B", ts: 2 },
+  { k: "seg", s: 4, upd: { "/c": "v1", "/b": "v2" }, desc: "创建 /c=v1，写 b=v2" },
+  { k: "half", s: 5, desc: "段 S5 写了一半" },
+  { k: "seg", s: 5, upd: { "/a": "v3", "/b": null }, desc: "写 a=v3，删除 /b" },
+  { k: "cr", part: "h", cr: "A", ts: 3 }, { k: "cr", part: "b", cr: "A", ts: 3 }, { k: "cr", part: "t", cr: "A", ts: 3 },
+];
+function crashState(n) {
+  // 执行前 n 个事件后的磁盘状态
+  const segs = {}, ckpt = { 0: { state: {}, tail: 0 } };
+  const cr = { A: { h: 0, b: 0, t: 0 }, B: { h: 0, b: 0, t: 0 } };
+  let fs = {}, lastSeg = 0;
+  for (let i = 0; i < n; i++) {
+    const e = CRASH_EVENTS[i];
+    if (e.k === "half") segs[e.s] = { ok: false };
+    if (e.k === "seg") { segs[e.s] = { ok: true, upd: e.upd }; fs = applyUpd(fs, e.upd); lastSeg = e.s; }
+    if (e.k === "cr") {
+      if (e.part === "h") ckpt[e.ts] = { state: { ...fs }, tail: lastSeg };
+      cr[e.cr][e.part] = e.ts;
+    }
+  }
+  return { segs, ckpt, cr, fs };
+}
+function applyUpd(fs, upd) {
+  const o = { ...fs };
+  for (const [k, v] of Object.entries(upd)) { if (v == null) delete o[k]; else o[k] = v; }
+  return o;
+}
+function crashRecover(n, roll) {
+  const D = crashState(n), log = [];
+  const ok = (c) => c.h === c.t && c.b === c.h;
+  ["A", "B"].forEach((x) => {
+    const c = D.cr[x];
+    log.push({ what: "cr", cr: x, c, ok: ok(c) });
+  });
+  const cands = ["A", "B"].filter((x) => ok(D.cr[x]));
+  const use = cands.sort((x, y) => D.cr[y].t - D.cr[x].t)[0];
+  const ts = D.cr[use].t, ck = D.ckpt[ts];
+  let fs = { ...ck.state }, applied = [];
+  log.push({ what: "pick", cr: use, ts, tail: ck.tail, state: { ...fs } });
+  if (roll) {
+    for (let s = ck.tail + 1; ; s++) {
+      const g = D.segs[s];
+      if (!g) { log.push({ what: "end", s }); break; }
+      if (!g.ok) { log.push({ what: "torn", s }); break; }
+      fs = applyUpd(fs, g.upd);
+      applied.push(s);
+      log.push({ what: "apply", s, upd: g.upd, state: { ...fs } });
+    }
+  }
+  // 丢失的“已完成”更新：与崩溃前所有完整段的累计结果比较
+  const lost = [];
+  const keys = new Set([...Object.keys(D.fs), ...Object.keys(fs)]);
+  keys.forEach((k) => { if (D.fs[k] !== fs[k]) lost.push(`${k}: 应为 ${D.fs[k] || "（已删除）"}，恢复出 ${fs[k] || "（不存在）"}`); });
+  return { D, log, use, ts, fs, applied, lost };
+}
+// CRASH-END
+
+// ================= 模拟器 3：崩溃恢复 =================
+(function () {
+  const { h } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  let crashAt = 14, R = null;
+  const evName = (e) => e.k === "seg" ? `写段 S${e.s}` : e.k === "half" ? `S${e.s} 写一半` : `CR-${e.cr} ${{ h: "头", b: "主体", t: "尾" }[e.part]} ts=${e.ts}`;
+  function drawEv() {
+    const box = $("cr-ev");
+    box.replaceChildren(...[h("button", { class: crashAt === 0 ? "crash" : "done", "data-i": 0 }, "开始前"),
+      ...CRASH_EVENTS.map((e, i) => h("button", { class: i + 1 === crashAt ? "crash" : i + 1 < crashAt ? "done" : "future", "data-i": i + 1, title: e.desc || "" }, (i + 1) + ". " + evName(e)))]);
+    box.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { crashAt = Number(b.dataset.i); rebuild(); }));
+  }
+  const fsStr = (fs) => Object.keys(fs).sort().map((k) => `${k}=${fs[k]}`).join(" ") || "（空）";
+  function rebuild() { drawEv(); R = crashRecover(crashAt, $("cr-roll").checked); stepper.reset(); }
+  function crBox(name, c, mark) {
+    const ok = c.h === c.t && c.b === c.h;
+    return h("div", { class: "blk k-cr " + (mark || ""), style: { width: "150px", height: "64px" } },
+      h("div", { class: "ty" }, name + (ok ? " ✓" : " ✗")),
+      h("div", { class: "dt" }, `头 ts=${c.h}　主体 ts=${c.b}`), h("div", { class: "dt" }, `尾 ts=${c.t}`),
+      h("span", { class: "badge " + (ok ? "ok" : "bad") }, ok ? "一致" : "不一致"));
+  }
+  function render(i) {
+    const D = R.D, entry = R.log[i];
+    const segIn = new Set(), segStop = new Set();
+    R.log.slice(0, i + 1).forEach((l) => { if (l.what === "apply") segIn.add(l.s); if (l.what === "torn" || l.what === "end") segStop.add(l.s); });
+    const row = h("div", { class: "segrow", style: { flexWrap: "nowrap" } });
+    row.append(crBox("CR-A", D.cr.A, entry.cr === "A" && entry.what !== "apply" ? "focus" : ""));
+    for (let s = 1; s <= 6; s++) {
+      const g = D.segs[s];
+      const ev = CRASH_EVENTS.find((e) => e.k === "seg" && e.s === s);
+      let cls = "k-d", t = `S${s}`, d = g ? (g.ok ? ev.desc : "只写了一半") : "未写";
+      if (!g) cls = "free";
+      else if (!g.ok) cls = "k-d dead";
+      let badge = null, bc = "";
+      if (segIn.has(s)) { badge = "前滚"; bc = "ok"; }
+      else if (segStop.has(s)) { badge = g ? "校验失败" : "日志尾"; bc = "bad"; }
+      else if (entry.what !== "cr" && s <= (R.log.find((l) => l.what === "pick") || {}).tail) { badge = "检查点内"; bc = ""; }
+      row.append(h("div", { class: `blk ${cls}`, style: { width: "92px", height: "64px" }, title: d }, h("div", { class: "ad" }, "段"), h("div", { class: "ty" }, t), h("div", { class: "dt" }, d), badge ? h("span", { class: "badge " + bc }, badge) : null));
+    }
+    row.append(crBox("CR-B", D.cr.B, entry.cr === "B" && entry.what !== "apply" ? "focus" : ""));
+    const stage = h("div", { class: "disk" }, row,
+      h("div", { class: "small", style: { marginTop: "8px" } }, `崩溃前应用程序已完成（段已完整写入）的状态：${fsStr(D.fs)}`));
+    $("cr-stage").replaceChildren(stage);
+    let msg = "";
+    if (entry.what === "cr") msg = `读 CR-${entry.cr}：头部时间戳 ${entry.c.h}，主体 ${entry.c.b}，尾块 ${entry.c.t}。` + (entry.ok ? "<span class='good'>头尾一致，这个 CR 完整可用。</span>" : "<span class='badt'>头尾不一致：崩溃发生在写这个 CR 的中途，不能用。</span>");
+    else if (entry.what === "pick") msg = `选择时间戳一致且最新的 <b>CR-${entry.cr}（ts=${entry.ts}）</b>。它的 imap 给出的文件系统状态：${fsStr(entry.state)}；它记录的日志尾是 ${entry.tail ? "S" + entry.tail : "（空日志）"}。` + ($("cr-roll").checked ? " 接下来从下一个段开始前滚。" : " 不做前滚：恢复到此为止。");
+    else if (entry.what === "apply") msg = `前滚：段 S${entry.s} 的段摘要校验通过（完整写入），应用其中的更新 ${Object.entries(entry.upd).map(([k, v]) => `${k}=${v || "删除"}`).join("，")} → ${fsStr(entry.state)}`;
+    else if (entry.what === "torn") msg = `前滚：段 S${entry.s} 只写了一半，校验不通过（真实 LFS 靠段摘要里的时间戳/校验判断），停止前滚。这一段里的更新在崩溃前本来就没写完，丢了也符合预期。`;
+    else if (entry.what === "end") msg = `前滚：S${entry.s} 还没写过，已到日志末尾，前滚结束。`;
+    if (i === R.log.length - 1) msg += `<br><b>恢复结果：</b>${fsStr(R.fs)}。` + (R.lost.length ? `<span class='badt'>与崩溃前已完成的状态相比丢失：${R.lost.join("；")}</span>` : "<span class='good'>所有已完整写入的更新都找回了。</span>");
+    $("cr-nar").innerHTML = msg;
+    $("cr-s1").textContent = `CR-${R.use} (ts=${R.ts})`;
+    $("cr-s2").textContent = R.applied.length ? R.applied.map((s) => "S" + s).join(" ") : "无";
+    $("cr-s3").textContent = R.lost.length;
+  }
+  const stepper = OSTEP.stepper($("cr-step"), { steps: () => (R ? R.log.length : 1), render: (i) => R && render(i), autoplayMs: 1300 });
+  $("cr-roll").addEventListener("change", rebuild);
+  document.querySelectorAll("#sim-crash button[data-k]").forEach((b) => b.addEventListener("click", () => { crashAt = Number(b.dataset.k); rebuild(); }));
+  rebuild();
+})();
+</script>
+</body></html>

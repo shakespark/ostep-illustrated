@@ -1,0 +1,1113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 45 章 · 数据完整性和保护</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+/* 校验和演示：按列排开的比特网格 */
+.bitgrid { width: auto; font-size: 13px; }
+.bitgrid td, .bitgrid th { padding: 4px 10px; white-space: nowrap; }
+.bitgrid td.mono, .bitgrid .mono { font-family: var(--mono); }
+.bitgrid .nib { display: inline-block; padding: 1px 3px; margin-right: 5px; border-radius: 4px; font-family: var(--mono); letter-spacing: .06em; }
+.bitgrid .nib.act { background: var(--accent-soft); outline: 1px solid var(--accent); }
+.bitgrid .nib.done { color: var(--muted); }
+.bitgrid .b1 { color: var(--accent); font-weight: 700; }
+.bitgrid tr.res td { border-top: 2px solid var(--fg); font-weight: 600; }
+.bitgrid tr.cur td { background: var(--warn-soft); }
+.bitgrid tr.dim td { color: var(--faint); }
+.crc-trace { font: 12.5px/1.6 var(--mono); background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin: 10px 0 0; white-space: pre; overflow-x: auto; }
+.okc { color: var(--ok); font-weight: 650; }
+.badc { color: var(--bad); font-weight: 650; }
+/* 镜像磁盘模拟器 */
+.disks { display: grid; gap: 10px; min-width: 760px; }
+.drow { display: flex; gap: 8px; align-items: stretch; }
+.drow .dl { width: 92px; flex: none; font-size: 13px; color: var(--muted); align-self: center; line-height: 1.35; }
+.blk { flex: 1; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); padding: 5px 8px; font: 12px/1.5 var(--mono); position: relative; min-width: 104px; transition: box-shadow .2s, background .2s; }
+.blk .bh { font-family: var(--font); font-size: 12px; color: var(--muted); }
+.blk.dmg { border-style: dashed; border-color: var(--bad); }
+.blk.lse { background: var(--bad-soft); }
+.blk.t-w { box-shadow: 0 0 0 2px var(--accent); }
+.blk.t-ok { box-shadow: 0 0 0 2px var(--ok); }
+.blk.t-bad { box-shadow: 0 0 0 2px var(--bad); }
+.blk.t-fix { box-shadow: 0 0 0 2px var(--ok); background: var(--ok-soft); }
+.blk .flag { position: absolute; top: 4px; right: 6px; font: 11px var(--font); color: var(--bad); }
+.blk .idm { color: var(--bad); font-weight: 700; }
+.blk.meta { background: var(--surface-2); }
+.oplist { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 10px; }
+.oplist .pill { font-family: var(--mono); }
+.oplist .pill.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.oplist .pill.past { color: var(--muted); }
+.narrate ul { margin: 6px 0 0; }
+.narrate li { margin: 2px 0; }
+.legend { font-size: 12.5px; color: var(--muted); margin-top: 8px; }
+.legend span { display: inline-block; margin-right: 14px; }
+.sw { display: inline-block; width: 14px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 4px; border: 1px solid var(--border); }
+textarea.ops { min-height: 120px; font-size: 13px; }
+.hexin { width: 26em; max-width: 100%; }
+.controls label.wide { flex-wrap: wrap; max-width: 100%; }
+</style>
+</head>
+<body data-chapter="45">
+<main>
+
+<h2 id="intro"><span class="num">1</span>一句话 + 关键问题</h2>
+<div class="crux">
+<p><strong>如何确保数据完整性？</strong>存储系统怎样保证写进去的数据被保护好？需要哪些技术？怎样让这些技术足够高效——空间和时间开销都很低？</p>
+<p class="small muted">How should systems ensure that the data written to storage is protected? What techniques are required? How can such techniques be made efficient, with both low space and time overheads?</p>
+</div>
+<p><strong>一句话：</strong>磁盘不只是"要么好、要么整块坏"，它还会<em>悄悄地</em>坏掉某一个块——读不出来（潜在扇区错误），或者读出来的内容是错的（块损坏）。本章的答案是：用<strong>校验和（checksum）</strong>发现静默损坏，再加上<strong>物理 ID</strong>、<strong>父块中的校验和</strong>、<strong>磁盘擦洗（scrubbing）</strong>去对付错位写入、丢失写入和"没人读的数据慢慢烂掉"这几种更刁钻的情况；发现问题之后，靠 RAID / 镜像等冗余把正确数据找回来。</p>
+<p>本章承接第 38 章 RAID（当时只考虑"整盘失效"）和第 40–43 章的文件系统实现：前面几章关心的是<strong>快</strong>（FFS、LFS）和<strong>崩溃后一致</strong>（日志），这一章关心的是<strong>数据本身对不对</strong>。后面的分布式系统章节（第 48 章起）也会反复用到校验和：网络上传输的数据同样会损坏。</p>
+
+<h2 id="cards"><span class="num">2</span>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>全盘失效（fail-stop）</h4><p>磁盘要么完全正常、要么整块坏掉，而且坏了立刻能发现。早期 RAID 只考虑这种模型。</p></div>
+  <div class="card"><h4>部分失效（fail-partial）</h4><p>磁盘看起来还在工作，但个别块读不出（非静默）或内容是错的（静默）。</p></div>
+  <div class="card"><h4>潜在扇区错误（LSE）</h4><p>扇区物理损坏，磁盘内部 ECC 纠不回来，读时<strong>返回错误</strong>——容易发现，用冗余恢复即可。</p></div>
+  <div class="card"><h4>块损坏（block corruption）</h4><p>固件 bug、总线故障等让块内容变错，磁盘却报告"一切正常"——<strong>静默故障</strong>，需要校验和才能发现。</p></div>
+  <div class="card"><h4>校验和（checksum）</h4><p>对一个块（如 4 KB）算出的小摘要（如 4–8 字节），和数据一起存；读时重算并比较 Cs 与 Cc。</p></div>
+  <div class="card"><h4>碰撞（collision）</h4><p>把大数据压成小摘要，必然有不同数据得到相同校验和。好的校验和让碰撞尽量少、计算尽量快。</p></div>
+  <div class="card"><h4>错位写入 / 丢失写入</h4><p>写到了错误的位置 / 报告写成功却没落盘。前者靠物理 ID，后者靠写后读或把校验和存到父块（inode）里。</p></div>
+  <div class="card"><h4>磁盘擦洗（scrubbing）</h4><p>定期把所有块读一遍核对校验和，趁还有好副本时修复，避免所有副本都慢慢烂掉。</p></div>
+</div>
+
+<h2 id="failure"><span class="num">3</span>磁盘故障模式：不只是"整盘坏"</h2>
+<p>第 38 章讲 RAID 时，我们采用的是<strong>全盘失效（fail-stop）</strong>模型：磁盘要么正常工作，要么彻底坏掉，而且"坏掉"很容易检测。这让 RAID 的设计相对简单。</p>
+<p>但 Bairavasundaram 等人的研究发现，现代磁盘经常<strong>大体上还能工作</strong>，只是某一个或几个块出问题。常见的单块故障有两类：</p>
+<ul>
+<li><strong>潜在扇区错误（latent sector error, LSE）</strong>：扇区（或一组扇区）物理损坏。比如磁头碰到盘面（磁头划伤，head crash）弄坏了表面；宇宙射线也可能翻转比特。磁盘内部用<strong>纠错码（ECC）</strong>判断块里的比特是否完好、有时还能修好；修不好时，读这个块会<strong>返回错误</strong>。</li>
+<li><strong>块损坏（block corruption）</strong>：块的内容坏了，而磁盘自己察觉不到。例如有 bug 的磁盘固件把块写到了<strong>错误的位置</strong>——磁盘 ECC 认为内容没问题，但客户端读到的却是"别的块"；又如数据经过有故障的总线从主机传到磁盘时就已经坏了，磁盘把坏数据老老实实存下来。这类故障是<strong>静默故障（silent fault）</strong>：返回错误数据时磁盘不给任何提示，所以格外阴险。</li>
+</ul>
+<p>Prabhakaran 等人把这种更现代的视角称为<strong>部分失效（fail-partial）</strong>模型：磁盘仍可能整块失效；也可能看似正常，却偶尔读写某块时报错（<em>非静默</em>部分故障），或者干脆返回错误内容（<em>静默</em>部分故障）。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 720 232" width="720" role="img" aria-label="三种故障模型对比">
+  <defs><marker id="ar45" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <!-- 面板 1：fail-stop -->
+  <g transform="translate(0,0)">
+    <rect x="1" y="2" width="224" height="226" rx="10" class="box"/>
+    <text x="113" y="26" text-anchor="middle" font-size="15" font-weight="700">全盘失效 fail-stop</text>
+    <text x="113" y="46" text-anchor="middle" font-size="12" class="t-muted">整个磁盘不可用</text>
+    <rect x="13" y="58" width="200" height="50" rx="8" class="box-strong"/>
+    <g font-size="11" class="mono" text-anchor="middle">
+      <rect x="19" y="66" width="28" height="34" rx="4" class="bad-soft"/><text x="33" y="87">D0</text>
+      <rect x="51" y="66" width="28" height="34" rx="4" class="bad-soft"/><text x="65" y="87">D1</text>
+      <rect x="83" y="66" width="28" height="34" rx="4" class="bad-soft"/><text x="97" y="87">D2</text>
+      <rect x="115" y="66" width="28" height="34" rx="4" class="bad-soft"/><text x="129" y="87">D3</text>
+      <rect x="147" y="66" width="28" height="34" rx="4" class="bad-soft"/><text x="161" y="87">D4</text>
+      <rect x="179" y="66" width="28" height="34" rx="4" class="bad-soft"/><text x="193" y="87">D5</text>
+    </g>
+    <line x1="13" y1="58" x2="213" y2="108" style="stroke:var(--bad);stroke-width:3"/>
+    <line x1="13" y1="108" x2="213" y2="58" style="stroke:var(--bad);stroke-width:3"/>
+    <line x1="129" y1="110" x2="129" y2="138" class="arrow" marker-end="url(#ar45)"/>
+    <rect x="23" y="140" width="180" height="30" rx="6" class="bad-soft"/>
+    <text x="113" y="160" text-anchor="middle" font-size="12.5">任何访问都失败</text>
+    <text x="113" y="196" text-anchor="middle" font-size="12.5">早期 RAID 的假设</text>
+    <text x="113" y="215" text-anchor="middle" font-size="12" class="t-muted">坏了立刻知道，检测简单</text>
+  </g>
+  <!-- 面板 2：LSE -->
+  <g transform="translate(247,0)">
+    <rect x="1" y="2" width="224" height="226" rx="10" class="box"/>
+    <text x="113" y="26" text-anchor="middle" font-size="15" font-weight="700">潜在扇区错误 LSE</text>
+    <text x="113" y="46" text-anchor="middle" font-size="12" class="t-muted">非静默的部分故障</text>
+    <rect x="13" y="58" width="200" height="50" rx="8" class="box-strong"/>
+    <g font-size="11" class="mono" text-anchor="middle">
+      <rect x="19" y="66" width="28" height="34" rx="4" class="ok-soft"/><text x="33" y="87">D0</text>
+      <rect x="51" y="66" width="28" height="34" rx="4" class="ok-soft"/><text x="65" y="87">D1</text>
+      <rect x="83" y="66" width="28" height="34" rx="4" class="ok-soft"/><text x="97" y="87">D2</text>
+      <rect x="115" y="66" width="28" height="34" rx="4" class="bad-soft"/><text x="129" y="87">✕</text>
+      <rect x="147" y="66" width="28" height="34" rx="4" class="ok-soft"/><text x="161" y="87">D4</text>
+      <rect x="179" y="66" width="28" height="34" rx="4" class="ok-soft"/><text x="193" y="87">D5</text>
+    </g>
+    <line x1="129" y1="110" x2="129" y2="138" class="arrow" marker-end="url(#ar45)"/>
+    <rect x="23" y="140" width="180" height="30" rx="6" class="warn-soft"/>
+    <text x="113" y="160" text-anchor="middle" font-size="12.5">读 D3 → 返回 I/O 错误</text>
+    <text x="113" y="196" text-anchor="middle" font-size="12.5">盘面划伤、宇宙射线……</text>
+    <text x="113" y="215" text-anchor="middle" font-size="12" class="t-muted">ECC 修不好 → 磁盘主动报错</text>
+  </g>
+  <!-- 面板 3：corruption -->
+  <g transform="translate(494,0)">
+    <rect x="1" y="2" width="224" height="226" rx="10" class="box"/>
+    <text x="113" y="26" text-anchor="middle" font-size="15" font-weight="700">块损坏 corruption</text>
+    <text x="113" y="46" text-anchor="middle" font-size="12" class="t-muted">静默的部分故障</text>
+    <rect x="13" y="58" width="200" height="50" rx="8" class="box-strong"/>
+    <g font-size="11" class="mono" text-anchor="middle">
+      <rect x="19" y="66" width="28" height="34" rx="4" class="ok-soft"/><text x="33" y="87">D0</text>
+      <rect x="51" y="66" width="28" height="34" rx="4" class="ok-soft"/><text x="65" y="87">D1</text>
+      <rect x="83" y="66" width="28" height="34" rx="4" class="ok-soft"/><text x="97" y="87">D2</text>
+      <rect x="115" y="66" width="28" height="34" rx="4" class="bad-soft"/><text x="129" y="87">D3′</text>
+      <rect x="147" y="66" width="28" height="34" rx="4" class="ok-soft"/><text x="161" y="87">D4</text>
+      <rect x="179" y="66" width="28" height="34" rx="4" class="ok-soft"/><text x="193" y="87">D5</text>
+    </g>
+    <line x1="129" y1="110" x2="129" y2="138" class="arrow" marker-end="url(#ar45)"/>
+    <rect x="23" y="140" width="180" height="30" rx="6" class="bad-soft"/>
+    <text x="113" y="160" text-anchor="middle" font-size="12.5">读 D3 → "成功"，但内容错</text>
+    <text x="113" y="196" text-anchor="middle" font-size="12.5">固件写错位置、总线损坏……</text>
+    <text x="113" y="215" text-anchor="middle" font-size="12" class="t-muted">磁盘毫无察觉，不会报错</text>
+  </g>
+</svg>
+<figcaption>图 45-A　三种故障模型。后两种合称"部分失效（fail-partial）"：LSE 会被磁盘报告出来，块损坏则是静默的。</figcaption>
+</figure>
+
+<h3>它们有多常见？</h3>
+<p>原书 Figure 45.1 汇总了 Bairavasundaram 等人两项研究的结果：在大约 3 年里、超过 150 万块磁盘中，<strong>至少出现过一次</strong> LSE 或块损坏的磁盘所占比例。"廉价"盘通常是 SATA，"昂贵"盘通常是 SCSI 或光纤通道（Fibre Channel）。</p>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th class="num">廉价盘（Cheap）</th><th class="num">昂贵盘（Costly）</th></tr></thead>
+<tbody>
+<tr><td>潜在扇区错误（LSEs）</td><td class="num">9.40%</td><td class="num">1.40%</td></tr>
+<tr><td>块损坏（Corruption）</td><td class="num">0.50%</td><td class="num">0.05%</td></tr>
+</tbody></table></div>
+<p>买更好的盘大约能把两类问题的频率降低<strong>一个数量级</strong>，但它们仍然常见到必须认真对待。原书列出的其他发现：</p>
+<div class="cards">
+<div class="card"><h4>关于 LSE</h4><p>
+· 已有不止一个 LSE 的昂贵盘，和廉价盘一样容易再出新错误<br>
+· 对多数磁盘，第二年的年错误率会上升<br>
+· LSE 数量随磁盘容量增加<br>
+· 大多数出现 LSE 的盘，LSE 少于 50 个<br>
+· 出过 LSE 的盘更容易出更多 LSE<br>
+· 存在显著的空间与时间局部性<br>
+· 磁盘擦洗很有用（大多数 LSE 是这样发现的）</p></div>
+<div class="card"><h4>关于块损坏</h4><p>
+· 同一档次内，不同型号的损坏概率差别很大<br>
+· 不同型号的老化效应不同<br>
+· 工作负载和磁盘容量对损坏影响很小<br>
+· 多数出现损坏的盘只有少数几处损坏<br>
+· 损坏<strong>不独立</strong>：同盘内、RAID 中的不同盘之间都相关<br>
+· 有空间局部性，也有一定时间局部性<br>
+· 与 LSE 有弱相关</p></div>
+</div>
+<p>结论很清楚：<strong>想构建可靠的存储系统，就必须有检测并恢复 LSE 和块损坏的机制。</strong></p>
+
+<section class="sim" id="sim-rate">
+  <div class="sim-head"><span class="tag">估算器</span><h3>我的机房里会不会遇到？</h3><div class="desc">用上表的比例粗略估算：n 块盘在约 3 年内，至少一块出现 LSE / 块损坏的概率。注意这里假设各盘独立——原书恰恰指出损坏在盘之间<strong>并不独立</strong>，所以只是量级感受。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>磁盘数 n <input type="number" id="rt-n" value="100" min="1" max="100000"></label>
+      <label>档次 <select id="rt-cls"><option value="cheap">廉价盘（SATA）</option><option value="costly">昂贵盘（SCSI/FC）</option></select></label>
+    </div>
+    <div class="stats" id="rt-stats"></div>
+  </div>
+</section>
+
+<h2 id="lse"><span class="num">4</span>处理潜在扇区错误：检测容易，靠冗余恢复</h2>
+<div class="crux"><p><strong>如何处理潜在扇区错误？</strong>存储系统该怎样应对 LSE？需要多少额外机制？</p>
+<p class="small muted">How should a storage system handle latent sector errors? How much extra machinery is needed to handle this form of partial failure?</p></div>
+<p>LSE 按定义就<strong>很容易检测</strong>：访问某块时磁盘直接返回错误。存储系统只需要动用已有的冗余机制拿到正确数据：镜像 RAID 就去读另一份副本；RAID-4/5 就用同一奇偶校验组里的其他块重建出这个块。</p>
+<p>但 LSE 越来越常见，也影响了 RAID 设计。一个典型难题出现在 RAID-4/5 上：<strong>整盘失效和 LSE 同时发生</strong>。一块盘坏了，RAID 要把它重建到热备盘上，就得把奇偶校验组里其他所有盘从头到尾读一遍；如果重建途中在另一块盘上碰到 LSE，这一条带就同时缺了两个块，单个奇偶校验块救不回来——重建无法顺利完成。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 720 262" width="720" role="img" aria-label="RAID-5 重建时遇到 LSE">
+  <defs><marker id="ar45b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <g font-size="13" text-anchor="middle">
+    <text x="75" y="24">磁盘 0</text><text x="185" y="24">磁盘 1</text><text x="295" y="24">磁盘 2</text><text x="405" y="24">磁盘 3</text><text x="615" y="24">热备盘</text>
+  </g>
+  <g font-size="12.5" class="mono" text-anchor="middle">
+    <!-- 条带 0 -->
+    <rect x="35" y="36" width="80" height="34" rx="5" class="box"/><text x="75" y="58">D0</text>
+    <rect x="145" y="36" width="80" height="34" rx="5" class="box"/><text x="185" y="58">D1</text>
+    <rect x="255" y="36" width="80" height="34" rx="5" class="bad-soft"/><text x="295" y="58">D2</text>
+    <rect x="365" y="36" width="80" height="34" rx="5" class="box"/><text x="405" y="58">P0</text>
+    <rect x="570" y="36" width="90" height="34" rx="5" class="ok-soft"/><text x="615" y="58">D2 ✓</text>
+    <!-- 条带 1 -->
+    <rect x="35" y="80" width="80" height="34" rx="5" class="bad-soft"/><text x="75" y="102">D3 LSE</text>
+    <rect x="145" y="80" width="80" height="34" rx="5" class="box"/><text x="185" y="102">D4</text>
+    <rect x="255" y="80" width="80" height="34" rx="5" class="bad-soft"/><text x="295" y="102">P1</text>
+    <rect x="365" y="80" width="80" height="34" rx="5" class="box"/><text x="405" y="102">D5</text>
+    <rect x="570" y="80" width="90" height="34" rx="5" class="bad-soft"/><text x="615" y="102">P1 ？</text>
+    <!-- 条带 2 -->
+    <rect x="35" y="124" width="80" height="34" rx="5" class="box"/><text x="75" y="146">D6</text>
+    <rect x="145" y="124" width="80" height="34" rx="5" class="box"/><text x="185" y="146">P2</text>
+    <rect x="255" y="124" width="80" height="34" rx="5" class="bad-soft"/><text x="295" y="146">D7</text>
+    <rect x="365" y="124" width="80" height="34" rx="5" class="box"/><text x="405" y="146">D8</text>
+    <rect x="570" y="124" width="90" height="34" rx="5" class="ok-soft"/><text x="615" y="146">D7 ✓</text>
+  </g>
+  <line x1="255" y1="36" x2="335" y2="158" style="stroke:var(--bad);stroke-width:3"/>
+  <line x1="335" y1="36" x2="255" y2="158" style="stroke:var(--bad);stroke-width:3"/>
+  <line x1="455" y1="97" x2="562" y2="97" class="arrow" marker-end="url(#ar45b)"/>
+  <text x="508" y="88" text-anchor="middle" font-size="12" class="t-muted">XOR 重建</text>
+  <g font-size="13">
+    <text x="35" y="190">① 磁盘 2 整盘失效 → 读其他盘同一条带的块，XOR 算出缺失块，写到热备盘。</text>
+    <text x="35" y="214">② 条带 1 在磁盘 0 上碰到 LSE：D3 读不出，P1 也没了——两处缺失，单奇偶校验救不回。</text>
+    <text x="35" y="238">③ 对策：NetApp 的 RAID-DP 相当于有两块奇偶校验盘，多出的校验可以补上这个 LSE。</text>
+  </g>
+</svg>
+<figcaption>图 45-B　RAID-5 重建遇到 LSE。整盘故障 + 一个 LSE = 同一条带缺两个块。</figcaption>
+</figure>
+<p>为此有的系统增加一层冗余。例如 NetApp 的 <strong>RAID-DP</strong> 相当于有两块奇偶校验盘：重建时碰到 LSE，额外的校验信息可以把缺失块重建出来。代价照例存在：每个条带要维护两个校验块更贵（不过 NetApp 的 WAFL 文件系统是日志结构式的，很多时候能摊薄这部分开销），剩下的主要代价是空间——多占一块盘来放第二个校验块。</p>
+
+<h2 id="checksum"><span class="num">5</span>检测损坏：校验和</h2>
+<div class="crux"><p><strong>在存在损坏的情况下如何保持数据完整性？</strong>既然这类故障是静默的，存储系统怎样才能发现损坏已经发生？需要哪些技术？如何高效实现？</p>
+<p class="small muted">Given the silent nature of such failures, what can a storage system do to detect when corruption arises? What techniques are needed? How can one implement them efficiently?</p></div>
+<p>和 LSE 不同，损坏的难点在于<strong>检测</strong>。一旦知道某块坏了，恢复方法和前面一样：找另一份副本（但愿那份没坏）。所以这里集中讨论检测技术。</p>
+<p>现代存储系统保护数据完整性的主要手段是<strong>校验和（checksum）</strong>：一个函数，输入一块数据（比如 4 KB），输出一个很小的摘要（比如 4 或 8 字节）。把校验和与数据一起存下来，以后访问时重新计算，对比当前数据的校验和与当初存下的值，就能发现数据是否被改动过。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 720 300" width="720" role="img" aria-label="校验和的写入与读取流程">
+  <defs><marker id="ar45c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="10" y="56" font-size="13" font-weight="700">写</text>
+  <rect x="40" y="32" width="150" height="40" rx="6" class="box"/><text x="115" y="57" text-anchor="middle" font-size="13">数据块 D（4 KB）</text>
+  <line x1="190" y1="52" x2="236" y2="52" class="arrow" marker-end="url(#ar45c)"/>
+  <rect x="240" y="32" width="160" height="40" rx="6" class="accent-soft"/><text x="320" y="57" text-anchor="middle" font-size="13">计算 C(D)（如 8 字节）</text>
+  <line x1="400" y1="52" x2="446" y2="52" class="arrow" marker-end="url(#ar45c)"/>
+  <rect x="450" y="32" width="54" height="40" rx="6" class="warn-soft"/><text x="477" y="57" text-anchor="middle" font-size="12" class="mono">C(D)</text>
+  <rect x="506" y="32" width="170" height="40" rx="6" class="box"/><text x="591" y="57" text-anchor="middle" font-size="13">D　一起写到磁盘</text>
+
+  <text x="10" y="146" font-size="13" font-weight="700">读</text>
+  <rect x="40" y="122" width="150" height="40" rx="6" class="box"/><text x="115" y="147" text-anchor="middle" font-size="13">读出 D′ 和 Cs(D)</text>
+  <line x1="190" y1="142" x2="236" y2="142" class="arrow" marker-end="url(#ar45c)"/>
+  <rect x="240" y="122" width="160" height="40" rx="6" class="accent-soft"/><text x="320" y="147" text-anchor="middle" font-size="13">重新计算 Cc(D′)</text>
+  <line x1="400" y1="142" x2="436" y2="142" class="arrow" marker-end="url(#ar45c)"/>
+  <polygon points="500,112 562,142 500,172 438,142" class="box-strong"/>
+  <text x="500" y="147" text-anchor="middle" font-size="13">Cs = Cc ?</text>
+  <line x1="562" y1="142" x2="586" y2="142" class="arrow" marker-end="url(#ar45c)"/>
+  <text x="574" y="134" text-anchor="middle" font-size="12" class="t-muted">是</text>
+  <rect x="590" y="122" width="100" height="40" rx="6" class="ok-soft"/><text x="640" y="147" text-anchor="middle" font-size="13">返回数据</text>
+  <line x1="500" y1="172" x2="500" y2="206" class="arrow" marker-end="url(#ar45c)"/>
+  <text x="512" y="194" font-size="12" class="t-muted">否</text>
+  <rect x="430" y="210" width="140" height="40" rx="6" class="bad-soft"/><text x="500" y="235" text-anchor="middle" font-size="13">检测到损坏！</text>
+  <line x1="430" y1="222" x2="372" y2="206" class="arrow" marker-end="url(#ar45c)"/>
+  <line x1="430" y1="240" x2="372" y2="258" class="arrow" marker-end="url(#ar45c)"/>
+  <rect x="160" y="186" width="210" height="34" rx="6" class="ok-soft"/><text x="265" y="208" text-anchor="middle" font-size="12.5">有冗余副本 → 改读副本（并修复）</text>
+  <rect x="160" y="244" width="210" height="34" rx="6" class="warn-soft"/><text x="265" y="266" text-anchor="middle" font-size="12.5">没有副本 → 只能返回错误</text>
+</svg>
+<figcaption>图 45-C　校验和的使用：写入时算好 C(D) 一起存；读取时重算 Cc 与存储的 Cs 比较。校验和只负责<strong>发现</strong>，恢复要靠冗余。</figcaption>
+</figure>
+
+<div class="aside" data-title="TIP：天下没有免费的午餐（TNSTAAFL）">
+<p>There's No Such Thing As A Free Lunch——看似白得的东西，其实总要付出代价。老式餐馆打出"免费午餐"招揽客人，进去才发现要"免费"午餐得先买几杯酒。校验和也一样：<strong>保护越强，通常越贵</strong>。</p>
+</div>
+
+<h3>常见的校验和函数</h3>
+<p>不同校验和函数在<strong>强度</strong>（保护数据完整性的能力）和<strong>速度</strong>（计算快慢）上各有取舍。</p>
+<ul>
+<li><strong>异或（XOR）</strong>：把数据块切成若干等长的单元，全部异或起来。原书的例子：对 16 字节的块算 4 字节校验和，把数据排成每行 4 字节，<strong>对每一列求异或</strong>。数据 <code>365e c4cd ba14 8a92 ecef 2c3a 40be f666</code> 的结果是 <code>0x201b9403</code>。XOR 的弱点：如果<strong>两个比特在各自单元的同一位置</strong>同时翻转，校验和不变，检测不到。</li>
+<li><strong>加法（addition）</strong>：对每个单元做二进制补码加法，忽略溢出。很快，能发现很多改动；但如果数据被<strong>移位/重排</strong>了就不行（加法和异或都满足交换律，顺序变了结果不变）。</li>
+<li><strong>Fletcher 校验和</strong>：设数据块 D 由字节 d<sub>1</sub> … d<sub>n</sub> 组成，对所有 d<sub>i</sub> 依次计算 <code>s1 = (s1 + d<sub>i</sub>) mod 255</code>，<code>s2 = (s2 + s1) mod 255</code>。s2 是 s1 的累加，隐含了<strong>位置信息</strong>，所以重排也能发现。原书称它几乎和 CRC 一样强，能检测所有单比特、双比特错误和很多突发错误。</li>
+<li><strong>循环冗余校验（CRC）</strong>：把数据块 D 看成一个很大的二进制数，除以一个约定好的值 k，余数就是 CRC。这种"二进制取模"可以实现得很高效，所以 CRC 在网络中也很流行。</li>
+</ul>
+<p>无论哪种方法，<strong>都不存在完美的校验和</strong>：内容不同的两个块可能得到相同的校验和，这叫<strong>碰撞（collision）</strong>。这很直观：把 4 KB 压缩成 4 或 8 字节的摘要，必然有很多输入对应同一个输出。选校验和函数，就是在"碰撞尽量少"和"计算尽量快"之间找平衡。</p>
+
+<section class="sim" id="sim-csum">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>逐位计算校验和：XOR / 加法 / Fletcher / CRC</h3><div class="desc">默认载入原书的 16 字节示例。选择算法后单步执行：XOR 看每一列怎么求奇偶，加法看进位怎么被丢掉，Fletcher 看 s1、s2 怎么滚动，CRC 看"模 2 长除法"的每一次移位异或。下面再制造一次损坏（翻转比特、同列翻转、交换两行），看哪些校验和能发现。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label class="wide">原始数据（十六进制，4–32 字节）<input type="text" id="cs-a" class="hexin" value="365e c4cd ba14 8a92 ecef 2c3a 40be f666"></label>
+    </div>
+    <div class="controls">
+      <label>算法 <select id="cs-alg"><option value="xor">XOR 异或</option><option value="add">加法（忽略溢出）</option><option value="fl">Fletcher</option><option value="crc">CRC-8（演示除法）</option></select></label>
+      <label>XOR/加法的单元 <select id="cs-unit"><option value="4">4 字节（原书）</option><option value="1">1 字节（checksum.py）</option></select></label>
+      <span class="sep"></span>
+      <button id="cs-p-book">载入原书示例</button>
+      <button id="cs-p-1234">1,2,3,4</button>
+      <button id="cs-p-4321">4,3,2,1</button>
+    </div>
+    <div id="cs-step"></div>
+    <div class="stage" id="cs-vis"></div>
+    <div class="narrate" id="cs-nar"></div>
+    <h4 style="margin:18px 0 6px">制造损坏：读回的数据</h4>
+    <div class="controls">
+      <label class="wide">读回的数据 <input type="text" id="cs-b" class="hexin"></label>
+    </div>
+    <div class="controls">
+      <label>比特号 k（从最左边数，0 基）<input type="number" id="cs-k" value="4" min="0" max="255"></label>
+      <button id="cs-flip">翻转第 k 位</button>
+      <button id="cs-col">同列翻转两位（第 1、2 行的第 k 列）</button>
+      <button id="cs-swap">交换第 1、2 行</button>
+      <button id="cs-reset">复原</button>
+    </div>
+    <div class="table-wrap" id="cs-cmp"></div>
+  </div>
+</section>
+
+<h3>CRC 的"除法"到底是什么</h3>
+<p>CRC 的除法是<strong>模 2 运算</strong>：没有进位和借位，减法就是异或。以上面模拟器用的 CRC-8 为例，除数 k = <code>1 0000 0111</code>（多项式 x<sup>8</sup>+x<sup>2</sup>+x+1，简写 0x07）。实现时维护一个 8 位寄存器，每读入一个字节先异或进寄存器，再逐位处理：</p>
+<pre><code>uint8_t crc8(const uint8_t *p, size_t n) {
+    uint8_t c = 0;
+    for (size_t i = 0; i &lt; n; i++) {
+        c ^= p[i];                          // 把下一个字节"拉下来"
+        for (int k = 0; k &lt; 8; k++)
+            c = (c &amp; 0x80) ? (c &lt;&lt; 1) ^ 0x07   // 最高位是 1：够"除"，减去除数（= 异或）
+                           : (c &lt;&lt; 1);         // 最高位是 0：商这一位为 0，只移位
+    }
+    return c;                               // 最后剩下的就是余数
+}</code></pre>
+<p>这和小学的竖式长除法一模一样，只是"减法"变成了异或。每次最高位为 1 时异或上除数，等价于长除法里"够减就减"。实际系统常用 CRC-32（除数 33 位），并用查表法一次处理一个字节（见本章实验）。</p>
+
+<h3>校验和放在哪里：布局（layout）</h3>
+<p>最直接的做法是每个扇区（或块）配一个校验和：给定数据块 D，记其校验和为 C(D)。但校验和很小（如 8 字节），而磁盘只能以扇区（512 字节）为单位写入，怎么放？</p>
+<figure class="fig">
+<svg viewBox="0 0 720 206" width="720" role="img" aria-label="两种校验和布局">
+  <text x="20" y="22" font-size="13" font-weight="600">方案一：每个扇区自带校验和（例如把盘格式化成 520 字节扇区：多出的 8 字节放校验和）</text>
+  <g font-size="12" class="mono" text-anchor="middle">
+    <rect x="20" y="34" width="36" height="40" rx="4" class="warn-soft"/><text x="38" y="58">C0</text>
+    <rect x="56" y="34" width="88" height="40" rx="4" class="box"/><text x="100" y="58">D0</text>
+    <rect x="156" y="34" width="36" height="40" rx="4" class="warn-soft" style="stroke:var(--accent);stroke-width:2"/><text x="174" y="58">C1</text>
+    <rect x="192" y="34" width="88" height="40" rx="4" class="box" style="stroke:var(--accent);stroke-width:2"/><text x="236" y="58">D1</text>
+    <rect x="292" y="34" width="36" height="40" rx="4" class="warn-soft"/><text x="310" y="58">C2</text>
+    <rect x="328" y="34" width="88" height="40" rx="4" class="box"/><text x="372" y="58">D2</text>
+    <rect x="428" y="34" width="36" height="40" rx="4" class="warn-soft"/><text x="446" y="58">C3</text>
+    <rect x="464" y="34" width="88" height="40" rx="4" class="box"/><text x="508" y="58">D3</text>
+    <rect x="564" y="34" width="36" height="40" rx="4" class="warn-soft"/><text x="582" y="58">C4</text>
+    <rect x="600" y="34" width="88" height="40" rx="4" class="box"/><text x="644" y="58">D4</text>
+  </g>
+  <text x="20" y="108" font-size="13" font-weight="600">方案二：n 个校验和打包进一个扇区，后面跟 n 个数据块（任何磁盘都能用）</text>
+  <g font-size="12" class="mono" text-anchor="middle">
+    <rect x="20" y="120" width="200" height="40" rx="4" class="warn-soft"/>
+    <text x="40" y="144">C0</text><text x="80" y="144" style="font-weight:700;fill:var(--accent)">C1</text><text x="120" y="144">C2</text><text x="160" y="144">C3</text><text x="200" y="144">C4</text>
+    <rect x="228" y="120" width="88" height="40" rx="4" class="box"/><text x="272" y="144">D0</text>
+    <rect x="322" y="120" width="88" height="40" rx="4" class="box" style="stroke:var(--accent);stroke-width:2"/><text x="366" y="144">D1</text>
+    <rect x="416" y="120" width="88" height="40" rx="4" class="box"/><text x="460" y="144">D2</text>
+    <rect x="510" y="120" width="88" height="40" rx="4" class="box"/><text x="554" y="144">D3</text>
+    <rect x="604" y="120" width="88" height="40" rx="4" class="box"/><text x="648" y="144">D4</text>
+  </g>
+  <text x="20" y="186" font-size="12.5" class="t-muted">覆盖写 D1：方案一只需 1 次写；方案二要读校验和扇区 → 改 C(D1) → 写回校验和扇区 + 写 D1（1 读 2 写）。</text>
+</svg>
+<figcaption>图 45-D　两种校验和布局（不按比例：实际校验和约 8 字节，而块有 4 KB 或更大）。</figcaption>
+</figure>
+<p>磁盘厂商的一种办法是把盘格式化为 <strong>520 字节扇区</strong>，每扇区多出的 8 字节存校验和。没有这种功能的磁盘，文件系统就得自己把校验和打包进 512 字节的块里：一个校验和扇区存 n 个校验和，后面跟 n 个数据块，然后是下一组。这种方案在所有磁盘上都能用，但效率可能差一些：想覆盖 D1，就得先读入存有 C(D1) 的校验和扇区、更新 C(D1)，再写出校验和扇区和新的 D1——<strong>一次读、两次写</strong>；而每扇区自带校验和的方案只需一次写。</p>
+
+<h2 id="using"><span class="num">6</span>使用校验和，以及两个新问题</h2>
+<p>读块 D 时，客户端（文件系统或存储控制器）同时从磁盘读出它的校验和，称为<strong>存储的校验和</strong> C<sub>s</sub>(D)；再对读到的块重新算一遍，称为<strong>计算的校验和</strong> C<sub>c</sub>(D)。相等说明数据很可能没被损坏，可以放心返回；不相等说明数据自存储以来被改动过——校验和帮我们发现了一次损坏。</p>
+<p>发现损坏后怎么办？有冗余副本就简单：改用副本。没有副本，多半只能返回错误。要明白，检测损坏不是灵丹妙药：<strong>如果没有其他途径拿到未损坏的数据，你就是没辙了。</strong></p>
+
+<h3>错位写入（misdirected write）</h3>
+<div class="crux"><p><strong>如何处理错位写入？</strong>存储系统或磁盘控制器该怎样发现错位写入？校验和需要额外包含什么？</p>
+<p class="small muted">How should a storage system or disk controller detect misdirected writes? What additional features are required from the checksum?</p></div>
+<p>磁盘和 RAID 控制器有时会把数据<strong>正确地写到了错误的位置</strong>。单盘系统中，本该写到地址 x 的 D<sub>x</sub> 被写到了地址 y（于是"损坏"了 D<sub>y</sub>）；多盘系统中，控制器还可能把 D<sub>i,x</sub> 写到了另一块盘 j 上。</p>
+<p>注意：错位写入后，块 y 上是一份<strong>完整、自洽</strong>的数据——它的内容和它的校验和完全匹配（校验和就是对这份数据算的）。所以单纯的校验和发现不了！答案也很简单：给校验和再加一点信息——<strong>物理 ID（physical ID）</strong>，即块所在的<strong>磁盘号和扇区号</strong>。读磁盘 10 的块 4（D<sub>10,4</sub>）时，存储的信息里应该写着"disk=10、block=4"；对不上，就说明发生了错位写入。</p>
+<figure class="fig">
+<svg viewBox="0 0 720 250" width="720" role="img" aria-label="带物理 ID 的校验和布局与错位写入">
+  <defs><marker id="ar45d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--bad)"/></marker></defs>
+  <text x="10" y="70" font-size="13" font-weight="700">磁盘 0</text>
+  <text x="10" y="176" font-size="13" font-weight="700">磁盘 1</text>
+  <g font-size="11.5" class="mono">
+    <!-- 磁盘 0 -->
+    <rect x="80" y="44" width="84" height="54" rx="4" class="warn-soft"/><text x="88" y="60">C[D0]</text><text x="88" y="75">disk=0</text><text x="88" y="90">block=0</text>
+    <rect x="164" y="44" width="70" height="54" rx="4" class="box"/><text x="199" y="76" text-anchor="middle">D0</text>
+    <rect x="290" y="44" width="84" height="54" rx="4" class="warn-soft"/><text x="298" y="60">C[D1]</text><text x="298" y="75">disk=0</text><text x="298" y="90">block=1</text>
+    <rect x="374" y="44" width="70" height="54" rx="4" class="box"/><text x="409" y="70" text-anchor="middle">D1</text><text x="409" y="86" text-anchor="middle" style="fill:var(--bad)">(旧)</text>
+    <rect x="500" y="44" width="84" height="54" rx="4" class="bad-soft"/><text x="508" y="60">C[D1′]</text><text x="508" y="75">disk=0</text><text x="508" y="90" style="fill:var(--bad);font-weight:700">block=1</text>
+    <rect x="584" y="44" width="70" height="54" rx="4" class="bad-soft"/><text x="619" y="76" text-anchor="middle">D1′</text>
+    <!-- 磁盘 1 -->
+    <rect x="80" y="150" width="84" height="54" rx="4" class="warn-soft"/><text x="88" y="166">C[D0]</text><text x="88" y="181">disk=1</text><text x="88" y="196">block=0</text>
+    <rect x="164" y="150" width="70" height="54" rx="4" class="box"/><text x="199" y="182" text-anchor="middle">D0</text>
+    <rect x="290" y="150" width="84" height="54" rx="4" class="warn-soft"/><text x="298" y="166">C[D1′]</text><text x="298" y="181">disk=1</text><text x="298" y="196">block=1</text>
+    <rect x="374" y="150" width="70" height="54" rx="4" class="box"/><text x="409" y="182" text-anchor="middle">D1′</text>
+    <rect x="500" y="150" width="84" height="54" rx="4" class="warn-soft"/><text x="508" y="166">C[D2]</text><text x="508" y="181">disk=1</text><text x="508" y="196">block=2</text>
+    <rect x="584" y="150" width="70" height="54" rx="4" class="box"/><text x="619" y="182" text-anchor="middle">D2</text>
+  </g>
+  <g font-size="12" text-anchor="middle" class="t-muted"><text x="157" y="118">块 0</text><text x="367" y="118">块 1</text><text x="577" y="118">块 2</text></g>
+  <path d="M 409 40 C 430 24, 560 24, 590 38" style="stroke:var(--bad);fill:none;stroke-width:2;stroke-dasharray:5 4" marker-end="url(#ar45d)"/>
+  <text x="498" y="13" text-anchor="middle" font-size="12" style="fill:var(--bad)">"写 D1′ 到块 1"被错写到块 2</text>
+  <text x="10" y="236" font-size="12.5">读磁盘 0 的块 2：C[D1′] 与 D1′ 相符，但 block=1 ≠ 2 → 发现错位写入，改读磁盘 1 的块 2。</text>
+</svg>
+<figcaption>图 45-E　两盘镜像系统中带物理 ID 的布局（原书图，此处加上一次错位写入）。注意：磁盘 0 的块 1 仍是旧的 D1——对它来说这是一次"丢失写入"，物理 ID 帮不上忙。</figcaption>
+</figure>
+<p>从这个磁盘格式可以看到，盘上多了不少冗余信息：每个块都重复记着磁盘号，块的偏移也紧挨着块本身存了一份。这并不奇怪：<strong>冗余是错误检测（以及恢复）的关键</strong>。对完美的磁盘来说这点额外信息并非必需，但在出问题时能帮大忙。</p>
+
+<h3>最后一个问题：丢失写入（lost write）</h3>
+<div class="crux"><p><strong>如何处理丢失写入？</strong>存储系统或磁盘控制器该怎样发现丢失写入？校验和需要额外做些什么？</p>
+<p class="small muted">How should a storage system or disk controller detect lost writes? What additional features are required from the checksum?</p></div>
+<p>有些设备会告诉上层"写完了"，实际上数据<strong>从未落盘</strong>，块上留着的还是旧内容。前面的办法有用吗？<strong>没用</strong>：旧块的校验和与旧数据完全匹配，物理 ID（磁盘号 + 块偏移）也完全正确。</p>
+<figure class="fig">
+<svg viewBox="0 0 720 236" width="720" role="img" aria-label="丢失写入与父块校验和">
+  <defs><marker id="ar45e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <rect x="4" y="4" width="346" height="228" rx="10" class="box"/>
+  <text x="177" y="28" text-anchor="middle" font-size="14" font-weight="700">只有块内校验和</text>
+  <text x="20" y="56" font-size="12.5">① 写 D1 = v2，磁盘回复"完成 ✓"</text>
+  <text x="20" y="78" font-size="12.5">② 实际上盘面上仍是：</text>
+  <rect x="40" y="90" width="70" height="36" rx="4" class="warn-soft"/><text x="75" y="113" text-anchor="middle" font-size="12" class="mono">C(v1)</text>
+  <rect x="110" y="90" width="80" height="36" rx="4" class="box"/><text x="150" y="113" text-anchor="middle" font-size="12" class="mono">v1（旧）</text>
+  <rect x="190" y="90" width="110" height="36" rx="4" class="warn-soft"/><text x="245" y="113" text-anchor="middle" font-size="11.5" class="mono">disk=0 blk=1</text>
+  <text x="20" y="152" font-size="12.5">③ 读 D1：Cc(v1) = Cs = C(v1) ✓，物理 ID ✓</text>
+  <rect x="20" y="166" width="310" height="34" rx="6" class="bad-soft"/>
+  <text x="175" y="188" text-anchor="middle" font-size="12.5">一切"正常"，返回了旧数据 v1 ✗</text>
+  <rect x="370" y="4" width="346" height="228" rx="10" class="box"/>
+  <text x="543" y="28" text-anchor="middle" font-size="14" font-weight="700">父块里也存一份校验和（ZFS）</text>
+  <rect x="400" y="44" width="286" height="52" rx="6" class="accent-soft"/>
+  <text x="412" y="64" font-size="12.5">inode / 间接块</text>
+  <text x="412" y="86" font-size="12" class="mono">指针→块 1　期望校验和 C(v2)</text>
+  <line x1="543" y1="96" x2="543" y2="118" class="arrow" marker-end="url(#ar45e)"/>
+  <rect x="470" y="120" width="70" height="36" rx="4" class="warn-soft"/><text x="505" y="143" text-anchor="middle" font-size="12" class="mono">C(v1)</text>
+  <rect x="540" y="120" width="80" height="36" rx="4" class="box"/><text x="580" y="143" text-anchor="middle" font-size="12" class="mono">v1（旧）</text>
+  <rect x="386" y="166" width="314" height="34" rx="6" class="ok-soft"/>
+  <text x="543" y="188" text-anchor="middle" font-size="12.5">Cc(v1) ≠ inode 中的 C(v2) → 发现丢失写入 ✓</text>
+  <text x="543" y="220" text-anchor="middle" font-size="11.5" class="t-muted">除非 inode 和数据块的写入同时丢失</text>
+</svg>
+<figcaption>图 45-F　丢失写入：块自身的校验和与物理 ID 都"自洽"，只有存在别处的校验和才能揭穿它。</figcaption>
+</figure>
+<p>可行的办法有好几种：</p>
+<ul>
+<li><strong>写验证（write verify）/ 写后读（read-after-write）</strong>：写完立刻读回来，确认数据确实到达了盘面。缺点是<strong>很慢</strong>，完成一次写所需的 I/O 翻倍。</li>
+<li><strong>在系统的别处再存一份校验和</strong>：例如 Sun 的 ZFS 在每个文件的 inode 和间接块里，为文件包含的每个块都存了校验和。即使对数据块的写丢失了，inode 里的校验和也对不上旧数据。只有 inode 和数据块的写<strong>同时</strong>丢失，这个方案才会失效——不太可能，但遗憾的是确实可能。</li>
+</ul>
+
+<h2 id="scrub"><span class="num">7</span>磁盘擦洗与开销</h2>
+<h3>擦洗（scrubbing）：校验和到底什么时候被检查？</h3>
+<p>应用访问数据时会顺带检查一部分，但<strong>大多数数据很少被访问</strong>，于是一直没人检查。对可靠的存储系统来说这很危险：<strong>比特腐烂（bit rot）</strong>最终可能波及同一份数据的<em>所有</em>副本。</p>
+<p>补救办法是<strong>磁盘擦洗（disk scrubbing）</strong>：定期读遍系统中的每一个块，核对校验和是否仍然有效，趁还有好副本时修复坏副本，从而降低某份数据所有副本都坏掉的概率。典型系统每晚或每周扫描一次。（前面的研究也提到：大多数 LSE 就是这样被发现的。）</p>
+<figure class="fig">
+<svg viewBox="0 0 720 214" width="720" role="img" aria-label="擦洗与否的对比">
+  <text x="10" y="22" font-size="13" font-weight="700">不擦洗</text>
+  <text x="10" y="52" font-size="12" class="t-muted">副本 A</text><text x="10" y="82" font-size="12" class="t-muted">副本 B</text>
+  <line x1="70" y1="48" x2="640" y2="48" class="stroke" stroke-width="1.5"/>
+  <line x1="70" y1="78" x2="640" y2="78" class="stroke" stroke-width="1.5"/>
+  <circle cx="230" cy="48" r="7" style="fill:var(--bad)"/><text x="230" y="36" text-anchor="middle" font-size="11" style="fill:var(--bad)">腐烂</text>
+  <circle cx="520" cy="78" r="7" style="fill:var(--bad)"/><text x="520" y="100" text-anchor="middle" font-size="11" style="fill:var(--bad)">腐烂</text>
+  <rect x="580" y="30" width="134" height="30" rx="6" class="bad-soft"/><text x="647" y="50" text-anchor="middle" font-size="12">两份都坏：数据丢失</text>
+  <text x="10" y="132" font-size="13" font-weight="700">定期擦洗</text>
+  <text x="10" y="162" font-size="12" class="t-muted">副本 A</text><text x="10" y="192" font-size="12" class="t-muted">副本 B</text>
+  <line x1="70" y1="158" x2="640" y2="158" class="stroke" stroke-width="1.5"/>
+  <line x1="70" y1="188" x2="640" y2="188" class="stroke" stroke-width="1.5"/>
+  <g style="stroke:var(--accent);stroke-dasharray:4 3" stroke-width="1.5">
+    <line x1="150" y1="140" x2="150" y2="200"/><line x1="300" y1="140" x2="300" y2="200"/><line x1="450" y1="140" x2="450" y2="200"/><line x1="600" y1="140" x2="600" y2="200"/>
+  </g>
+  <g font-size="11" text-anchor="middle" style="fill:var(--accent)"><text x="150" y="136">擦洗</text><text x="300" y="136">擦洗</text><text x="450" y="136">擦洗</text><text x="600" y="136">擦洗</text></g>
+  <circle cx="230" cy="158" r="7" style="fill:var(--bad)"/>
+  <circle cx="300" cy="158" r="7" style="fill:var(--ok)"/><text x="316" y="154" font-size="11" style="fill:var(--ok)">用 B 修复</text>
+  <circle cx="520" cy="188" r="7" style="fill:var(--bad)"/>
+  <circle cx="600" cy="188" r="7" style="fill:var(--ok)"/><text x="616" y="184" font-size="11" style="fill:var(--ok)">用 A 修复</text>
+</svg>
+<figcaption>图 45-G　擦洗把"两份副本先后坏掉"的时间窗口切碎：只要两次腐烂不落在同一个擦洗间隔里，数据就救得回来。</figcaption>
+</figure>
+
+<h3>校验和的开销</h3>
+<p>和计算机系统中常见的情况一样，开销分<strong>空间</strong>和<strong>时间</strong>两种。</p>
+<ul>
+<li><strong>空间·磁盘上</strong>：每个校验和都占掉本可存用户数据的空间。典型比例是每 4 KB 数据块配 8 字节校验和，磁盘空间开销约 <strong>0.19%</strong>（8 / 4096 ≈ 0.195%）。</li>
+<li><strong>空间·内存中</strong>：访问数据时内存里要同时放校验和。如果校验完就丢掉，这个开销很短暂，不必担心；只有为了防范内存损坏而把校验和一直留在内存里时，才看得到这点小开销。</li>
+<li><strong>时间·CPU</strong>：空间开销很小，时间开销却可能相当明显。CPU 至少要在<strong>存储时</strong>（算出要存的校验和）和<strong>访问时</strong>（重算并比较）各算一遍。许多系统（包括网络协议栈）的优化办法是<strong>把复制和校验合二为一</strong>：数据反正要从内核页缓存复制到用户缓冲区，边复制边算校验和非常划算。</li>
+<li><strong>时间·额外 I/O</strong>：校验和与数据分开存放时需要额外 I/O（可通过设计减少）；后台擦洗也要额外 I/O（可以调节，比如放在大多数人——并非所有人！——都已上床睡觉的深夜进行）。</li>
+</ul>
+
+<section class="sim" id="sim-cost">
+  <div class="sim-head"><span class="tag">计算器</span><h3>校验和的空间与时间开销</h3><div class="desc">改变校验和大小、块大小和算法吞吐（下拉里的数字来自本章实验的真实输出），看空间开销和每块 CPU 时间。对比一下：一次机械硬盘随机 I/O 大约是毫秒级。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>校验和大小（字节）<input type="number" id="co-c" value="8" min="1" max="64"></label>
+      <label>块大小（字节）<input type="number" id="co-b" value="4096" min="512" max="1048576" step="512"></label>
+      <label>算法吞吐 <select id="co-alg">
+        <option value="15986.8">XOR 64 位字 · 15987 MB/s</option>
+        <option value="1552.7">Fletcher 推迟取模 · 1553 MB/s</option>
+        <option value="409.1" selected>CRC32 查表 · 409 MB/s</option>
+        <option value="116.2">CRC32 逐位 · 116 MB/s</option>
+      </select></label>
+    </div>
+    <div class="stats" id="co-stats"></div>
+  </div>
+</section>
+
+<h2 id="sim"><span class="num">8</span>模拟器：镜像 + 校验和，检测并恢复</h2>
+<p>把本章所有机制放进一个小系统：两块互为镜像的磁盘，每块盘 6 个块，每个块旁存着 Fletcher 校验和（可选再加物理 ID）；还可以选择在 inode 里再存一份校验和（ZFS 式）。你可以注入各种故障，然后读取或擦洗，看系统能不能发现、能不能修好。</p>
+
+<section class="sim" id="sim-mirror">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>两块镜像盘上的故障注入与恢复</h3><div class="desc">读取策略：先读磁盘 0，校验失败（或 LSE）就改读磁盘 1，并用好副本修复磁盘 0；擦洗则逐块检查两份副本。虚线红框是"上帝视角"——块内容已经不是应用最后写入的值，但文件系统未必知道。重点观察"静默返回错误数据"这个数字何时不为 0。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label><input type="checkbox" id="mr-phys"> 校验和旁存物理 ID（磁盘号 + 块号）</label>
+      <label><input type="checkbox" id="mr-parent"> inode 里也存每块的校验和（ZFS 式）</label>
+    </div>
+    <div class="controls">
+      <button data-p="flip">比特翻转</button>
+      <button data-p="lse">潜在扇区错误</button>
+      <button data-p="misdir">错位写入</button>
+      <button data-p="lost">丢失写入</button>
+      <button data-p="scrub">擦洗</button>
+      <button data-p="both">两份都坏</button>
+    </div>
+    <details class="reveal"><summary>编辑操作脚本（语法说明）</summary><div>
+      <p class="small">每行一条，<code>#</code> 后为注释。块号 0–5，磁盘号 0/1，数值为最多 8 位十六进制。</p>
+      <ul class="small">
+        <li><code>w 块 值</code>：正常写（两块盘都写）</li>
+        <li><code>wm 盘 块 值 错块</code>：错位写入——该盘把"写到块"错写到"错块"，另一块盘正常</li>
+        <li><code>wl 盘 块 值</code>：丢失写入——该盘报告成功但没写，另一块盘正常</li>
+        <li><code>flip 盘 块 位</code>：翻转数据的第"位"位（0–31）</li>
+        <li><code>lse 盘 块</code>：该扇区出现潜在扇区错误</li>
+        <li><code>r 块</code>：读；<code>scrub</code>：擦洗所有块</li>
+      </ul>
+      <textarea id="mr-ops" class="ops" spellcheck="false"></textarea>
+      <div class="controls" style="margin-top:8px"><button id="mr-apply" class="primary">应用脚本</button></div>
+    </div></details>
+    <div id="mr-step"></div>
+    <div class="stage">
+      <div class="oplist" id="mr-oplist"></div>
+      <div class="disks" id="mr-disks"></div>
+      <div class="legend"><span><i class="sw" style="border:2px dashed var(--bad)"></i>上帝视角：已损坏</span><span><i class="sw" style="background:var(--bad-soft)"></i>LSE（读会报错）</span><span><i class="sw" style="box-shadow:0 0 0 2px var(--accent)"></i>本步写入/注入</span><span><i class="sw" style="box-shadow:0 0 0 2px var(--ok)"></i>校验通过</span><span><i class="sw" style="box-shadow:0 0 0 2px var(--bad)"></i>校验失败</span><span><i class="sw" style="background:var(--ok-soft)"></i>已修复</span></div>
+    </div>
+    <div class="narrate" id="mr-nar"></div>
+    <div class="stats" id="mr-stats"></div>
+  </div>
+</section>
+
+<h2 id="predict"><span class="num">9</span>先预测，再验证</h2>
+<div class="exercise"><div class="q">在"逐位计算校验和"模拟器里载入原书示例，选 XOR。第 1 组 4 列（每行最左边的 4 位）是 0011 / 1011 / 1110 / 0100。先心算这 4 列各有几个 1、结果的第一个十六进制数字是多少，再单步验证。</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>4 列的 1 的个数依次是 2、2、3、1（第 1 列 0,1,1,0；第 2 列 0,0,1,1；第 3 列 1,1,1,0；第 4 列 1,1,0,0）。偶数得 0、奇数得 1 → <code>0010</code> = <code>0x2</code>，正是 <code>0x201b9403</code> 的首位。XOR 本质上就是<strong>每一列的奇偶校验</strong>。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">仍用原书示例，把 k 设为 4，点"同列翻转两位"（第 1 行和第 2 行的第 4 列同时翻转）。预测：XOR、加法、Fletcher、CRC-8、CRC-32 中哪些能发现？再把 k 改成 6 做一次，最后点"交换第 1、2 行"预测一次。</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p><strong>同列翻转</strong>：XOR 两次都发现不了——这一列翻了两次，奇偶不变，这正是原书说的 XOR 局限。加法要看方向：k = 4 时，第 1 行这一位是 0（0→1，+2<sup>27</sup>），第 2 行这一位是 1（1→0，−2<sup>27</sup>），正好抵消，加法<strong>也漏检</strong>；k = 6 时两行这一位都是 1，同向减少 2×2<sup>25</sup>，加法能发现（本章实验测得随机情况下约一半能发现）。Fletcher 与 CRC 两次都能发现。</p>
+<p><strong>交换两行</strong>：XOR 和加法都满足交换律，结果不变，全部漏检；Fletcher 的 s2 与位置有关，CRC 更是逐位"除"下去，都能发现。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（改编自原书 Homework 第 7 题）把单元改成"1 字节"，分别载入 1,2,3,4 和 4,3,2,1。先预测两组数据的加法、XOR、Fletcher 校验和，然后验证：它们有什么共同点？Fletcher 好在哪里？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>加法都是 10（0x0a），XOR 都是 1⊕2⊕3⊕4 = 4。Fletcher：1,2,3,4 时 s1 = 1,3,6,10，s2 = 1,4,10,20 → (s2, s1) = (20, 10)；4,3,2,1 时 s1 = 4,7,9,10，s2 = 4,11,20,30 → (30, 10)。s1 一样（它就是模 255 的加法），但 s2 是"前缀和的和"，字节越靠前贡献越大，所以<strong>顺序</strong>不同 s2 就不同。这就是 Fletcher 比简单加法强的地方。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（改编自 Homework 第 3、4 题）1 字节单元下，找一个不全为 0 的 4 字节数据，使加法和 XOR 校验和相同。一般在什么时候二者相同？什么时候不同？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>例如 <code>01 02 04 08</code>：加法 = 15 = XOR。异或就是"不带进位的加法"，所以只要加的过程中<strong>从不产生进位</strong>（任意两个字节没有同时为 1 的比特位）且总和不溢出，二者就相等。只要某一位上有两个 1 相加产生进位（例如 <code>01 01 00 00</code>：加法 = 2，XOR = 0），二者就会不同。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">在镜像模拟器里点"错位写入"（默认不开物理 ID、不开 inode 校验和）。先预测第 2 条操作 <code>r 3</code> 和第 3 条 <code>r 1</code> 会返回什么、"静默返回错误数据"会变成几；然后依次勾上"物理 ID"、再勾上"inode 校验和"，各预测一次。</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p><strong>都不开</strong>：<code>r 3</code> 读到磁盘 0 块 3 上的 CAFEF00D，校验和自洽 → 静默返回错误数据；<code>r 1</code> 读到磁盘 0 块 1 的旧值，同样自洽 → 又一次静默错误（计数 2）。擦洗时两份副本的块 1、块 3 内容不同，但各自校验和都通过，擦洗无法判断谁对。</p>
+<p><strong>开物理 ID</strong>：块 3 上记录的是 block=1 ≠ 3 → 发现，改读磁盘 1 并修复；但块 1 仍是旧数据且 ID 正确——对块 1 而言这其实是一次<strong>丢失写入</strong>，仍静默出错（计数 1）。</p>
+<p><strong>再开 inode 校验和</strong>：inode 里记着块 1 应为 C(CAFEF00D)，旧数据对不上 → 发现并修复，计数 0。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">点"擦洗"预设：磁盘 1 的块 0 翻转、磁盘 1 的块 5 出现 LSE、磁盘 0 的块 3 翻转。如果<strong>不</strong>擦洗、只做 <code>r 0</code> 和 <code>r 5</code>，这些问题会被发现吗？为什么擦洗这一步能全部修好？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>读操作先读磁盘 0，磁盘 0 的块 0、块 5 都是好的，直接返回——磁盘 1 上的两个问题<strong>永远不会被读路径发现</strong>，块 3 的问题也要等到有人读块 3 才会暴露。它们就这样潜伏着，直到另一份副本也坏掉。擦洗逐块检查<em>两份</em>副本，此时每个块都至少还有一份好的，于是三个问题全部被修复。这就是原书说"大多数 LSE 是靠擦洗发现的"的原因。</p>
+</div></details></div>
+
+<h2 id="lab"><span class="num">10</span>动手实验：实现并比较四种校验和</h2>
+<div class="lab">
+<p>改编自原书 Homework (Code) 第 1–4 题：<code>labs/45-data-integrity/csum.c</code> 实现了 XOR、加法、Fletcher（朴素版和推迟取模版）、CRC32（逐位版和查表版），程序分三段：① 自检（原书示例 XOR 必须是 0x201b9403，CRC32("123456789") 必须是 0xCBF43926）；② 64 MB 数据测速；③ 对 4 KB 随机块施加 10 万次各类损坏，统计检测率。</p>
+<pre><code><span class="cmd">cd labs/45-data-integrity && make && ./csum</span></code></pre>
+<p>核心代码（Fletcher 与 CRC32 查表）：</p>
+<pre><code>// Fletcher（原书定义）：每个字节都取模
+for (size_t i = 0; i &lt; n; i++) { s1 = (s1 + p[i]) % 255; s2 = (s2 + s1) % 255; }
+
+// 推迟取模：64 位累加器足够大，每 4096 字节才取一次模，结果完全相同
+for (size_t i = 0; i &lt; k; i++) { s1 += p[i]; s2 += s1; }
+s1 %= 255; s2 %= 255;
+
+// CRC32 查表：T[] 预先存好"一个字节经过 8 次移位/异或"的结果
+for (size_t i = 0; i &lt; n; i++) c = T[(c ^ p[i]) &amp; 0xFF] ^ (c &gt;&gt; 8);</code></pre>
+<p>示例输出（本机 WSL2 + gcc 14 实际运行；测速数字取决于 CPU 和负载，你的机器上会不同，检测率由固定种子生成，应基本一致）：</p>
+<pre><code>== 自检 ==
+原书示例 XOR      = 0x201b9403 （原书：0x201b9403） OK
+原书示例 加法     = 0x1e2171ff
+原书示例 Fletcher = s2=0x04 s1=0xb2
+原书示例 CRC32    = 0x314ca7a8
+CRC32("123456789") 逐位=0xcbf43926 查表=0xcbf43926 （标准值 0xcbf43926） OK
+
+== 测速：64 MB 随机数据（每种算至少 0.3 秒）==
+  15986.8 MB/s   XOR (64位字)
+   3208.7 MB/s   XOR (32位字,大端)
+   3358.2 MB/s   加法 (32位字)
+    285.6 MB/s   Fletcher 朴素
+   1552.7 MB/s   Fletcher 推迟取模
+    116.2 MB/s   CRC32 逐位
+    409.1 MB/s   CRC32 查表
+
+== 检测率：4 KB 块，每种损坏 100000 次 ==
+       XOR      加法  Fletcher     CRC32   损坏方式
+  100.000%  100.000%  100.000%  100.000%   随机 1 比特翻转
+   96.928%   98.364%   99.984%  100.000%   随机 2 比特翻转
+    0.000%   48.549%   99.888%  100.000%   同列 2 比特翻转(相隔 4 字节倍数)
+    0.000%    0.000%   97.852%  100.000%   交换两个 4 字节字
+  100.000%   99.939%   99.992%  100.000%   随机 3 比特翻转</code></pre>
+<p><strong>怎么读这组数字：</strong></p>
+<ul>
+<li><strong>没有免费的午餐</strong>：XOR 最快，CRC32 查表版慢了一个多数量级，逐位版更慢；但 CRC32 在所有测试里都是 100%。Fletcher 把取模推迟后快了约 5 倍，强度几乎不变——"算法相同、实现不同"对开销影响巨大。</li>
+<li><strong>XOR 的死穴</strong>：同一列的两个比特翻转 0% 检出，交换两个字也 0%；但奇数个比特翻转它一定能发现（至少有一列的奇偶变了）。</li>
+<li><strong>加法</strong>对同列翻转约有一半能发现：两位翻转方向相反（一个 0→1、一个 1→0）时正好抵消。</li>
+<li><strong>Fletcher 偶尔漏掉双比特错误</strong>：原书说 Fletcher 能检测所有双比特错误——对这种按字节模 255 的版本，这在数据不超过 255 字节时成立。4 KB 块里，若两个<strong>相距 255 字节整数倍</strong>的字节在同一比特位上一个 0→1、一个 1→0，s1 和 s2 的变化恰好都是 255 的倍数，就漏了。实际系统会用更宽的 Fletcher（如 Fletcher-32/64）或 CRC 来避免。</li>
+</ul>
+</div>
+
+<h2 id="quiz"><span class="num">11</span>自测题</h2>
+<p class="quiz-score"></p>
+
+<div class="mcq" data-answer="2"><div class="q">潜在扇区错误（LSE）和块损坏最本质的区别是？</div>
+<div class="opts"><button>A. LSE 影响整块磁盘，块损坏只影响一个块</button><button>B. LSE 可以用 ECC 修好，块损坏不能</button><button>C. LSE 会被磁盘报告为读错误（非静默），块损坏时磁盘照常返回错误数据（静默）</button><button>D. LSE 只发生在廉价盘上，块损坏只发生在昂贵盘上</button></div>
+<div class="explain">LSE 时磁盘 ECC 修不回来会主动报错，所以很容易检测，靠冗余恢复即可；块损坏（固件写错位置、总线损坏）磁盘毫无察觉，是静默故障，需要校验和才能发现。两类故障在两档磁盘上都会出现，只是昂贵盘少一个数量级。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">按原书 Figure 45.1，约 3 年内至少出现一次 LSE 的<strong>廉价</strong>盘比例约为？</div>
+<div class="opts"><button>A. 0.05%</button><button>B. 0.50%</button><button>C. 9.40%</button><button>D. 1.40%</button></div>
+<div class="explain">廉价盘 LSE 9.40%、昂贵盘 1.40%；块损坏分别为 0.50% 和 0.05%。更好的盘大约降低一个数量级，但仍不可忽略。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">以 4 字节为单元的 XOR 校验和，下列哪种损坏<strong>一定</strong>检测不到？</div>
+<div class="opts"><button>A. 任意三个比特翻转</button><button>B. 两个不同的 4 字节字里、相同位置的比特各翻转一次</button><button>C. 同一个 4 字节字里的两个不同比特翻转</button><button>D. 任意一个比特翻转</button></div>
+<div class="explain">XOR 就是每一列的奇偶。同一列翻两次，奇偶不变 → 漏检（原书指出的局限）。A、D 是奇数个翻转，必然至少有一列奇偶改变；C 中两个比特在不同列，两列都会变。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">在校验和旁边加入物理 ID（磁盘号 + 扇区号），主要是为了发现哪种问题？</div>
+<div class="opts"><button>A. 丢失写入</button><button>B. 校验和碰撞</button><button>C. 潜在扇区错误</button><button>D. 错位写入</button></div>
+<div class="explain">错位写入后，目标位置上的数据和它的校验和是自洽的，但记录的"应在何处"对不上当前位置。丢失写入时旧块的校验和与物理 ID 都正确，物理 ID 帮不上忙；LSE 本身就会报错。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">关于丢失写入（lost write），下列说法正确的是？</div>
+<div class="opts"><button>A. 可以把校验和也存到 inode/间接块里（ZFS），除非 inode 和数据块的写同时丢失</button><button>B. 物理 ID 能发现，因为块号会变</button><button>C. 块内校验和能发现，因为新数据的校验和与旧数据不同</button><button>D. 写后读既能发现丢失写入，又几乎没有性能代价</button></div>
+<div class="explain">丢失写入后盘上是旧数据 + 旧校验和 + 正确的物理 ID，一切自洽。ZFS 在父块中存子块的校验和，就能对不上；写后读也能发现，但它使写的 I/O 次数翻倍，很慢。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">采用"一个校验和扇区 + n 个数据块"的打包布局时，覆盖写数据块 D1 需要？</div>
+<div class="opts"><button>A. 1 次读 + 2 次写</button><button>B. 2 次读 + 2 次写</button><button>C. 1 次写</button><button>D. 2 次读 + 1 次写</button></div>
+<div class="explain">先读入包含 C(D1) 的校验和扇区，更新其中的 C(D1)，再写出校验和扇区和新 D1。520 字节扇区的方案只需 1 次写。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">每 4 KB 数据块配 8 字节校验和，磁盘空间开销约为？</div>
+<div class="opts"><button>A. 0.019%</button><button>B. 1.9%</button><button>C. 8%</button><button>D. 0.19%</button></div>
+<div class="explain">8 / 4096 ≈ 0.195%，原书写作 0.19%。空间开销很小；真正明显的是 CPU 时间开销（以及校验和分开存放、后台擦洗带来的额外 I/O）。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">为什么需要磁盘擦洗（scrubbing）？</div>
+<div class="opts"><button>A. 因为读路径不做校验，只有擦洗才检查校验和</button><button>B. 因为大多数数据很少被访问，比特腐烂可能悄悄波及所有副本，定期检查才能趁还有好副本时修复</button><button>C. 为了让磁盘 ECC 重新计算纠错码</button><button>D. 为了整理碎片，提升顺序读性能</button></div>
+<div class="explain">读路径也会检查，但只覆盖被访问的数据。擦洗定期读遍所有块，通常每晚或每周一次，最好安排在深夜。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">关于校验和碰撞，下列说法正确的是？</div>
+<div class="opts"><button>A. 碰撞不可避免，因为把 4 KB 映射到 4–8 字节必然多对一；好的函数让碰撞尽量少、计算尽量快</button><button>B. 碰撞说明磁盘损坏了</button><button>C. 使用 CRC 就能完全避免碰撞</button><button>D. 碰撞只会在数据全为 0 时发生</button></div>
+<div class="explain">原书："there is no perfect checksum"。输出空间远小于输入空间，必然存在不同数据同一校验和的情况。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">RAID-5 一块盘整盘失效后重建时，另一块盘出现 LSE，会发生什么？</div>
+<div class="opts"><button>A. RAID 会自动切换成 RAID-1</button><button>B. 该条带同时缺两个块，单奇偶校验无法重建；RAID-DP 用第二份校验来应对</button><button>C. 没有影响，奇偶校验可以同时补上两个块</button><button>D. 只要重新读一次就一定能读出</button></div>
+<div class="explain">单奇偶校验只能容忍一处缺失。NetApp 的 RAID-DP 相当于两块校验盘，代价是维护两份校验和多一块盘的空间。</div></div>
+
+<h2 id="summary"><span class="num">12</span>常见误区与本章小结</h2>
+<div class="warn">
+<ul>
+<li><strong>"校验和能纠错"</strong>：不能。校验和只负责<em>发现</em>问题，恢复靠冗余（镜像、奇偶校验）。没有好副本就只能返回错误。</li>
+<li><strong>"磁盘有 ECC，文件系统就不用校验和了"</strong>：ECC 管得了盘面比特错误，却管不了固件把块写错位置、总线上传坏的数据——这些在磁盘看来都是"正确"的数据。</li>
+<li><strong>"加了物理 ID 就万无一失"</strong>：物理 ID 只对付错位写入；丢失写入时旧块处处自洽，需要写后读或父块中的校验和。</li>
+<li><strong>"XOR / 加法就够用了"</strong>：它们满足交换律，对重排完全无感；XOR 对同列的偶数次翻转也无感。</li>
+<li><strong>"买昂贵的盘就不会出问题"</strong>：只是少一个数量级（LSE 9.40% → 1.40%，损坏 0.50% → 0.05%），150 万块盘的规模下依然常见。</li>
+<li><strong>"读的时候会检查，所以不需要擦洗"</strong>：大多数数据很少被读，问题会一直潜伏到所有副本都坏掉。</li>
+</ul>
+</div>
+<div class="key">
+<p><strong>本章要点</strong></p>
+<ul>
+<li>现代磁盘是<strong>部分失效</strong>的：除了整盘失效，还有 LSE（非静默）和块损坏（静默）。</li>
+<li>LSE 容易检测，直接用 RAID/镜像冗余恢复；但它会让 RAID-5 重建失败，于是有了 RAID-DP 这类双校验方案。</li>
+<li>静默损坏靠<strong>校验和</strong>检测：存储 Cs，读时重算 Cc 并比较。XOR、加法快但弱；Fletcher 带位置信息；CRC 最强也最贵。没有完美的校验和。</li>
+<li>布局：520 字节扇区（1 次写）或打包的校验和扇区（覆盖写要 1 读 2 写）。</li>
+<li>错位写入 → 在校验和旁加<strong>物理 ID</strong>；丢失写入 → <strong>写后读</strong>或把校验和存到 <strong>inode/间接块</strong>里（ZFS）。</li>
+<li><strong>擦洗</strong>定期检查所有块，防止比特腐烂波及所有副本。</li>
+<li>开销：空间很小（8 B / 4 KB ≈ 0.19%），CPU 时间明显，可用"复制与校验合一"来降低；额外 I/O 可以通过设计和调度来控制。</li>
+</ul>
+<p><strong>与后续章节的联系：</strong>下一部分进入分布式系统（第 48 章）。网络和磁盘一样会丢包、损坏数据包，校验和几乎原样出现在网络协议里，而"端到端"地检查完整性也会是分布式系统的核心思想。回头看，第 42 章的日志提交块里也可以放校验和（ext4 的做法），第 43 章 LFS 那样的写时复制设计（如 WAFL、ZFS）正是"父块存子块校验和"最自然的载体。</p>
+</div>
+
+</main>
+<script>
+(function () {
+  "use strict";
+  const { h } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  // ================= CORE-BEGIN：纯计算逻辑（可在 node 中单独测试） =================
+  function parseHex(str) {
+    const t = String(str).replace(/0x/gi, "").replace(/[^0-9a-fA-F]/g, "");
+    if (t.length === 0 || t.length % 2) return null;
+    const out = [];
+    for (let i = 0; i < t.length; i += 2) out.push(parseInt(t.substr(i, 2), 16));
+    return out;
+  }
+  function fmtHex(bytes) {
+    const parts = [];
+    for (let i = 0; i < bytes.length; i += 2) parts.push(bytes.slice(i, i + 2).map((b) => b.toString(16).padStart(2, "0")).join(""));
+    return parts.join(" ");
+  }
+  // 把字节按每 unit 字节组成一个大端单元（原书"每行 4 字节"的排法）
+  function words(bytes, unit) {
+    const w = [];
+    for (let i = 0; i + unit <= bytes.length; i += unit) {
+      let v = 0;
+      for (let k = 0; k < unit; k++) v = v * 256 + bytes[i + k];
+      w.push(v >>> 0);
+    }
+    return w;
+  }
+  function xorSum(bytes, unit) { return words(bytes, unit).reduce((a, b) => (a ^ b) >>> 0, 0); }
+  function addSum(bytes, unit) { const mod = unit === 4 ? 4294967296 : 256; return words(bytes, unit).reduce((a, b) => (a + b) % mod, 0); }
+  function fletcher(bytes) { let s1 = 0, s2 = 0; for (const d of bytes) { s1 = (s1 + d) % 255; s2 = (s2 + s1) % 255; } return { s1, s2, v: (s2 << 8) | s1 }; }
+  function crc8(bytes) {
+    let c = 0;
+    for (const d of bytes) { c ^= d; for (let k = 0; k < 8; k++) c = c & 0x80 ? ((c << 1) ^ 0x07) & 0xff : (c << 1) & 0xff; }
+    return c;
+  }
+  const CRC_T = (() => { const t = []; for (let i = 0; i < 256; i++) { let c = i; for (let k = 0; k < 8; k++) c = c & 1 ? (c >>> 1) ^ 0xedb88320 : c >>> 1; t.push(c >>> 0); } return t; })();
+  function crc32(bytes) { let c = 0xffffffff; for (const d of bytes) c = (CRC_T[(c ^ d) & 0xff] ^ (c >>> 8)) >>> 0; return (c ^ 0xffffffff) >>> 0; }
+  function flipBit(bytes, k) { const b = bytes.slice(); if (k >= 0 && k < b.length * 8) b[k >> 3] ^= 0x80 >> (k & 7); return b; }
+
+  // ---- 镜像磁盘模拟 ----
+  const NB = 6;
+  const INIT = [0x1a2b3c4d, 0x5e6f7081, 0x92a3b4c5, 0xd6e7f809, 0x0b1c2d3e, 0x4f5a6b7c];
+  const vbytes = (v) => [v >>> 24, (v >>> 16) & 255, (v >>> 8) & 255, v & 255];
+  const C = (v) => fletcher(vbytes(v)).v;
+  const H8 = (v) => (v >>> 0).toString(16).toUpperCase().padStart(8, "0");
+  const H4 = (v) => v.toString(16).toUpperCase().padStart(4, "0");
+
+  function parseOps(text) {
+    const ops = [], errs = [];
+    String(text).split("\n").forEach((line, ln) => {
+      const t = line.replace(/#.*/, "").trim();
+      if (!t) return;
+      const a = t.split(/\s+/), c = a[0].toLowerCase();
+      const num = (x, lo, hi) => { const n = Number(x); return Number.isInteger(n) && n >= lo && n <= hi ? n : NaN; };
+      const hexv = (x) => (/^(0x)?[0-9a-f]{1,8}$/i.test(x || "") ? parseInt(x.replace(/^0x/i, ""), 16) >>> 0 : NaN);
+      let op = null;
+      if (c === "w" && a.length === 3) op = { c, b: num(a[1], 0, NB - 1), v: hexv(a[2]) };
+      else if (c === "wm" && a.length === 5) op = { c, d: num(a[1], 0, 1), b: num(a[2], 0, NB - 1), v: hexv(a[3]), y: num(a[4], 0, NB - 1) };
+      else if (c === "wl" && a.length === 4) op = { c, d: num(a[1], 0, 1), b: num(a[2], 0, NB - 1), v: hexv(a[3]) };
+      else if (c === "flip" && a.length === 4) op = { c, d: num(a[1], 0, 1), b: num(a[2], 0, NB - 1), k: num(a[3], 0, 31) };
+      else if (c === "lse" && a.length === 3) op = { c, d: num(a[1], 0, 1), b: num(a[2], 0, NB - 1) };
+      else if (c === "r" && a.length === 2) op = { c, b: num(a[1], 0, NB - 1) };
+      else if (c === "scrub" && a.length === 1) op = { c };
+      if (!op || Object.values(op).some((x) => typeof x === "number" && isNaN(x)) || (op.c === "wm" && op.y === op.b)) errs.push(`第 ${ln + 1} 行无法解析：${t}`);
+      else { op.src = t; ops.push(op); }
+    });
+    return { ops, errs };
+  }
+  function initState() {
+    return {
+      disk: [0, 1].map((d) => INIT.map((v, b) => ({ v, cs: C(v), id: { d, b }, lse: false }))),
+      truth: INIT.slice(), parent: INIT.map(C),
+      stats: { det: 0, fix: 0, silent: 0, fail: 0 },
+    };
+  }
+  function check(st, d, b, o) {
+    const x = st.disk[d][b];
+    if (x.lse) return { ok: false, why: "LSE：磁盘 ECC 无法纠正，返回读错误" };
+    const cc = C(x.v);
+    if (cc !== x.cs) return { ok: false, why: `计算的 Cc=${H4(cc)} ≠ 存储的 Cs=${H4(x.cs)}` };
+    if (o.phys && (x.id.d !== d || x.id.b !== b)) return { ok: false, why: `物理 ID 记录的是 disk=${x.id.d} block=${x.id.b}，而我们读的是 disk=${d} block=${b}` };
+    if (o.parent && st.parent[b] !== cc) return { ok: false, why: `inode 中记录的校验和 ${H4(st.parent[b])} ≠ Cc=${H4(cc)}` };
+    return { ok: true, why: `Cs = Cc = ${H4(cc)}` + (o.phys ? "，物理 ID 匹配" : "") + (o.parent ? "，与 inode 记录一致" : "") };
+  }
+  function writeGood(st, d, b, v) { st.disk[d][b] = { v, cs: C(v), id: { d, b }, lse: false }; }
+  // 执行一条操作，返回 {log:[html…], touch:{"d:b": 类名}}
+  function apply(st, op, o) {
+    const log = [], touch = {};
+    const S = st.stats;
+    const tag = o.phys ? " + 物理 ID" : "";
+    if (op.c === "w") {
+      [0, 1].forEach((d) => { writeGood(st, d, op.b, op.v); touch[d + ":" + op.b] = "t-w"; });
+      st.truth[op.b] = op.v; st.parent[op.b] = C(op.v);
+      log.push(`两块盘的块 ${op.b} 都写入 ${H8(op.v)}，旁边存 C=${H4(C(op.v))}${tag}` + (o.parent ? `；inode 里也记下 C=${H4(C(op.v))}` : "") + "。");
+    } else if (op.c === "wm") {
+      const other = 1 - op.d, old = st.disk[op.d][op.y].v;
+      st.disk[op.d][op.y] = { v: op.v, cs: C(op.v), id: { d: op.d, b: op.b }, lse: false };
+      writeGood(st, other, op.b, op.v);
+      st.truth[op.b] = op.v; st.parent[op.b] = C(op.v);
+      touch[op.d + ":" + op.y] = "t-w"; touch[other + ":" + op.b] = "t-w";
+      log.push(`文件系统要把 ${H8(op.v)} 写到块 ${op.b}。磁盘 ${other} 正确写入。`);
+      log.push(`<b>错位写入</b>：磁盘 ${op.d} 的控制器把它写到了<b>块 ${op.y}</b>（覆盖了原来的 ${H8(old)}），并报告"成功"。写进去的校验和 C=${H4(C(op.v))}` + (o.phys ? `，物理 ID 记的是预期位置 block=${op.b}` : "") + `。`);
+      log.push(`结果：磁盘 ${op.d} 的块 ${op.y} 内容错了；块 ${op.b} 还是旧数据。两处从磁盘的角度看都"完好"。`);
+    } else if (op.c === "wl") {
+      const other = 1 - op.d;
+      writeGood(st, other, op.b, op.v);
+      st.truth[op.b] = op.v; st.parent[op.b] = C(op.v);
+      touch[other + ":" + op.b] = "t-w"; touch[op.d + ":" + op.b] = "t-w";
+      log.push(`写块 ${op.b} = ${H8(op.v)}：磁盘 ${other} 正确写入` + (o.parent ? `，inode 记下 C=${H4(C(op.v))}` : "") + "。");
+      log.push(`<b>丢失写入</b>：磁盘 ${op.d} 报告"完成"，但数据根本没落盘——块 ${op.b} 上仍是旧值 ${H8(st.disk[op.d][op.b].v)} 和与之匹配的旧校验和。`);
+    } else if (op.c === "flip") {
+      const x = st.disk[op.d][op.b], nv = (x.v ^ (1 << (31 - op.k))) >>> 0;
+      log.push(`磁盘 ${op.d} 块 ${op.b} 数据的第 ${op.k} 位（从最高位数）翻转：${H8(x.v)} → ${H8(nv)}。存储的校验和 Cs=${H4(x.cs)} 没变，磁盘也不会报告任何异常。`);
+      x.v = nv; touch[op.d + ":" + op.b] = "t-w";
+    } else if (op.c === "lse") {
+      st.disk[op.d][op.b].lse = true; touch[op.d + ":" + op.b] = "t-w";
+      log.push(`磁盘 ${op.d} 块 ${op.b} 所在扇区物理损坏（潜在扇区错误）。现在没人知道，要等到下次读它才会暴露。`);
+    } else if (op.c === "r") {
+      let got = null, from = -1, firstBad = false;
+      for (const d of [0, 1]) {
+        const r = check(st, d, op.b, o);
+        touch[d + ":" + op.b] = r.ok ? "t-ok" : "t-bad";
+        if (r.ok) { log.push(`读磁盘 ${d} 块 ${op.b}：${r.why} → 通过。`); got = st.disk[d][op.b].v; from = d; break; }
+        S.det++; firstBad = firstBad || d === 0;
+        log.push(`读磁盘 ${d} 块 ${op.b}：<span class="badc">${r.why}</span> → 发现问题！` + (d === 0 ? "改读镜像磁盘 1。" : ""));
+      }
+      if (from < 0) { S.fail++; log.push(`<span class="badc">两份副本都坏了——没有别的途径拿到正确数据，只能向上层返回错误。</span>`); }
+      else {
+        if (from === 1 && firstBad) {
+          writeGood(st, 0, op.b, got); S.fix++; touch["0:" + op.b] = "t-fix";
+          log.push(`<span class="okc">用磁盘 1 的好副本重写磁盘 0 的块 ${op.b}</span>（若是 LSE，磁盘会在写时把坏扇区重映射到备用扇区）。`);
+        }
+        if (got !== st.truth[op.b]) { S.silent++; log.push(`<span class="badc">⚠ 上帝视角：返回的 ${H8(got)} 不是最后写入的 ${H8(st.truth[op.b])}——静默返回了错误数据！</span>`); }
+        else log.push(`返回 ${H8(got)}，正确。`);
+      }
+    } else if (op.c === "scrub") {
+      let problems = 0;
+      for (let b = 0; b < NB; b++) {
+        const r0 = check(st, 0, b, o), r1 = check(st, 1, b, o);
+        touch["0:" + b] = r0.ok ? "t-ok" : "t-bad"; touch["1:" + b] = r1.ok ? "t-ok" : "t-bad";
+        if (r0.ok && r1.ok) {
+          if (st.disk[0][b].v !== st.disk[1][b].v) log.push(`块 ${b}：两份副本内容不同（${H8(st.disk[0][b].v)} / ${H8(st.disk[1][b].v)}），但各自的检查都通过——擦洗无法判断哪份是对的。`);
+          continue;
+        }
+        problems++;
+        if (!r0.ok) S.det++;
+        if (!r1.ok) S.det++;
+        if (r0.ok !== r1.ok) {
+          const good = r0.ok ? 0 : 1, bad = 1 - good;
+          writeGood(st, bad, b, st.disk[good][b].v); S.fix++; touch[bad + ":" + b] = "t-fix";
+          log.push(`块 ${b}：磁盘 ${bad} <span class="badc">${(r0.ok ? r1 : r0).why}</span> → <span class="okc">用磁盘 ${good} 修复</span>。`);
+        } else {
+          S.fail++;
+          log.push(`块 ${b}：<span class="badc">两份都检查失败，无法修复</span>（${r0.why}；${r1.why}）。`);
+        }
+      }
+      log.unshift(`擦洗：逐块读取两块盘上的所有副本并检查。发现问题的块：${problems} 个。`);
+    }
+    return { log, touch };
+  }
+  function simulate(ops, n, o) {
+    const st = initState();
+    let last = null;
+    for (let i = 0; i < n; i++) last = apply(st, ops[i], o);
+    return { st, last };
+  }
+  // ================= CORE-END =================
+
+  // ---------------- 估算器：LSE / 损坏概率 ----------------
+  (function rate() {
+    const RATES = { cheap: { lse: 0.094, cor: 0.005 }, costly: { lse: 0.014, cor: 0.0005 } };
+    function upd() {
+      const n = Math.max(1, Math.min(100000, Math.floor(+$("rt-n").value || 1)));
+      const r = RATES[$("rt-cls").value];
+      const pl = 1 - Math.pow(1 - r.lse, n), pc = 1 - Math.pow(1 - r.cor, n);
+      const stat = (v, l) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+      $("rt-stats").replaceChildren(
+        stat((pl * 100).toFixed(pl > 0.999 ? 3 : 1) + "%", "至少一块盘出现 LSE"),
+        stat((n * r.lse).toFixed(1), "预计出现 LSE 的盘数"),
+        stat((pc * 100).toFixed(pc > 0.999 ? 3 : 1) + "%", "至少一块盘出现块损坏"),
+        stat((n * r.cor).toFixed(2), "预计出现损坏的盘数"));
+    }
+    $("rt-n").addEventListener("input", upd); $("rt-cls").addEventListener("change", upd); upd();
+  })();
+
+  // ---------------- 计算器：开销 ----------------
+  (function cost() {
+    function upd() {
+      const c = Math.max(1, +$("co-c").value || 8), b = Math.max(512, +$("co-b").value || 4096), mbps = +$("co-alg").value;
+      const pct = (c / b) * 100;
+      const perTiB = (c / b) * 1024; // GiB / TiB
+      const us = (b / (mbps * 1048576)) * 1e6;
+      const stat = (v, l) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+      $("co-stats").replaceChildren(
+        stat(pct.toFixed(pct < 1 ? 3 : 2) + "%", "磁盘空间开销（c / b）"),
+        stat(perTiB.toFixed(2) + " GiB", "每 1 TiB 数据的校验和"),
+        stat(us < 10 ? us.toFixed(2) + " µs" : us.toFixed(1) + " µs", "每块 CPU 校验时间"),
+        stat((us / 10000 * 100).toFixed(us < 10 ? 3 : 2) + "%", "相当于一次 10 ms 硬盘随机 I/O 的"));
+    }
+    ["co-c", "co-b"].forEach((id) => $(id).addEventListener("input", upd));
+    $("co-alg").addEventListener("change", upd); upd();
+  })();
+
+  // ---------------- 模拟器 1：逐位计算校验和 ----------------
+  (function csumSim() {
+    const inA = $("cs-a"), inB = $("cs-b"), selAlg = $("cs-alg"), selUnit = $("cs-unit"), kIn = $("cs-k");
+    const vis = $("cs-vis"), nar = $("cs-nar"), cmp = $("cs-cmp");
+    const BOOK = "365e c4cd ba14 8a92 ecef 2c3a 40be f666";
+    let A = [], B = [];
+    const unit = () => +selUnit.value;
+    function load() { A = parseHex(inA.value) || []; const pb = parseHex(inB.value); B = pb || A.slice(); }
+    function valid() { const u = unit(); return A.length >= u && A.length % u === 0 && A.length <= 32 && A.length >= 4; }
+    function nSteps() {
+      if (!valid()) return 1;
+      const u = unit(), alg = selAlg.value;
+      if (alg === "xor") return u * 2 + 2;
+      if (alg === "add") return A.length / u + 2;
+      return A.length + 2;
+    }
+    load();
+    inB.value = fmtHex(B);
+    const stp = OSTEP.stepper($("cs-step"), { steps: nSteps, render, autoplayMs: 1100 });
+
+    function bitSpans(w, bits, nibFrom, nibTo, cls) {
+      const out = [];
+      for (let n = 0; n < bits / 4; n++) {
+        const sp = h("span", { class: "nib" + (cls(n) ? " " + cls(n) : "") });
+        if (n < nibFrom || n >= nibTo) { sp.textContent = "····"; out.push(sp); continue; }
+        for (let j = 0; j < 4; j++) { const bit = Math.floor(w / Math.pow(2, bits - 1 - (n * 4 + j))) % 2; sp.append(h("span", { class: bit ? "b1" : "" }, String(bit))); }
+        out.push(sp);
+      }
+      return out;
+    }
+    const hx = (v, digits) => "0x" + (v >>> 0).toString(16).padStart(digits, "0");
+
+    function render(i) {
+      if (!valid()) {
+        vis.replaceChildren(h("p", { class: "muted" }, "数据无效：需要 4–32 个字节，且字节数是单元大小的整数倍。"));
+        nar.textContent = "请检查输入。例如原书示例：" + BOOK;
+        renderCmp(); return;
+      }
+      ({ xor: renderXor, add: renderAdd, fl: renderFl, crc: renderCrc })[selAlg.value](i);
+      renderCmp();
+    }
+    function renderXor(i) {
+      const u = unit(), W = words(A, u), nib = u * 2, bits = u * 8, res = xorSum(A, u);
+      const cur = i >= 1 && i <= nib ? i - 1 : -1, doneTo = i > nib ? nib : Math.max(0, i);
+      const tb = h("tbody");
+      W.forEach((w, r) => tb.append(h("tr", {}, h("td", {}, `第 ${r + 1} 行`), h("td", { class: "mono" }, hx(w, nib)),
+        h("td", {}, bitSpans(w, bits, 0, nib, (n) => (n === cur ? "act" : ""))))));
+      tb.append(h("tr", { class: "res" }, h("td", {}, "逐列异或"), h("td", { class: "mono" }, i > nib ? hx(res, nib) : "?"),
+        h("td", {}, bitSpans(res, bits, 0, doneTo, (n) => (n === cur ? "act" : "")))));
+      vis.replaceChildren(h("table", { class: "bitgrid" }, h("thead", {}, h("tr", {}, h("th", {}, ""), h("th", {}, "十六进制"), h("th", {}, "二进制（每 4 位一组）"))), tb));
+      if (i === 0) nar.innerHTML = `把 ${A.length} 个字节按每行 ${u} 字节排好（共 ${W.length} 行），这正是原书的排法。XOR 校验和 = 对<strong>每一列</strong>求异或，也就是求每一列 1 的个数的奇偶。点"下一步"一次算一组 4 列。`;
+      else if (cur >= 0) {
+        const counts = [0, 1, 2, 3].map((j) => W.filter((w) => Math.floor(w / Math.pow(2, bits - 1 - (cur * 4 + j))) % 2).length);
+        const nibv = counts.reduce((a, c) => a * 2 + (c % 2), 0);
+        nar.innerHTML = `第 ${cur + 1} 组（第 ${cur * 4 + 1}–${cur * 4 + 4} 列）：各列 1 的个数 = [${counts.join(", ")}] → 奇数得 1、偶数得 0 → <code>${counts.map((c) => c % 2).join("")}</code> = 十六进制 <code>${nibv.toString(16)}</code>。`;
+      } else {
+        const isBook = u === 4 && fmtHex(A) === BOOK;
+        nar.innerHTML = `结果：<code>${hx(res, nib)}</code>。` + (isBook ? `<span class="okc">与原书一致（0x201b9403）✓</span>` : "") + " 注意：任何一列里偶数个比特同时翻转，这一列的奇偶不变——XOR 就检测不到。";
+      }
+    }
+    function renderAdd(i) {
+      const u = unit(), W = words(A, u), mod = u === 4 ? 4294967296 : 256, dg = u * 2;
+      const tb = h("tbody"); let s = 0, note = "";
+      W.forEach((w, r) => {
+        const before = s, raw = s + w; s = raw % mod;
+        const shown = r < i;
+        if (r === i - 1) note = `第 ${r + 1} 行：${hx(before, dg)} + ${hx(w, dg)} = ` + (raw >= mod ? `${raw.toString(16)}（超出 ${u * 8} 位，<strong>丢弃进位</strong>）→ ${hx(s, dg)}` : hx(s, dg));
+        tb.append(h("tr", { class: r === i - 1 ? "cur" : shown ? "" : "dim" }, h("td", {}, `第 ${r + 1} 行`), h("td", { class: "mono" }, hx(w, dg)),
+          h("td", { class: "mono" }, shown ? hx(s, dg) : "…"), h("td", {}, shown && raw >= mod ? "溢出，丢弃进位" : "")));
+      });
+      const res = addSum(A, u);
+      vis.replaceChildren(h("table", { class: "bitgrid" }, h("thead", {}, h("tr", {}, h("th", {}, ""), h("th", {}, "单元"), h("th", {}, "累加和"), h("th", {}, "备注"))), tb));
+      if (i === 0) nar.innerHTML = `加法校验和：把每个 ${u} 字节单元当成无符号整数相加（二进制补码加法），超出 ${u * 8} 位的进位直接丢掉。`;
+      else if (i <= W.length) nar.innerHTML = note;
+      else nar.innerHTML = `结果：<code>${hx(res, dg)}</code>。加法满足交换律：把任意两行交换，结果完全一样——这就是原书说它"数据被移位时不行"的原因。`;
+    }
+    function renderFl(i) {
+      const tb = h("tbody"); let s1 = 0, s2 = 0, note = "";
+      A.forEach((d, r) => {
+        const p1 = s1, p2 = s2; s1 = (s1 + d) % 255; s2 = (s2 + s1) % 255;
+        const shown = r < i;
+        if (r === i - 1) note = `d<sub>${r + 1}</sub> = ${hx(d, 2)} = ${d}：s1 = (${p1} + ${d}) mod 255 = <b>${s1}</b>；s2 = (${p2} + ${s1}) mod 255 = <b>${s2}</b>。`;
+        tb.append(h("tr", { class: r === i - 1 ? "cur" : shown ? "" : "dim" }, h("td", {}, `i = ${r + 1}`), h("td", { class: "mono" }, `${hx(d, 2)} (${d})`),
+          h("td", { class: "mono" }, shown ? String(s1) : "…"), h("td", { class: "mono" }, shown ? String(s2) : "…")));
+      });
+      vis.replaceChildren(h("table", { class: "bitgrid" }, h("thead", {}, h("tr", {}, h("th", {}, ""), h("th", {}, "字节 dᵢ"), h("th", {}, "s1"), h("th", {}, "s2"))), tb));
+      const f = fletcher(A);
+      if (i === 0) nar.innerHTML = "Fletcher：逐字节更新 s1 = (s1 + dᵢ) mod 255，s2 = (s2 + s1) mod 255。s1 是普通的累加；s2 把每个 s1 再累加一次，<strong>越靠前的字节被加的次数越多</strong>，所以它带有位置信息。";
+      else if (i <= A.length) nar.innerHTML = note;
+      else nar.innerHTML = `结果：s2 = ${f.s2}（${hx(f.s2, 2)}），s1 = ${f.s1}（${hx(f.s1, 2)}），合成 16 位校验和 <code>${hx(f.v, 4)}</code>。`;
+    }
+    function renderCrc(i) {
+      const tb = h("tbody"); let c = 0, trace = "";
+      A.forEach((d, r) => {
+        const shown = r < i;
+        if (r === i - 1) {
+          const b8 = (x) => x.toString(2).padStart(8, "0");
+          trace = `寄存器 ${hx(c, 2)} ⊕ 输入字节 ${hx(d, 2)} = ${b8(c ^ d)}\n`;
+          let x = c ^ d;
+          for (let k = 0; k < 8; k++) {
+            if (x & 0x80) { const sh = (x << 1) & 0xff; x = sh ^ 0x07; trace += `  第 ${k + 1} 步：最高位 1 → 左移 ${b8(sh)} ⊕ 00000111 = ${b8(x)}\n`; }
+            else { x = (x << 1) & 0xff; trace += `  第 ${k + 1} 步：最高位 0 → 只左移          = ${b8(x)}\n`; }
+          }
+          trace += `新寄存器 = ${hx(x, 2)}`;
+        }
+        c ^= d; for (let k = 0; k < 8; k++) c = c & 0x80 ? ((c << 1) ^ 0x07) & 0xff : (c << 1) & 0xff;
+        tb.append(h("tr", { class: r === i - 1 ? "cur" : shown ? "" : "dim" }, h("td", {}, `字节 ${r + 1}`), h("td", { class: "mono" }, hx(d, 2)), h("td", { class: "mono" }, shown ? hx(c, 2) : "…")));
+      });
+      const kids = [h("table", { class: "bitgrid" }, h("thead", {}, h("tr", {}, h("th", {}, ""), h("th", {}, "输入"), h("th", {}, "处理后寄存器"))), tb)];
+      if (trace) kids.push(h("div", { class: "crc-trace" }, trace));
+      vis.replaceChildren(...kids);
+      if (i === 0) nar.innerHTML = "CRC-8（除数 1 0000 0111，即 x⁸+x²+x+1）：把整个数据看成一个大二进制数做<strong>模 2 长除法</strong>，减法就是异或。每读入一个字节就把它异或进 8 位寄存器，再移位 8 次：最高位是 1 就\"够除\"，异或上除数。";
+      else if (i <= A.length) nar.innerHTML = `处理第 ${i} 个字节，下方是这一字节的 8 次移位/异或。`;
+      else nar.innerHTML = `余数（CRC-8）= <code>${hx(crc8(A), 2)}</code>。实际系统多用 CRC-32，本数据的 CRC-32 = <code>${hx(crc32(A), 8)}</code>（与本章 C 实验输出一致）。`;
+    }
+    function renderCmp() {
+      const u = unit();
+      const okLen = valid() && B.length === A.length;
+      const same = okLen && A.every((x, k) => x === B[k]);
+      const algs = [
+        [`XOR（${u} 字节单元）`, (x) => hx(xorSum(x, u), u * 2)],
+        [`加法（${u} 字节单元）`, (x) => hx(addSum(x, u), u * 2)],
+        ["Fletcher (s2:s1)", (x) => hx(fletcher(x).v, 4)],
+        ["CRC-8", (x) => hx(crc8(x), 2)],
+        ["CRC-32", (x) => hx(crc32(x), 8)],
+      ];
+      let diffBits = 0;
+      if (okLen) A.forEach((x, k) => { let d = x ^ B[k]; while (d) { diffBits += d & 1; d >>= 1; } });
+      const tb = h("tbody");
+      algs.forEach(([name, f]) => {
+        const a = valid() ? f(A) : "—", b = okLen ? f(B) : "—";
+        let verdict = "—";
+        if (okLen && same) verdict = "数据相同";
+        else if (okLen) verdict = a !== b ? h("span", { class: "okc" }, "✓ 发现损坏") : h("span", { class: "badc" }, "✗ 漏检（碰撞）");
+        tb.append(h("tr", {}, h("td", {}, name), h("td", { class: "mono" }, a), h("td", { class: "mono" }, b), h("td", {}, verdict)));
+      });
+      cmp.replaceChildren(h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "校验和"), h("th", {}, "原始数据"), h("th", {}, `读回数据（${okLen ? diffBits + " 个比特不同" : "长度不一致"}）`), h("th", {}, "能否发现"))), tb));
+    }
+    function setA(str, u) { inA.value = str; if (u) selUnit.value = String(u); load(); B = A.slice(); inB.value = fmtHex(B); stp.reset(); }
+    inA.addEventListener("input", () => { load(); stp.reset(); });
+    inB.addEventListener("input", () => { load(); renderCmp(); });
+    selAlg.addEventListener("change", () => stp.reset());
+    selUnit.addEventListener("change", () => stp.reset());
+    $("cs-p-book").onclick = () => setA(BOOK, 4);
+    $("cs-p-1234").onclick = () => setA("01 02 03 04", 1);
+    $("cs-p-4321").onclick = () => setA("04 03 02 01", 1);
+    const k = () => Math.max(0, Math.floor(+kIn.value || 0));
+    function setB(bytes) { B = bytes; inB.value = fmtHex(B); renderCmp(); }
+    $("cs-flip").onclick = () => setB(flipBit(B.length === A.length ? B : A, k()));
+    $("cs-col").onclick = () => { const u = unit(), col = k() % (u * 8); setB(flipBit(flipBit(A, col), col + u * 8)); };
+    $("cs-swap").onclick = () => { const u = unit(), b = A.slice(); if (b.length >= 2 * u) for (let j = 0; j < u; j++) { const t = b[j]; b[j] = b[u + j]; b[u + j] = t; } setB(b); };
+    $("cs-reset").onclick = () => setB(A.slice());
+  })();
+
+  // ---------------- 模拟器 2：镜像 + 校验和 ----------------
+  (function mirrorSim() {
+    const PRESETS = {
+      flip: { phys: true, parent: false, text: "# 磁盘 0 块 2 的一个比特翻转，然后读两次块 2\nflip 0 2 5\nr 2\nr 2" },
+      lse: { phys: true, parent: false, text: "# 磁盘 0 块 1 出现潜在扇区错误\nlse 0 1\nr 1\nr 1" },
+      misdir: { phys: false, parent: false, text: "# 磁盘 0 把写给块 1 的数据错写到了块 3\nwm 0 1 CAFEF00D 3\nr 3\nr 1\nscrub" },
+      lost: { phys: true, parent: false, text: "# 磁盘 0 丢失了对块 4 的写入\nwl 0 4 12345678\nr 4\nscrub" },
+      scrub: { phys: true, parent: false, text: "# 三个潜伏的问题，读路径只读磁盘 0\nflip 1 0 3\nlse 1 5\nflip 0 3 30\nr 0\nr 5\nscrub\nr 3" },
+      both: { phys: true, parent: false, text: "# 同一块的两份副本都坏了\nflip 0 2 1\nflip 1 2 9\nr 2" },
+    };
+    const ta = $("mr-ops"), cbP = $("mr-phys"), cbI = $("mr-parent");
+    let parsed = { ops: [], errs: [] };
+    const opts = () => ({ phys: cbP.checked, parent: cbI.checked });
+    function loadPreset(name) { const p = PRESETS[name]; ta.value = p.text; cbP.checked = p.phys; cbI.checked = p.parent; parsed = parseOps(ta.value); }
+    loadPreset("flip");
+    const stp = OSTEP.stepper($("mr-step"), { steps: () => parsed.ops.length + 1, render, autoplayMs: 1600 });
+
+    function blockCard(st, d, b, o, touch) {
+      const x = st.disk[d][b];
+      const dmg = x.lse || x.v !== st.truth[b];
+      const cls = ["blk", dmg ? "dmg" : "", x.lse ? "lse" : "", touch[d + ":" + b] || ""].join(" ");
+      const idBad = x.id.d !== d || x.id.b !== b;
+      return h("div", { class: cls },
+        h("div", { class: "bh" }, `块 ${b}`),
+        dmg ? h("span", { class: "flag" }, x.lse ? "LSE" : "⚠ 已损坏") : null,
+        h("div", {}, x.lse ? "?? 读不出 ??" : H8(x.v)),
+        h("div", { class: "muted" }, "C=" + H4(x.cs)),
+        o.phys ? h("div", { class: idBad ? "idm" : "muted" }, `d=${x.id.d} b=${x.id.b}`) : null);
+    }
+    function render(i) {
+      const o = opts();
+      const { st, last } = simulate(parsed.ops, i, o);
+      const touch = last ? last.touch : {};
+      $("mr-oplist").replaceChildren(h("span", { class: "pill" + (i === 0 ? " on" : " past") }, "初始"),
+        ...parsed.ops.map((op, k) => h("span", { class: "pill" + (k === i - 1 ? " on" : k < i - 1 ? " past" : "") }, op.src)));
+      const rows = [0, 1].map((d) => h("div", { class: "drow" }, h("div", { class: "dl" }, d === 0 ? "磁盘 0\n（先读）" : "磁盘 1\n（镜像）"), ...Array.from({ length: NB }, (_, b) => blockCard(st, d, b, o, touch))));
+      rows.forEach((r) => (r.firstChild.style.whiteSpace = "pre-line"));
+      if (o.parent) rows.push(h("div", { class: "drow" }, h("div", { class: "dl" }, "inode 中的\n校验和"), ...st.parent.map((c, b) => h("div", { class: "blk meta" }, h("div", { class: "bh" }, `块 ${b}`), "C=" + H4(c)))));
+      rows.push(h("div", { class: "drow" }, h("div", { class: "dl" }, "最后写入的值\n（上帝视角）"), ...st.truth.map((v, b) => h("div", { class: "blk meta" }, h("div", { class: "bh" }, `块 ${b}`), H8(v)))));
+      rows.slice(2).forEach((r) => (r.firstChild.style.whiteSpace = "pre-line"));
+      $("mr-disks").replaceChildren(...rows);
+      const nar = $("mr-nar");
+      if (i === 0) {
+        nar.innerHTML = (parsed.errs.length ? `<span class="badc">${parsed.errs.map(esc).join("<br>")}</span><br>` : "") +
+          `初始状态：两块镜像盘内容相同，每块旁存有 Fletcher 校验和` + (o.phys ? "和物理 ID" : "") + (o.parent ? "，inode 里也记着每块的校验和" : "") +
+          `。共 ${parsed.ops.length} 条操作，点"下一步"逐条执行。`;
+      } else {
+        nar.innerHTML = `<b>第 ${i} 条：<code>${esc(parsed.ops[i - 1].src)}</code></b><ul>` + last.log.map((l) => `<li>${l}</li>`).join("") + "</ul>";
+      }
+      const S = st.stats;
+      const stat = (v, l, bad) => h("div", { class: "stat" }, h("div", { class: "v", style: bad && v > 0 ? { color: "var(--bad)" } : null }, String(v)), h("div", { class: "l" }, l));
+      $("mr-stats").replaceChildren(stat(S.det, "检测到的问题"), stat(S.fix, "自动修复"), stat(S.silent, "静默返回错误数据", true), stat(S.fail, "无法恢复", true));
+    }
+    document.querySelectorAll("#sim-mirror [data-p]").forEach((b) => (b.onclick = () => { loadPreset(b.dataset.p); stp.reset(); }));
+    $("mr-apply").onclick = () => { parsed = parseOps(ta.value); stp.reset(); };
+    [cbP, cbI].forEach((cb) => cb.addEventListener("change", () => stp.refresh()));
+  })();
+})();
+</script>
+</body></html>

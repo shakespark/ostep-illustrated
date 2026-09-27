@@ -1,0 +1,807 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 2 章 · 操作系统导论</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+  .term { font: 13px/1.5 var(--mono); background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; max-height: 190px; overflow: auto; white-space: pre; }
+  .term .new { background: var(--accent-soft); }
+  .term .lost { color: var(--bad); font-weight: 700; }
+  .vbars { display: grid; gap: 6px; margin-top: 10px; }
+  .vbar { display: grid; grid-template-columns: 5.5em 1fr 4.5em; gap: 8px; align-items: center; font-size: 13px; }
+  .vbar .track { height: 14px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+  .vbar .fill { height: 100%; border-radius: 7px; transition: width .2s; }
+  .regs { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+  .regbox { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; background: var(--surface); font: 13px/1.7 var(--mono); }
+  .regbox.active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+  .regbox b { font-family: var(--font); }
+  .ilist { position: relative; font: 12.5px/1.55 var(--mono); max-height: 220px; overflow: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 6px 0; margin-top: 10px; }
+  .ilist div { padding: 0 12px; white-space: nowrap; }
+  .ilist div.cur { background: var(--accent-soft); font-weight: 700; }
+  .ilist div.lost { color: var(--bad); }
+  .ilist div.fut { color: var(--faint); }
+  .runs { font: 13px var(--mono); display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .runs span { padding: 2px 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); }
+  .runs span.bad { border-color: var(--bad); background: var(--bad-soft); }
+  .runs span.good { border-color: var(--ok); background: var(--ok-soft); }
+  .verdict { margin-top: 10px; padding: 10px 14px; border-radius: 8px; font-size: 14.5px; }
+  .verdict.ok { background: var(--ok-soft); border-left: 4px solid var(--ok); }
+  .verdict.bad { background: var(--bad-soft); border-left: 4px solid var(--bad); }
+  .verdict.warn { background: var(--warn-soft); border-left: 4px solid var(--warn); }
+</style>
+</head>
+<body data-chapter="2">
+<main>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker>
+    <marker id="arw-acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker>
+    <marker id="arw-bad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--bad)"/></marker>
+  </defs>
+</svg>
+
+<h2><span class="num">1</span>一句话 + 关键问题</h2>
+<div class="crux">
+  <p><strong>操作系统如何把资源虚拟化？</strong>——为了达成虚拟化，OS 实现了哪些机制和策略？如何高效地做到？需要哪些硬件支持？</p>
+  <p class="muted small">HOW TO VIRTUALIZE RESOURCES. One central question we will answer in this book is quite simple: how does the operating system virtualize resources?</p>
+</div>
+<p><strong>一句话：操作系统（operating system，OS）是一大块软件，它让程序"容易运行"</strong>——让许多程序看起来同时运行、共享内存、与设备打交道。它的主要手段是<strong>虚拟化（virtualization）</strong>：把 CPU、内存、磁盘这类物理资源变成更通用、更强大、更易用的虚拟形式。</p>
+<p>这一章是全书的地图。它用四个小程序分别预告全书的<strong>三大主题（three easy pieces）</strong>：<strong>虚拟化</strong>（CPU 与内存，第 4–23 章）、<strong>并发</strong>（第 26–33 章）、<strong>持久化</strong>（第 36–45 章），然后讨论 OS 的设计目标和发展简史。本页的四个模拟器分别对应这四个程序——每一个现象你都会在后面的章节里找到完整的答案。</p>
+
+<h2><span class="num">2</span>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>冯·诺依曼模型</h4><p>处理器不断地取指（fetch）、译码（decode）、执行（execute）——程序运行就是这么简单的一件事。</p></div>
+  <div class="card"><h4>虚拟化（virtualization）</h4><p>把一个物理资源变成（看起来有很多份的）虚拟资源。因此 OS 有时被称为<strong>虚拟机（virtual machine）</strong>。</p></div>
+  <div class="card"><h4>系统调用（system call）</h4><p>OS 导出的几百个接口，程序靠它们运行程序、访问内存和设备。所以 OS 也被称为提供了<strong>标准库（standard library）</strong>。</p></div>
+  <div class="card"><h4>资源管理器（resource manager）</h4><p>CPU、内存、磁盘都是资源；OS 负责高效、公平地管理它们。</p></div>
+  <div class="card"><h4>并发（concurrency）</h4><p>同时处理许多事时出现的一类问题。多线程共享内存时，看似简单的 <code>counter++</code> 也会出错。</p></div>
+  <div class="card"><h4>持久化（persistence）</h4><p>内存断电即失；硬盘、SSD 加上<strong>文件系统（file system）</strong>让数据长期保存。</p></div>
+  <div class="card"><h4>机制与策略</h4><p>机制（mechanism）是底层的"怎么做"，策略（policy）是"做哪个"的决定，如两个程序都想运行时选谁。</p></div>
+  <div class="card"><h4>设计目标</h4><p>抽象、高性能（低开销）、保护与隔离、可靠性，以及能效、安全、移动性。</p></div>
+</div>
+
+<h2><span class="num">3</span>程序运行时发生了什么</h2>
+<p>运行中的程序只做一件非常简单的事：<strong>执行指令</strong>。每秒成百万（如今是数十亿）次，处理器从内存<strong>取</strong>出一条指令、<strong>译码</strong>（弄清是哪条指令）、<strong>执行</strong>（加两个数、访问内存、检查条件、跳转到函数……），然后继续下一条，直到程序结束。这就是计算的<strong>冯·诺依曼模型（Von Neumann model）</strong>。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 210" width="640" role="img" aria-label="取指-译码-执行循环，以及 OS 的三个角色">
+  <circle cx="130" cy="105" r="78" class="box" />
+  <rect x="85" y="20" width="90" height="34" rx="17" class="accent-soft"/><text x="130" y="42" text-anchor="middle" font-size="13" font-weight="700">取指 fetch</text>
+  <rect x="160" y="130" width="96" height="34" rx="17" class="accent-soft"/><text x="208" y="152" text-anchor="middle" font-size="13" font-weight="700">译码 decode</text>
+  <rect x="4" y="130" width="96" height="34" rx="17" class="accent-soft"/><text x="52" y="152" text-anchor="middle" font-size="13" font-weight="700">执行 execute</text>
+  <path d="M178,48 C205,65 215,95 212,126" class="arrow" marker-end="url(#arw)"/>
+  <path d="M160,160 C135,182 110,182 100,160" class="arrow" marker-end="url(#arw)"/>
+  <path d="M40,128 C35,90 55,55 84,42" class="arrow" marker-end="url(#arw)"/>
+  <text x="130" y="110" text-anchor="middle" font-size="12" class="t-muted">每秒数十亿次</text>
+  <text x="300" y="30" font-weight="700">让这件事"容易"的那块软件 = 操作系统，它扮演三个角色：</text>
+  <rect x="300" y="45" width="330" height="44" rx="8" class="box-strong"/><text x="314" y="65" font-size="13.5" font-weight="700">虚拟机（virtual machine）</text><text x="314" y="82" font-size="12.5" class="t-muted">把 CPU、内存、磁盘变成易用的虚拟形式</text>
+  <rect x="300" y="97" width="330" height="44" rx="8" class="box-strong"/><text x="314" y="117" font-size="13.5" font-weight="700">标准库（standard library）</text><text x="314" y="134" font-size="12.5" class="t-muted">导出几百个系统调用供应用程序使用</text>
+  <rect x="300" y="149" width="330" height="44" rx="8" class="box-strong"/><text x="314" y="169" font-size="13.5" font-weight="700">资源管理器（resource manager）</text><text x="314" y="186" font-size="12.5" class="t-muted">在众多程序间高效、公平地分配资源</text>
+</svg>
+<figcaption>图 A：左边是硬件眼中的程序（取指—译码—执行的循环）；右边是 OS 的三种身份。早期 OS 也被叫作 supervisor（监督者），甚至 master control program（主控程序）。</figcaption>
+</figure>
+
+<h2><span class="num">4</span>虚拟化 CPU</h2>
+<p>第一个程序 <code>cpu.c</code>（原书图 2.1）什么正经事也不干：调用 <code>Spin(1)</code>（反复检查时间，直到跑满 1 秒才返回），打印命令行传入的字符串，然后永远重复：</p>
+<pre><code>int main(int argc, char *argv[]) {
+    if (argc != 2) { fprintf(stderr, "usage: cpu &lt;string&gt;\n"); exit(1); }
+    char *str = argv[1];
+    while (1) {
+        Spin(1);              // 忙等约 1 秒：一直占着 CPU
+        printf("%s\n", str);
+    }
+    return 0;
+}</code></pre>
+<p>单独运行 <code>./cpu "A"</code>，它每秒打印一个 A，Ctrl-C 才停。有趣的是同时运行四个（原书图 2.2）：</p>
+<pre><code>prompt&gt; ./cpu A &amp; ./cpu B &amp; ./cpu C &amp; ./cpu D &amp;
+A
+B
+D
+C
+A
+B
+D
+C
+A
+...</code></pre>
+<p>明明只有<strong>一个</strong>处理器，四个程序却好像同时在运行！这个假象由 OS（在硬件的帮助下）制造：它让系统看起来拥有非常多的<strong>虚拟 CPU</strong>。把一个（或少数几个）CPU 变成看似无限多个 CPU，从而让许多程序看似同时运行，这就是<strong>虚拟化 CPU（virtualizing the CPU）</strong>，全书第一大部分的重点。</p>
+<p>能同时运行多个程序也带来新问题：两个程序都想在某一时刻运行，该运行哪个？回答这类问题的是 OS 的<strong>策略（policy）</strong>；而"能同时运行多个程序"这种能力本身，是 OS 实现的<strong>机制（mechanism）</strong>。</p>
+
+<section class="sim" id="sim-cpu">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>一个 CPU，多个 cpu 程序</h3>
+    <div class="desc">每一步 = OS 让某个程序运行一个时间片。观察：物理 CPU 上任一时刻只有一个程序在跑，但每个程序的"进度条"都在前进，终端里的输出交错出现。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>程序个数 <input type="number" id="cpu-n" min="1" max="6" value="4"></label>
+      <label>时间片 <select id="cpu-q"><option value="100">100 ms</option><option value="250" selected>250 ms</option><option value="500">500 ms</option><option value="1000">1000 ms</option></select></label>
+      <label>调度策略 <select id="cpu-pol"><option value="rr">轮转（依次）</option><option value="rand">随机挑选</option></select></label>
+      <label>随机种子 <input type="number" id="cpu-seed" value="7" min="0"></label>
+      <button data-preset="book">载入原书示例（4 个）</button>
+    </div>
+    <div id="cpu-step"></div>
+    <div class="stage">
+      <div class="small muted">物理 CPU 的实际时间线（ms）</div>
+      <div id="cpu-gantt"></div>
+      <div class="small muted" style="margin-top:8px">每个程序眼中的"自己的 CPU"：距离打印下一行还差多少计算（每行需 1000 ms CPU）</div>
+      <div class="vbars" id="cpu-bars"></div>
+      <div class="small muted" style="margin-top:10px">终端输出</div>
+      <div class="term" id="cpu-term"></div>
+    </div>
+    <div class="narrate" id="cpu-nar"></div>
+    <div class="stats" id="cpu-stats"></div>
+  </div>
+</section>
+<p class="small muted">模拟器的简化：真实的 <code>Spin(1)</code> 是按墙上时间忙等 1 秒，这里改为"每打印一行需要 1000 ms 的 CPU 计算"，这样能直接看出共享 CPU 的代价——N 个程序分享 1 个 CPU 时，每个程序大约慢 N 倍。</p>
+
+<h2><span class="num">5</span>虚拟化内存</h2>
+<p>物理内存的模型很简单：它就是一个<strong>字节数组</strong>。读内存要给出地址；写内存要给出地址和数据。程序运行时时刻都在访问内存——数据结构在内存里，<strong>每条指令本身也在内存里</strong>，所以每次取指都是一次内存访问。</p>
+<pre><code>int main(int argc, char *argv[]) {
+    int *p = malloc(sizeof(int));                          // a1：分配内存
+    assert(p != NULL);
+    printf("(%d) address pointed to by p: %p\n", getpid(), p); // a2：打印地址
+    *p = 0;                                                // a3：写入 0
+    while (1) {
+        Spin(1);
+        *p = *p + 1;
+        printf("(%d) p: %d\n", getpid(), *p);              // a4：加一并打印
+    }
+    return 0;
+}</code></pre>
+<p>单独运行 <code>mem</code>，它在地址 <code>0x200000</code> 分配到内存，然后每秒把值加一。同时运行两个（原书图 2.4），每个进程打印时都带着自己的<strong>进程标识符（PID，process identifier）</strong>：</p>
+<pre><code>prompt&gt; ./mem &amp; ./mem &amp;
+(24113) address pointed to by p: 0x200000
+(24114) address pointed to by p: 0x200000
+(24113) p: 1
+(24114) p: 1
+(24114) p: 2
+(24113) p: 2
+...</code></pre>
+<p>两个进程在<strong>同一个地址</strong> <code>0x200000</code> 分配到内存，却各自独立地更新那里的值！就好像每个进程都有自己私有的内存。事实正是如此：OS 在<strong>虚拟化内存</strong>。每个进程访问的是它自己私有的<strong>虚拟地址空间（virtual address space，简称地址空间）</strong>，OS 以某种方式把它映射到机器的物理内存上。一个进程的内存访问不会影响其他进程（或 OS 自己）的地址空间；而实际上物理内存是由 OS 管理的共享资源。</p>
+<div class="aside" data-title="原书脚注：地址空间随机化"><p>要让两个进程打印出相同的地址，需要关闭<strong>地址空间随机化（address-space randomization）</strong>——它是防御某些安全漏洞（如栈溢出攻击）的好手段。现代 Linux 默认开启，本页"动手实验"里用 <code>setarch -R</code> 关闭它。</p></div>
+
+<section class="sim" id="sim-mem">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>两个 mem 进程，同一个虚拟地址</h3>
+    <div class="desc">逐步运行两个 mem。对比三种情形：原书情形（有虚拟内存、关闭随机化）、开启随机化、以及假想的"没有虚拟内存"——两个进程直接使用物理地址时会发生什么？</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>情形 <select id="mem-mode">
+        <option value="vm">有虚拟内存（原书图 2.4）</option>
+        <option value="aslr">有虚拟内存 + 地址随机化（现代 Linux 默认）</option>
+        <option value="none">假想：没有虚拟内存，直接用物理地址</option></select></label>
+      <label>随机种子 <input type="number" id="mem-seed" value="3" min="0"></label>
+    </div>
+    <div id="mem-step"></div>
+    <div class="stage"><div id="mem-svg"></div><div class="term" id="mem-term" style="margin-top:10px"></div></div>
+    <div class="narrate" id="mem-nar"></div>
+  </div>
+</section>
+
+<h2><span class="num">6</span>并发</h2>
+<p>本书的另一个主题是<strong>并发（concurrency）</strong>：同时（并发地）处理很多事情时出现、必须解决的一类问题。它首先出现在 OS 内部——前面的例子里 OS 就在同时周旋于多个进程之间；如今多线程程序也面临同样的问题。原书图 2.5：</p>
+<pre><code>volatile int counter = 0;
+int loops;
+
+void *worker(void *arg) {
+    int i;
+    for (i = 0; i &lt; loops; i++) {
+        counter++;
+    }
+    return NULL;
+}
+
+int main(int argc, char *argv[]) {
+    loops = atoi(argv[1]);
+    pthread_t p1, p2;
+    printf("Initial value : %d\n", counter);
+    Pthread_create(&amp;p1, NULL, worker, NULL);   // 两个线程都执行 worker
+    Pthread_create(&amp;p2, NULL, worker, NULL);
+    Pthread_join(p1, NULL);                    // 等两个线程结束
+    Pthread_join(p2, NULL);
+    printf("Final value   : %d\n", counter);
+    return 0;
+}</code></pre>
+<p>可以把<strong>线程（thread）</strong>想成在同一个内存空间里运行的函数，而且同时有不止一个处于活动状态。两个线程各把共享的 <code>counter</code> 加 <code>loops</code> 次。<code>loops = 1000</code> 时结果是 2000，符合预期；但 <code>loops = 100000</code> 时：</p>
+<pre><code>prompt&gt; ./threads 100000
+Initial value : 0
+Final value   : 143012     // huh??
+prompt&gt; ./threads 100000
+Initial value : 0
+Final value   : 137298     // what the??</code></pre>
+<p>不仅错了，而且每次错得不一样（偶尔还会碰巧对）。原因在于指令是一条一条执行的，而 <code>counter++</code> 这个关键操作需要<strong>三条</strong>指令：从内存把 <code>counter</code> <strong>加载（load）</strong>到寄存器、寄存器<strong>加一</strong>、<strong>存（store）</strong>回内存。这三条指令不是<strong>原子地（atomically）</strong>一起执行的，于是怪事就发生了。</p>
+<div class="crux"><p><strong>如何构建正确的并发程序？</strong>当同一内存空间里有很多并发执行的线程时，如何写出正确工作的程序？需要 OS 提供什么原语？硬件应提供什么机制？如何用它们解决并发问题？</p><p class="muted small">HOW TO BUILD CORRECT CONCURRENT PROGRAMS</p></div>
+
+<section class="sim" id="sim-cnt">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>丢失的更新：counter++ 的三条指令</h3>
+    <div class="desc">两个线程在一个 CPU 上交替执行，OS 每隔约"时间片"条指令就切换一次。小 loops 时可以逐条指令单步；大 loops 时一键运行 10 次，看最终值是否等于 2 × loops、每次是否相同。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>loops <input type="number" id="cnt-loops" value="4" min="1" max="1000000" style="width:8em"></label>
+      <label>平均时间片（指令数） <select id="cnt-q"><option>2</option><option selected>4</option><option>10</option><option>100</option><option>1000</option><option>10000</option></select></label>
+      <label>随机种子 <input type="number" id="cnt-seed" value="5" min="0"></label>
+      <button data-cnt="small">载入：小例子逐条单步</button>
+      <button data-cnt="book">载入：原书 loops=1000 / 100000</button>
+    </div>
+    <div id="cnt-step"></div>
+    <div class="stage">
+      <div class="regs" id="cnt-regs"></div>
+      <div class="ilist" id="cnt-list"></div>
+    </div>
+    <div class="narrate" id="cnt-nar"></div>
+    <div class="stats" id="cnt-stats"></div>
+    <div class="controls" style="margin-top:12px"><button class="primary" id="cnt-batch">用当前 loops 连续运行 10 次（种子 1–10）</button></div>
+    <div class="runs" id="cnt-runs"></div>
+  </div>
+</section>
+
+<h2><span class="num">7</span>持久化</h2>
+<p>第三个主题是<strong>持久化（persistence）</strong>。DRAM 以<strong>易失（volatile）</strong>的方式保存数据：一断电或系统崩溃，内存里的数据就没了。硬件上需要<strong>输入/输出（I/O）设备</strong>，如硬盘或 SSD；软件上，OS 中管理磁盘的部分叫<strong>文件系统（file system）</strong>，负责把用户创建的文件可靠、高效地存到磁盘上。</p>
+<p>与 CPU 和内存不同，OS <strong>不会</strong>为每个应用创建一个私有的虚拟磁盘——人们通常<em>希望</em>在程序之间共享文件：用编辑器写 <code>main.c</code>，编译器读它生成可执行文件，最后运行这个可执行文件。原书图 2.6 的 <code>io.c</code> 用三个系统调用创建 <code>/tmp/file</code>：</p>
+<pre><code>int main(int argc, char *argv[]) {
+    int fd = open("/tmp/file", O_WRONLY|O_CREAT|O_TRUNC, S_IRWXU);  // ① 打开（并创建）文件
+    assert(fd &gt; -1);
+    int rc = write(fd, "hello world\n", 12);                        // ② 写入 12 字节
+    assert(rc == 12);
+    close(fd);                                                      // ③ 关闭：不再写了
+    return 0;
+}</code></pre>
+<p>这些系统调用被转给 OS 中的文件系统处理。文件系统要做不少活：决定新数据放在磁盘哪里，在它维护的各种结构里记录下来，这就需要向存储设备发 I/O 请求读或更新这些结构。为了性能，多数文件系统会<strong>先把写操作推迟一会儿</strong>，攒成更大的批次；为了应对写的过程中系统崩溃，多数文件系统采用某种精巧的写协议，如<strong>日志（journaling）</strong>或<strong>写时复制（copy-on-write）</strong>，仔细安排写入顺序，保证崩溃后能恢复到合理的状态。</p>
+<div class="crux"><p><strong>如何持久地存储数据？</strong>文件系统是 OS 中负责管理持久数据的部分。要正确地做到这一点需要什么技术？要高性能需要什么机制和策略？面对软硬件故障如何实现可靠性？</p><p class="muted small">HOW TO STORE DATA PERSISTENTLY</p></div>
+
+<section class="sim" id="sim-io">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>一次 write() 的旅程，以及"此刻断电会怎样"</h3>
+    <div class="desc">逐步跟踪 io.c 的写入路径：系统调用 → 文件系统 → 内存中的缓存 → （稍后）磁盘。任何一步都可以点"在这一步之后断电"，看看重启后磁盘上剩下什么。这是简化模型，细节在第 39–42 章。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label><input type="checkbox" id="io-fsync"> write 之后调用 <code>fsync(fd)</code></label>
+      <label><input type="checkbox" id="io-jnl" checked> 文件系统使用日志（journaling）</label>
+      <button id="io-crash">⚡ 在这一步之后断电</button>
+    </div>
+    <div id="io-step"></div>
+    <div class="stage"><div id="io-svg"></div></div>
+    <div class="narrate" id="io-nar"></div>
+    <div id="io-verdict"></div>
+  </div>
+</section>
+
+<h2><span class="num">8</span>设计目标</h2>
+<p>OS 把 CPU、内存、磁盘这些物理资源虚拟化，处理棘手的并发问题，持久地保存文件。构建这样一个系统时，需要一些目标来指导设计和取舍——找到合适的取舍是构建系统的关键。</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>目标</th><th>含义</th><th>本书中的体现</th></tr></thead>
+  <tbody>
+    <tr><td><strong>抽象（abstraction）</strong></td><td>让系统方便易用；把大问题分解成小而易懂的部分（用 C 写程序时不用想汇编，写汇编时不用想逻辑门……）</td><td>进程、地址空间、线程、文件……每一部分都讨论主要的抽象</td></tr>
+    <tr><td><strong>高性能（performance）</strong></td><td>把 OS 的<strong>开销（overhead）</strong>降到最低：额外的时间（更多指令）和额外的空间（内存或磁盘）</td><td>受限直接执行（第 6 章）、TLB（第 19 章）……完美并不总能做到，要学会识别并容忍</td></tr>
+    <tr><td><strong>保护（protection）</strong></td><td>应用之间、应用与 OS 之间互相保护；核心原则是<strong>隔离（isolation）</strong></td><td>用户态/内核态、地址空间</td></tr>
+    <tr><td><strong>可靠性（reliability）</strong></td><td>OS 一旦失败，其上所有应用都失败；而 OS 代码动辄数百万行</td><td>崩溃一致性、数据完整性（第 42、45 章）</td></tr>
+    <tr><td>其他</td><td><strong>能效（energy-efficiency）</strong>、<strong>安全（security）</strong>（保护的延伸）、<strong>移动性（mobility）</strong></td><td>系统用途不同，目标就不同，实现方式也会有所不同</td></tr>
+  </tbody>
+</table></div>
+
+<h2><span class="num">9</span>简史：OS 是怎么一步步长成今天的样子的</h2>
+<figure class="fig">
+<svg viewBox="0 0 760 250" width="760" role="img" aria-label="操作系统发展简史时间线">
+  <line x1="20" y1="60" x2="740" y2="60" class="stroke" stroke-width="2"/>
+  <g font-size="12.5">
+    <circle cx="80" cy="60" r="8" style="fill:var(--c8)"/><text x="80" y="40" text-anchor="middle" font-weight="700">早期：只是库</text>
+    <text x="20" y="90">常用函数库（如 I/O）</text><text x="20" y="108">大型机一次跑一个程序</text><text x="20" y="126">人工操作员排队</text><text x="20" y="144"><tspan font-weight="700">批处理</tspan>（batch）</text><text x="20" y="162" class="t-muted">机器太贵，不能交互</text>
+    <circle cx="260" cy="60" r="8" style="fill:var(--c1)"/><text x="260" y="40" text-anchor="middle" font-weight="700">超越库：保护</text>
+    <text x="200" y="90"><tspan font-weight="700">系统调用</tspan>（Atlas 首创）</text><text x="200" y="108">特殊的硬件指令 trap</text><text x="200" y="126">用户态 → 内核态</text><text x="200" y="144">return-from-trap 返回</text><text x="200" y="162" class="t-muted">文件系统不能只是个库</text>
+    <circle cx="450" cy="60" r="8" style="fill:var(--c3)"/><text x="450" y="40" text-anchor="middle" font-weight="700">小型机：多道程序</text>
+    <text x="385" y="90">PDP 系列降低成本</text><text x="385" y="108"><tspan font-weight="700">多道程序</tspan>（multiprogramming）</text><text x="385" y="126">I/O 慢 → 切换提高利用率</text><text x="385" y="144">内存保护、并发问题</text><text x="385" y="162"><tspan font-weight="700">UNIX</tspan>（Thompson、Ritchie）</text>
+    <circle cx="650" cy="60" r="8" style="fill:var(--c2)"/><text x="650" y="40" text-anchor="middle" font-weight="700">现代：PC 时代</text>
+    <text x="580" y="90">Apple II、IBM PC</text><text x="580" y="108">起初倒退：DOS 无内存保护</text><text x="580" y="126">Mac OS 9 协作式调度</text><text x="580" y="144">后来：macOS（UNIX 内核）</text><text x="580" y="162">Windows NT、Linux、Android</text>
+  </g>
+  <rect x="20" y="190" width="720" height="48" rx="8" class="warn-soft"/>
+  <text x="34" y="210" font-size="12.5">UNIX 的理念：把小而强大的程序连接起来完成大任务，如 <tspan class="mono">grep foo file.txt | wc -l</tspan>；源码小而易读，</text>
+  <text x="34" y="229" font-size="12.5">催生了 BSD；Linus Torvalds 按其原则重写出 Linux，借助 GNU 工具走向服务器、手机（Android）乃至桌面。</text>
+</svg>
+<figcaption>图 B：好的想法是一点点积累起来的。今天的手机 OS 更像 1970 年代小型机上的 OS，而不是 1980 年代 PC 上的 OS。</figcaption>
+</figure>
+<p><strong>系统调用与过程调用的关键区别</strong>：系统调用把控制转移（跳转）进 OS 的<strong>同时提升硬件特权级</strong>。应用运行在<strong>用户模式（user mode）</strong>下，硬件限制它能做的事（比如不能直接向磁盘发 I/O 请求、访问任意物理内存页、发网络包）；系统调用通过一条叫 <strong>trap</strong> 的特殊硬件指令发起，硬件把控制转给 OS 事先设置好的<strong>陷阱处理程序（trap handler）</strong>，同时把特权级提升到<strong>内核模式（kernel mode）</strong>；OS 服务完请求，再用 <strong>return-from-trap</strong> 指令回到用户模式、回到应用离开的地方。第 6 章会把这个过程拆开细看。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 200" width="640" role="img" aria-label="过程调用与系统调用对比">
+  <text x="20" y="22" font-weight="700" font-size="14">过程调用</text>
+  <rect x="20" y="34" width="280" height="150" rx="8" class="box"/>
+  <text x="34" y="56" font-size="12.5" class="t-muted">用户模式（同一特权级）</text>
+  <rect x="40" y="70" width="100" height="36" rx="6" class="box-strong"/><text x="90" y="93" text-anchor="middle" font-size="13">main()</text>
+  <rect x="180" y="120" width="100" height="36" rx="6" class="box-strong"/><text x="230" y="143" text-anchor="middle" font-size="13">lib_func()</text>
+  <path d="M140,92 C170,92 190,100 205,118" class="arrow" marker-end="url(#arw)"/><text x="176" y="84" font-size="12">call</text>
+  <path d="M185,140 C150,140 120,130 100,108" class="arrow" marker-end="url(#arw)"/><text x="104" y="140" font-size="12">ret</text>
+  <text x="340" y="22" font-weight="700" font-size="14">系统调用</text>
+  <rect x="340" y="34" width="280" height="70" rx="8" class="box"/>
+  <text x="354" y="54" font-size="12.5" class="t-muted">用户模式：受限</text>
+  <rect x="360" y="62" width="100" height="34" rx="6" class="box-strong"/><text x="410" y="84" text-anchor="middle" font-size="13">main()</text>
+  <rect x="340" y="114" width="280" height="70" rx="8" class="accent-soft"/>
+  <text x="354" y="176" font-size="12.5" style="fill:var(--accent)">内核模式：完全访问硬件</text>
+  <rect x="500" y="124" width="104" height="34" rx="6" class="box-strong"/><text x="552" y="146" text-anchor="middle" font-size="13">trap handler</text>
+  <path d="M460,80 C520,80 545,95 550,122" class="arrow" style="stroke:var(--accent);stroke-width:2" marker-end="url(#arw-acc)"/><text x="492" y="74" font-size="12" style="fill:var(--accent)">trap（提升特权级）</text>
+  <path d="M500,146 C450,146 420,125 412,98" class="arrow" style="stroke:var(--accent);stroke-width:2" marker-end="url(#arw-acc)"/><text x="360" y="136" font-size="12" style="fill:var(--accent)">return-from-trap</text>
+</svg>
+<figcaption>图 C：过程调用可以跳到任意地址；系统调用只能跳到 OS 事先登记的处理程序，并同时切换特权级。</figcaption>
+</figure>
+<p><strong>多道程序（multiprogramming）</strong>为什么重要？I/O 设备很慢，让一个程序占着 CPU 等 I/O 纯属浪费。与其如此，不如切换到另一个作业运行一会儿：</p>
+<figure class="fig">
+<svg viewBox="0 0 640 150" width="640" role="img" aria-label="批处理与多道程序对比">
+  <text x="10" y="30" font-size="13" font-weight="700">一次一个作业</text>
+  <g font-size="12">
+    <rect x="130" y="14" width="80" height="26" rx="3" style="fill:var(--c1)"/><text x="170" y="32" text-anchor="middle" style="fill:#fff">A 计算</text>
+    <rect x="210" y="14" width="100" height="26" rx="3" class="warn-soft"/><text x="260" y="32" text-anchor="middle">A 等 I/O（CPU 闲）</text>
+    <rect x="310" y="14" width="60" height="26" rx="3" style="fill:var(--c1)"/><text x="340" y="32" text-anchor="middle" style="fill:#fff">A</text>
+    <rect x="370" y="14" width="80" height="26" rx="3" style="fill:var(--c2)"/><text x="410" y="32" text-anchor="middle" style="fill:#fff">B 计算</text>
+    <rect x="450" y="14" width="100" height="26" rx="3" class="warn-soft"/><text x="500" y="32" text-anchor="middle">B 等 I/O（CPU 闲）</text>
+    <rect x="550" y="14" width="60" height="26" rx="3" style="fill:var(--c2)"/><text x="580" y="32" text-anchor="middle" style="fill:#fff">B</text>
+  </g>
+  <text x="10" y="86" font-size="13" font-weight="700">多道程序</text>
+  <g font-size="12">
+    <rect x="130" y="70" width="80" height="26" rx="3" style="fill:var(--c1)"/><text x="170" y="88" text-anchor="middle" style="fill:#fff">A 计算</text>
+    <rect x="210" y="70" width="80" height="26" rx="3" style="fill:var(--c2)"/><text x="250" y="88" text-anchor="middle" style="fill:#fff">B 计算</text>
+    <rect x="290" y="70" width="60" height="26" rx="3" style="fill:var(--c1)"/><text x="320" y="88" text-anchor="middle" style="fill:#fff">A</text>
+    <rect x="350" y="70" width="60" height="26" rx="3" class="box"/><text x="380" y="88" text-anchor="middle" class="t-muted">闲</text>
+    <rect x="410" y="70" width="60" height="26" rx="3" style="fill:var(--c2)"/><text x="440" y="88" text-anchor="middle" style="fill:#fff">B</text>
+    <rect x="210" y="100" width="100" height="16" rx="3" class="warn-soft"/><text x="260" y="112" text-anchor="middle" font-size="11">A 的 I/O</text>
+    <rect x="290" y="120" width="100" height="16" rx="3" class="warn-soft"/><text x="340" y="132" text-anchor="middle" font-size="11">B 的 I/O</text>
+  </g>
+  <line x1="130" y1="145" x2="620" y2="145" class="arrow" marker-end="url(#arw)"/><text x="600" y="140" font-size="11" class="t-muted">时间</text>
+</svg>
+<figcaption>图 D：计算与 I/O 重叠（overlap），同样的两个作业早早完成。代价是新问题：内存保护、中断带来的并发……第 4 章的模拟器可以让你亲手验证这一点。</figcaption>
+</figure>
+
+<h2><span class="num">10</span>先预测，再验证</h2>
+<div class="exercise"><div class="q">在"一个 CPU，多个 cpu 程序"中设 4 个程序、时间片 250 ms、轮转。先预测：到第 4 秒末，终端里共有几行输出？A 第一次打印发生在什么时刻？</div>
+<details class="reveal"><summary>看答案</summary><div>每个程序每 1 秒墙上时间只能分到 250 ms CPU，要 4 秒才攒够 1000 ms，所以前 4 秒每个程序各打印 1 行，共 4 行。A 在 0–250、1000–1250、2000–2250、3000–3250 ms 运行，第 3250 ms 攒够 1000 ms，第一次打印发生在 3250 ms。这就是"时分共享的代价是每个程序都变慢"。</div></details></div>
+<div class="exercise"><div class="q">把调度策略改成"随机挑选"，换几个种子。输出顺序还是 A B C D 循环吗？这与原书图 2.2 的 A B D C 有什么联系？</div>
+<details class="reveal"><summary>看答案</summary><div>不再是固定循环，而且换个种子顺序就变了。原书的 A B D C 也是调度器决定的结果——程序员不能假定输出顺序。选谁运行是<strong>策略</strong>问题，第 7–9 章专门讨论。</div></details></div>
+<div class="exercise"><div class="q">在内存模拟器中选"假想：没有虚拟内存"。预测两个进程打印的 <code>p</code> 值序列，和原书图 2.4 比较。</div>
+<details class="reveal"><summary>看答案</summary><div>两个进程写的是同一个物理地址，值变成 1、2、3、4……交替递增：每个进程都看到对方"偷偷"改了自己的变量。这正是虚拟内存要防止的——每个进程都应当觉得物理内存全归自己。</div></details></div>
+<div class="exercise"><div class="q">在并发模拟器中，loops = 1000、时间片 10000，运行 10 次；再把 loops 改成 100000 运行 10 次。结果分别怎样？为什么 loops 小时通常"碰巧"正确？</div>
+<details class="reveal"><summary>看答案</summary><div>loops = 1000 时每个线程只有 3000 条指令，第一个线程往往在一个时间片内就做完了，两个线程根本没有交错，结果是 2000。loops = 100000 时每个线程要执行 30 万条指令，必然被切换许多次；只要切换点落在 load 与 store 之间，另一线程在这段时间里的所有加法都会被旧值覆盖掉，于是结果偏小且每次不同。</div></details></div>
+<div class="exercise"><div class="q">在持久化模拟器里（开启日志、不 fsync），在 <code>close()</code> 返回、程序退出之后立刻断电。数据还在吗？勾上 fsync 再试一次。</div>
+<details class="reveal"><summary>看答案</summary><div>不在。<code>write()</code> 和 <code>close()</code> 都成功返回了，但文件系统为了性能推迟了写盘，数据还在内存里。调用 <code>fsync()</code> 会强制文件系统在返回前把数据（经日志）写到磁盘上，此后断电也不丢。</div></details></div>
+
+<h2><span class="num">11</span>动手实验</h2>
+<div class="lab">
+<p>把原书的四个程序在你的机器上跑一遍。源码与说明见 <code>labs/02-intro/</code>。</p>
+<pre><code><span class="cmd">cd labs/02-intro &amp;&amp; make</span>
+<span class="cmd">make cpu4</span>        # 4 个 cpu 程序绑在同一个 CPU（taskset -c 0）上跑 4 秒
+<span class="cmd">make mem2</span>        # 两个 mem，用 setarch -R 关闭地址随机化
+<span class="cmd">make mem2-aslr</span>   # 两个 mem，保留地址随机化
+<span class="cmd">make race</span>        # threads 的 loops 从 1000 到 1000000，各跑 3 次
+<span class="cmd">make io-run</span>      # io 写出 /tmp/file</code></pre>
+<p class="small muted">示例输出（WSL2、16 核；你的机器上 PID、地址和数字会不同）：</p>
+<pre><code>$ make cpu4
+A
+C
+B
+D
+C
+A
+D
+B
+...
+$ make mem2
+(342669) address pointed to by p: 0x5555555592a0
+(342668) address pointed to by p: 0x5555555592a0
+(342668) p: 1
+(342669) p: 1
+(342668) p: 2
+(342669) p: 2
+$ make mem2-aslr
+(342741) address pointed to by p: 0x61e7792c12a0
+(342742) address pointed to by p: 0x57e38958c2a0
+$ make race
+loops=1000     Final value   : 2000
+loops=10000    Final value   : 20000
+loops=100000   Final value   : 200000
+loops=100000   Final value   : 186011
+loops=100000   Final value   : 190737
+loops=1000000  Final value   : 1334958
+loops=1000000  Final value   : 1415085
+$ make io-run
+hello world
+-rwx------ 1 lee lee 12 Sep 24 22:38 /tmp/file</code></pre>
+<p>注意三点：① 四个 <code>cpu</code> 的打印顺序由调度器决定，不是固定的 A B C D；② 关闭随机化后两个进程的虚拟地址完全相同，打开后则各不相同——但无论哪种情况，两个 <code>p</code> 都各自从 1 数起；③ 在多核机器上两个线程真正并行，<code>loops=100000</code> 有时对有时错，<code>loops=1000000</code> 几乎必错。</p>
+</div>
+
+<h2><span class="num">12</span>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="2"><div class="q">1. 本书围绕的三个主题（three easy pieces）是？</div>
+  <div class="opts"><button>A. 安全、网络、图形</button><button>B. 进程、线程、文件</button><button>C. 虚拟化、并发、持久化</button><button>D. 调度、分页、日志</button></div>
+  <div class="explain">原书第 2 章用 cpu/mem 演示虚拟化、threads 演示并发、io 演示持久化。网络、图形和深入的安全话题本书不讲。</div></div>
+<div class="mcq" data-answer="1"><div class="q">2. 两个 <code>mem</code> 进程打印出相同的地址 0x200000，却各自独立计数。最准确的解释是？</div>
+  <div class="opts"><button>A. malloc 保证每个进程得到相同的物理地址</button><button>B. 打印的是虚拟地址；OS 把两个进程的地址空间映射到不同的物理内存</button><button>C. 这是巧合，多运行几次地址就不同了</button><button>D. 两个进程轮流使用同一块物理内存，OS 在切换时保存/恢复它的值</button></div>
+  <div class="explain">每个进程都有自己私有的虚拟地址空间，OS 把它映射到物理内存上。一个进程的内存访问不会影响其他进程。（开启地址随机化后地址会不同，但那是另一回事。）</div></div>
+<div class="mcq" data-answer="0"><div class="q">3. 为什么 <code>threads 100000</code> 的结果常常小于 200000？</div>
+  <div class="opts"><button>A. <code>counter++</code> 是 load、add、store 三条指令，不是原子的，两个线程交错时会丢失更新</button><button>B. <code>volatile</code> 让编译器跳过了部分加法</button><button>C. 循环次数太大，int 溢出了</button><button>D. 线程创建失败，只有一个线程运行</button></div>
+  <div class="explain">若线程 1 load 了旧值后被打断，线程 2 在此期间做的加法会被线程 1 稍后 store 的旧值 + 1 覆盖。200000 远小于 int 上限，不存在溢出。</div></div>
+<div class="mcq" data-answer="3"><div class="q">4. 关于 OS 对磁盘的"虚拟化"，下列说法正确的是？</div>
+  <div class="opts"><button>A. OS 为每个应用创建一个私有的虚拟磁盘</button><button>B. 应用必须直接操作磁盘控制器</button><button>C. 文件只能被创建它的进程读取</button><button>D. OS 不为每个应用创建私有磁盘，因为用户常常希望在程序间共享文件</button></div>
+  <div class="explain">原书："Unlike the abstractions provided by the OS for the CPU and memory, the OS does not create a private, virtualized disk for each application." 编辑器、编译器、可执行程序之间正是通过文件共享数据。</div></div>
+<div class="mcq" data-answer="2"><div class="q">5. 系统调用与普通过程调用的关键区别是？</div>
+  <div class="opts"><button>A. 没有区别，只是名字不同</button><button>B. 系统调用只能用汇编写</button><button>C. 系统调用在转入 OS 的同时提升硬件特权级，且只能跳到 OS 预先设定的处理程序</button><button>D. 系统调用更快</button></div>
+  <div class="explain">trap 指令跳入内核并切换到内核模式；OS 完成后用 return-from-trap 回到用户模式。这一思想由 Atlas 首创。</div></div>
+<div class="mcq" data-answer="1"><div class="q">6. 多道程序（multiprogramming）流行起来的主要动机是？</div>
+  <div class="opts"><button>A. 为了支持图形界面</button><button>B. I/O 很慢，程序等 I/O 时切换到别的作业可以提高 CPU 利用率</button><button>C. 减少内存占用</button><button>D. 让用户可以同时登录</button></div>
+  <div class="explain">让一个程序在 CPU 上干等 I/O 是浪费。多道程序把多个作业装入内存并快速切换，同时也带来了内存保护和并发问题。</div></div>
+<div class="mcq" data-answer="3"><div class="q">7. <code>write()</code> 成功返回后立刻断电，数据一定在磁盘上吗？</div>
+  <div class="opts"><button>A. 一定不在</button><button>B. 取决于 CPU 型号</button><button>C. 一定在，write 返回就代表写盘完成</button><button>D. 不一定：多数文件系统会推迟写盘以便批量写入，需要 fsync 等手段强制落盘</button></div>
+  <div class="explain">原书："most file systems first delay such writes for a while, hoping to batch them into larger groups." 为了应对崩溃，文件系统还使用日志或写时复制来保证一致性。</div></div>
+<div class="mcq" data-answer="0"><div class="q">8. 早期 PC 操作系统（如 DOS、Mac OS 9）相对小型机 OS 被称为"大倒退"，主要因为？</div>
+  <div class="opts"><button>A. 缺少内存保护、采用协作式调度，一个程序出错就能拖垮整个系统</button><button>B. 只能运行在大型机上</button><button>C. 不支持 C 语言</button><button>D. 没有文件系统</button></div>
+  <div class="explain">DOS 不认为内存保护重要，恶意或有 bug 的程序可以乱写整个内存；Mac OS 9 协作式调度，一个线程死循环就得重启。后来 macOS、Windows NT 才把小型机时代的好想法带回桌面。</div></div>
+
+<h2><span class="num">13</span>常见误区与本章小结</h2>
+<div class="warn">
+  <ul>
+    <li><strong>"多个程序同时输出，说明它们在同时运行"</strong>：在单 CPU 上，它们是被 OS 快速轮流运行的——这是时分共享制造的假象。</li>
+    <li><strong>"打印出的指针就是物理地址"</strong>：程序看到的都是虚拟地址；两个进程的同一虚拟地址通常对应不同的物理内存。</li>
+    <li><strong>"<code>counter++</code> 是一条语句，所以是一步完成的"</strong>：它编译成 load/add/store 三条指令，线程可以在任意两条之间被打断。</li>
+    <li><strong>"小规模测试结果正确，程序就没有并发 bug"</strong>：loops=1000 时碰巧正确，loops 大了才暴露问题；并发 bug 与时机相关。</li>
+    <li><strong>"write 返回了，数据就安全了"</strong>：文件系统可能还没把它写到磁盘。</li>
+  </ul>
+</div>
+<div class="key">
+  <ul>
+    <li>OS 让系统<strong>易于使用</strong>：它通过<strong>虚拟化</strong>把物理资源变成易用的虚拟形式（所以也叫虚拟机），提供几百个系统调用（所以也叫标准库），并管理 CPU、内存、磁盘等资源（所以也叫资源管理器）。</li>
+    <li><strong>虚拟化 CPU</strong>：一个 CPU 看起来像很多个，多个程序看似同时运行；由<strong>机制</strong>实现，由<strong>策略</strong>决定运行谁。</li>
+    <li><strong>虚拟化内存</strong>：每个进程有自己私有的虚拟地址空间，OS 把它映射到共享的物理内存上。</li>
+    <li><strong>并发</strong>：多个线程共享内存时，非原子的操作会交错出错，需要 OS 与硬件提供正确的原语。</li>
+    <li><strong>持久化</strong>：文件系统把数据可靠地存到磁盘；为性能会推迟写入，为可靠会用日志或写时复制。</li>
+    <li>设计目标：抽象、高性能（低开销）、保护与隔离、可靠性，以及能效、安全、移动性。历史上 OS 从"只是库"演进到有保护的系统调用、多道程序、UNIX，再到今天的 Linux/macOS/Windows。</li>
+  </ul>
+  <p><strong>下一步：</strong>第 4 章正式引入"进程"这一抽象——本章的 <code>cpu</code> 程序每一次运行，都是一个进程。</p>
+</div>
+</main>
+
+<script>
+/* CORE:BEGIN */
+const CORE = (() => {
+  // ---------- CPU 虚拟化：时间片轮转 ----------
+  // n 个程序，每打印一行需要 work ms 的 CPU；时间片 q；policy: 'rr' | 'rand'
+  function cpuSim(n, q, policy, seed, work = 1000, totalMs = 4000) {
+    const rng = OSTEP.rng(seed);
+    const prog = Array.from({ length: n }, () => ({ done: 0, lines: 0, cpu: 0 }));
+    const slices = [];
+    let t = 0, k = -1;
+    while (t < totalMs) {
+      k = policy === "rand" ? rng.int(0, n - 1) : (k + 1) % n;
+      const p = prog[k], start = t, end = Math.min(totalMs, t + q), prints = [];
+      let left = end - start;
+      while (left > 0) {
+        const need = work - p.done;
+        if (need <= left) { t += need; left -= need; p.done = 0; p.lines++; p.cpu += need; prints.push({ who: k, t }); }
+        else { p.done += left; p.cpu += left; t += left; left = 0; }
+      }
+      slices.push({ who: k, start, end, prints, snap: prog.map((x) => ({ ...x })) });
+    }
+    return slices;
+  }
+
+  // ---------- 虚拟化内存：两个 mem 进程 ----------
+  // mode: 'vm' | 'aslr' | 'none'
+  function memSim(mode, seed) {
+    const rng = OSTEP.rng(seed);
+    const pids = [24113, 24114];
+    const va = mode === "aslr" ? [0x555555550000 + rng.int(1, 0xfffff) * 0x1000 + 0x2a0, 0x555555550000 + rng.int(1, 0xfffff) * 0x1000 + 0x2a0] : [0x200000, 0x200000];
+    const pa = mode === "none" ? [0x200000, 0x200000] : [0x3c1000, 0x0a7000];
+    const phys = {};
+    const steps = [], out = [];
+    const snap = (who, line, text, extra = {}) => steps.push({ who, line, text, out: out.slice(), phys: { ...phys }, va, pa, mapped: extra.mapped || [false, false], ...extra });
+    let mapped = [false, false];
+    snap(-1, "", "两个 mem 进程（PID 24113、24114）刚刚启动。每个进程都以为自己独占一整片内存。", { mapped });
+    for (const i of [0, 1]) {
+      mapped = mapped.slice(); mapped[i] = true;
+      snap(i, "a1", mode === "none"
+        ? `进程 ${pids[i]} 执行 a1：malloc 返回 0x${va[i].toString(16)}。没有虚拟内存时，这就是真实的物理地址——两个进程拿到的是<b>同一块</b>物理内存！`
+        : `进程 ${pids[i]} 执行 a1：malloc 返回虚拟地址 0x${va[i].toString(16)}。OS 悄悄把它映射到物理地址 <b>0x${pa[i].toString(16)}</b>。`, { mapped });
+    }
+    for (const i of [0, 1]) { out.push(`(${pids[i]}) address pointed to by p: 0x${va[i].toString(16)}`); snap(i, "a2", `进程 ${pids[i]} 执行 a2：打印 p 的值——它只能看到虚拟地址。`, { mapped }); }
+    for (const i of [0, 1]) { phys[pa[i]] = 0; snap(i, "a3", `进程 ${pids[i]} 执行 a3：<code>*p = 0</code>，写入物理地址 0x${pa[i].toString(16)}。`, { mapped, write: i }); }
+    // 原书图 2.4 的打印顺序
+    const order = [0, 1, 1, 0, 0, 1, 0, 1];
+    for (const i of order) {
+      phys[pa[i]] = phys[pa[i]] + 1;
+      out.push(`(${pids[i]}) p: ${phys[pa[i]]}`);
+      snap(i, "a4", `进程 ${pids[i]} 执行 <code>*p = *p + 1</code>：读出物理地址 0x${pa[i].toString(16)} 处的值、加一、写回，打印 ${phys[pa[i]]}。` +
+        (mode === "none" ? " 注意：另一个进程也在改这同一个位置！" : ""), { mapped, write: i });
+    }
+    return steps;
+  }
+
+  // ---------- 并发：两个线程执行 counter++ ----------
+  // 返回 {final, lost, trace?}；trace 仅在指令总数不大时记录
+  const OPS = ["load", "add", "store"];
+  function counterSim(loops, avgQ, seed, wantTrace) {
+    const rng = OSTEP.rng(seed);
+    const th = [{ i: 0, pc: 0, reg: 0 }, { i: 0, pc: 0, reg: 0 }];
+    let counter = 0, cur = 0, left = rng.int(1, 2 * avgQ - 1), lost = 0;
+    const trace = wantTrace ? [] : null;
+    const doneT = (t) => th[t].i >= loops;
+    while (!(doneT(0) && doneT(1))) {
+      if (doneT(cur) || left <= 0) {
+        const other = 1 - cur;
+        if (!doneT(other)) { cur = other; if (trace) trace.push({ sw: true, to: cur }); }
+        left = rng.int(1, 2 * avgQ - 1);
+      }
+      const T = th[cur], op = OPS[T.pc];
+      let isLost = false, before = counter;
+      if (op === "load") T.reg = counter;
+      else if (op === "add") T.reg = T.reg + 1;
+      else { if (T.reg <= counter) { isLost = true; lost += counter - T.reg + 1; } counter = T.reg; }
+      if (trace) trace.push({ t: cur, op, iter: T.i, reg: T.reg, counter, before, lost: isLost, regs: [th[0].reg, th[1].reg] });
+      T.pc = (T.pc + 1) % 3;
+      if (T.pc === 0) T.i++;
+      left--;
+    }
+    return { final: counter, trace };
+  }
+
+  // ---------- 持久化：写路径与崩溃 ----------
+  // 返回步骤列表，每步给出内存/日志/磁盘上的状态
+  function ioSteps(fsync, journal) {
+    const S = [];
+    const st = { mode: "user", mem: [], jnl: [], commit: false, disk: [], ret: "", prog: "" };
+    const push = (text, o) => { Object.assign(st, o || {}); S.push({ text, ...JSON.parse(JSON.stringify(st)) }); };
+    push("程序开始运行，处于用户模式。磁盘上还没有 <code>/tmp/file</code>。", { prog: "main()" });
+    push("调用 <code>open(\"/tmp/file\", O_CREAT…)</code>：执行 trap 指令进入内核（内核模式），交给文件系统处理。", { mode: "kernel", prog: "open()" });
+    push("文件系统在<b>内存中</b>分配一个 inode、在位图中标记它、在 <code>/tmp</code> 目录里加一项 <code>file</code>——这些改动都只是内存里的“脏”数据。返回 fd = 3。", { mem: ["inode", "bitmap", "dir"], ret: "fd = 3" });
+    push("回到用户模式。调用 <code>write(fd, \"hello world\\n\", 12)</code>：再次 trap 进入内核。", { mode: "kernel", prog: "write()", ret: "" });
+    push("文件系统决定数据放在磁盘哪一块，把 12 字节拷进内存中的缓存（脏），更新 inode 里的文件大小。<b>没有碰磁盘</b>就返回 12——为了性能，写盘被推迟了。", { mem: ["inode", "bitmap", "dir", "data"], ret: "rc = 12" });
+    const flush = (why) => {
+      if (journal) {
+        push(`${why}先把所有改动（inode、位图、目录、数据）作为一个<b>事务</b>顺序写入磁盘上的<b>日志区</b>。`, { jnl: ["inode", "bitmap", "dir", "data"] });
+        push("日志写完后，再写一个<b>提交块（commit）</b>。从这一刻起，这次更新“算数”了：即使马上崩溃，重启时也能按日志重放。", { commit: true });
+        push("<b>检查点（checkpoint）</b>：把各项改动写到它们在磁盘上的最终位置。", { disk: ["inode", "bitmap", "dir", "data"], mem: [] });
+        push("最终位置都写好了，日志空间可以释放。", { jnl: [], commit: false });
+      } else {
+        const order = ["data", "inode", "bitmap", "dir"];
+        const name = { data: "数据块", inode: "inode", bitmap: "位图", dir: "目录项" };
+        order.forEach((x, k) => {
+          const d = order.slice(0, k + 1);
+          push(`${k === 0 ? why : ""}没有日志：文件系统把改动逐个写到最终位置。这一步写<b>${name[x]}</b>。`, { disk: d, mem: order.filter((y) => !d.includes(y)) });
+        });
+      }
+    };
+    if (fsync) {
+      push("调用 <code>fsync(fd)</code>：要求文件系统在返回前把这个文件的数据和元数据都写到磁盘。", { prog: "fsync()", mode: "kernel", ret: "" });
+      flush("fsync 触发写盘：");
+      push("<code>fsync</code> 返回 0：此后即使断电，数据也在磁盘上。", { ret: "0", mode: "user" });
+    }
+    push("调用 <code>close(fd)</code> 并返回。" + (fsync ? "" : "注意：close 并不保证数据已写到磁盘！"), { prog: "close()", mode: "user", ret: "0" });
+    push("程序退出。" + (fsync ? "" : "从程序的角度看，写文件已经“成功”了——但数据可能还只在内存里。"), { prog: "（已退出）", ret: "" });
+    if (!fsync) flush("几秒后，文件系统在后台把积攒的写批量写回磁盘：");
+    push("完成：<code>/tmp/file</code> 及其内容 “hello world” 已持久保存在磁盘上。", {});
+    return S;
+  }
+  // 断电后重启：根据磁盘上的状态判断结果
+  function crashOutcome(st, journal) {
+    const D = new Set(st.disk);
+    if (D.size === 4) return { kind: "ok", text: "重启后 <code>/tmp/file</code> 完整存在，内容是 hello world。" };
+    if (journal && st.jnl.length && st.commit) return { kind: "ok", text: "日志里有一个<b>已提交</b>的事务。重启时文件系统<b>重放（replay）</b>日志，把改动写到最终位置——文件完整恢复，一致。" };
+    if (journal && st.jnl.length && !st.commit) return { kind: "warn", text: "日志里的事务<b>没有提交块</b>，重启时被直接丢弃。文件系统保持写入前的<b>一致</b>状态：没有 /tmp/file，hello world 丢失。" };
+    if (D.size === 0) return { kind: "warn", text: "磁盘上什么都没有写：重启后没有 /tmp/file，hello world <b>丢失</b>。文件系统本身是一致的，但程序以为已经写成功的数据没了——需要持久性保证时要用 <code>fsync()</code>。" };
+    if (D.size === 1) return { kind: "warn", text: "只有数据块写到了磁盘，但没有任何元数据指向它，位图也认为它空闲——等于没写。文件系统一致，数据丢失。" };
+    if (D.size === 2) return { kind: "bad", text: "<b>不一致！</b>inode 已指向数据块，但位图仍说这块空闲——以后它可能被分配给别的文件，两个文件互相覆盖；目录里也没有这个 inode（空间泄漏）。需要 fsck 扫描整个磁盘修复。" };
+    return { kind: "bad", text: "<b>不一致！</b>inode 和位图都更新了，但目录里没有 <code>file</code> 这一项：文件成了没有名字的“孤儿”。需要 fsck 修复（通常放进 lost+found）。" };
+  }
+  return { cpuSim, memSim, counterSim, ioSteps, crashOutcome };
+})();
+/* CORE:END */
+
+(() => {
+  const { h, s, color, letter } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+
+  // ===================== CPU =====================
+  (() => {
+    let slices = [];
+    const nI = $("cpu-n"), qS = $("cpu-q"), polS = $("cpu-pol"), seedI = $("cpu-seed");
+    function build() { const n = Math.max(1, Math.min(6, +nI.value || 4)); slices = CORE.cpuSim(n, +qS.value, polS.value, +seedI.value || 0); st.reset(); }
+    function render(i) {
+      const n = slices[0].snap.length, sl = slices[i];
+      OSTEP.gantt($("cpu-gantt"), slices.slice(0, i + 1).map((x) => ({ who: x.who, start: x.start, end: x.end })), { unit: 500, pxPer: 0.19, height: 24 });
+      $("cpu-bars").replaceChildren(...sl.snap.map((p, k) => h("div", { class: "vbar" },
+        h("span", { style: { color: color(k), fontWeight: 700 } }, `cpu ${letter(k)}`),
+        h("div", { class: "track" }, h("div", { class: "fill", style: { width: (p.done / 10) + "%", background: color(k) } })),
+        h("span", { class: "small muted mono" }, `${p.done}/1000`))));
+      const lines = [], fresh = new Set();
+      slices.slice(0, i + 1).forEach((x, j) => x.prints.forEach((pr) => { lines.push(pr); if (j === i) fresh.add(lines.length - 1); }));
+      const term = $("cpu-term");
+      term.replaceChildren(...(lines.length ? lines.map((pr, j) => h("div", { class: fresh.has(j) ? "new" : "" }, `${letter(pr.who)}        ← t = ${pr.t} ms`)) : [h("div", { class: "muted" }, "（还没有输出）")]));
+      term.scrollTop = 1e6;
+      const who = letter(sl.who);
+      let txt = `<b>${sl.start}–${sl.end} ms</b>：OS 让 <b style="color:${color(sl.who)}">cpu ${who}</b> 运行一个时间片，其余程序都在等待。`;
+      if (sl.prints.length) txt += ` 在 ${sl.prints.map((p) => p.t + " ms").join("、")} 攒够 1000 ms 计算，打印 “${who}”。`;
+      if (i === slices.length - 1) txt += " 4 秒到。每个程序都只拿到约 1/" + n + " 的 CPU。";
+      $("cpu-nar").innerHTML = txt;
+      $("cpu-stats").replaceChildren(
+        h("div", { class: "stat" }, h("div", { class: "v" }, sl.end + " ms"), h("div", { class: "l" }, "墙上时间")),
+        h("div", { class: "stat" }, h("div", { class: "v" }, String(lines.length)), h("div", { class: "l" }, "已输出行数")),
+        ...sl.snap.map((p, k) => h("div", { class: "stat" }, h("div", { class: "v", style: { color: color(k) } }, p.cpu + " ms"), h("div", { class: "l" }, `cpu ${letter(k)} 获得的 CPU`))));
+    }
+    const st = OSTEP.stepper($("cpu-step"), { steps: () => slices.length, render, autoplayMs: 500 });
+    [nI, qS, polS, seedI].forEach((el) => (el.onchange = build));
+    document.querySelector('#sim-cpu [data-preset="book"]').onclick = () => { nI.value = 4; qS.value = "250"; polS.value = "rr"; build(); };
+    slices = CORE.cpuSim(4, 250, "rr", 7);
+  })();
+
+  // ===================== 内存 =====================
+  (() => {
+    let steps = [];
+    const modeS = $("mem-mode"), seedI = $("mem-seed");
+    function build() { steps = CORE.memSim(modeS.value, +seedI.value || 0); st.reset(); }
+    const hx = (v) => "0x" + v.toString(16);
+    function render(i) {
+      const S = steps[i], none = modeS.value === "none";
+      const svg = s("svg", { viewBox: "0 0 660 270", width: 660, role: "img", "aria-label": "两个进程的地址空间与物理内存" });
+      const col = (x, title, sub, k) => {
+        svg.append(s("text", { x: x + 80, y: 20, "text-anchor": "middle", "font-weight": 700, text: title }));
+        svg.append(s("text", { x: x + 80, y: 38, "text-anchor": "middle", "font-size": 12, class: "t-muted", text: sub }));
+        svg.append(s("rect", { x, y: 48, width: 160, height: 200, rx: 8, class: S.who === k ? "accent-soft" : "box", "stroke-width": S.who === k ? 2 : 1 }));
+        svg.append(s("rect", { x: x + 10, y: 58, width: 140, height: 28, rx: 4, style: "fill:var(--c1);opacity:.85" }));
+        svg.append(s("text", { x: x + 80, y: 77, "text-anchor": "middle", "font-size": 12, style: "fill:#fff", text: "代码 code" }));
+        svg.append(s("rect", { x: x + 10, y: 206, width: 140, height: 32, rx: 4, style: "fill:var(--c2);opacity:.85" }));
+        svg.append(s("text", { x: x + 80, y: 226, "text-anchor": "middle", "font-size": 12, style: "fill:#fff", text: "栈：p 变量" }));
+        if (S.mapped[k]) {
+          svg.append(s("rect", { x: x + 10, y: 120, width: 140, height: 40, rx: 4, style: "fill:var(--c5);opacity:.9" }));
+          svg.append(s("text", { x: x + 80, y: 137, "text-anchor": "middle", "font-size": 12, style: "fill:#fff", class: "mono", text: hx(S.va[k]) }));
+          svg.append(s("text", { x: x + 80, y: 153, "text-anchor": "middle", "font-size": 11.5, style: "fill:#fff", text: "堆：*p" }));
+        }
+      };
+      col(10, "进程 24113", none ? "（直接看到物理内存）" : "虚拟地址空间", 0);
+      col(490, "进程 24114", none ? "（直接看到物理内存）" : "虚拟地址空间", 1);
+      // 物理内存
+      const PX = 250, PW = 160;
+      svg.append(s("text", { x: PX + PW / 2, y: 20, "text-anchor": "middle", "font-weight": 700, text: "物理内存" }));
+      svg.append(s("text", { x: PX + PW / 2, y: 38, "text-anchor": "middle", "font-size": 12, class: "t-muted", text: "真正的字节数组，由 OS 管理" }));
+      svg.append(s("rect", { x: PX, y: 48, width: PW, height: 200, rx: 8, class: "box-strong" }));
+      const slots = none ? [{ a: 0x200000, y: 140 }] : [{ a: S.pa[1], y: 90 }, { a: S.pa[0], y: 180 }];
+      for (const sl of slots) {
+        const has = sl.a in S.phys, w = S.write != null && S.pa[S.write] === sl.a;
+        svg.append(s("rect", { x: PX + 10, y: sl.y - 20, width: PW - 20, height: 40, rx: 4, class: w ? "warn-soft" : "box", "stroke-width": w ? 2.5 : 1 }));
+        svg.append(s("text", { x: PX + 20, y: sl.y - 3, "font-size": 11.5, class: "mono t-muted", text: hx(sl.a) }));
+        svg.append(s("text", { x: PX + PW - 20, y: sl.y + 12, "text-anchor": "end", "font-size": 16, "font-weight": 700, class: "mono", text: has ? String(S.phys[sl.a]) : "?" }));
+      }
+      // 映射箭头
+      const ys = none ? [140, 140] : [180, 90];
+      [0, 1].forEach((k) => {
+        if (!S.mapped[k]) return;
+        const x1 = k === 0 ? 160 : 500, x2 = k === 0 ? PX + 10 : PX + PW - 10;
+        const hot = S.who === k;
+        svg.append(s("path", { d: `M${x1},140 C${(x1 + x2) / 2},140 ${(x1 + x2) / 2},${ys[k]} ${x2},${ys[k]}`, class: "arrow", style: hot ? (none ? "stroke:var(--bad);stroke-width:2.5" : "stroke:var(--accent);stroke-width:2.5") : "", "marker-end": hot ? (none ? "url(#arw-bad)" : "url(#arw-acc)") : "url(#arw)" }));
+      });
+      $("mem-svg").replaceChildren(svg);
+      const term = $("mem-term");
+      term.replaceChildren(...(S.out.length ? S.out.map((l, j) => h("div", { class: j === S.out.length - 1 && S.line !== "a3" && S.line !== "a1" ? "new" : "" }, l)) : [h("div", { class: "muted" }, "prompt> ./mem & ./mem &")]));
+      term.scrollTop = 1e6;
+      $("mem-nar").innerHTML = S.text;
+    }
+    const st = OSTEP.stepper($("mem-step"), { steps: () => steps.length, render, autoplayMs: 900 });
+    modeS.onchange = build; seedI.onchange = build;
+    steps = CORE.memSim("vm", 3);
+  })();
+
+  // ===================== 并发 counter =====================
+  (() => {
+    let res = null, loops = 4;
+    const lI = $("cnt-loops"), qS = $("cnt-q"), seedI = $("cnt-seed");
+    const MAXTRACE = 600;
+    function build() {
+      loops = Math.max(1, Math.min(1000000, +lI.value || 1));
+      const want = loops * 6 <= MAXTRACE;
+      res = CORE.counterSim(loops, +qS.value, +seedI.value || 0, want);
+      if (want) res.ins = res.trace.filter((x) => !x.sw);
+      st.reset();
+    }
+    function render(i) {
+      const box = $("cnt-regs"), list = $("cnt-list");
+      if (!res.ins) {
+        box.replaceChildren(h("div", { class: "small muted" }, `loops = ${loops} 时共有 ${(loops * 6).toLocaleString()} 条指令，太多，不逐条显示。直接看结果，或用下方按钮连续运行 10 次。`));
+        list.replaceChildren();
+        $("cnt-nar").innerHTML = `最终 counter = <b>${res.final.toLocaleString()}</b>，期望 ${(2 * loops).toLocaleString()}。` + (res.final === 2 * loops ? "这次碰巧正确。" : `少了 ${(2 * loops - res.final).toLocaleString()}：这些加法被“丢失”了。`);
+        stats(res.final, 2 * loops);
+        return;
+      }
+      const ins = res.ins, x = ins[i];
+      // 当前两个线程的寄存器、迭代
+      const it = [0, 0], pcs = [0, 0];
+      for (let k = 0; k <= i; k++) { const y = ins[k]; pcs[y.t] = (OPSIDX[y.op] + 1) % 3; it[y.t] = y.iter + (y.op === "store" ? 1 : 0); }
+      box.replaceChildren(
+        ...[0, 1].map((t) => h("div", { class: "regbox" + (x.t === t ? " active" : "") }, h("b", { style: { color: color(t) } }, `线程 T${t + 1}`), h("br"),
+          `eax = ${x.regs[t]}`, h("br"), `已完成 ${it[t]} / ${loops} 次`, h("br"), `下一条：${OPS[pcs[t]]}`)),
+        h("div", { class: "regbox active", style: { borderColor: x.lost ? "var(--bad)" : "" } }, h("b", {}, "共享内存"), h("br"), `counter = ${x.counter}`, h("br"), h("span", { class: "muted" }, `期望最终 ${2 * loops}`)));
+      // 指令列表
+      let k = 0;
+      const rows = [];
+      res.trace.forEach((y) => {
+        if (y.sw) { rows.push(h("div", { class: k > i ? "fut" : "", style: { color: "var(--muted)" } }, `—— 时钟中断：切换到 T${y.to + 1} ——`)); return; }
+        const idx = k++;
+        const desc = y.op === "load" ? `mov counter, %eax   ; eax ← ${y.before}` : y.op === "add" ? `add $1, %eax        ; eax = ${y.reg}` : `mov %eax, counter   ; counter ← ${y.reg}${y.lost ? "   ✗ 覆盖了另一线程的结果！" : ""}`;
+        rows.push(h("div", { class: (idx === i ? "cur " : "") + (idx > i ? "fut " : "") + (y.lost && idx <= i ? "lost" : "") }, h("span", { style: { color: color(y.t) } }, `T${y.t + 1} `), idx > i ? "…" : desc));
+      });
+      list.replaceChildren(...rows);
+      const cur = list.querySelector(".cur"); if (cur) list.scrollTop = cur.offsetTop - list.clientHeight / 2;
+      let txt = `T${x.t + 1} 执行 <b>${x.op}</b>（第 ${x.iter + 1} 次循环）。`;
+      if (x.op === "load") txt += ` 把 counter 的当前值 ${x.before} 读进自己的寄存器 eax。如果在 store 之前被切走，这个值就会“过时”。`;
+      if (x.op === "add") txt += ` 只改了寄存器：eax = ${x.reg}，内存里的 counter 仍是 ${x.counter}。`;
+      if (x.op === "store") txt += x.lost ? ` <b style="color:var(--bad)">丢失更新！</b>T${x.t + 1} 写回的 ${x.reg} 是基于过时的值算出来的，内存里原本已是 ${x.before}，另一线程的加法被覆盖了。` : ` 写回 counter = ${x.reg}。`;
+      if (i === ins.length - 1) txt += ` 两个线程都结束：counter = <b>${x.counter}</b>，期望 ${2 * loops}。`;
+      $("cnt-nar").innerHTML = txt;
+      stats(x.counter, 2 * loops, ins.slice(0, i + 1).filter((y) => y.lost).length, i === ins.length - 1);
+    }
+    function stats(v, exp, lostN, fin = true) {
+      const items = [
+        h("div", { class: "stat" }, h("div", { class: "v" }, v.toLocaleString()), h("div", { class: "l" }, fin ? "最终 counter" : "当前 counter")),
+        h("div", { class: "stat" }, h("div", { class: "v" }, exp.toLocaleString()), h("div", { class: "l" }, "期望值 2 × loops"))];
+      if (lostN != null) items.push(h("div", { class: "stat" }, h("div", { class: "v", style: { color: lostN ? "var(--bad)" : "" } }, String(lostN)), h("div", { class: "l" }, "发生丢失更新的 store")));
+      $("cnt-stats").replaceChildren(...items);
+    }
+    const OPS = ["load", "add", "store"], OPSIDX = { load: 0, add: 1, store: 2 };
+    const st = OSTEP.stepper($("cnt-step"), { steps: () => (res && res.ins ? res.ins.length : 1), render, autoplayMs: 450 });
+    [lI, qS, seedI].forEach((el) => (el.onchange = build));
+    document.querySelector('#sim-cnt [data-cnt="small"]').onclick = () => { lI.value = 4; qS.value = "4"; seedI.value = 5; build(); };
+    document.querySelector('#sim-cnt [data-cnt="book"]').onclick = () => { lI.value = 1000; qS.value = "10000"; build(); batch(); lI.value = 100000; build(); batch(true); };
+    function batch(append) {
+      const L = Math.max(1, Math.min(1000000, +lI.value || 1)), q = +qS.value;
+      const host = $("cnt-runs");
+      if (!append) host.replaceChildren();
+      host.append(h("span", {}, `loops=${L.toLocaleString()}：`));
+      for (let sd = 1; sd <= 10; sd++) { const r = CORE.counterSim(L, q, sd, false); host.append(h("span", { class: r.final === 2 * L ? "good" : "bad" }, r.final.toLocaleString())); }
+    }
+    $("cnt-batch").onclick = () => batch(false);
+    res = CORE.counterSim(4, 4, 5, true); res.ins = res.trace.filter((x) => !x.sw);
+  })();
+
+  // ===================== 持久化 =====================
+  (() => {
+    let steps = [];
+    const fs = $("io-fsync"), jn = $("io-jnl");
+    function build() { steps = CORE.ioSteps(fs.checked, jn.checked); $("io-verdict").replaceChildren(); st.reset(); }
+    const NAMES = { inode: "inode", bitmap: "位图", dir: "目录项", data: "数据块" };
+    function render(i) {
+      const S = steps[i];
+      $("io-verdict").replaceChildren();
+      const svg = s("svg", { viewBox: "0 0 660 300", width: 660, role: "img", "aria-label": "写入路径示意" });
+      // 用户层
+      svg.append(s("rect", { x: 10, y: 10, width: 640, height: 56, rx: 8, class: S.mode === "user" ? "accent-soft" : "box", "stroke-width": S.mode === "user" ? 2 : 1 }));
+      svg.append(s("text", { x: 24, y: 32, "font-weight": 700, text: "用户模式：io.c" }));
+      svg.append(s("text", { x: 24, y: 54, "font-size": 13, class: "mono", text: `正在执行：${S.prog}` }));
+      if (S.ret) svg.append(s("text", { x: 636, y: 54, "text-anchor": "end", "font-size": 13, class: "mono", style: "fill:var(--ok)", text: `返回 ${S.ret}` }));
+      // 内核层
+      svg.append(s("rect", { x: 10, y: 80, width: 640, height: 82, rx: 8, class: S.mode === "kernel" ? "accent-soft" : "box", "stroke-width": S.mode === "kernel" ? 2 : 1 }));
+      svg.append(s("text", { x: 24, y: 102, "font-weight": 700, text: "内核模式：文件系统 + 内存中的缓存（易失！）" }));
+      ["inode", "bitmap", "dir", "data"].forEach((k, j) => {
+        const on = S.mem.includes(k);
+        svg.append(s("rect", { x: 24 + j * 156, y: 114, width: 140, height: 34, rx: 5, class: on ? "warn-soft" : "box", "stroke-dasharray": on ? "" : "4 3" }));
+        svg.append(s("text", { x: 94 + j * 156, y: 136, "text-anchor": "middle", "font-size": 12.5, class: on ? "" : "t-muted", text: on ? `${NAMES[k]}（脏）` : NAMES[k] }));
+      });
+      // 磁盘
+      svg.append(s("rect", { x: 10, y: 176, width: 640, height: 114, rx: 8, class: "box-strong" }));
+      svg.append(s("text", { x: 24, y: 198, "font-weight": 700, text: "磁盘（持久）" }));
+      const J = jn.checked;
+      if (J) {
+        svg.append(s("rect", { x: 24, y: 210, width: 200, height: 68, rx: 5, class: S.jnl.length ? "ok-soft" : "box" }));
+        svg.append(s("text", { x: 34, y: 228, "font-size": 12.5, "font-weight": 700, text: "日志区 journal" }));
+        svg.append(s("text", { x: 34, y: 248, "font-size": 12, class: "mono", text: S.jnl.length ? "TxB inode bmap dir data" : "（空）" }));
+        svg.append(s("text", { x: 34, y: 268, "font-size": 12, class: "mono", style: S.commit ? "fill:var(--ok);font-weight:700" : "", text: S.commit ? "TxE 已提交 ✓" : S.jnl.length ? "TxE 未写" : "" }));
+      }
+      ["inode", "bitmap", "dir", "data"].forEach((k, j) => {
+        const on = S.disk.includes(k), x0 = J ? 240 + j * 102 : 24 + j * 156, w = J ? 92 : 140;
+        svg.append(s("rect", { x: x0, y: 226, width: w, height: 40, rx: 5, class: on ? "ok-soft" : "box" }));
+        svg.append(s("text", { x: x0 + w / 2, y: 250, "text-anchor": "middle", "font-size": 12, class: on ? "" : "t-muted", text: on ? NAMES[k] + " ✓" : NAMES[k] }));
+      });
+      svg.append(s("text", { x: J ? 240 : 24, y: 218, "font-size": 11.5, class: "t-muted", text: "最终位置" }));
+      $("io-svg").replaceChildren(svg);
+      $("io-nar").innerHTML = S.text;
+    }
+    const st = OSTEP.stepper($("io-step"), { steps: () => steps.length, render, autoplayMs: 1100 });
+    fs.onchange = build; jn.onchange = build;
+    $("io-crash").onclick = () => {
+      const S = steps[st.index], o = CORE.crashOutcome(S, jn.checked);
+      $("io-verdict").replaceChildren(h("div", { class: "verdict " + o.kind, html: "⚡ 断电并重启：" + o.text + " <span class='muted small'>（内存里的一切都消失了）</span>" }));
+    };
+    steps = CORE.ioSteps(false, true);
+  })();
+})();
+</script>
+</body></html>

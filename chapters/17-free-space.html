@@ -1,0 +1,1206 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 17 章 · 空闲空间管理</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+  .stage svg { max-width: none; display: block; }
+  figure.fig svg.wide { min-width: 620px; }
+  .grow { flex: 1 1 260px; min-width: 0; }
+  .grow input { flex: 1; min-width: 0; }
+  .presets { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 12px; font-size: 13.5px; }
+  .presets button { font-size: 13px; padding: 4px 9px; }
+  .trace17 { font: 12.5px/1.55 var(--mono); background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; margin-top: 12px; max-height: 230px; overflow: auto; white-space: pre; }
+  .trace17 .cur { background: var(--warn-soft); display: block; }
+  .trace17 .dim { color: var(--faint); }
+  .cmdline { font: 12.5px var(--mono); color: var(--muted); margin: -4px 0 12px; overflow-wrap: anywhere; }
+  .cmp17 { font-size: 13.5px; }
+  .cmp17 td, .cmp17 th { padding: 5px 10px; white-space: nowrap; }
+  .cmp17 tr.cur td { background: var(--accent-soft); }
+  .legend17 { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12.5px; color: var(--muted); margin: 8px 0 0; }
+  .legend17 i { display: inline-block; width: 14px; height: 11px; border-radius: 2px; vertical-align: -1px; margin-right: 4px; border: 1px solid var(--border); }
+  .orders17 { font: 12.5px/1.6 var(--mono); background: var(--code-bg); border-radius: 8px; padding: 8px 12px; margin-top: 12px; white-space: pre-wrap; }
+</style>
+</head>
+<body data-chapter="17">
+<main>
+
+<h2><span class="num">1</span>一句话 + 关键问题</h2>
+<div class="crux">
+  <p><strong>如何管理空闲空间？</strong>当要满足的请求大小各不相同时，空闲空间应该怎样管理？有哪些策略能把碎片降到最少？不同做法的时间和空间开销分别是多少？</p>
+  <p class="small muted">原文：How should free space be managed, when satisfying variable-sized requests? What strategies can be used to minimize fragmentation? What are the time and space overheads of alternate approaches?</p>
+</div>
+<p>这一章是虚拟内存部分的一段"插曲"：暂时不谈地址转换，转而讨论<strong>所有</strong>内存管理系统都绕不开的问题：空闲空间怎么记、怎么分。无论是用户态的 <code>malloc</code> 库（管理进程堆里的空间），还是 OS 本身（用分段实现虚拟内存时管理物理内存），面对的都是同一个问题。</p>
+<p>如果空间被切成<strong>固定大小</strong>的单元（下一章的分页就是这样），管理很简单：维护一张单元列表，有请求就给第一个。难的是<strong>变长</strong>请求，这时会出现<strong>外部碎片（external fragmentation）</strong>：空闲空间被切成大小不一的小块，总量明明够，却找不到一块连续的空间满足请求。</p>
+<figure class="fig">
+<svg viewBox="0 0 560 128" width="560" role="img" aria-label="30 字节堆中的外部碎片">
+  <text x="280" y="16" text-anchor="middle" font-size="13" style="font-weight:600">30 字节的堆：空闲 20 字节，却满足不了 15 字节的请求</text>
+  <rect x="40" y="30" width="160" height="40" rx="3" class="ok-soft" style="stroke-dasharray:4 3"/>
+  <text x="120" y="55" text-anchor="middle" font-size="13">free（10）</text>
+  <rect x="200" y="30" width="160" height="40" rx="3" style="fill:var(--c1)"/>
+  <text x="280" y="55" text-anchor="middle" font-size="13" style="fill:#fff;font-weight:600">used（10）</text>
+  <rect x="360" y="30" width="160" height="40" rx="3" class="ok-soft" style="stroke-dasharray:4 3"/>
+  <text x="440" y="55" text-anchor="middle" font-size="13">free（10）</text>
+  <g font-size="11" class="t-muted mono" text-anchor="middle"><text x="40" y="86">0</text><text x="200" y="86">10</text><text x="360" y="86">20</text><text x="520" y="86">30</text></g>
+  <rect x="120" y="96" width="240" height="22" rx="3" class="bad-soft"/>
+  <text x="240" y="112" text-anchor="middle" font-size="12" style="fill:var(--bad);font-weight:600">malloc(15)：没有一块 ≥ 15 的连续空间 → 失败</text>
+</svg>
+<figcaption>原书开篇的图：总空闲 20 字节，但被已用块隔成两个 10 字节的洞</figcaption>
+</figure>
+<p>上一章的分段正是这种变长分配的典型场景；下一章的分页则用"只发固定大小的块"彻底绕开它。本章介于两者之间：看清楚变长分配到底难在哪里，以及几十年来人们想出的各种应对办法。</p>
+
+<h2><span class="num">2</span>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>空闲链表（free list）</h4><p>记录堆中所有空闲块的数据结构。不一定真是链表，但通常是。</p></div>
+  <div class="card"><h4>外部碎片 vs. 内部碎片</h4><p>外部碎片：空闲空间碎在块与块<em>之间</em>；内部碎片：发出去的块比请求大，浪费在块<em>内部</em>。</p></div>
+  <div class="card"><h4>分割（splitting）</h4><p>请求比空闲块小：把空闲块切成两半，前一半交出去，剩下的留在链表里。</p></div>
+  <div class="card"><h4>合并（coalescing）</h4><p>释放时检查地址上相邻的空闲块，把它们并成一个更大的块，防止堆"碎成渣"。</p></div>
+  <div class="card"><h4>头块（header）</h4><p>放在每个已分配块前面的小结构，至少记录大小（常加魔数）。<code>free(ptr)</code> 就靠它知道要释放多少。</p></div>
+  <div class="card"><h4>嵌入式空闲链表</h4><p>分配器不能 <code>malloc</code> 链表节点，于是把节点（size + next）直接写在空闲块自己的开头。</p></div>
+  <div class="card"><h4>适配策略</h4><p>最优（best）、最差（worst）、首次（first）、下次（next）适配：在"碎片多少"和"搜索多快"之间权衡。</p></div>
+  <div class="card"><h4>分离链表 / slab / 伙伴</h4><p>为常见大小单开链表；slab 缓存预初始化的内核对象；伙伴系统只发 2 的幂大小，合并极其简单。</p></div>
+</div>
+
+<h2><span class="num">3</span>图解：底层机制</h2>
+
+<h3>3.1 基本假设</h3>
+<ul>
+  <li><strong>接口</strong>：<code>void *malloc(size_t size)</code> 返回一块至少 size 字节的空间；<code>void free(void *ptr)</code> <strong>只接收指针，不告诉库大小</strong>。所以库必须能仅凭指针查出块有多大（见 3.3）。</li>
+  <li>被管理的空间历史上叫<strong>堆（heap）</strong>，管理它的通用数据结构叫<strong>空闲链表（free list）</strong>。</li>
+  <li>主要关心<strong>外部碎片</strong>。如果分配器发出的块比请求大，块内多出来的部分是<strong>内部碎片（internal fragmentation）</strong>，本章大多略过。</li>
+  <li><strong>不能搬家</strong>：一块内存交给程序后，直到被 <code>free</code> 之前都归程序所有，库不能挪动它。因此用户态分配器<strong>无法紧凑（compaction）</strong>。（C 程序的指针可能藏在任何变量甚至寄存器里，库无从修改；OS 实现分段时倒是可以紧凑。）</li>
+  <li>分配器管理一段<strong>连续</strong>的字节区域。实际的库可以用 <code>sbrk</code> 让它变大（3.5 节），但讨论时先假设大小固定。</li>
+</ul>
+<figure class="fig">
+<svg viewBox="0 0 620 150" width="620" role="img" aria-label="内部碎片与外部碎片">
+  <defs><pattern id="h17a" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" style="fill:var(--bad-soft)"/><line x1="0" y1="0" x2="0" y2="6" style="stroke:var(--bad);stroke-width:1.6"/></pattern></defs>
+  <text x="150" y="16" text-anchor="middle" font-size="13" style="font-weight:600">外部碎片：浪费在块之间</text>
+  <rect x="20" y="30" width="60" height="40" rx="2" style="fill:var(--c1)"/>
+  <rect x="80" y="30" width="30" height="40" rx="2" class="ok-soft" style="stroke-dasharray:3 2"/>
+  <rect x="110" y="30" width="70" height="40" rx="2" style="fill:var(--c2)"/>
+  <rect x="180" y="30" width="25" height="40" rx="2" class="ok-soft" style="stroke-dasharray:3 2"/>
+  <rect x="205" y="30" width="50" height="40" rx="2" style="fill:var(--c3)"/>
+  <rect x="255" y="30" width="30" height="40" rx="2" class="ok-soft" style="stroke-dasharray:3 2"/>
+  <text x="150" y="92" text-anchor="middle" font-size="12">三个小洞加起来够用，但没有一个够大</text>
+  <text x="150" y="110" text-anchor="middle" font-size="11.5" class="t-muted">本章主角；变长分配的必然产物</text>
+  <text x="470" y="16" text-anchor="middle" font-size="13" style="font-weight:600">内部碎片：浪费在块内部</text>
+  <rect x="340" y="30" width="180" height="40" rx="2" style="fill:var(--c4)"/>
+  <rect x="520" y="30" width="80" height="40" rx="2" style="fill:url(#h17a);stroke:var(--bad)"/>
+  <text x="430" y="55" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">请求的 7KB</text>
+  <text x="470" y="92" text-anchor="middle" font-size="12">发出去的是 8KB 的块，多出的 1KB 没人用</text>
+  <text x="470" y="110" text-anchor="middle" font-size="11.5" class="t-muted">伙伴系统、对齐、固定大小分配都会产生</text>
+  <line x1="310" y1="26" x2="310" y2="120" style="stroke:var(--border)"/>
+  <text x="310" y="142" text-anchor="middle" font-size="11.5" class="t-muted">两者都是空间浪费；区别在于浪费发生在"已分配单元"之外还是之内</text>
+</svg>
+<figcaption>外部碎片 vs. 内部碎片</figcaption>
+</figure>
+
+<h3>3.2 分割与合并</h3>
+<p>还是那个 30 字节的堆。它的空闲链表有两个元素：一个描述 0–9 字节，另一个描述 20–29 字节。</p>
+<p>请求大于 10 字节会失败（返回 NULL）；正好 10 字节，任一块都行。<strong>比 10 小</strong>呢？比如只要 1 字节，分配器会做<strong>分割（splitting）</strong>：找一块能满足请求的空闲块，一分为二，前一块还给调用者，后一块留在链表里。如果选中第二个元素，<code>malloc</code> 返回 20，链表变成下图第二行：几乎没变，只是第二块从 21 开始、长度变成 9。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 222" width="640" role="img" aria-label="分割：malloc(1) 前后的空闲链表">
+  <defs><marker id="m17a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="20" y="18" font-size="12.5" style="font-weight:600">分割前</text>
+  <rect x="20" y="28" width="100" height="26" rx="2" class="ok-soft" style="stroke-dasharray:3 2"/><rect x="120" y="28" width="100" height="26" rx="2" style="fill:var(--c1)"/><rect x="220" y="28" width="100" height="26" rx="2" class="ok-soft" style="stroke-dasharray:3 2"/>
+  <g font-size="10" class="t-muted mono" text-anchor="middle"><text x="20" y="66">0</text><text x="120" y="66">10</text><text x="220" y="66">20</text><text x="320" y="66">30</text></g>
+  <text x="360" y="46" font-size="12" class="mono">head</text>
+  <rect x="400" y="28" width="82" height="30" rx="4" class="box-strong"/><text x="441" y="41" text-anchor="middle" font-size="10.5" class="mono">addr:0</text><text x="441" y="53" text-anchor="middle" font-size="10.5" class="mono">len:10</text>
+  <rect x="506" y="28" width="82" height="30" rx="4" class="box-strong"/><text x="547" y="41" text-anchor="middle" font-size="10.5" class="mono">addr:20</text><text x="547" y="53" text-anchor="middle" font-size="10.5" class="mono">len:10</text>
+  <path d="M390 43 L398 43" class="arrow" marker-end="url(#m17a)"/><path d="M482 43 L504 43" class="arrow" marker-end="url(#m17a)"/><path d="M588 43 L600 43" class="arrow"/><text x="604" y="47" font-size="10.5" class="mono t-muted">NULL</text>
+  <text x="20" y="100" font-size="12.5" style="font-weight:600">malloc(1) 用第二块，分割后</text>
+  <rect x="20" y="110" width="100" height="26" rx="2" class="ok-soft" style="stroke-dasharray:3 2"/><rect x="120" y="110" width="100" height="26" rx="2" style="fill:var(--c1)"/><rect x="220" y="110" width="10" height="26" rx="1" style="fill:var(--c2)"/><rect x="230" y="110" width="90" height="26" rx="2" class="ok-soft" style="stroke-dasharray:3 2"/>
+  <g font-size="10" class="t-muted mono" text-anchor="middle"><text x="20" y="148">0</text><text x="120" y="148">10</text><text x="218" y="148">20</text><text x="236" y="148">21</text><text x="320" y="148">30</text></g>
+  <text x="360" y="128" font-size="12" class="mono">head</text>
+  <rect x="400" y="110" width="82" height="30" rx="4" class="box-strong"/><text x="441" y="123" text-anchor="middle" font-size="10.5" class="mono">addr:0</text><text x="441" y="135" text-anchor="middle" font-size="10.5" class="mono">len:10</text>
+  <rect x="506" y="110" width="82" height="30" rx="4" class="warn-soft"/><text x="547" y="123" text-anchor="middle" font-size="10.5" class="mono">addr:21</text><text x="547" y="135" text-anchor="middle" font-size="10.5" class="mono">len:9</text>
+  <path d="M390 125 L398 125" class="arrow" marker-end="url(#m17a)"/><path d="M482 125 L504 125" class="arrow" marker-end="url(#m17a)"/><path d="M588 125 L600 125" class="arrow"/><text x="604" y="129" font-size="10.5" class="mono t-muted">NULL</text>
+  <text x="320" y="180" text-anchor="middle" font-size="12">返回 20；第二个元素从 [20, len 10] 变成 [21, len 9]，链表结构不变</text>
+  <text x="320" y="200" text-anchor="middle" font-size="11.5" class="t-muted">（这里暂时假设没有头块，这是一个不现实但便于讲解的简化，3.3 节再加上）</text>
+</svg>
+<figcaption>分割（splitting）：请求比空闲块小时，切下需要的部分，剩余部分留在链表中</figcaption>
+</figure>
+<p>与之配套的是<strong>合并（coalescing）</strong>。回到"空闲 10 / 已用 10 / 空闲 10"的堆，如果程序调用 <code>free(10)</code> 归还中间那块，而库只是不假思索地把它插到链表头部，链表会变成 10 → 0 → 20 三个元素。<strong>整个堆明明全空了</strong>，看起来却是三块各 10 字节，20 字节的请求照样失败。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 176" width="640" role="img" aria-label="不合并与合并后的空闲链表">
+  <defs><marker id="m17b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="20" y="18" font-size="12.5" style="font-weight:600">free(10) 后不合并</text>
+  <rect x="20" y="28" width="100" height="26" rx="2" class="ok-soft" style="stroke-dasharray:3 2"/><rect x="120" y="28" width="100" height="26" rx="2" class="warn-soft" style="stroke-dasharray:3 2"/><rect x="220" y="28" width="100" height="26" rx="2" class="ok-soft" style="stroke-dasharray:3 2"/>
+  <g font-size="10" class="t-muted mono" text-anchor="middle"><text x="20" y="66">0</text><text x="120" y="66">10</text><text x="220" y="66">20</text><text x="320" y="66">30</text></g>
+  <text x="336" y="46" font-size="12" class="mono">head</text>
+  <rect x="372" y="28" width="68" height="30" rx="4" class="warn-soft"/><text x="406" y="41" text-anchor="middle" font-size="10.5" class="mono">addr:10</text><text x="406" y="53" text-anchor="middle" font-size="10.5" class="mono">len:10</text>
+  <rect x="458" y="28" width="68" height="30" rx="4" class="box-strong"/><text x="492" y="41" text-anchor="middle" font-size="10.5" class="mono">addr:0</text><text x="492" y="53" text-anchor="middle" font-size="10.5" class="mono">len:10</text>
+  <rect x="544" y="28" width="68" height="30" rx="4" class="box-strong"/><text x="578" y="41" text-anchor="middle" font-size="10.5" class="mono">addr:20</text><text x="578" y="53" text-anchor="middle" font-size="10.5" class="mono">len:10</text>
+  <path d="M364 43 L370 43" class="arrow" marker-end="url(#m17b)"/><path d="M440 43 L456 43" class="arrow" marker-end="url(#m17b)"/><path d="M526 43 L542 43" class="arrow" marker-end="url(#m17b)"/>
+  <text x="490" y="80" text-anchor="middle" font-size="11.5" style="fill:var(--bad)">三块 10 字节 → malloc(20) 失败</text>
+  <text x="20" y="112" font-size="12.5" style="font-weight:600">free(10) 时合并</text>
+  <rect x="20" y="122" width="300" height="26" rx="2" class="ok-soft" style="stroke-dasharray:3 2"/>
+  <g font-size="10" class="t-muted mono" text-anchor="middle"><text x="20" y="160">0</text><text x="320" y="160">30</text></g>
+  <text x="336" y="140" font-size="12" class="mono">head</text>
+  <rect x="372" y="122" width="68" height="30" rx="4" class="ok-soft"/><text x="406" y="135" text-anchor="middle" font-size="10.5" class="mono">addr:0</text><text x="406" y="147" text-anchor="middle" font-size="10.5" class="mono">len:30</text>
+  <path d="M364 137 L370 137" class="arrow" marker-end="url(#m17b)"/><path d="M440 137 L452 137" class="arrow"/><text x="456" y="141" font-size="10.5" class="mono t-muted">NULL</text>
+  <text x="560" y="140" text-anchor="middle" font-size="11.5" style="fill:var(--ok)">恢复成一整块</text>
+</svg>
+<figcaption>合并（coalescing）：归还一块时，看看它两边的地址是否也空闲，是就并成一个大块</figcaption>
+</figure>
+<p>合并的思路很简单：归还一块时，仔细看它的地址和附近空闲块的地址，如果新释放的块紧挨着一个（或像这里一样两个）空闲块，就把它们并成一个更大的块。合并之后链表只剩一个元素 [0, 30]，正是最初什么都没分配时的样子。有了合并，分配器才能尽量保证应用能拿到大的连续空闲区域。</p>
+
+<h3>3.3 记录已分配块的大小：头块</h3>
+<p><code>free(void *ptr)</code> 不带大小参数，库怎么知道要回收多少？大多数分配器在交出去的内存块<strong>前面</strong>放一个<strong>头块（header）</strong>，里面至少有块的大小，还可能有加速释放用的指针、做完整性检查的<strong>魔数（magic number）</strong>等。原书的简单头块：</p>
+<pre><code>typedef struct {
+    int size;    // 用户区的大小（不含头块）
+    int magic;   // 魔数，用来检查 free 收到的指针是否合法
+} header_t;</code></pre>
+<figure class="fig">
+<svg viewBox="0 0 560 190" width="560" role="img" aria-label="已分配区域加上头块">
+  <defs><marker id="m17c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker></defs>
+  <rect x="190" y="20" width="160" height="28" class="box" style="fill:var(--surface-2);stroke:var(--fg)"/><text x="270" y="38" text-anchor="middle" font-size="12" class="mono">size: 20</text>
+  <rect x="190" y="48" width="160" height="28" class="box" style="fill:var(--surface-2);stroke:var(--fg)"/><text x="270" y="66" text-anchor="middle" font-size="12" class="mono">magic: 1234567</text>
+  <rect x="190" y="76" width="160" height="80" style="fill:var(--c1)"/><text x="270" y="112" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">交给调用者的 20 字节</text><text x="270" y="130" text-anchor="middle" font-size="11" style="fill:#fff">（ptr = malloc(20)）</text>
+  <text x="120" y="24" text-anchor="middle" font-size="12" class="mono" style="fill:var(--accent)">hptr</text>
+  <path d="M140 20 L186 20" style="stroke:var(--accent);stroke-width:1.5;fill:none" marker-end="url(#m17c)"/>
+  <text x="120" y="80" text-anchor="middle" font-size="12" class="mono" style="fill:var(--accent)">ptr</text>
+  <path d="M140 76 L186 76" style="stroke:var(--accent);stroke-width:1.5;fill:none" marker-end="url(#m17c)"/>
+  <path d="M356 22 C 390 22, 390 74, 356 74" class="arrow"/>
+  <text x="396" y="44" font-size="11.5">malloc 库使用的头块</text>
+  <text x="396" y="60" font-size="11.5" class="mono t-muted">sizeof(header_t) = 8</text>
+  <text x="396" y="116" font-size="11.5">用户看到的区域</text>
+  <text x="280" y="180" text-anchor="middle" font-size="12">free(ptr)：hptr = (header_t *) ptr − 1，往回退一个头块就找到了大小</text>
+</svg>
+<figcaption>图 17.1 + 17.2：已分配区域加上头块，头块里是 size = 20、magic = 1234567</figcaption>
+</figure>
+<pre><code>void free(void *ptr) {
+    header_t *hptr = (header_t *) ptr - 1;   // 指针运算：往回退 sizeof(header_t) 字节
+    assert(hptr->magic == 1234567);          // 完整性检查
+    // 这块空闲区域的总大小 = hptr->size + sizeof(header_t)
+    ...
+}</code></pre>
+<ul>
+  <li><code>(header_t *) ptr - 1</code>：把 <code>ptr</code> 当作 <code>header_t *</code> 减 1，按 C 的指针运算规则正好后退 8 字节，落到头块起点。</li>
+  <li>magic 对不上，说明传进来的不是 <code>malloc</code> 发出的指针（或者头块被越界写坏了）。</li>
+  <li><strong>关键细节</strong>：释放区域的大小 = 头块大小 + 用户区大小。反过来，<strong>用户请求 N 字节时，库要找的不是 N 字节的空闲块，而是 N + 头块大小。</strong></li>
+</ul>
+
+<h3>3.4 把空闲链表嵌进空闲空间里</h3>
+<p>普通链表要新节点时会调用 <code>malloc()</code>，可我们<strong>就是</strong> <code>malloc</code>，没法这么做。办法是：直接在空闲空间里构建链表。每个空闲块的开头放一个节点：</p>
+<pre><code>typedef struct __node_t {
+    int              size;   // 这个空闲块中可用的字节数（不含节点本身）
+    struct __node_t *next;   // 下一个空闲块
+} node_t;
+
+// mmap() 返回一块空闲空间的指针；假设这块 4KB 的堆从虚拟地址 16KB 开始
+node_t *head = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_ANON|MAP_PRIVATE, -1, 0);
+head-&gt;size = 4096 - sizeof(node_t);   // 4088
+head-&gt;next = NULL;</code></pre>
+<p>运行后链表只有一个元素，大小 <strong>4088</strong>（4096 减去 8 字节的节点）。接下来依次：</p>
+<ol>
+  <li><strong>malloc(100)</strong>：唯一的空闲块被选中并分割。连头块共 108 字节交出去，返回的 <code>ptr</code> = 16384 + 8 = 16392；剩下的空闲块缩小为 4088 − 108 = <strong>3980</strong>，节点挪到 16492。</li>
+  <li>再分配两次 100 字节：前 <strong>324</strong> 字节（3 × 108）都被占用，空闲块只剩 <strong>3764</strong>。</li>
+  <li><strong>free(16500)</strong>：归还中间块（16384 + 前一块的 108 + 本块头块 8 = 16500）。库从头块得知大小，把这块插到链表头部：head → 16492（100 字节）→ 16708（3764 字节）。链表终于不止一个元素，空闲空间开始碎了。</li>
+  <li>再释放剩下两块、<strong>不合并</strong>：链表变成 head → 16600 → 16384 → 16492 → 16708。所有内存都空闲了，却被切成四块。解决办法很简单：遍历链表，合并相邻块，堆就重新完整了。</li>
+</ol>
+<figure class="fig">
+<svg viewBox="0 0 920 392" width="920" class="wide" role="img" aria-label="嵌入式空闲链表：图 17.3 到 17.7">
+  <g id="fig17-embed"></g>
+</svg>
+<figcaption>图 17.3–17.7：4KB 堆中的嵌入式空闲链表（头块与空闲节点都是 8 字节；块高不按比例）。深色为头块，蓝色为已分配的用户区，虚线为空闲区</figcaption>
+</figure>
+<div class="tip"><p>下面的 malloc.py 模拟器里点"原书 4KB 堆"可以逐步重放这个过程。注意 malloc.py 的空闲链表记的 <code>sz</code> 是空闲块的<strong>总字节数</strong>（含节点头），比原书节点里的 size 字段多 8：3988 对应书中的 3980，3772 对应 3764，每块 108 对应 100。</p></div>
+
+<h3>3.5 堆不够了：让堆增长</h3>
+<p>堆空间耗尽时怎么办？最简单的做法是直接失败，返回 NULL，这完全正当（"你尽力了"）。但大多数传统分配器一开始只要一个小堆，不够时再向 OS 要：调用 <code>sbrk</code>（多数 UNIX 系统）之类的系统调用让堆变大，然后从新空间里分配。为了服务 <code>sbrk</code>，OS 找到空闲的物理页，把它们映射进请求进程的地址空间，并返回新的堆末尾。</p>
+<figure class="fig">
+<svg viewBox="0 0 620 200" width="620" role="img" aria-label="sbrk 让堆增长">
+  <defs><marker id="m17d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker></defs>
+  <text x="150" y="16" text-anchor="middle" font-size="12.5" style="font-weight:600">调用前：堆里找不到够大的块</text>
+  <text x="470" y="16" text-anchor="middle" font-size="12.5" style="font-weight:600">sbrk 之后：堆末尾后移</text>
+  <g id="fig17-sbrk"></g>
+</svg>
+<figcaption>sbrk：OS 把新的物理页映射到堆末尾之后，并返回新的堆末尾（program break），分配器再从新空间里切块</figcaption>
+</figure>
+
+<h2><span class="num">4</span>图解：基本策略</h2>
+<p>有了机制，再看<strong>策略</strong>：有多个空闲块能满足请求时选哪一个？理想的分配器既快又少碎片；可惜请求序列由程序员决定、可以是任意的，<strong>任何策略遇到"合适"的坏输入都会表现很差</strong>。所以没有"最好"的策略，只有各自的利弊。</p>
+<div class="table-wrap"><table>
+<thead><tr><th>策略</th><th>怎么选</th><th>好处</th><th>代价</th></tr></thead>
+<tbody>
+<tr><td>最优适配（best fit）</td><td>遍历整张表，在够大的块里选<strong>最小</strong>的</td><td>返回的块最接近请求，试图减少浪费</td><td>要完整遍历；常常留下很多小碎片</td></tr>
+<tr><td>最差适配（worst fit）</td><td>遍历整张表，选<strong>最大</strong>的块，切下需要的部分</td><td>想让剩余的块依然很大</td><td>要完整遍历；多数研究表明碎片反而更多、开销也高</td></tr>
+<tr><td>首次适配（first fit）</td><td>从表头找，<strong>第一个</strong>够大的就用</td><td>快，不必遍历全部</td><td>表头容易堆满小碎块；链表顺序变得重要（按地址排序利于合并、碎片往往更少）</td></tr>
+<tr><td>下次适配（next fit）</td><td>像首次适配，但从<strong>上次停下的位置</strong>接着找</td><td>把搜索分散到整个链表，避免表头被切碎</td><td>性能与首次适配相近</td></tr>
+</tbody></table></div>
+<p>原书的例子：空闲链表有三个元素，大小 10、30、20（忽略头块），请求 15 字节：</p>
+<figure class="fig">
+<svg viewBox="0 0 640 240" width="640" class="wide" role="img" aria-label="best/worst/first fit 在 10、30、20 链表上的结果">
+  <g id="fig17-fit"></g>
+</svg>
+<figcaption>最优适配选 20，留下 5 字节的小块；最差适配和首次适配都选 30。区别在搜索成本：前两者都遍历整张表（3 个元素），首次适配只看了 2 个</figcaption>
+</figure>
+<p>这些例子只是冰山一角。更深入的理解需要真实负载和更复杂的分配器行为（比如合并）下的分析，这正是章末作业和下面模拟器要做的。</p>
+
+<h2><span class="num">5</span>图解：其他方法</h2>
+
+<h3>5.1 分离空闲链表（segregated lists）与 slab 分配器</h3>
+<p>如果某个应用有一种（或少数几种）<strong>特别常见</strong>的请求大小，就单独为这个大小维护一个链表，其他请求交给通用分配器。好处很明显：专门服务一种大小，碎片几乎不是问题；而且大小正合适的请求无需复杂搜索，分配和释放都很快。</p>
+<p>新的难题：该拿多少内存给专用池、多少留给通用池？Jeff Bonwick 为 Solaris 内核设计的 <strong>slab 分配器（slab allocator）</strong>处理得很漂亮：</p>
+<ul>
+  <li>内核启动时，为经常请求的内核对象（锁、文件系统 inode 等）建立若干<strong>对象缓存（object cache）</strong>，每个缓存就是某个大小的分离空闲链表。</li>
+  <li>某个缓存空闲空间不足时，向通用分配器要一些 <strong>slab</strong>（总大小是页大小和对象大小的倍数）。</li>
+  <li>反过来，某个 slab 里所有对象的引用计数都归零时，通用分配器可以把它收回，通常发生在 VM 系统需要更多内存时。</li>
+  <li>更进一步：空闲对象保持在<strong>已初始化状态</strong>。Bonwick 发现数据结构的初始化和析构很昂贵，保持预初始化状态可以省掉每个对象频繁的初始化/析构循环，明显降低开销。</li>
+</ul>
+<figure class="fig">
+<svg viewBox="0 0 680 236" width="680" class="wide" role="img" aria-label="slab 分配器：对象缓存与 slab">
+  <g id="fig17-slab"></g>
+</svg>
+<figcaption>slab 分配器：每种常用对象一个缓存（分离链表），缓存由若干 slab 组成；缓存不足时向通用分配器要 slab，slab 全空时可以被回收</figcaption>
+</figure>
+<div class="aside" data-title="ASIDE · 伟大的工程师真的很伟大">
+  <p>Jeff Bonwick 不仅写了 slab 分配器，还领导了 ZFS 文件系统的开发。原书借这个例子说：几乎每个伟大的产品或技术背后，都有一个（或一小群）天赋、能力和投入远超常人的人。努力成为这样的人；如果做不到，就想办法和这样的人一起工作，你一天学到的会比大多数人一个月还多。</p>
+</div>
+
+<h3>5.2 伙伴系统（buddy allocation）</h3>
+<p>合并对分配器至关重要，于是有些方案专门围绕"让合并变简单"来设计，<strong>二分伙伴分配器（binary buddy allocator）</strong>就是一例。空闲内存一开始被看成一整块大小为 2<sup>N</sup> 的空间。有请求时，把空闲空间<strong>递归地一分为二</strong>，直到再分一次就放不下请求为止，然后把这块交出去。下图是 64KB 空间为 7KB 请求一路分割的过程：</p>
+<figure class="fig">
+<svg viewBox="0 0 640 236" width="640" role="img" aria-label="图 17.8 伙伴系统管理的堆">
+  <g id="fig17-buddy"></g>
+</svg>
+<figcaption>图 17.8：64KB → 32KB → 16KB → 8KB，最左边的 8KB 块被分配（深色）。7KB 请求拿到 8KB，多出的 1KB 是内部碎片</figcaption>
+</figure>
+<p>因为只能发 2 的幂大小的块，伙伴系统会有<strong>内部碎片</strong>。它的妙处在释放时：归还 8KB 块时，分配器检查它的"伙伴"8KB 是否空闲，是就合并成 16KB；再检查这个 16KB 的伙伴，空闲就再合并……这个递归合并一直沿树向上，要么恢复出整块空间，要么在遇到正被使用的伙伴时停下。</p>
+<p>为什么找伙伴这么容易？看看地址：<strong>每对伙伴的地址只差一位</strong>，差的是哪一位由它们在树中的层级决定。大小为 2<sup>k</sup> 的块，伙伴地址 = 地址 XOR 2<sup>k</sup>。</p>
+<figure class="fig">
+<svg viewBox="0 0 720 166" width="720" class="wide" role="img" aria-label="伙伴地址只差一位">
+  <g id="fig17-bits"></g>
+</svg>
+<figcaption>64KB 空间用 16 位地址。大小为 2<sup>k</sup> 的一对伙伴，地址只在第 k 位不同；求伙伴只需一次异或，不用搜索</figcaption>
+</figure>
+
+<h3>5.3 其他想法</h3>
+<ul>
+  <li><strong>扩展性</strong>：上面很多方法的大问题是缺乏扩展性，尤其是链表搜索可能很慢。高级分配器用更复杂的数据结构换性能，比如平衡二叉树、伸展树（splay tree）、偏序树（partially-ordered tree）。</li>
+  <li><strong>多处理器</strong>：现代系统多核、跑多线程负载，因此很多工作致力于让分配器在多处理器上表现良好，两个经典例子是 Berger 等人的 Hoard 和 Evans 的 jemalloc（用于 FreeBSD、Firefox、Facebook 等）。</li>
+  <li><strong>真实世界</strong>：想知道真实分配器有多复杂，可以读读 glibc 分配器的工作原理（下面的实验就偷看了 glibc 的头块）。</li>
+</ul>
+
+<h2><span class="num">6</span>模拟器</h2>
+
+<section class="sim" id="sim-malloc">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>空闲链表分配器（复刻 malloc.py）</h3>
+    <div class="desc">参数与官方作业 <code>malloc.py</code> 一一对应。<b>随机模式</b>（操作留空）用与 Python 完全相同的随机数生成器生成操作序列，逐字节核对过：同样的参数与官方 <code>malloc.py -c</code> 输出完全一致。每步画出堆的线性布局（深灰 = 头块，彩色 = 用户区，斜线 = 对齐填充，绿色虚线 = 空闲块）、搜索时检查过的链表元素和操作后的链表。<code>NEXT</code> 是本页额外加的下次适配，官方脚本没有。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>堆大小 -S <input type="number" id="ml-S" value="100" min="1" max="65536"></label>
+      <label>基址 -b <input type="number" id="ml-b" value="1000" min="0"></label>
+      <label>头块 -H <input type="number" id="ml-H" value="0" min="0" max="64"></label>
+      <label>对齐 -a <input type="number" id="ml-a" value="-1" min="-1" max="64"></label>
+    </div>
+    <div class="controls">
+      <label>策略 -p <select id="ml-p"><option>BEST</option><option>WORST</option><option>FIRST</option><option value="NEXT">NEXT（扩展）</option></select></label>
+      <label>链表顺序 -l <select id="ml-l"><option>ADDRSORT</option><option>SIZESORT+</option><option>SIZESORT-</option><option>INSERT-FRONT</option><option>INSERT-BACK</option></select></label>
+      <label><input type="checkbox" id="ml-C"> 合并 -C</label>
+    </div>
+    <div class="controls">
+      <label class="grow">操作 -A <input type="text" id="ml-A" value="" placeholder="留空 = 随机；例：+10,+20,-0,+5"></label>
+    </div>
+    <div class="controls">
+      <label>种子 -s <input type="number" id="ml-s" value="0" min="0"></label>
+      <label>操作数 -n <input type="number" id="ml-n" value="10" min="1" max="2000"></label>
+      <label>最大请求 -r <input type="number" id="ml-r" value="10" min="1" max="4096"></label>
+      <label>分配比例 -P <input type="number" id="ml-P" value="50" min="1" max="100"></label>
+      <button id="ml-run" class="primary">运行</button>
+    </div>
+    <div class="presets"><span class="muted">预设：</span>
+      <button data-pre="hw1">作业 1：-p BEST -s 0</button>
+      <button data-pre="hw2">作业 2：WORST</button>
+      <button data-pre="hw3">作业 3：FIRST</button>
+      <button data-pre="fit">原书 10/30/20，请求 15</button>
+      <button data-pre="c30n">原书 30 字节堆：不合并</button>
+      <button data-pre="c30y">原书 30 字节堆：合并</button>
+      <button data-pre="k4">原书 4KB 堆（头块 8）</button>
+      <button data-pre="frag">制造碎片（作业 7）</button>
+    </div>
+    <div class="cmdline" id="ml-cmd"></div>
+    <div id="ml-step"></div>
+    <div class="stage"><div id="ml-svg"></div></div>
+    <div class="legend17"><span><i style="background:var(--c8)"></i>头块</span><span><i style="background:var(--c1)"></i>用户区（颜色区分 ptr 编号）</span><span><i style="background:var(--ok-soft);border:1px dashed var(--ok)"></i>空闲块</span><span><i style="background:var(--accent-soft);border-color:var(--accent)"></i>搜索时检查过</span><span><i style="background:var(--warn-soft);border-color:var(--warn)"></i>选中 / 新插入</span></div>
+    <div class="narrate" id="ml-narrate"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="ml-s1">–</div><div class="l">空闲块数</div></div>
+      <div class="stat"><div class="v" id="ml-s2">–</div><div class="l">最大空闲块 / 空闲总量</div></div>
+      <div class="stat"><div class="v" id="ml-s3">–</div><div class="l">外部碎片 = 1 − 最大/总量</div></div>
+      <div class="stat"><div class="v" id="ml-s4">–</div><div class="l">本次搜索元素数</div></div>
+      <div class="stat"><div class="v" id="ml-s5">–</div><div class="l">累计失败 / 分配次数</div></div>
+    </div>
+    <div class="trace17" id="ml-trace" aria-label="malloc.py -c 格式的输出"></div>
+    <div class="controls" style="margin-top:12px;margin-bottom:0"><button id="ml-cmp">用当前参数比较四种策略</button><span class="muted small">（其他参数不变，只换 -p，跑完整个工作负载）</span></div>
+    <div class="table-wrap" id="ml-cmpbox"></div>
+  </div>
+</section>
+
+<section class="sim" id="sim-buddy">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>二分伙伴系统</h3>
+    <div class="desc">每一行是树的一层（最上面是整块空间）。分配时看它怎样向上取整到 2 的幂、一路对半分割；释放时看它怎样用 <code>地址 XOR 大小</code> 找到伙伴并递归合并，或在伙伴正被使用时停下。斜线部分是内部碎片。操作：<code>+7K</code>、<code>+3000</code> 分配（按顺序编号 #0、#1…），<code>-0</code> 释放 #0。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>总大小 <select id="bd-total"><option value="16384">16KB</option><option value="32768">32KB</option><option value="65536" selected>64KB</option><option value="131072">128KB</option><option value="262144">256KB</option></select></label>
+      <label>最小块 <select id="bd-min"><option value="512">512B</option><option value="1024" selected>1KB</option><option value="2048">2KB</option><option value="4096">4KB</option></select></label>
+    </div>
+    <div class="controls">
+      <label class="grow">操作 <input type="text" id="bd-ops" value="+7K,+8K,+3K,+16K,-1,-0,-2,-3"></label>
+      <button id="bd-run" class="primary">运行</button>
+    </div>
+    <div class="presets"><span class="muted">预设：</span>
+      <button data-bd="+7K,-0">原书图 17.8：请求 7KB 再释放</button>
+      <button data-bd="+7K,+8K,+3K,+16K,-1,-0,-2,-3">递归合并与停止</button>
+      <button data-bd="+33K,+1K">内部碎片：请求 33KB</button>
+      <button data-bd="+16K,+16K,+16K,+16K,-0,-2,+32K">不是伙伴就不能合并</button>
+    </div>
+    <div id="bd-step"></div>
+    <div class="stage"><div id="bd-svg"></div></div>
+    <div class="narrate" id="bd-narrate"></div>
+    <div class="orders17" id="bd-orders"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="bd-s1">–</div><div class="l">请求总量 / 实际分配</div></div>
+      <div class="stat"><div class="v" id="bd-s2">–</div><div class="l">内部碎片</div></div>
+      <div class="stat"><div class="v" id="bd-s3">–</div><div class="l">空闲块数</div></div>
+      <div class="stat"><div class="v" id="bd-s4">–</div><div class="l">最大空闲块 / 空闲总量</div></div>
+    </div>
+  </div>
+</section>
+
+<h2><span class="num">7</span>先预测，再验证</h2>
+<div class="exercise"><div class="q">（作业 1）点"作业 1"预设（<code>-n 10 -H 0 -p BEST -s 0</code>，堆 100 字节、基址 1000）。先别点下一步：看操作序列（跟踪框里的 <code>ptr[k] = Alloc(n)</code>），预测每次分配返回什么、链表怎样变化。随着时间推移，链表有什么特点？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>Alloc(3) → 1000，链表 [1003:97]；Free(ptr[0]) → [1000:3][1003:97]；Alloc(5) → 1003（3 太小，97 是唯一够大的）；Free → [1000:3][1003:5][1008:92]；Alloc(8) → 1008；Free → 4 个元素；Alloc(8) → 1008（8 正好完全匹配，不分割，链表少一个元素）；Free → 又是 4 个；Alloc(2) → <strong>1000</strong>（最优适配选大小 3 的块，剩 [1002:1]）；Alloc(7) → <strong>1008</strong>（选 8，剩 [1015:1]）。</p>
+<p>特点：没有合并，链表只增不减，开头堆积了 3、5、1、1 这样的小块，每次搜索都要把它们全看一遍（最优适配本来就要遍历整张表）。</p>
+</div></details></div>
+<div class="exercise"><div class="q">（作业 2、3）同样的种子，把策略换成 WORST，再换成 FIRST（点预设"作业 2 / 作业 3"）。哪一步开始和 BEST 不同？"本次搜索元素数"有什么变化？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p><strong>WORST</strong>：第 4 次分配 Alloc(8) 不再复用 1008 的 8 字节块，而是去切最大的 84 字节块，返回 1016；之后 Alloc(2)、Alloc(7) 也从大块切（1024、1026）。结果最大块从 84 缩到 67，链表涨到 5 个元素，碎片更多。</p>
+<p><strong>FIRST</strong>：返回地址和 BEST 完全相同（这个负载下恰好一样），但搜索更少：Alloc(8) 第二次只看了 3 个元素，Alloc(2) 只看了 1 个。平均每次分配搜索的元素数：BEST 3.00、WORST 3.33、FIRST 2.17。点"用当前参数比较四种策略"可以直接看到这张表。</p>
+</div></details></div>
+<div class="exercise"><div class="q">（作业 4）在作业 1 的参数上分别试 <code>-l ADDRSORT / SIZESORT+ / SIZESORT-</code>。对 BEST、WORST 来说，链表顺序会改变结果吗？对 FIRST 呢？FIRST + SIZESORT− 相当于什么策略？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>BEST 和 WORST 总是遍历整张表，顺序只影响<strong>平局</strong>时选谁，这个负载里结果和搜索数都不变。FIRST 就不同了：<strong>SIZESORT−</strong> 让最大块永远在表头，首次适配第一个元素就命中，行为等同于最差适配，但每次只搜索 1 个元素（平均 1.00）；<strong>SIZESORT+</strong> 让最小块在前面，首次适配找到的第一个够大的块就是最优适配的那一块，相当于"不用遍历全表的最优适配"。代价是：释放时要维持有序（插入变慢），而且按大小排序会妨碍合并（见下一题）。</p>
+</div></details></div>
+<div class="exercise"><div class="q">（作业 5）把 <code>-n</code> 改成 1000（BEST、ADDRSORT），分别在不勾选和勾选"合并 -C"时运行，看最后的空闲块数和失败次数。然后保持 -C，把顺序改成 SIZESORT+，合并还有效吗？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>不合并：591 次分配中 <strong>177 次失败</strong>，大请求（≥ 8 字节）几乎都失败，最后链表有 31 个元素、最大块只有 6 字节。合并：515 次分配只失败 <strong>29 次</strong>，最后链表只剩 1 个 98 字节的块。WORST 不合并更惨：堆最终碎成 100 个 1 字节的块，658 次失败。</p>
+<p>顺序很重要：malloc.py 的合并只检查<strong>链表中相邻</strong>的两个元素地址是否连续。按大小排序时地址相邻的块通常不在链表里挨着，于是 BEST + SIZESORT+ + -C 仍有 163 次失败、28 个空闲块，几乎等于没合并。这就是原书说"按地址排序让合并更容易"的原因。</p>
+</div></details></div>
+<div class="exercise"><div class="q">（作业 6、7）回到作业 1 的参数、<code>-n 1000 -C</code>，把分配比例 <code>-P</code> 改成 90、再改成 10，会发生什么？然后点"制造碎片"预设：怎样的请求序列会让空闲空间高度碎片化，即使开了合并也没用？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p><code>-P 90</code>：分配远多于释放，堆很快被占满，904 次分配里 753 次失败，最后只剩 2 字节空闲。<code>-P 10</code>：几乎每次分配后都会释放，堆大部分时间是空的，一次失败都没有，合并后空闲链表只有 1 个元素。</p>
+<p>"制造碎片"：先连续分配 10 个 10 字节把堆填满，再释放第 0、2、4、6、8 块。空闲 50 字节，但五个洞互不相邻（中间隔着仍在使用的块），合并也无能为力，<code>+20</code> 失败。规律：<strong>交替释放</strong>，让每个空闲块都被已分配块夹住。</p>
+</div></details></div>
+<div class="exercise"><div class="q">（伙伴系统）64KB、最小块 1KB，依次执行 <code>+7K,+8K,+3K,+16K</code>，然后 <code>-1</code>。先预测：四个块分别落在哪个地址？释放 #1 时能合并吗？再释放 #0 呢？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>#0：7K → 8K 块，64→32→16→8 分割后得到 [0, 8K)；#1：8K 正好用掉 #0 的伙伴 [8K, 16K)；#2：3K → 4K，分割 [16K, 32K) 后得到 [16K, 20K)；#3：16K，分割 [32K, 64K) 得到 [32K, 48K)。</p>
+<p>释放 #1：伙伴 = 8192 XOR 8192 = 0，也就是 #0，正在使用 → 不能合并。再释放 #0：伙伴 0 XOR 8192 = 8K 空闲 → 合并为 [0, 16K)；新块的伙伴 = 0 XOR 16384 = 16K，即 [16K, 32K)，它已被分割、里面还有 #2 → 停止。内部碎片：#0 浪费 1K、#2 浪费 1K。</p>
+</div></details></div>
+
+<h2><span class="num">8</span>动手实验：嵌入式空闲链表与 glibc 的头块</h2>
+<div class="lab">
+  <p>实验目录 <code>labs/17-free-space/</code>：</p>
+  <ul>
+    <li><code>freelist.c</code>：按原书 17.2 节，在一块 <code>mmap</code> 得到的 4KB 内存里构建空闲链表。头块 8 字节（size + magic），空闲节点 8 字节（size + next）；首次适配 + 分割，释放时插到表头、不自动合并，最后手动合并。为了和书上的数字一致，<code>next</code> 存的是"书中地址"（堆起点记作 16384）。</li>
+    <li><code>glibc_header.c</code>：偷看真实的 glibc <code>malloc</code>：相邻两块差多少字节、用户指针前 8 字节里的 size 字段、释放后立刻再分配会不会拿回同一块。</li>
+  </ul>
+<pre><code><span class="cmd">cd labs/17-free-space &amp;&amp; make</span>
+<span class="cmd">./freelist</span>
+<span class="cmd">./glibc_header</span></code></pre>
+</div>
+<p><code>freelist</code> 的输出（确定性的，逐项对应图 17.3–17.7）：</p>
+<pre><code>Fig 17.3 init:                     free list: head -&gt; [addr 16384, size 4088] -&gt; NULL
+ptr1 = malloc(100) = 16392
+Fig 17.4 after 1 alloc:            free list: head -&gt; [addr 16492, size 3980] -&gt; NULL
+ptr2 = 16500, ptr3 = 16608
+Fig 17.5 after 3 allocs:           free list: head -&gt; [addr 16708, size 3764] -&gt; NULL
+free(16500)
+Fig 17.6 after free(ptr2):         free list: head -&gt; [addr 16492, size 100] -&gt; [addr 16708, size 3764] -&gt; NULL
+free(16392), free(16608)
+Fig 17.7 all freed, no coalesce:   free list: head -&gt; [addr 16600, size 100] -&gt; [addr 16384, size 100] -&gt; [addr 16492, size 100] -&gt; [addr 16708, size 3764] -&gt; NULL
+malloc(3900) = NULL (no single chunk is big enough!)
+after coalesce:                    free list: head -&gt; [addr 16384, size 4088] -&gt; NULL
+malloc(3900) = 16392</code></pre>
+<p>看点：<code>malloc(100)</code> 返回 16392 而不是 16384，因为前 8 字节是头块；三次分配后空闲块是 3764（4088 − 3 × 108）。全部释放却不合并时，空闲总量有 3 × 100 + 3764 + 3 × 8 = 4088 字节，<code>malloc(3900)</code> 仍然失败，因为没有一块单独够大；合并之后立刻成功。</p>
+<p><code>glibc_header</code> 的输出（示例输出，你的机器上地址会不同）：</p>
+<pre><code>a=0x5e2b8f7552a0 b=0x5e2b8f755310 c=0x5e2b8f755380
+b - a = 112 bytes  (请求 100，实际每块占 112)
+malloc_usable_size(a) = 104
+header size field of a = 0x71 -&gt; chunk size 112, flags 1
+after free(b): d = malloc(100) = 0x5e2b8f755310  (same as b)</code></pre>
+<p>在 64 位 glibc 上，<code>malloc(100)</code> 实际占 112 字节：请求加上头部开销，再向上对齐到 16 字节。用户指针前 8 字节存着"块大小 | 标志位"：0x71 = 112 | 1，最低位是 PREV_INUSE 标志（前一块正在使用）。由于块大小总是 16 的倍数，低 3 位本来就是 0，glibc 便拿它们存标志。<code>free(b)</code> 后再 <code>malloc(100)</code> 拿回了同一块：glibc 为常见的小尺寸维护了按大小分开的缓存链表（tcache/fastbin），这正是 5.1 节"分离空闲链表"的思想。</p>
+
+<h2><span class="num">9</span>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="1"><div class="q">原书的 4KB 堆，初始空闲块 size 字段为 4088，头块 8 字节。执行 malloc(100) 后，剩下的空闲块 size 字段是多少？</div>
+  <div class="opts"><button>A. 3988</button><button>B. 3980</button><button>C. 3888</button><button>D. 4080</button></div>
+  <div class="explain">库要找 100 + 8 = 108 字节，4088 − 108 = 3980。3988 是只减了 100、忘了头块。（malloc.py 模拟器显示的 sz:3988 是另一种记法：它把空闲块自己的 8 字节节点头也算进 sz 里。）</div></div>
+<div class="mcq" data-answer="3"><div class="q"><code>free(ptr)</code> 不带大小参数，库是怎么知道要释放多少字节的？</div>
+  <div class="opts"><button>A. 遍历空闲链表，找到 ptr 所在的空闲块</button><button>B. OS 通过页表记录了每次 malloc 的大小</button><button>C. 看 ptr 之后第一个非零字节在哪里</button><button>D. 读 ptr 前面的头块：hptr = (header_t *) ptr − 1，里面有 size</button></div>
+  <div class="explain">头块放在交出去的内存之前，释放时往回退一个头块就能读到大小，魔数还能做完整性检查。已分配块本来就不在空闲链表里（A 不对）。</div></div>
+<div class="mcq" data-answer="0"><div class="q">空闲链表依次为 10、30、20（忽略头块），请求 15 字节。最优适配（best fit）之后的链表是？</div>
+  <div class="opts"><button>A. 10、30、5</button><button>B. 10、15、20</button><button>C. 10、30、20（失败）</button><button>D. 5、30、20</button></div>
+  <div class="explain">最优适配在够大的块（30、20）里选最小的 20，切下 15，留下 5。B 是最差适配和首次适配的结果。</div></div>
+<div class="mcq" data-answer="0"><div class="q">下列哪种策略<strong>不需要</strong>每次都遍历整个空闲链表？</div>
+  <div class="opts"><button>A. 首次适配（first fit）</button><button>B. 最优适配（best fit）</button><button>C. 最差适配（worst fit）</button><button>D. 三者都必须遍历整个链表</button></div>
+  <div class="explain">首次适配找到第一个够大的块就停；最优和最差适配都要看完所有元素才能确定最小/最大的那个（除非链表按大小排好序）。</div></div>
+<div class="mcq" data-answer="2"><div class="q">64KB 的二分伙伴系统收到 7KB 的请求，调用者实际占用多大的块？</div>
+  <div class="opts"><button>A. 7KB</button><button>B. 7KB 加一个头块</button><button>C. 8KB</button><button>D. 16KB</button></div>
+  <div class="explain">伙伴系统只发 2 的幂大小的块：64 → 32 → 16 → 8，再分就是 4KB，放不下 7KB，所以停在 8KB。多出的 1KB 是内部碎片。</div></div>
+<div class="mcq" data-answer="3"><div class="q">伙伴系统中，一个 8KB 块位于地址 16384（16KB）。它的伙伴在哪里？</div>
+  <div class="opts"><button>A. 0</button><button>B. 8192</button><button>C. 32768</button><button>D. 24576</button></div>
+  <div class="explain">伙伴地址 = 地址 XOR 块大小 = 16384 XOR 8192 = 24576（24KB）。两者只在第 13 位（8192）上不同。8192 是 [0, 16K) 那个 16KB 块的右半，和它不在同一个父块下。</div></div>
+<div class="mcq" data-answer="1"><div class="q">下列哪一项属于<strong>内部碎片</strong>？</div>
+  <div class="opts"><button>A. 空闲 20 字节被分成两个 10 字节的洞，15 字节的请求失败</button><button>B. 分配器按 8 字节对齐，malloc(13) 实际拿走 16 字节，其中 3 字节没人用</button><button>C. 释放后没有合并，链表里有许多相邻的小块</button><button>D. 堆用完了，必须调用 sbrk</button></div>
+  <div class="explain">内部碎片是发出去的块内部没被请求的部分。A、C 都是外部碎片（空闲空间被切碎在块之间）。</div></div>
+<div class="mcq" data-answer="2"><div class="q">slab 分配器比一般的分离空闲链表多做了什么？</div>
+  <div class="opts"><button>A. 用伙伴系统合并空闲对象</button><button>B. 用平衡二叉树管理空闲块以加速搜索</button><button>C. 把空闲对象保持在已初始化状态，省掉反复的初始化和析构</button><button>D. 定期紧凑内存，把使用中的对象挪到一起</button></div>
+  <div class="explain">Bonwick 发现初始化和析构数据结构很昂贵；slab 让空闲对象保持预初始化状态，降低了每个对象的开销。另外，缓存不足时它向通用分配器要 slab，slab 全空时可以被收回。</div></div>
+
+<h2><span class="num">10</span>常见误区与小结</h2>
+<div class="warn">
+  <p><strong>误区 1："malloc(N) 只占 N 字节。"</strong>还有头块（原书例子 8 字节，glibc 上 malloc(100) 实际占 112 字节），可能还有对齐填充。分配器找的是 N + 头块大小的空闲块。</p>
+  <p><strong>误区 2："最优适配浪费最少，所以碎片最少。"</strong>它常常留下大量很小、几乎没用的碎块，还要遍历整张表。没有任何策略在所有负载下都最好。</p>
+  <p><strong>误区 3："释放了就不会碎片。"</strong>不合并时，即使所有内存都空闲，也可能被切成很多块（图 17.7）。而且合并只能合并<strong>地址相邻</strong>的空闲块；被使用中的块隔开的洞无论如何都合并不了。</p>
+  <p><strong>误区 4："空闲链表节点另外 malloc 出来。"</strong>分配器不能调用自己；节点就写在空闲块自己的开头。</p>
+  <p><strong>误区 5："碎片多了就紧凑一下。"</strong>用户态分配器不能移动已交出去的内存，C 程序的指针可能在任何地方。紧凑只在 OS 管理分段（或有 GC 的语言）里可行。</p>
+  <p><strong>误区 6："伙伴系统没有碎片。"</strong>它有内部碎片（只发 2 的幂），也有外部碎片：两个空闲块如果不是伙伴，就不能合并（模拟器预设"不是伙伴就不能合并"）。</p>
+</div>
+<div class="key">
+  <p><strong>本章小结</strong></p>
+  <ul>
+    <li>变长分配会产生<strong>外部碎片</strong>：总空闲足够，却没有足够大的连续块。这是本章所有技术要对付的问题。</li>
+    <li>两个基本机制：<strong>分割</strong>（请求小于空闲块时切下一部分）和<strong>合并</strong>（释放时并起地址相邻的空闲块）。</li>
+    <li><strong>头块</strong>放在每个已分配块之前，记录大小（和魔数），<code>free(ptr)</code> 用 <code>ptr − 1</code> 找到它；因此 malloc(N) 实际需要 N + 头块大小。</li>
+    <li>空闲链表<strong>嵌入空闲空间本身</strong>：每个空闲块开头放 size + next。原书数字：4KB 堆 → 4088 → malloc(100) 后 3980 → 三次后 3764。</li>
+    <li>堆不够时可以失败，也可以用 <code>sbrk</code> 让 OS 扩大堆。</li>
+    <li>基本策略 best / worst / first / next fit 各有取舍；链表的排序方式（按地址利于合并）与策略同样重要。</li>
+    <li>更进一步：<strong>分离链表</strong>和 <strong>slab</strong> 专门服务常见大小；<strong>伙伴系统</strong>让合并变成一次异或，代价是内部碎片；高级分配器用树结构、针对多处理器优化。</li>
+    <li>与后续章节的联系：第 18 章的<strong>分页</strong>只分配固定大小的页，从根本上避开外部碎片；OS 内核内部仍然大量使用 slab、伙伴这类分配器管理自己的数据结构和物理页。</li>
+  </ul>
+</div>
+
+</main>
+<script>
+(function () {
+  "use strict";
+  const { h, s, color, stepper } = OSTEP;
+  // ==CORE-BEGIN==
+  // Python random 兼容：MT19937 + init_by_array + genrand_res53（与 CPython 的 random.random() 逐位一致）
+  function PyRandom(seed) {
+    const N = 624, M = 397;
+    const mt = new Uint32Array(N); let mti = N + 1;
+    function initGen(s) { mt[0] = s >>> 0; for (mti = 1; mti < N; mti++) { const p = mt[mti - 1] ^ (mt[mti - 1] >>> 30); mt[mti] = (Math.imul(1812433253, p) + mti) >>> 0; } }
+    function initByArray(key) {
+      initGen(19650218);
+      let i = 1, j = 0, k = Math.max(N, key.length);
+      for (; k; k--) { const p = mt[i - 1] ^ (mt[i - 1] >>> 30); mt[i] = ((mt[i] ^ Math.imul(p, 1664525)) + key[j] + j) >>> 0; i++; j++; if (i >= N) { mt[0] = mt[N - 1]; i = 1; } if (j >= key.length) j = 0; }
+      for (k = N - 1; k; k--) { const p = mt[i - 1] ^ (mt[i - 1] >>> 30); mt[i] = ((mt[i] ^ Math.imul(p, 1566083941)) - i) >>> 0; i++; if (i >= N) { mt[0] = mt[N - 1]; i = 1; } }
+      mt[0] = 0x80000000;
+    }
+    function genrand() {
+      let y; const mag = [0, 0x9908b0df];
+      if (mti >= N) {
+        let kk = 0;
+        for (; kk < N - M; kk++) { y = (mt[kk] & 0x80000000) | (mt[kk + 1] & 0x7fffffff); mt[kk] = mt[kk + M] ^ (y >>> 1) ^ mag[y & 1]; }
+        for (; kk < N - 1; kk++) { y = (mt[kk] & 0x80000000) | (mt[kk + 1] & 0x7fffffff); mt[kk] = mt[kk + (M - N)] ^ (y >>> 1) ^ mag[y & 1]; }
+        y = (mt[N - 1] & 0x80000000) | (mt[0] & 0x7fffffff); mt[N - 1] = mt[M - 1] ^ (y >>> 1) ^ mag[y & 1];
+        mti = 0;
+      }
+      y = mt[mti++];
+      y ^= y >>> 11; y ^= (y << 7) & 0x9d2c5680; y ^= (y << 15) & 0xefc60000; y ^= y >>> 18;
+      return y >>> 0;
+    }
+    let n = Math.abs(Math.floor(seed)); const key = [];
+    do { key.push(n % 4294967296); n = Math.floor(n / 4294967296); } while (n > 0);
+    initByArray(key);
+    return () => { const a = genrand() >>> 5, b = genrand() >>> 6; return (a * 67108864 + b) / 9007199254740992; };
+  }
+
+  // ---- 复刻 malloc.py 的分配器（另加 NEXT 下次适配，官方没有）----
+  // 空闲链表元素 [addr, sz]：sz 是这块空闲空间的总字节数（malloc.py 的记法）。
+  function Allocator(o) {
+    this.size = o.size; this.H = o.H; this.policy = o.policy; this.order = o.order;
+    this.coalesce = o.coalesce; this.align = o.align;
+    this.free = [[o.base, o.size]];
+    this.sizemap = new Map();
+    this.rover = o.base;               // NEXT：上次搜索停下的位置（地址）
+  }
+  Allocator.prototype.malloc = function (req) {
+    let size = req, pad = 0;
+    if (this.align !== -1) { const left = size % this.align; pad = left ? this.align - left : 0; size += pad; }
+    const need = size + this.H;
+    const before = this.free.map((e) => e.slice());
+    const examined = [];
+    let bestIdx = -1, bestSize = this.policy === "BEST" ? this.size + 1 : -1, bestAddr = -1, count = 0;
+    if (this.policy === "NEXT") {
+      const n = this.free.length;
+      let st = this.free.findIndex((e) => e[0] === this.rover);
+      if (st < 0) st = this.free.findIndex((e) => e[0] > this.rover);
+      if (st < 0) st = 0;
+      for (let k = 0; k < n; k++) {
+        const i = (st + k) % n, [ea, es] = this.free[i];
+        count++; examined.push(i);
+        if (es >= need) { bestIdx = i; bestAddr = ea; bestSize = es; break; }
+      }
+    } else {
+      for (let i = 0; i < this.free.length; i++) {
+        const [ea, es] = this.free[i];
+        count++; examined.push(i);
+        if (es >= need && ((this.policy === "BEST" && es < bestSize) || (this.policy === "WORST" && es > bestSize) || this.policy === "FIRST")) {
+          bestAddr = ea; bestSize = es; bestIdx = i;
+          if (this.policy === "FIRST") break;
+        }
+      }
+    }
+    const r = { kind: "alloc", req, pad, need, before, examined, count, idx: bestIdx, addr: -1, split: false };
+    if (bestIdx !== -1) {
+      if (bestSize > need) { this.free[bestIdx] = [bestAddr + need, bestSize - need]; r.split = true; r.rest = [bestAddr + need, bestSize - need]; this.rover = bestAddr + need; }
+      else { this.free.splice(bestIdx, 1); const nx = this.free[bestIdx] || this.free[0]; this.rover = nx ? nx[0] : this.rover; }
+      this.sizemap.set(bestAddr, need);
+      r.addr = bestAddr; r.chunk = bestSize;
+    }
+    r.after = this.free.map((e) => e.slice());
+    return r;
+  };
+  Allocator.prototype.freeAt = function (addr) {
+    const r = { kind: "free", addr, before: this.free.map((e) => e.slice()), merges: [] };
+    if (!this.sizemap.has(addr)) { r.rc = -1; r.after = r.before; return r; }
+    const size = this.sizemap.get(addr);
+    r.size = size;
+    const ent = [addr, size];
+    if (this.order === "INSERT-BACK") this.free.push(ent);
+    else if (this.order === "INSERT-FRONT") this.free.unshift(ent);
+    else {
+      this.free.push(ent);
+      // Python 的 sorted 是稳定排序；JS 的 Array.prototype.sort 同样稳定（ES2019 起）
+      if (this.order === "ADDRSORT") this.free.sort((a, b) => a[0] - b[0]);
+      else if (this.order === "SIZESORT+") this.free.sort((a, b) => a[1] - b[1]);
+      else if (this.order === "SIZESORT-") this.free.sort((a, b) => b[1] - a[1]);
+    }
+    r.inserted = this.free.map((e) => e.slice());
+    if (this.coalesce) {
+      // 与 malloc.py 一样：只合并"在链表里相邻、且地址也相邻"的元素
+      const out = []; let cur = this.free[0].slice();
+      for (let i = 1; i < this.free.length; i++) {
+        const [ea, es] = this.free[i];
+        if (ea === cur[0] + cur[1]) { r.merges.push([cur.slice(), [ea, es]]); cur = [cur[0], cur[1] + es]; }
+        else { out.push(cur); cur = [ea, es]; }
+      }
+      out.push(cur);
+      this.free = out;
+    }
+    this.sizemap.delete(addr);
+    r.rc = 0;
+    r.after = this.free.map((e) => e.slice());
+    return r;
+  };
+
+  // 运行一整个工作负载，返回每一步的快照。o 同 malloc.py 的参数：
+  // {size, base, H, align, policy, order, coalesce, seed, n, range, pAlloc, ops}
+  function runMalloc(o) {
+    const A = new Allocator(o);
+    const steps = [];
+    const blocks = new Map();          // addr -> {id, req, pad, need}
+    const snap = (r) => { r.blocks = [...blocks.entries()].map(([a, b]) => ({ addr: a, ...b })); steps.push(r); };
+    snap({ kind: "init", before: [], after: A.free.map((e) => e.slice()) });
+    const p = new Map(), L = [];
+    const doAlloc = (c, size, randomMode) => {
+      const r = A.malloc(size);
+      r.id = c;
+      if (r.addr !== -1) { p.set(c, r.addr); if (randomMode) L.push(c); blocks.set(r.addr, { id: c, req: size, pad: r.pad, need: r.need }); }
+      const shown = randomMode ? r.addr + o.H : r.addr;   // malloc.py：随机模式打印 ptr+H，-A 模式打印 ptr
+      r.line = `ptr[${c}] = Alloc(${size}) returned ${shown} (searched ${r.count} elements)`;
+      return r;
+    };
+    const doFree = (idx, addr) => {
+      const r = A.freeAt(addr);
+      r.id = idx;
+      const b = blocks.get(addr);
+      if (b && r.rc === 0) { r.blk = b; blocks.delete(addr); }
+      r.line = `Free(ptr[${idx}])\nreturned ${r.rc}`;
+      return r;
+    };
+    const dump = (r) => { r.dump = `Free List [ Size ${r.after.length} ]: ` + r.after.map((e) => `[ addr:${e[0]} sz:${e[1]} ]`).join(""); };
+    if (!o.ops || !o.ops.trim()) {
+      const R = PyRandom(o.seed || 0), percent = Math.max(1, Math.min(100, o.pAlloc | 0)) / 100.0;
+      let c = 0, j = 0, guard = 0;
+      while (j < o.n && ++guard < 1e6) {
+        if (R() < percent) {
+          const size = Math.floor(R() * o.range) + 1;
+          const r = doAlloc(c, size, true); c++; j++; dump(r); snap(r);
+        } else if (p.size > 0) {
+          const d = Math.floor(R() * L.length);
+          const r = doFree(L[d], p.get(L[d]));
+          p.delete(L[d]); L.splice(d, 1); j++; dump(r); snap(r);
+        }
+      }
+    } else {
+      let c = 0;
+      for (const raw of o.ops.split(",")) {
+        const op = raw.trim(); if (!op) continue;
+        let m;
+        if ((m = op.match(/^\+(\d+)$/))) { const r = doAlloc(c, +m[1], false); c++; dump(r); snap(r); }
+        else if ((m = op.match(/^-(\d+)$/))) {
+          const index = +m[1];
+          if (index >= p.size || !p.has(index)) { snap({ kind: "invalid", id: index, line: "Invalid Free: Skipping", before: A.free.map((e) => e.slice()), after: A.free.map((e) => e.slice()) }); continue; }
+          const r = doFree(index, p.get(index)); dump(r); snap(r);
+        } else snap({ kind: "bad", op, line: `无法解析的操作 "${op}"（应为 +大小 或 -编号）`, before: A.free.map((e) => e.slice()), after: A.free.map((e) => e.slice()) });
+      }
+    }
+    return steps;
+  }
+  // 统计：空闲块数、最大空闲块、空闲总量、外部碎片程度 = 1 − 最大块/空闲总量
+  function freeStats(list) {
+    const total = list.reduce((a, e) => a + e[1], 0), big = list.reduce((a, e) => Math.max(a, e[1]), 0);
+    return { n: list.length, total, big, frag: total ? 1 - big / total : 0 };
+  }
+
+  // ---- 二分伙伴系统（binary buddy allocator）----
+  // 节点 key = "addr:size"，state = free | split | alloc。分配时找"够大的最小空闲块、同大小取最低地址"，
+  // 反复一分为二（保留左半）；释放时反复检查伙伴（addr XOR size）是否空闲，是就合并。
+  function runBuddy(total, minBlk, opsStr) {
+    const nodes = new Map();
+    const key = (a, s) => a + ":" + s;
+    nodes.set(key(0, total), { addr: 0, size: total, state: "free" });
+    const steps = [];
+    const live = new Map();             // id -> key
+    let nextId = 0;
+    const snap = (x) => steps.push(Object.assign({ nodes: [...nodes.values()].map((n) => ({ ...n })) }, x));
+    const pow2up = (n) => { let p = minBlk; while (p < n) p *= 2; return p; };
+    snap({ msg: `初始：整块 ${total} 字节都空闲，只有一个 order 最大的空闲块。`, hl: [key(0, total)] });
+    const ops = opsStr.split(/[\s,]+/).filter(Boolean);
+    for (const op of ops) {
+      let m;
+      if ((m = op.match(/^\+(\d+(?:\.\d+)?)(k|kb)?$/i))) {
+        const req = Math.round(parseFloat(m[1]) * (m[2] ? 1024 : 1));
+        const id = nextId++;
+        if (req <= 0) { snap({ op, msg: `请求 ${req} 字节无意义，跳过。`, hl: [] }); continue; }
+        const need = pow2up(req);
+        if (need > total) { snap({ op, id, fail: true, msg: `请求 ${req} 字节 → 向上取整为 ${need}，比整个空间还大，失败。`, hl: [] }); continue; }
+        const cands = [...nodes.values()].filter((n) => n.state === "free" && n.size >= need).sort((a, b) => a.size - b.size || a.addr - b.addr);
+        snap({ op, id, req, need, phase: "round", msg: `请求 ${req} 字节：伙伴系统只发 2 的幂大小的块，向上取整为 <b>${need}</b> 字节${need > req ? `（${need - req} 字节注定是内部碎片）` : "（正好是 2 的幂，没有浪费）"}。` + (cands.length ? `够大的空闲块中最小的是 [${cands[0].addr}, +${cands[0].size}]。` : ""), hl: cands.length ? [key(cands[0].addr, cands[0].size)] : [] });
+        if (!cands.length) {
+          const fr = [...nodes.values()].filter((n) => n.state === "free");
+          steps[steps.length - 1].fail = true;
+          steps[steps.length - 1].msg += ` <b>失败</b>：没有 ≥ ${need} 的空闲块（空闲总量 ${fr.reduce((a, n) => a + n.size, 0)} 字节，但被切成了 ${fr.length} 块）。`;
+          continue;
+        }
+        let cur = cands[0];
+        while (cur.size > need) {
+          const half = cur.size / 2;
+          cur.state = "split";
+          const L2 = { addr: cur.addr, size: half, state: "free" }, R2 = { addr: cur.addr + half, size: half, state: "free" };
+          nodes.set(key(L2.addr, half), L2); nodes.set(key(R2.addr, half), R2);
+          snap({ op, id, phase: "split", msg: `分割：[${cur.addr}, +${cur.size}] 比 ${need} 大，一分为二 → 左 [${L2.addr}, +${half}]、右 [${R2.addr}, +${half}]。这两块互为<b>伙伴（buddy）</b>，继续处理左半。`, hl: [key(L2.addr, half), key(R2.addr, half)], bits: { a: L2.addr, b: R2.addr, size: half } });
+          cur = L2;
+        }
+        cur.state = "alloc"; cur.id = id; cur.req = req;
+        live.set(id, key(cur.addr, cur.size));
+        snap({ op, id, phase: "alloc", msg: `分配块 #${id}：[${cur.addr}, +${cur.size}] 交给调用者。请求 ${req}、实得 ${cur.size}，内部碎片 ${cur.size - req} 字节。`, hl: [key(cur.addr, cur.size)] });
+      } else if ((m = op.match(/^-(\d+)$/))) {
+        const id = +m[1], k = live.get(id);
+        if (k == null) { snap({ op, msg: `块 #${id} 不存在或已释放，跳过。`, hl: [] }); continue; }
+        live.delete(id);
+        let cur = nodes.get(k);
+        cur.state = "free"; delete cur.id; delete cur.req;
+        snap({ op, id, phase: "free", msg: `释放块 #${id}：[${cur.addr}, +${cur.size}] 变回空闲。接下来看它的伙伴。`, hl: [k] });
+        for (;;) {
+          if (cur.size === total) { snap({ op, id, phase: "top", msg: `已经合并回整块 ${total} 字节——整个空间恢复原状。`, hl: [key(0, total)] }); break; }
+          const baddr = cur.addr ^ cur.size, bn = nodes.get(key(baddr, cur.size));
+          const bits = { a: cur.addr, b: baddr, size: cur.size };
+          if (bn && bn.state === "free") {
+            const paddr = Math.min(cur.addr, baddr), parent = nodes.get(key(paddr, cur.size * 2));
+            nodes.delete(key(cur.addr, cur.size)); nodes.delete(key(baddr, cur.size));
+            parent.state = "free";
+            snap({ op, id, phase: "merge", msg: `伙伴地址 = ${cur.addr} XOR ${cur.size} = <b>${baddr}</b>，它是空闲的 → 合并成 [${paddr}, +${cur.size * 2}]。继续向上检查。`, hl: [key(paddr, cur.size * 2)], bits });
+            cur = parent;
+          } else {
+            snap({ op, id, phase: "stop", msg: `伙伴地址 = ${cur.addr} XOR ${cur.size} = <b>${baddr}</b>，它${bn && bn.state === "alloc" ? "正在使用" : "已被分割（里面有块在用）"} → 停止合并。`, hl: [key(cur.addr, cur.size)], bits, stop: true });
+            break;
+          }
+        }
+      } else snap({ op, msg: `无法解析 "${op}"（应为 +7K、+3000 或 -0）。`, hl: [] });
+    }
+    return steps;
+  }
+  function buddyStats(nodes) {
+    const al = nodes.filter((n) => n.state === "alloc"), fr = nodes.filter((n) => n.state === "free");
+    return {
+      req: al.reduce((a, n) => a + n.req, 0), got: al.reduce((a, n) => a + n.size, 0),
+      free: fr.reduce((a, n) => a + n.size, 0), big: fr.reduce((a, n) => Math.max(a, n.size), 0), nfree: fr.length,
+    };
+  }
+  // ==CORE-END==
+
+  const $ = (id) => document.getElementById(id);
+  const fmtK = (n) => (n >= 1024 && n % 1024 === 0 ? n / 1024 + "K" : String(n));
+
+  // ---------- 正文图：嵌入式空闲链表（图 17.3–17.7） ----------
+  (function () {
+    const g = $("fig17-embed");
+    const mk = (id) => s("marker", { id, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto" }, s("path", { d: "M0,0 L10,5 L0,10 z", style: "fill:var(--accent)" }));
+    g.append(s("defs", {}, mk("m17e")));
+    const U = (a) => ({ k: "used", a }), F = (a, next) => ({ k: "free", a, size: 100, next }), B = (a, size) => ({ k: "big", a, size, next: 0 });
+    const cols = [
+      { t: "图 17.3 初始", sub: "一个空闲块", head: 16384, items: [B(16384, 4088)] },
+      { t: "图 17.4 malloc(100)", sub: "ptr = 16392", head: 16492, ptr: 16384, items: [U(16384), B(16492, 3980)] },
+      { t: "图 17.5 三次分配后", sub: "前 324 字节已用", head: 16708, items: [U(16384), U(16492), U(16600), B(16708, 3764)] },
+      { t: "图 17.6 free(16500)", sub: "插到表头", head: 16492, items: [U(16384), F(16492, 16708), U(16600), B(16708, 3764)] },
+      { t: "图 17.7 全部释放、未合并", sub: "四块，碎片化", head: 16600, items: [F(16384, 16492), F(16492, 16708), F(16600, 16384), B(16708, 3764)] },
+    ];
+    const cw = 182, rowH = 16, bodyH = 30, bigH = 78, top = 46;
+    cols.forEach((c, ci) => {
+      const x0 = 8 + ci * cw, bx = x0 + 42, bw = 108;
+      g.append(s("text", { x: bx + bw / 2, y: 14, "text-anchor": "middle", "font-size": 11.5, style: "font-weight:600", text: c.t }));
+      g.append(s("text", { x: bx + bw / 2, y: 30, "text-anchor": "middle", "font-size": 10.5, class: "t-muted", text: c.sub }));
+      let y = top;
+      for (const it of c.items) {
+        g.append(s("text", { x: bx - 4, y: y + 11, "text-anchor": "end", "font-size": 9.5, class: "mono t-muted", text: it.a }));
+        const hdrStyle = it.k === "used" ? "fill:var(--c8)" : "fill:var(--surface-2);stroke:var(--ok)";
+        const tStyle = it.k === "used" ? "fill:#fff" : "";
+        g.append(s("rect", { x: bx, y, width: bw, height: rowH, style: hdrStyle }), s("rect", { x: bx, y: y + rowH, width: bw, height: rowH, style: hdrStyle }));
+        g.append(s("text", { x: bx + 6, y: y + 12, "font-size": 10, class: "mono", style: tStyle, text: "size: " + (it.k === "used" ? 100 : it.size) }));
+        g.append(s("text", { x: bx + 6, y: y + rowH + 12, "font-size": 10, class: "mono", style: tStyle, text: it.k === "used" ? "magic: 1234567" : "next: " + it.next }));
+        y += rowH * 2;
+        const bh = it.k === "big" ? bigH : bodyH;
+        if (it.k === "used") {
+          g.append(s("rect", { x: bx, y, width: bw, height: bh, style: "fill:var(--c1)" }));
+          g.append(s("text", { x: bx + bw / 2, y: y + 19, "text-anchor": "middle", "font-size": 10.5, style: "fill:#fff", text: "100 字节已分配" }));
+        } else {
+          g.append(s("rect", { x: bx, y, width: bw, height: bh, class: "ok-soft", style: "stroke-dasharray:3 2" }));
+          g.append(s("text", { x: bx + bw / 2, y: y + (it.k === "big" ? 36 : 19), "text-anchor": "middle", "font-size": 10.5, text: it.k === "big" ? `空闲 ${it.size} 字节` : "（现在空闲）" }));
+          if (it.k === "big") g.append(s("text", { x: bx + bw / 2, y: y + 54, "text-anchor": "middle", "font-size": 9.5, class: "t-muted", text: "4KB 的其余部分" }));
+        }
+        if (it.a === c.head) {
+          g.append(s("text", { x: bx + bw + 4, y: y - rowH * 2 + 20, "font-size": 10, class: "mono", style: "fill:var(--accent);font-weight:600", text: "←head" }));
+        }
+        y += bh + 4;
+      }
+      if (c.ptr) g.append(s("text", { x: bx + bw + 4, y: top + rowH * 2 + 12, "font-size": 10, class: "mono", style: "fill:var(--accent)", text: "←ptr" }));
+    });
+    g.append(s("text", { x: 460, y: 384, "text-anchor": "middle", "font-size": 11.5, text: "每个已分配块 = 8 字节头块 + 100 字节；空闲块开头的 8 字节是链表节点（size + next），next 存的是下一个空闲块的地址" }));
+  })();
+
+  // ---------- 正文图：sbrk ----------
+  (function () {
+    const g = $("fig17-sbrk");
+    const draw = (x0, heapH, note) => {
+      const y0 = 28, H = 150, w = 120;
+      const seg = (y, hh, st, t, tc) => { g.append(s("rect", { x: x0, y, width: w, height: hh, rx: 2, style: st })); if (t) g.append(s("text", { x: x0 + w / 2, y: y + hh / 2 + 4, "text-anchor": "middle", "font-size": 11, style: tc || "", text: t })); };
+      seg(y0, 24, "fill:var(--c4)", "代码", "fill:#fff;font-weight:600");
+      seg(y0 + 24, heapH, "fill:var(--c3)", "堆", "fill:#fff;font-weight:600");
+      seg(y0 + 24 + heapH, H - 24 - heapH - 28, "fill:var(--surface-2);stroke:var(--border);stroke-dasharray:3 3", "（未使用）", "fill:var(--muted)");
+      seg(y0 + H - 28, 28, "fill:var(--c2)", "栈", "fill:#fff;font-weight:600");
+      const by = y0 + 24 + heapH;
+      g.append(s("line", { x1: x0 - 8, x2: x0 + w + 8, y1: by, y2: by, style: "stroke:var(--accent);stroke-width:2" }));
+      g.append(s("text", { x: x0 + w + 12, y: by + 4, "font-size": 11, class: "mono", style: "fill:var(--accent)", text: "break（堆末尾）" }));
+      g.append(s("text", { x: x0 + w / 2, y: y0 + H + 18, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", text: note }));
+    };
+    draw(60, 40, "malloc 找不到够大的块");
+    draw(380, 76, "sbrk(n)：OS 映射新的物理页");
+    g.append(s("path", { d: "M268 100 L352 100", style: "stroke:var(--accent);stroke-width:1.8;fill:none", "marker-end": "url(#m17d)" }));
+    g.append(s("text", { x: 310, y: 92, "text-anchor": "middle", "font-size": 11, class: "mono", text: "sbrk" }));
+  })();
+
+  // ---------- 正文图：10/30/20 的三种适配 ----------
+  (function () {
+    const g = $("fig17-fit");
+    g.append(s("defs", {}, s("marker", { id: "m17f", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto" }, s("path", { d: "M0,0 L10,5 L0,10 z", style: "fill:var(--muted)" }))));
+    const rows = [
+      { t: "初始链表", list: [10, 30, 20], hl: -1, note: "请求 15" },
+      { t: "最优适配 best", list: [10, 30, 5], hl: 2, note: "遍历 3 个，选最小的够用块 20" },
+      { t: "最差适配 worst", list: [10, 15, 20], hl: 1, note: "遍历 3 个，选最大的 30" },
+      { t: "首次适配 first", list: [10, 15, 20], hl: 1, note: "只看 2 个：30 是第一个够大的" },
+    ];
+    rows.forEach((r, i) => {
+      const y = 12 + i * 56;
+      g.append(s("text", { x: 10, y: y + 22, "font-size": 12, style: "font-weight:600", text: r.t }));
+      g.append(s("text", { x: 130, y: y + 22, "font-size": 11.5, class: "mono", text: "head" }));
+      r.list.forEach((v, j) => {
+        const x = 176 + j * 88;
+        g.append(s("path", { d: `M${x - 18} ${y + 18} L${x - 2} ${y + 18}`, class: "arrow", "marker-end": "url(#m17f)" }));
+        g.append(s("rect", { x, y: y + 4, width: 60, height: 28, rx: 4, class: j === r.hl ? "warn-soft" : "box-strong" }));
+        g.append(s("text", { x: x + 30, y: y + 23, "text-anchor": "middle", "font-size": 13, class: "mono", text: v }));
+      });
+      g.append(s("text", { x: 436, y: y + 22, "font-size": 11, class: "mono t-muted", text: "NULL" }));
+      g.append(s("text", { x: 478, y: y + 22, "font-size": 11.5, class: i ? "" : "t-muted", text: r.note }));
+    });
+  })();
+
+  // ---------- 正文图：slab ----------
+  (function () {
+    const g = $("fig17-slab");
+    g.append(s("rect", { x: 10, y: 30, width: 150, height: 190, rx: 6, class: "box" }));
+    g.append(s("text", { x: 85, y: 22, "text-anchor": "middle", "font-size": 12, style: "font-weight:600", text: "通用分配器" }));
+    for (let i = 0; i < 6; i++) g.append(s("rect", { x: 26, y: 44 + i * 28, width: 118, height: 20, rx: 3, style: i === 1 || i === 4 ? "fill:var(--surface);stroke:var(--border)" : "fill:var(--c8);opacity:.55" }));
+    g.append(s("text", { x: 85, y: 214, "text-anchor": "middle", "font-size": 10.5, class: "t-muted", text: "按页管理的空闲内存" }));
+    const caches = [
+      { n: "inode 缓存", c: 2, per: 4, used: [1, 1, 0, 1, 1, 0, 0, 1] },
+      { n: "锁对象缓存", c: 0, per: 6, used: [1, 0, 1, 1, 0, 0] },
+      { n: "进程描述符缓存", c: 3, per: 3, used: [1, 1, 1, 0, 0, 0] },
+    ];
+    caches.forEach((ca, i) => {
+      const y = 30 + i * 66;
+      g.append(s("text", { x: 230, y: y + 12, "font-size": 11.5, style: "font-weight:600", text: ca.n }));
+      const slabs = Math.ceil(ca.used.length / ca.per);
+      for (let k = 0; k < slabs; k++) {
+        const sx = 230 + k * 170, ow = 150 / ca.per;
+        g.append(s("rect", { x: sx - 2, y: y + 18, width: 154, height: 30, rx: 4, style: "fill:none;stroke:var(--muted);stroke-dasharray:3 2" }));
+        for (let j = 0; j < ca.per; j++) {
+          const u = ca.used[k * ca.per + j];
+          if (u == null) continue;
+          g.append(s("rect", { x: sx + j * ow + 1, y: y + 21, width: ow - 2, height: 24, rx: 2, style: u ? `fill:${color(ca.c)}` : `fill:var(--surface);stroke:${color(ca.c)}` }));
+        }
+      }
+      g.append(s("path", { d: `M160 ${60 + i * 50} C 190 ${60 + i * 50}, 200 ${y + 33}, 226 ${y + 33}`, class: "arrow", "stroke-dasharray": "4 3" }));
+    });
+    g.append(s("text", { x: 400, y: 222, "text-anchor": "middle", "font-size": 11, class: "t-muted", text: "实心 = 使用中的对象；空心 = 空闲对象（已预初始化，直接可用）；虚线框 = 一个 slab" }));
+  })();
+
+  // ---------- 正文图：图 17.8 伙伴树 ----------
+  (function () {
+    const g = $("fig17-buddy");
+    g.append(s("defs", {}, s("pattern", { id: "h17b", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" }, s("rect", { width: 6, height: 6, style: "fill:var(--c1)" }), s("line", { x1: 0, y1: 0, x2: 0, y2: 6, style: "stroke:var(--surface);stroke-width:2" }))));
+    const X = (kb) => 40 + kb * 8.5, rows = [[0, 64, "64 KB"], [0, 32, "32 KB"], [32, 32, "32 KB"], [0, 16, "16 KB"], [16, 16, "16 KB"], [0, 8, ""], [8, 8, "8 KB"]];
+    const lev = { 64: 0, 32: 1, 16: 2, 8: 3 };
+    rows.forEach(([a, sz, t]) => {
+      const y = 10 + lev[sz] * 46, split = (sz === 64) || (a === 0 && sz >= 16);
+      g.append(s("rect", { x: X(a) + 1, y, width: sz * 8.5 - 2, height: 34, rx: 4, class: split ? "box" : "ok-soft", style: split ? "" : "stroke-dasharray:4 3" }));
+      if (t) g.append(s("text", { x: X(a) + sz * 4.25, y: y + 22, "text-anchor": "middle", "font-size": 12.5, text: t }));
+    });
+    const y3 = 10 + 3 * 46;
+    g.append(s("rect", { x: X(0) + 1, y: y3, width: 7 * 8.5, height: 34, style: "fill:var(--c1)" }));
+    g.append(s("rect", { x: X(7), y: y3, width: 8.5 - 1, height: 34, style: "fill:url(#h17b)" }));
+    g.append(s("text", { x: X(0) + 30, y: y3 + 22, "text-anchor": "middle", "font-size": 12, style: "fill:#fff;font-weight:600", text: "8 KB" }));
+    g.append(s("text", { x: X(0), y: y3 + 54, "font-size": 11.5, text: "请求 7KB → 实得 8KB，1KB 内部碎片（斜线）" }));
+    for (let l = 0; l < 3; l++) g.append(s("text", { x: 610, y: 10 + l * 46 + 22, "text-anchor": "end", "font-size": 10.5, class: "t-muted", text: "分割" }));
+  })();
+
+  // ---------- 正文图：伙伴地址只差一位 ----------
+  (function () {
+    const g = $("fig17-bits");
+    const pairs = [[0, 8192, 13], [0, 16384, 14], [16384, 24576, 13], [0, 32768, 15]];
+    g.append(s("text", { x: 20, y: 18, "font-size": 12, style: "font-weight:600", text: "块大小" }));
+    g.append(s("text", { x: 100, y: 18, "font-size": 12, style: "font-weight:600", text: "地址 A（二进制）" }));
+    g.append(s("text", { x: 380, y: 18, "font-size": 12, style: "font-weight:600", text: "伙伴 B = A XOR 大小" }));
+    g.append(s("text", { x: 650, y: 18, "font-size": 12, style: "font-weight:600", text: "差异位" }));
+    pairs.forEach(([a, b, bit], i) => {
+      const y = 44 + i * 36;
+      g.append(s("text", { x: 20, y, "font-size": 12, class: "mono", text: fmtK(1 << bit) + "B" }));
+      [[a, 100], [b, 380]].forEach(([v, x0]) => {
+        const str = v.toString(2).padStart(16, "0");
+        for (let k = 0; k < 16; k++) {
+          const isBit = 15 - k === bit, xx = x0 + k * 13 + Math.floor(k / 4) * 5;
+          if (isBit) g.append(s("rect", { x: xx - 2, y: y - 13, width: 13, height: 18, rx: 2, class: "warn-soft" }));
+          g.append(s("text", { x: xx + 4.5, y, "text-anchor": "middle", "font-size": 12, class: "mono", style: isBit ? "font-weight:700" : "", text: str[k] }));
+        }
+        g.append(s("text", { x: x0 + 230, y, "font-size": 10.5, class: "mono t-muted", text: "=" + fmtK(v) }));
+      });
+      g.append(s("text", { x: 650, y, "font-size": 12, class: "mono", text: "第 " + bit + " 位" }));
+    });
+  })();
+
+  // ---------- 模拟器 1：malloc.py ----------
+  const PRESETS = {
+    hw1: { S: 100, b: 1000, H: 0, a: -1, p: "BEST", l: "ADDRSORT", C: false, A: "", s: 0, n: 10, r: 10, P: 50 },
+    hw2: { S: 100, b: 1000, H: 0, a: -1, p: "WORST", l: "ADDRSORT", C: false, A: "", s: 0, n: 10, r: 10, P: 50 },
+    hw3: { S: 100, b: 1000, H: 0, a: -1, p: "FIRST", l: "ADDRSORT", C: false, A: "", s: 0, n: 10, r: 10, P: 50 },
+    fit: { S: 80, b: 0, H: 0, a: -1, p: "BEST", l: "ADDRSORT", C: false, A: "+10,+10,+30,+10,+20,-0,-2,-4,+15",
+      note: "原书 17.3 节：先把 80 字节的堆填满，再释放 #0、#2、#4，得到大小为 10、30、20 的空闲链表，然后请求 15。换策略（BEST / WORST / FIRST）对比最后一步。" },
+    c30n: { S: 30, b: 0, H: 0, a: -1, p: "FIRST", l: "INSERT-FRONT", C: false, A: "+10,+10,+10,-2,-0,-1,+20",
+      note: "原书 17.2 节：30 字节的堆，释放顺序 20、0、10，每次插到表头且不合并 → head → 10 → 0 → 20，三个 10 字节块，malloc(20) 失败。" },
+    c30y: { S: 30, b: 0, H: 0, a: -1, p: "FIRST", l: "ADDRSORT", C: true, A: "+10,+10,+10,-2,-0,-1,+20",
+      note: "同样的操作，但链表按地址排序并合并：释放中间块时与两边合并成 [0, 30]，malloc(20) 成功。" },
+    k4: { S: 4096, b: 16384, H: 8, a: -1, p: "FIRST", l: "INSERT-FRONT", C: false, A: "+100,+100,+100,-1,-0,-2,+3900",
+      note: "对照原书图 17.3–17.7：malloc.py 的 sz 含空闲块自己的 8 字节节点头，所以比书中节点的 size 字段多 8（3988 ↔ 3980，3772 ↔ 3764，108 ↔ 100）；-A 模式下 malloc.py 打印的是块起点（含头块），用户拿到的指针要再加 8（16392、16500…）。" },
+    frag: { S: 100, b: 1000, H: 0, a: -1, p: "FIRST", l: "ADDRSORT", C: true, A: "+10,+10,+10,+10,+10,+10,+10,+10,+10,+10,-0,-2,-4,-6,-8,+20",
+      note: "作业 7：先填满堆，再隔一个释放一个。即使开了合并，五个空闲块两两之间都隔着使用中的块，+20 仍然失败。" },
+  };
+  let MO = null, MS = [], mNote = "";
+  const POL = { BEST: "最优适配", WORST: "最差适配", FIRST: "首次适配", NEXT: "下次适配" };
+  function readParams() {
+    const num = (id, d) => { const v = parseInt($(id).value, 10); return Number.isFinite(v) ? v : d; };
+    const o = {
+      size: Math.max(1, Math.min(65536, num("ml-S", 100))), base: Math.max(0, num("ml-b", 1000)), H: Math.max(0, Math.min(64, num("ml-H", 0))),
+      align: num("ml-a", -1), policy: $("ml-p").value, order: $("ml-l").value, coalesce: $("ml-C").checked,
+      ops: $("ml-A").value.replace(/\s+/g, ""), seed: Math.max(0, num("ml-s", 0)), n: Math.max(1, Math.min(2000, num("ml-n", 10))),
+      range: Math.max(1, num("ml-r", 10)), pAlloc: Math.max(1, Math.min(100, num("ml-P", 50))),
+    };
+    if (o.align === 0 || o.align < -1) o.align = -1;
+    return o;
+  }
+  function cmdLine(o) {
+    const parts = ["./malloc.py", "-S", o.size, "-b", o.base, "-H", o.H];
+    if (o.align !== -1) parts.push("-a", o.align);
+    parts.push("-p", o.policy === "NEXT" ? "NEXT(本页扩展)" : o.policy, "-l", o.order);
+    if (o.coalesce) parts.push("-C");
+    if (o.ops) parts.push("-A", o.ops); else parts.push("-s", o.seed, "-n", o.n, "-r", o.range, "-P", o.pAlloc);
+    parts.push("-c");
+    return parts.join(" ");
+  }
+  function runSim() {
+    MO = readParams();
+    MS = runMalloc(MO);
+    $("ml-cmd").textContent = "等价命令：" + cmdLine(MO);
+    $("ml-cmpbox").replaceChildren();
+    mlStep.reset();
+  }
+  const lst = (l) => l.length ? l.map((e) => `[${e[0]}:${e[1]}]`).join(" ") : "（空）";
+  function drawList(svg, y, title, list, mark, W) {
+    const nodeW = 86, nodeH = 34, gap = 20, x0 = 60, per = Math.max(1, Math.floor((W - x0 - 40) / (nodeW + gap)));
+    const cap = 36, shown = list.slice(0, cap);
+    svg.append(s("text", { x: 10, y: y + 12, "font-size": 12, style: "font-weight:600", text: title }));
+    const yy = y + 22;
+    svg.append(s("text", { x: 10, y: yy + 22, "font-size": 11.5, class: "mono", text: "head" }));
+    if (!list.length) { svg.append(s("text", { x: x0, y: yy + 22, "font-size": 11.5, class: "mono t-muted", text: "→ NULL（链表为空）" })); return 22 + nodeH + 10; }
+    shown.forEach((e, i) => {
+      const r = Math.floor(i / per), c = i % per, x = x0 + c * (nodeW + gap), ny = yy + r * (nodeH + 14);
+      const m = mark(i, e) || {};
+      const cls = m.cls === "pick" ? "warn-soft" : m.cls === "exam" ? "accent-soft" : m.cls === "merge" ? "ok-soft" : "box-strong";
+      svg.append(s("rect", { x, y: ny, width: nodeW, height: nodeH, rx: 4, class: cls, style: (m.cls === "pick" || m.cls === "merge" ? "stroke-width:2.2;" : "") + (m.dim ? "opacity:.45" : "") }));
+      svg.append(s("text", { x: x + nodeW / 2, y: ny + 14, "text-anchor": "middle", "font-size": 10.5, class: "mono", text: "addr:" + e[0] }));
+      svg.append(s("text", { x: x + nodeW / 2, y: ny + 28, "text-anchor": "middle", "font-size": 10.5, class: "mono", text: "sz:" + e[1] }));
+      if (m.n) {
+        svg.append(s("circle", { cx: x + nodeW - 2, cy: ny, r: 8, style: "fill:var(--accent)" }));
+        svg.append(s("text", { x: x + nodeW - 2, y: ny + 3.5, "text-anchor": "middle", "font-size": 9.5, style: "fill:#fff;font-weight:700", text: m.n }));
+      }
+      if (m.tag) svg.append(s("text", { x: x + nodeW / 2, y: ny + nodeH + 11, "text-anchor": "middle", "font-size": 9.5, style: "fill:var(--warn);font-weight:600", text: m.tag }));
+      const last = i === shown.length - 1;
+      if (c < per - 1 || last) {
+        svg.append(s("path", { d: `M${x + nodeW} ${ny + nodeH / 2} L${x + nodeW + gap - 3} ${ny + nodeH / 2}`, class: "arrow", "marker-end": "url(#m17g)" }));
+        if (last) svg.append(s("text", { x: x + nodeW + gap, y: ny + nodeH / 2 + 4, "font-size": 10, class: "mono t-muted", text: list.length > cap ? `…还有 ${list.length - cap} 个` : "NULL" }));
+      } else {
+        svg.append(s("path", { d: `M${x + nodeW} ${ny + nodeH / 2} q 10 0 10 12`, class: "arrow" }));
+      }
+    });
+    const rows = Math.ceil(shown.length / per);
+    return 22 + rows * (nodeH + 14) + 4;
+  }
+  function drawMalloc(k) {
+    const st = MS[k], o = MO, W = 780, bx = 20, bw = 740, sc = bw / o.size;
+    const svg = s("svg", { viewBox: "0 0 780 100", width: W, role: "img", "aria-label": "堆布局与空闲链表" });
+    svg.append(s("defs", {},
+      s("marker", { id: "m17g", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto" }, s("path", { d: "M0,0 L10,5 L0,10 z", style: "fill:var(--muted)" })),
+      s("pattern", { id: "h17c", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" }, s("rect", { width: 6, height: 6, style: "fill:var(--surface)" }), s("line", { x1: 0, y1: 0, x2: 0, y2: 6, style: "stroke:var(--muted);stroke-width:2" }))));
+    const opText = st.kind === "init" ? "初始状态" : st.kind === "alloc" ? `ptr[${st.id}] = malloc(${st.req})` : st.kind === "free" ? `free(ptr[${st.id}])` : st.line;
+    svg.append(s("text", { x: bx, y: 16, "font-size": 12.5, style: "font-weight:600", text: `堆 [${o.base}, ${o.base + o.size})　·　${opText}` }));
+    const y = 28, hh = 44;
+    svg.append(s("rect", { x: bx, y, width: bw, height: hh, rx: 3, style: "fill:var(--surface-2);stroke:var(--border)" }));
+    const X = (a) => bx + (a - o.base) * sc;
+    for (const b of st.blocks) {
+      const x = X(b.addr), wH = o.H * sc, wU = b.req * sc, wP = b.pad * sc;
+      if (wH > 0) svg.append(s("rect", { x, y, width: Math.max(0.8, wH), height: hh, style: "fill:var(--c8)" }));
+      svg.append(s("rect", { x: x + wH, y, width: Math.max(0.8, wU), height: hh, style: `fill:${color(b.id)}` }));
+      if (wP > 0) svg.append(s("rect", { x: x + wH + wU, y, width: wP, height: hh, style: `fill:url(#h17c);stroke:${color(b.id)}` }));
+      svg.append(s("rect", { x, y, width: b.need * sc, height: hh, style: `fill:none;stroke:var(--surface);stroke-width:1` }));
+      if (b.need * sc >= 22) svg.append(s("text", { x: x + wH + wU / 2, y: y + hh / 2 + 4, "text-anchor": "middle", "font-size": 11, style: "fill:#fff;font-weight:600", text: "#" + b.id }));
+    }
+    const freshNew = st.kind === "free" && st.rc === 0 ? st.addr : null;
+    for (const e of st.after) {
+      const x = X(e[0]), w = e[1] * sc;
+      const isNew = freshNew != null && e[0] <= freshNew && freshNew < e[0] + e[1];
+      svg.append(s("rect", { x: x + 0.5, y: y + 0.5, width: Math.max(0.5, w - 1), height: hh - 1, rx: 2, class: "ok-soft", style: `stroke-dasharray:4 3;${isNew ? "stroke:var(--warn);stroke-width:2.5;stroke-dasharray:none" : ""}` }));
+      if (w >= 30) svg.append(s("text", { x: x + w / 2, y: y + hh / 2 + 4, "text-anchor": "middle", "font-size": 10.5, text: e[1] >= 1000 || w < 44 ? e[1] : "空闲 " + e[1] }));
+    }
+    if (st.kind === "alloc" && st.addr !== -1) svg.append(s("rect", { x: X(st.addr), y: y - 3, width: st.need * sc, height: hh + 6, rx: 2, style: "fill:none;stroke:var(--fg);stroke-width:2" }));
+    // 地址刻度：块边界，避免重叠
+    const marks = new Set([o.base, o.base + o.size]);
+    st.blocks.forEach((b) => { marks.add(b.addr); marks.add(b.addr + b.need); });
+    st.after.forEach((e) => { marks.add(e[0]); marks.add(e[0] + e[1]); });
+    let lastX = -99;
+    [...marks].sort((a, b) => a - b).forEach((a, i, arr) => {
+      const x = X(a), isEnd = i === arr.length - 1;
+      if (x - lastX < 30 && !isEnd) return;
+      if (isEnd && x - lastX < 30) return;
+      svg.append(s("line", { x1: x, x2: x, y1: y + hh, y2: y + hh + 4, style: "stroke:var(--muted)" }));
+      svg.append(s("text", { x, y: y + hh + 15, "text-anchor": i === 0 ? "start" : isEnd ? "end" : "middle", "font-size": 9.5, class: "mono t-muted", text: a }));
+      lastX = x;
+    });
+    let yy = y + hh + 26;
+    if (st.kind === "alloc") {
+      const ex = new Map(st.examined.map((i, j) => [i, j + 1]));
+      yy += drawList(svg, yy, `搜索（操作前的链表，按${POL[o.policy]}，检查了 ${st.count} 个）`, st.before, (i) => ({ cls: i === st.idx ? "pick" : ex.has(i) ? "exam" : null, n: ex.get(i), dim: !ex.has(i), tag: i === st.idx ? (st.split ? "选中 → 分割" : "选中 → 整块") : null }), W);
+    } else if (st.kind === "free" && st.rc === 0) {
+      yy += drawList(svg, yy, `放回链表（${o.order}${o.coalesce ? "，合并前" : ""}）`, st.inserted, (i, e) => (e[0] === st.addr ? { cls: "pick", tag: "新释放" } : null), W);
+    }
+    const mergedAddrs = new Set((st.merges || []).map((m) => m[0][0]));
+    yy += drawList(svg, yy, st.kind === "init" ? "空闲链表" : "操作后的空闲链表", st.after, (i, e) => {
+      if (st.kind === "alloc" && st.rest && e[0] === st.rest[0]) return { cls: "pick", tag: "剩余部分" };
+      if (mergedAddrs.has(e[0])) return { cls: "merge", tag: "合并结果" };
+      return null;
+    }, W);
+    svg.setAttribute("viewBox", `0 0 780 ${yy + 4}`);
+    $("ml-svg").replaceChildren(svg);
+
+    // 讲解
+    let t = "";
+    const fst = freeStats(st.after);
+    if (st.kind === "init") {
+      t = `初始：整个堆 [${o.base}, ${o.base + o.size}) 是一个大小为 ${o.size} 的空闲块。` + (o.ops ? `操作序列来自 -A。` : `随机模式：种子 ${o.seed}，共 ${o.n} 个操作，约 ${o.pAlloc}% 是分配，请求大小 1–${o.range}。`) + `点"下一步"开始。`;
+    } else if (st.kind === "alloc") {
+      const a = [];
+      a.push(`<b>ptr[${st.id}] = malloc(${st.req})</b>：` + (st.pad ? `先对齐到 ${o.align} 的倍数 → ${st.req + st.pad}（多出的 ${st.pad} 字节是内部碎片）；` : "") + (o.H ? `加上 ${o.H} 字节头块，` : "") + `要找一块 <b>≥ ${st.need}</b> 的空闲块。`);
+      const seen = st.examined.map((i) => st.before[i][1]);
+      if (o.policy === "BEST") a.push(`最优适配遍历整张表（${seen.join("、") || "空"}），在够大的块中取最小的。`);
+      else if (o.policy === "WORST") a.push(`最差适配遍历整张表（${seen.join("、") || "空"}），取最大的块。`);
+      else if (o.policy === "FIRST") a.push(`首次适配从表头开始依次看 ${seen.join("、") || "（空表）"}，${st.addr !== -1 ? "遇到第一个够大的就停。" : "一个够大的都没有。"}`);
+      else a.push(`下次适配从上次停下的位置接着找，依次看 ${seen.join("、") || "（空表）"}${st.addr !== -1 ? "，遇到第一个够大的就停。" : "。"}`);
+      if (st.addr === -1) {
+        a.push(`<b style="color:var(--bad)">失败</b>：没有 ≥ ${st.need} 的块，返回 NULL（malloc.py 显示 ${o.ops ? -1 : -1 + o.H}）。` + (fst.total >= st.need ? `空闲总量 ${fst.total} 其实够，但最大的一块只有 ${fst.big}：这就是<b>外部碎片</b>。` : `空闲总量只有 ${fst.total}，确实不够。`));
+      } else {
+        a.push(`选中 [addr ${st.addr}, sz ${st.chunk}]。` + (st.split ? `<b>分割</b>：前 ${st.need} 字节交出去，剩下的 [${st.rest[0]}:${st.rest[1]}] 留在链表中原来的位置。` : `大小正好相等，整块拿走，这个元素从链表中删除。`));
+        a.push(o.H ? `头块写在 ${st.addr}，用户拿到的指针是 <b>${st.addr + o.H}</b>。` : `返回 <b>${st.addr}</b>。`);
+      }
+      t = a.join(" ");
+    } else if (st.kind === "free") {
+      if (st.rc !== 0) t = `<b>free(ptr[${st.id}])</b>：这个地址已经不在"已分配表"里（重复释放），malloc.py 返回 -1，链表不变。`;
+      else {
+        const a = [`<b>free(ptr[${st.id}])</b>：从头块得知这块共 ${st.size} 字节（地址 ${st.addr}）。`];
+        a.push({ ADDRSORT: "按地址排序插回链表。", "SIZESORT+": "插回链表后按大小升序排序。", "SIZESORT-": "插回链表后按大小降序排序。", "INSERT-FRONT": "直接插到表头。", "INSERT-BACK": "直接接到表尾。" }[o.order]);
+        if (o.coalesce) {
+          if (st.merges.length) a.push(`<b>合并</b>：` + st.merges.map((m) => `[${m[0][0]}:${m[0][1]}] + [${m[1][0]}:${m[1][1]}]`).join("，") + ` → 地址相连的块并成一块。`);
+          else a.push(`开启了合并，但链表里没有"前后相邻且地址相连"的元素，没有可合并的。`);
+          if (o.order !== "ADDRSORT") {
+            const adj = st.after.some((e) => st.after.some((f) => f !== e && e[0] + e[1] === f[0]));
+            if (adj) a.push(`<span style="color:var(--bad)">注意：链表里仍有地址相连的块没被合并，因为 malloc.py 只合并<b>链表中相邻</b>的元素，按 ${o.order} 排序时它们不挨着。</span>`);
+          }
+        } else {
+          const adj = st.after.some((e) => (e[0] + e[1] === st.addr || st.addr + st.size === e[0]));
+          a.push(adj ? `没有开启合并（-C）：它和旁边的空闲块地址相连，却仍作为独立的块留在链表里。` : `没有开启合并（-C）。`);
+        }
+        t = a.join(" ");
+      }
+    } else t = st.kind === "invalid" ? `Invalid Free：编号 ${st.id} 超出已成功分配的范围（或那次分配失败了），malloc.py 直接跳过。` : st.line;
+    if (mNote && k === 0) t += `<br><span class="muted">${mNote}</span>`;
+    $("ml-narrate").innerHTML = t;
+    // 统计
+    const done = MS.slice(1, k + 1), allocs = done.filter((x) => x.kind === "alloc");
+    $("ml-s1").textContent = fst.n;
+    $("ml-s2").textContent = `${fst.big} / ${fst.total}`;
+    $("ml-s3").textContent = (fst.frag * 100).toFixed(0) + "%";
+    $("ml-s4").textContent = st.kind === "alloc" ? st.count : "–";
+    $("ml-s5").textContent = `${allocs.filter((x) => x.addr === -1).length} / ${allocs.length}`;
+    // 跟踪框（malloc.py -c 格式）
+    const tr = $("ml-trace"); tr.replaceChildren();
+    let curEl = null;
+    MS.slice(1).forEach((x, j) => {
+      const text = x.kind === "invalid" || x.kind === "bad" ? x.line : x.line + "\n" + x.dump;
+      const el = h("span", { class: j + 1 === k ? "cur" : j + 1 > k ? "dim" : "" }, j + 1 > k ? text.replace(/returned .*|Free List.*/g, (m) => (m.startsWith("returned") ? "returned ?" : "List?")) : text);
+      tr.append(el, "\n");
+      if (j + 1 === k) curEl = el;
+    });
+    if (curEl) tr.scrollTop = Math.max(0, curEl.offsetTop - tr.offsetTop - 60); else tr.scrollTop = 0;
+  }
+  const mlStep = stepper($("ml-step"), { steps: () => Math.max(1, MS.length), autoplayMs: 1100, render(k) { if (MS.length) drawMalloc(k); } });
+  function applyPreset(name) {
+    const p = PRESETS[name];
+    const set = { "ml-S": p.S, "ml-b": p.b, "ml-H": p.H, "ml-a": p.a, "ml-p": p.p, "ml-l": p.l, "ml-A": p.A };
+    for (const [id, v] of Object.entries(set)) $(id).value = v;
+    if (p.s != null) { $("ml-s").value = p.s; $("ml-n").value = p.n; $("ml-r").value = p.r; $("ml-P").value = p.P; }
+    $("ml-C").checked = p.C;
+    mNote = p.note || "";
+    runSim();
+  }
+  document.querySelectorAll("#sim-malloc [data-pre]").forEach((b) => (b.onclick = () => applyPreset(b.dataset.pre)));
+  $("ml-run").onclick = () => { mNote = ""; runSim(); };
+  ["ml-p", "ml-l", "ml-C"].forEach((id) => ($(id).onchange = () => runSim()));
+  $("ml-cmp").onclick = () => {
+    const base = readParams();
+    const rows = ["BEST", "WORST", "FIRST", "NEXT"].map((p) => {
+      const st = runMalloc(Object.assign({}, base, { policy: p }));
+      const al = st.filter((x) => x.kind === "alloc"), fin = freeStats(st[st.length - 1].after);
+      const avg = al.length ? al.reduce((a, x) => a + x.count, 0) / al.length : 0;
+      return h("tr", { class: p === base.policy ? "cur" : "" }, h("td", {}, p + (p === "NEXT" ? "（扩展）" : "")), h("td", { class: "num" }, al.length), h("td", { class: "num" }, al.filter((x) => x.addr === -1).length), h("td", { class: "num" }, avg.toFixed(2)), h("td", { class: "num" }, fin.n), h("td", { class: "num" }, fin.big), h("td", { class: "num" }, (fin.frag * 100).toFixed(0) + "%"));
+    });
+    const tb = h("table", { class: "cmp17" }, h("thead", {}, h("tr", {}, ["策略", "分配次数", "失败", "平均搜索元素", "最终空闲块数", "最大空闲块", "外部碎片"].map((x) => h("th", {}, x)))), h("tbody", {}, rows));
+    $("ml-cmpbox").replaceChildren(tb);
+  };
+  applyPreset("hw1");
+
+  // ---------- 模拟器 2：伙伴系统 ----------
+  let BS = [], BT = 65536, BM = 1024;
+  function runBd() {
+    BT = +$("bd-total").value; BM = +$("bd-min").value;
+    if (BT / BM > 256) { BM = BT / 256; $("bd-min").value = String(BM); }
+    BS = runBuddy(BT, BM, $("bd-ops").value);
+    bdStep.reset();
+  }
+  function drawBuddy(k) {
+    const st = BS[k], W = 780, bx = 60, bw = 700, levels = Math.round(Math.log2(BT / BM)), rowH = 30, gap = 8;
+    const svg = s("svg", { viewBox: "0 0 780 100", width: W, role: "img", "aria-label": "伙伴系统分割树" });
+    svg.append(s("defs", {}, s("pattern", { id: "h17d", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" }, s("rect", { width: 6, height: 6, style: "fill:var(--surface)" }), s("line", { x1: 0, y1: 0, x2: 0, y2: 6, style: "stroke:var(--muted);stroke-width:2" }))));
+    svg.append(s("text", { x: 10, y: 14, "font-size": 12, style: "font-weight:600", text: st.op ? "操作：" + st.op : "初始状态" }));
+    const hl = new Set(st.hl || []);
+    for (let l = 0; l <= levels; l++) svg.append(s("text", { x: bx - 8, y: 24 + l * (rowH + gap) + rowH / 2 + 4, "text-anchor": "end", "font-size": 10.5, class: "mono t-muted", text: fmtK(BT >> l) }));
+    const nodes = [...st.nodes].sort((a, b) => b.size - a.size);
+    for (const n of nodes) {
+      const l = Math.round(Math.log2(BT / n.size)), y = 24 + l * (rowH + gap), x = bx + n.addr / BT * bw, w = n.size / BT * bw;
+      const on = hl.has(n.addr + ":" + n.size);
+      if (n.state === "split") {
+        svg.append(s("rect", { x: x + 0.5, y, width: w - 1, height: rowH, rx: 3, class: "box" }));
+        const cy = y + rowH, ny = y + rowH + gap;
+        svg.append(s("path", { d: `M${x + w / 4} ${ny} L${x + w / 2} ${cy} L${x + 3 * w / 4} ${ny}`, style: "fill:none;stroke:var(--faint);stroke-width:1" }));
+      } else if (n.state === "free") {
+        svg.append(s("rect", { x: x + 0.5, y, width: w - 1, height: rowH, rx: 3, class: "ok-soft", style: "stroke-dasharray:4 3" }));
+      } else {
+        const wu = n.req / n.size * w;
+        svg.append(s("rect", { x: x + 0.5, y, width: w - 1, height: rowH, rx: 3, style: "fill:url(#h17d);stroke:" + color(n.id) }));
+        svg.append(s("rect", { x: x + 0.5, y, width: Math.max(1, wu - 1), height: rowH, rx: 3, style: `fill:${color(n.id)}` }));
+      }
+      if (on) svg.append(s("rect", { x: x - 1, y: y - 2, width: w + 2, height: rowH + 4, rx: 4, style: "fill:none;stroke:var(--fg);stroke-width:2.2" }));
+      const label = n.state === "alloc" ? `#${n.id} ${fmtK(n.req)}/${fmtK(n.size)}` : fmtK(n.size);
+      if (w >= label.length * 6.2 + 6) svg.append(s("text", { x: x + (n.state === "alloc" ? Math.max(n.req / n.size * w, label.length * 6.2 + 6) / 2 : w / 2), y: y + rowH / 2 + 4, "text-anchor": "middle", "font-size": 10.5, class: n.state === "alloc" ? "" : "t-muted", style: n.state === "alloc" ? "fill:#fff;font-weight:600" : "", text: label }));
+      else if (n.state === "alloc" && w >= 16) svg.append(s("text", { x: x + w / 2, y: y + rowH / 2 + 4, "text-anchor": "middle", "font-size": 10, style: "fill:#fff;font-weight:600", text: "#" + n.id }));
+    }
+    let yy = 24 + (levels + 1) * (rowH + gap);
+    // 地址刻度
+    for (let q = 0; q <= 4; q++) svg.append(s("text", { x: bx + q * bw / 4, y: yy - 2, "text-anchor": q === 0 ? "start" : q === 4 ? "end" : "middle", "font-size": 9.5, class: "mono t-muted", text: fmtK(BT * q / 4) }));
+    yy += 14;
+    if (st.bits) {
+      const nb = Math.round(Math.log2(BT)), bit = Math.round(Math.log2(st.bits.size));
+      const row = (label, v, y) => {
+        svg.append(s("text", { x: 10, y, "font-size": 11.5, text: label }));
+        const str = v.toString(2).padStart(nb, "0");
+        for (let i = 0; i < nb; i++) {
+          const xx = 120 + i * 14 + Math.floor(i / 4) * 5, isB = nb - 1 - i === bit;
+          if (isB) svg.append(s("rect", { x: xx - 2, y: y - 12, width: 13, height: 17, rx: 2, class: "warn-soft" }));
+          svg.append(s("text", { x: xx + 4.5, y, "text-anchor": "middle", "font-size": 12, class: "mono", style: isB ? "font-weight:700" : "", text: str[i] }));
+        }
+        svg.append(s("text", { x: 120 + nb * 14 + Math.floor(nb / 4) * 5 + 8, y, "font-size": 11, class: "mono t-muted", text: `= ${v}（${fmtK(v)}）` }));
+      };
+      row("本块地址", st.bits.a, yy + 12);
+      row("伙伴地址", st.bits.b, yy + 32);
+      svg.append(s("text", { x: 10, y: yy + 54, "font-size": 11.5, text: `块大小 ${fmtK(st.bits.size)} = 2^${bit}：两个地址只在第 ${bit} 位不同（高亮），伙伴 = 地址 XOR ${st.bits.size}` }));
+      yy += 64;
+    }
+    svg.setAttribute("viewBox", `0 0 780 ${yy}`);
+    $("bd-svg").replaceChildren(svg);
+    $("bd-narrate").innerHTML = (st.fail ? '<b style="color:var(--bad)">✗ </b>' : "") + st.msg;
+    // 各阶空闲链表
+    const lines = [];
+    for (let sz = BT; sz >= BM; sz /= 2) {
+      const fr = st.nodes.filter((n) => n.state === "free" && n.size === sz).map((n) => fmtK(n.addr)).sort((a, b) => parseInt(a) - parseInt(b));
+      lines.push(`${fmtK(sz).padStart(5)} 空闲链表: ${fr.length ? fr.map((a) => "[" + a + "]").join(" ") : "—"}`);
+    }
+    $("bd-orders").textContent = "伙伴系统为每种大小维护一个空闲链表：\n" + lines.join("\n");
+    const bs = buddyStats(st.nodes);
+    $("bd-s1").textContent = `${fmtK(bs.req)} / ${fmtK(bs.got)}`;
+    $("bd-s2").textContent = bs.got ? `${fmtK(bs.got - bs.req)}（${((bs.got - bs.req) / bs.got * 100).toFixed(0)}%）` : "0";
+    $("bd-s3").textContent = bs.nfree;
+    $("bd-s4").textContent = `${fmtK(bs.big)} / ${fmtK(bs.free)}`;
+  }
+  const bdStep = stepper($("bd-step"), { steps: () => Math.max(1, BS.length), autoplayMs: 1100, render(k) { if (BS.length) drawBuddy(k); } });
+  $("bd-run").onclick = runBd;
+  $("bd-total").onchange = runBd; $("bd-min").onchange = runBd;
+  document.querySelectorAll("#sim-buddy [data-bd]").forEach((b) => (b.onclick = () => { $("bd-ops").value = b.dataset.bd; $("bd-total").value = "65536"; $("bd-min").value = "1024"; runBd(); }));
+  runBd();
+})();
+</script>
+</body></html>

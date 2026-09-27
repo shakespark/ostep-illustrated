@@ -1,0 +1,882 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 36 章 · I/O 设备</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+.cmp-table th, .cmp-table td { white-space: nowrap; }
+.tl-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; color: var(--muted); margin-top: 10px; }
+.tl-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.tl-legend i { display: inline-block; width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--border); }
+.cmp-table td.best { background: var(--ok-soft); font-weight: 650; }
+.presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.presets button { font-size: 13px; padding: 4px 10px; }
+.bits { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 3px; margin: 6px 0 12px; font: 12px var(--mono); text-align: center; }
+.bits div { border: 1px solid var(--border); border-radius: 4px; padding: 3px 1px; background: var(--surface); overflow: hidden; text-overflow: ellipsis; }
+.bits div.n { background: var(--surface-2); color: var(--muted); border-style: dashed; }
+.bits div.hot { background: var(--accent-soft); border-color: var(--accent); }
+.rng-row label { min-width: 0; }
+.rng-row input[type="range"] { width: 130px; }
+.rng-row output { font: 13px var(--mono); color: var(--fg); min-width: 3.5em; display: inline-block; }
+.book-tl { display: grid; gap: 14px; }
+.book-tl h4 { margin: 0 0 4px; font-size: 14px; }
+</style>
+</head>
+<body data-chapter="36">
+<main>
+
+<h2><span class="num">1</span>本章要解决的问题</h2>
+<div class="crux">
+  <p><strong>如何把 I/O 集成进系统？</strong>通用的机制是什么？怎样让它们高效？</p>
+  <p class="small muted">How should I/O be integrated into systems? What are the general mechanisms? How can we make them efficient?</p>
+</div>
+<p>没有输入的程序每次都输出同样的结果，没有输出的程序跑了也白跑，所以计算机离不开输入/输出（I/O）设备。前两部分我们虚拟化了 CPU 和内存，从这一章起进入全书第三部分<strong>持久化（persistence）</strong>。开篇之前，要先弄清一个更底层的问题：操作系统到底怎样和一块硬件"说话"？</p>
+<p>本章给出后面所有章节都要用到的基础：设备的<strong>硬件接口</strong>长什么样；OS 如何用<strong>轮询</strong>、<strong>中断</strong>、<strong>DMA</strong> 和设备打交道，以及各自的代价；OS 怎样用<strong>设备驱动</strong>把千奇百怪的设备藏在统一接口后面。下一章我们会把目光放到一种具体设备——硬盘上。</p>
+
+<h2><span class="num">2</span>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>分层总线（bus hierarchy）</h4><p>越快的总线越短、越贵：内存总线最快，I/O 总线次之，外围总线最慢但能挂很多设备。</p></div>
+  <div class="card"><h4>标准设备（canonical device）</h4><p>对外是<strong>接口</strong>（状态、命令、数据寄存器），对内是<strong>内部结构</strong>（微控制器、内存、固件）。</p></div>
+  <div class="card"><h4>轮询（polling）</h4><p>OS 反复读状态寄存器直到设备不忙。简单，但慢设备面前 CPU 白白空转。</p></div>
+  <div class="card"><h4>中断（interrupt）</h4><p>发出请求后让进程睡眠、切去跑别的；设备完成时发中断，CPU 进入中断处理程序（ISR）。让计算与 I/O <strong>重叠</strong>。</p></div>
+  <div class="card"><h4>PIO 与 DMA</h4><p>PIO（programmed I/O）由 CPU 亲自搬数据；DMA（直接内存访问）引擎替 CPU 搬，完成后再中断。</p></div>
+  <div class="card"><h4>I/O 指令 vs 内存映射 I/O</h4><p>访问设备寄存器的两种办法：x86 的特权指令 <code>in</code>/<code>out</code>，或把寄存器映射到内存地址用 load/store 访问。</p></div>
+  <div class="card"><h4>设备驱动（device driver）</h4><p>OS 中唯一知道设备细节的那一层；上层通过通用块接口访问，保持"设备无关"。</p></div>
+  <div class="card"><h4>活锁与中断合并</h4><p>中断太多时 OS 只顾处理中断，进程毫无进展（livelock）；合并（coalescing）把多个中断攒成一个。</p></div>
+</div>
+
+<h2><span class="num">3</span>系统架构：为什么总线要分层</h2>
+<p>先看一张"经典"的系统结构图。CPU 通过<strong>内存总线</strong>（通常是厂商专有的）连到主内存；一部分设备挂在<strong>通用 I/O 总线</strong>上（现代系统中多为 PCI 及其变种），显卡等高性能设备在这里；再往下是一条或多条<strong>外围总线</strong>（peripheral bus），例如 SCSI、SATA、USB，磁盘、鼠标、键盘这些慢设备连在上面。</p>
+<figure class="fig">
+<svg viewBox="0 0 680 320" width="680" role="img" aria-label="原型系统架构：内存总线、通用 I/O 总线、外围总线">
+  <defs><marker id="mk36-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <rect x="40" y="20" width="120" height="50" rx="8" class="box-strong"/><text x="100" y="50" text-anchor="middle" font-weight="700">CPU</text>
+  <rect x="450" y="20" width="130" height="50" rx="8" class="box-strong"/><text x="515" y="50" text-anchor="middle" font-weight="700">内存 Memory</text>
+  <line x1="160" y1="45" x2="450" y2="45" style="stroke:var(--c1);stroke-width:7"/>
+  <text x="305" y="34" text-anchor="middle" font-size="13">内存总线（专有） Memory Bus</text>
+  <line x1="305" y1="48" x2="305" y2="130" style="stroke:var(--muted);stroke-width:2"/>
+  <rect x="290" y="80" width="30" height="20" rx="3" class="box"/><text x="305" y="94" text-anchor="middle" font-size="10" class="t-muted">桥</text>
+  <line x1="40" y1="130" x2="580" y2="130" style="stroke:var(--c3);stroke-width:5"/>
+  <text x="440" y="122" font-size="13">通用 I/O 总线（如 PCI）</text>
+  <line x1="100" y1="130" x2="100" y2="150" class="stroke"/><rect x="40" y="150" width="120" height="38" rx="6" class="accent-soft"/><text x="100" y="174" text-anchor="middle" font-size="13">显卡 Graphics</text>
+  <line x1="220" y1="130" x2="220" y2="150" class="stroke"/><rect x="175" y="150" width="90" height="38" rx="6" class="box"/><text x="220" y="174" text-anchor="middle" font-size="13">高速网卡</text>
+  <line x1="305" y1="130" x2="305" y2="230" style="stroke:var(--muted);stroke-width:2"/>
+  <rect x="290" y="190" width="30" height="20" rx="3" class="box"/><text x="305" y="204" text-anchor="middle" font-size="10" class="t-muted">桥</text>
+  <line x1="40" y1="230" x2="580" y2="230" style="stroke:var(--c5);stroke-width:3"/>
+  <text x="330" y="222" font-size="13">外围 I/O 总线（SCSI、SATA、USB）</text>
+  <g font-size="13">
+    <line x1="80" y1="230" x2="80" y2="255" class="stroke"/><rect x="40" y="255" width="80" height="34" rx="6" class="box"/><text x="80" y="277" text-anchor="middle">磁盘</text>
+    <line x1="180" y1="230" x2="180" y2="255" class="stroke"/><rect x="140" y="255" width="80" height="34" rx="6" class="box"/><text x="180" y="277" text-anchor="middle">磁盘</text>
+    <line x1="280" y1="230" x2="280" y2="255" class="stroke"/><rect x="240" y="255" width="80" height="34" rx="6" class="box"/><text x="280" y="277" text-anchor="middle">键盘</text>
+    <line x1="380" y1="230" x2="380" y2="255" class="stroke"/><rect x="340" y="255" width="80" height="34" rx="6" class="box"/><text x="380" y="277" text-anchor="middle">鼠标</text>
+    <line x1="480" y1="230" x2="480" y2="255" class="stroke"/><rect x="440" y="255" width="80" height="34" rx="6" class="box"/><text x="480" y="277" text-anchor="middle">U 盘 …</text>
+  </g>
+  <line x1="630" y1="295" x2="630" y2="30" class="arrow" marker-end="url(#mk36-1)"/>
+  <text x="622" y="22" text-anchor="middle" font-size="12" class="t-muted">更快·更短·更贵</text>
+  <text x="620" y="312" text-anchor="end" font-size="12" class="t-muted">更慢·可以挂很多设备</text>
+</svg>
+<figcaption>图 36.1 原型系统架构（Prototypical System Architecture）：离 CPU 越近，总线越快</figcaption>
+</figure>
+<p>为什么要分层？一句话：<strong>物理和成本</strong>。总线越快就必须越短，高性能的内存总线上根本没多少地方插设备；而且把一条总线做快本身就很贵。于是设计者把要求高性能的部件（如显卡）放得离 CPU 近，性能要求低的放得远。把磁盘等慢设备放到外围总线上还有一个好处：可以挂<strong>很多</strong>设备。</p>
+<p>现代系统越来越多地用专用芯片组和更快的点对点互连。下图近似画出了 Intel Z270 芯片组：CPU 离内存最近，同时有一条高性能链路直连显卡；CPU 通过 Intel 专有的 <strong>DMI</strong>（Direct Media Interface）连到一块 I/O 芯片，其余设备再通过各种互连挂到这块芯片上。</p>
+<figure class="fig">
+<svg viewBox="0 0 680 340" width="680" role="img" aria-label="现代系统架构：Intel Z270 芯片组">
+  <g font-size="13">
+  <rect x="285" y="20" width="110" height="50" rx="8" class="box-strong"/><text x="340" y="50" text-anchor="middle" font-weight="700">CPU</text>
+  <rect x="540" y="20" width="110" height="50" rx="8" class="box-strong"/><text x="595" y="50" text-anchor="middle">内存 Memory</text>
+  <rect x="30" y="20" width="110" height="50" rx="8" class="accent-soft"/><text x="85" y="50" text-anchor="middle">显卡 Graphics</text>
+  <line x1="395" y1="45" x2="540" y2="45" style="stroke:var(--c1);stroke-width:6"/><text x="467" y="35" text-anchor="middle" font-size="12">内存互连</text>
+  <line x1="140" y1="45" x2="285" y2="45" style="stroke:var(--c3);stroke-width:5"/><text x="212" y="35" text-anchor="middle" font-size="12">PCIe（显卡）</text>
+  <line x1="340" y1="70" x2="340" y2="140" style="stroke:var(--c4);stroke-width:5"/><text x="350" y="110" font-size="12">DMI</text>
+  <rect x="275" y="140" width="130" height="50" rx="8" class="warn-soft"/><text x="340" y="170" text-anchor="middle" font-weight="650">I/O 芯片</text>
+  <line x1="405" y1="165" x2="500" y2="165" style="stroke:var(--c5);stroke-width:3"/><text x="452" y="157" text-anchor="middle" font-size="12">eSATA</text>
+  <line x1="500" y1="115" x2="500" y2="260" style="stroke:var(--c5);stroke-width:3"/>
+  <line x1="500" y1="115" x2="530" y2="115" class="stroke"/><rect x="530" y="100" width="90" height="30" rx="5" class="box"/><text x="575" y="120" text-anchor="middle">磁盘</text>
+  <line x1="500" y1="163" x2="530" y2="163" class="stroke"/><rect x="530" y="148" width="90" height="30" rx="5" class="box"/><text x="575" y="168" text-anchor="middle">磁盘</text>
+  <line x1="500" y1="211" x2="530" y2="211" class="stroke"/><rect x="530" y="196" width="90" height="30" rx="5" class="box"/><text x="575" y="216" text-anchor="middle">磁盘</text>
+  <line x1="500" y1="259" x2="530" y2="259" class="stroke"/><rect x="530" y="244" width="90" height="30" rx="5" class="box"/><text x="575" y="264" text-anchor="middle">磁盘</text>
+  <line x1="340" y1="190" x2="340" y2="260" style="stroke:var(--c6);stroke-width:3"/><text x="348" y="232" font-size="12">USB</text>
+  <line x1="260" y1="260" x2="420" y2="260" style="stroke:var(--c6);stroke-width:3"/>
+  <line x1="260" y1="260" x2="260" y2="285" class="stroke"/><rect x="215" y="285" width="90" height="32" rx="5" class="box"/><text x="260" y="306" text-anchor="middle">键盘</text>
+  <line x1="420" y1="260" x2="420" y2="285" class="stroke"/><rect x="375" y="285" width="90" height="32" rx="5" class="box"/><text x="420" y="306" text-anchor="middle">鼠标</text>
+  <line x1="275" y1="165" x2="170" y2="165" style="stroke:var(--c3);stroke-width:4"/><text x="222" y="157" text-anchor="middle" font-size="12">PCIe</text>
+  <line x1="170" y1="130" x2="170" y2="230" style="stroke:var(--c3);stroke-width:4"/>
+  <line x1="170" y1="135" x2="140" y2="135" class="stroke"/><rect x="30" y="118" width="110" height="34" rx="5" class="box"/><text x="85" y="140" text-anchor="middle">网卡 Network</text>
+  <line x1="170" y1="215" x2="140" y2="215" class="stroke"/><rect x="30" y="198" width="110" height="34" rx="5" class="ok-soft"/><text x="85" y="220" text-anchor="middle">NVMe 固态盘</text>
+  </g>
+</svg>
+<figcaption>图 36.2 现代系统架构（近似 Intel Z270 芯片组）：高速设备走 PCIe，磁盘走 eSATA，键鼠走 USB</figcaption>
+</figure>
+<p>右边，硬盘通过 eSATA 接入——ATA（AT Attachment）→ SATA（Serial ATA）→ eSATA（external SATA）是存储接口几十年来的演进，每一步都在追赶存储设备的速度。下方 USB 用来接键盘、鼠标这种低速设备。左边的 PCIe（Peripheral Component Interconnect Express）接更高性能的设备，比如网卡，以及 NVMe 这类高性能持久存储。</p>
+
+<h2><span class="num">4</span>标准设备与标准协议</h2>
+<p>为了抓住本质，书中虚构了一个"标准设备"（canonical device，并非真实存在的硬件）。任何设备都有两个重要部分：</p>
+<ul>
+  <li><strong>硬件接口（interface）</strong>：就像软件一样，硬件也要对外提供接口，让系统软件能控制它。每种设备都有约定好的接口和交互协议。</li>
+  <li><strong>内部结构（internal structure）</strong>：实现相关，负责实现设备对外呈现的抽象。简单设备几块芯片就够了；复杂设备里有一个简单的 CPU、通用内存和专用芯片。比如现代 RAID 控制器可能跑着几十万行<strong>固件（firmware）</strong>——也就是运行在硬件里的软件。</li>
+</ul>
+<figure class="fig">
+<svg viewBox="0 0 560 250" width="560" role="img" aria-label="标准设备：接口寄存器与内部结构">
+  <rect x="20" y="10" width="520" height="228" rx="10" class="box-strong"/>
+  <text x="36" y="58" font-weight="700">接口</text><text x="36" y="76" font-size="12" class="t-muted">Interface</text>
+  <rect x="130" y="30" width="120" height="56" rx="6" class="accent-soft"/><text x="190" y="55" text-anchor="middle" font-weight="650">状态</text><text x="190" y="74" text-anchor="middle" font-size="12" class="t-muted">Status</text>
+  <rect x="265" y="30" width="120" height="56" rx="6" class="accent-soft"/><text x="325" y="55" text-anchor="middle" font-weight="650">命令</text><text x="325" y="74" text-anchor="middle" font-size="12" class="t-muted">Command</text>
+  <rect x="400" y="30" width="120" height="56" rx="6" class="accent-soft"/><text x="460" y="55" text-anchor="middle" font-weight="650">数据</text><text x="460" y="74" text-anchor="middle" font-size="12" class="t-muted">Data</text>
+  <line x1="30" y1="104" x2="530" y2="104" style="stroke:var(--border);stroke-dasharray:6 4;stroke-width:1.5"/>
+  <text x="36" y="160" font-weight="700">内部</text><text x="36" y="178" font-size="12" class="t-muted">Internals</text>
+  <rect x="130" y="120" width="390" height="30" rx="5" class="box"/><text x="325" y="140" text-anchor="middle" font-size="13">微控制器（CPU） Micro-controller</text>
+  <rect x="130" y="156" width="390" height="30" rx="5" class="box"/><text x="325" y="176" text-anchor="middle" font-size="13">内存（DRAM / SRAM） Memory</text>
+  <rect x="130" y="192" width="390" height="30" rx="5" class="box"/><text x="325" y="212" text-anchor="middle" font-size="13">其他专用芯片 Other Hardware-specific Chips</text>
+</svg>
+<figcaption>图 36.3 标准设备（A Canonical Device）：OS 只能看到上面三个寄存器，下面的一切对 OS 透明</figcaption>
+</figure>
+<p>这个简化的接口只有三个寄存器：<strong>状态寄存器</strong>（读它可知设备当前状态）、<strong>命令寄存器</strong>（告诉设备执行某个任务）、<strong>数据寄存器</strong>（把数据传给设备或从设备取数据）。OS 读写这些寄存器，就能控制设备的行为。一次典型交互的<strong>标准协议</strong>如下：</p>
+<pre><code>While (STATUS == BUSY)
+    ;                          // ① 等设备空闲（轮询）
+Write data to DATA register    // ② 把数据写入数据寄存器（PIO）
+Write command to COMMAND register
+    // ③ 写命令：隐含地通知设备"数据已就位，开始干活"
+While (STATUS == BUSY)
+    ;                          // ④ 等设备完成这次请求（再次轮询）</code></pre>
+<figure class="fig">
+<svg viewBox="0 0 600 270" width="600" role="img" aria-label="标准协议的四个步骤时序">
+  <defs><marker id="mk36-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <rect x="60" y="10" width="120" height="32" rx="6" class="box-strong"/><text x="120" y="31" text-anchor="middle" font-weight="650">OS（CPU）</text>
+  <rect x="420" y="10" width="120" height="32" rx="6" class="box-strong"/><text x="480" y="31" text-anchor="middle" font-weight="650">设备</text>
+  <line x1="120" y1="42" x2="120" y2="262" style="stroke:var(--border);stroke-width:2"/>
+  <line x1="480" y1="42" x2="480" y2="262" style="stroke:var(--border);stroke-width:2"/>
+  <g font-size="13">
+  <line x1="122" y1="70" x2="476" y2="70" class="arrow" marker-end="url(#mk36-2)"/><text x="300" y="63" text-anchor="middle">① 读 STATUS …… 直到不再 BUSY（轮询）</text>
+  <line x1="476" y1="84" x2="124" y2="84" class="arrow" style="stroke-dasharray:4 3" marker-end="url(#mk36-2)"/><text x="300" y="99" text-anchor="middle" class="t-muted" font-size="12">READY</text>
+  <line x1="122" y1="126" x2="476" y2="126" class="arrow" marker-end="url(#mk36-2)"/><text x="300" y="119" text-anchor="middle">② 写 DATA（CPU 亲自搬数据 = PIO，可能要写很多次）</text>
+  <line x1="122" y1="162" x2="476" y2="162" class="arrow" marker-end="url(#mk36-2)"/><text x="300" y="155" text-anchor="middle">③ 写 COMMAND：启动设备</text>
+  <rect x="470" y="166" width="20" height="60" rx="3" style="fill:var(--c1)"/><text x="500" y="200" font-size="12">设备工作中</text>
+  <line x1="122" y1="210" x2="466" y2="210" class="arrow" marker-end="url(#mk36-2)"/><text x="300" y="203" text-anchor="middle">④ 读 STATUS …… 直到完成（再次轮询）</text>
+  <line x1="466" y1="234" x2="124" y2="234" class="arrow" style="stroke-dasharray:4 3" marker-end="url(#mk36-2)"/><text x="300" y="252" text-anchor="middle" class="t-muted" font-size="12">完成（可能附带错误码）</text>
+  </g>
+</svg>
+<figcaption>标准协议四步：两次轮询夹着一次数据传输和一次命令</figcaption>
+</figure>
+<ul>
+  <li><strong>① 轮询（polling）</strong>：反复读状态寄存器，问设备"你现在怎么样了"，直到它准备好接收命令。</li>
+  <li><strong>② 送数据</strong>：若是磁盘，传一个 4KB 的块需要多次写数据寄存器。当<strong>主 CPU 亲自参与数据搬运</strong>时，就叫<strong>programmed I/O（PIO）</strong>。</li>
+  <li><strong>③ 写命令</strong>：这一步隐含地告诉设备：数据已经到了，开始执行吧。</li>
+  <li><strong>④ 再轮询</strong>：循环等待设备完成，最后可能读到表示成功或失败的错误码。</li>
+</ul>
+<p>这个协议简单、能用，但有明显的低效之处：<strong>轮询浪费 CPU</strong>——设备可能很慢，CPU 却一直空转等待，而不是切换去运行别的就绪进程。第 ② 步的 PIO 也让 CPU 干着"搬砖"的粗活。下面两节分别解决这两个问题。</p>
+
+<h2><span class="num">5</span>用中断降低 CPU 开销</h2>
+<div class="crux"><p><strong>如何避免轮询的代价？</strong>OS 怎样在不频繁轮询的情况下获知设备状态，从而降低管理设备的 CPU 开销？</p><p class="small muted">How can the OS check device status without frequent polling, and thus lower the CPU overhead required to manage the device?</p></div>
+<p>工程师们多年前就找到了办法——我们早就见过的<strong>中断（interrupt）</strong>。OS 发出请求后，让调用进程<strong>睡眠</strong>，上下文切换到别的任务；设备完成操作时发出一个<strong>硬件中断</strong>，CPU 跳到 OS 预先设定好的<strong>中断服务例程（ISR，interrupt service routine）</strong>，也叫<strong>中断处理程序（interrupt handler）</strong>。这段 OS 代码完成请求的收尾（例如读出数据和错误码），并唤醒等待 I/O 的进程。</p>
+<figure class="fig">
+<svg viewBox="0 0 700 250" width="700" role="img" aria-label="一次中断驱动 I/O 的完整过程">
+  <defs><marker id="mk36-7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <g font-size="12">
+  <text x="10" y="44" class="t-muted">进程 1</text><text x="10" y="104" class="t-muted">OS 内核</text><text x="10" y="164" class="t-muted">进程 2</text><text x="10" y="224" class="t-muted">设备</text>
+  <rect x="70" y="28" width="90" height="26" rx="4" style="fill:var(--c1)"/><text x="115" y="46" text-anchor="middle" style="fill:#fff;font-weight:600">运行</text>
+  <rect x="160" y="88" width="80" height="26" rx="4" class="box-strong"/><text x="200" y="100" text-anchor="middle" font-size="11">① 系统调用：</text><text x="200" y="111" text-anchor="middle" font-size="11">发命令给设备</text>
+  <rect x="240" y="88" width="60" height="26" rx="4" style="fill:var(--c8)"/><text x="270" y="105" text-anchor="middle" style="fill:#fff" font-size="11">② 睡眠+切换</text>
+  <rect x="300" y="148" width="190" height="26" rx="4" style="fill:var(--c2)"/><text x="395" y="166" text-anchor="middle" style="fill:#fff;font-weight:600">③ 运行（与 I/O 重叠）</text>
+  <rect x="240" y="208" width="250" height="26" rx="4" style="fill:var(--c1);opacity:.75"/><text x="365" y="226" text-anchor="middle" style="fill:#fff;font-weight:600">设备处理请求</text>
+  <line x1="490" y1="206" x2="490" y2="118" class="arrow" marker-end="url(#mk36-7)"/><text x="496" y="190">④ 硬件中断 ⚡</text>
+  <rect x="490" y="88" width="80" height="26" rx="4" style="fill:var(--bad)"/><text x="530" y="100" text-anchor="middle" style="fill:#fff" font-size="11">⑤ ISR：取结果</text><text x="530" y="111" text-anchor="middle" style="fill:#fff" font-size="11">唤醒进程 1</text>
+  <rect x="570" y="88" width="50" height="26" rx="4" style="fill:var(--c8)"/><text x="595" y="105" text-anchor="middle" style="fill:#fff" font-size="11">⑥ 调度</text>
+  <rect x="620" y="28" width="70" height="26" rx="4" style="fill:var(--c1)"/><text x="655" y="46" text-anchor="middle" style="fill:#fff;font-weight:600">继续</text>
+  <line x1="160" y1="54" x2="170" y2="86" class="arrow" marker-end="url(#mk36-7)"/>
+  <line x1="300" y1="114" x2="310" y2="146" class="arrow" marker-end="url(#mk36-7)"/>
+  <line x1="620" y1="88" x2="630" y2="56" class="arrow" marker-end="url(#mk36-7)"/>
+  <line x1="240" y1="114" x2="250" y2="206" class="arrow" style="stroke-dasharray:4 3" marker-end="url(#mk36-7)"/>
+  </g>
+</svg>
+<figcaption>中断驱动 I/O 的一个完整回合：② 和 ⑤⑥ 就是"用中断的代价"——设备越快，这些固定开销越显得不划算</figcaption>
+</figure>
+<p>中断的价值在于让<strong>计算和 I/O 重叠（overlap）</strong>。原书用字符时间线说明（"1""2"表示进程 1、2 在运行，"p"表示轮询，"c"表示拷贝数据）：</p>
+<figure class="fig">
+  <div class="book-tl" id="book-tl"></div>
+  <figcaption>原书四张时间线（由下方模拟器的同一套算法绘制，零开销假设）：① 轮询 ② 中断 ③ PIO 写 ④ DMA 写</figcaption>
+</figure>
+<p>在 ① 中，进程 1 发出磁盘读请求后，没有中断的系统只能<strong>自旋</strong>，反复轮询直到 I/O 完成（5 个 p）。在 ② 中，OS 在磁盘服务进程 1 的请求时运行进程 2；请求完成时中断到来，OS 唤醒进程 1 再运行它。中间这段时间 CPU 和磁盘<strong>都在干活</strong>。</p>
+
+<h3>中断并不总是更好</h3>
+<div class="aside" data-title="TIP：中断不总是比轮询好">
+<p>中断能让计算和 I/O 重叠，但只对<strong>慢设备</strong>真正划算。设备很快时，第一次轮询往往就发现它已完成；此时用中断反而<strong>拖慢</strong>系统：切换到别的进程、处理中断、再切回来，这些都很昂贵。</p>
+</div>
+<ul>
+  <li><strong>快设备 → 轮询</strong>；<strong>慢设备 → 中断</strong>。粗略地算一笔账：设等待时间为 T<sub>dev</sub>，一次中断处理为 T<sub>isr</sub>，一次上下文切换为 T<sub>cs</sub>。轮询浪费 T<sub>dev</sub> 的 CPU；中断浪费 T<sub>isr</sub> + 2·T<sub>cs</sub>，还会让发起者晚一点醒来。T<sub>dev</sub> 明显大于后者时中断才划算。</li>
+  <li>速度未知或时快时慢？用<strong>两阶段（two-phased）混合</strong>方案：先轮询一小会儿，设备还没好再改用中断，兼得两者之长。</li>
+  <li><strong>网络与活锁（livelock）</strong>：海量数据包每个都触发中断时，OS 可能<strong>只顾处理中断</strong>，用户进程永远得不到运行、请求一个也服务不了。比如一个 Web 服务器突然登上 Hacker News 首页，流量暴涨。这时偶尔改用轮询更好，OS 能更好地控制节奏，让服务器先处理一些请求，再回头检查新到的包。</li>
+  <li><strong>中断合并（coalescing）</strong>：设备要发中断前先<strong>等一会儿</strong>，期间完成的其他请求就能合并到同一次中断里，降低中断处理开销。代价是请求的<strong>延迟增加</strong>——等太久就不划算，这是系统中常见的权衡。</li>
+</ul>
+
+<h2><span class="num">6</span>用 DMA 更高效地搬数据</h2>
+<div class="crux"><p><strong>如何降低 PIO 的开销？</strong>使用 PIO 时，CPU 花太多时间手工在内存和设备之间搬数据。怎样把这项工作卸载出去，让 CPU 得到更有效的利用？</p><p class="small muted">With PIO, the CPU spends too much time moving data to and from devices by hand. How can we offload this work and thus allow the CPU to be more effectively utilized?</p></div>
+<p>回到时间线 ③：进程 1 要写一些数据到磁盘，发起 I/O 时必须由 CPU 把数据<strong>一个字一个字</strong>地从内存拷到设备（c）。拷完了磁盘才开始工作，CPU 才能去做别的事。一件琐碎的活占用了宝贵的 CPU。</p>
+<p>解决办法是<strong>直接内存访问（DMA，Direct Memory Access）</strong>。DMA 引擎是系统中一个非常专门的设备，能在设备和主内存之间编排数据传输，几乎不需要 CPU 干预：</p>
+<figure class="fig">
+<svg viewBox="0 0 640 250" width="640" role="img" aria-label="DMA 工作流程">
+  <defs><marker id="mk36-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker>
+  <marker id="mk36-4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--c4)"/></marker></defs>
+  <g font-size="13">
+  <rect x="20" y="95" width="130" height="60" rx="8" class="box-strong"/><text x="85" y="122" text-anchor="middle" font-weight="650">内存</text><text x="85" y="141" text-anchor="middle" font-size="12" class="t-muted">进程 1 的缓冲区</text>
+  <rect x="490" y="95" width="130" height="60" rx="8" class="box-strong"/><text x="555" y="122" text-anchor="middle" font-weight="650">设备（磁盘）</text><text x="555" y="141" text-anchor="middle" font-size="12" class="t-muted">数据寄存器/缓存</text>
+  <rect x="255" y="15" width="130" height="46" rx="8" class="warn-soft"/><text x="320" y="43" text-anchor="middle" font-weight="650">DMA 引擎</text>
+  <rect x="255" y="190" width="130" height="46" rx="8" class="accent-soft"/><text x="320" y="218" text-anchor="middle" font-weight="650">CPU</text>
+  <line x1="150" y1="125" x2="488" y2="125" style="stroke:var(--c4);stroke-width:5" marker-end="url(#mk36-4)"/>
+  <text x="160" y="116" font-size="12">② 数据直接搬运</text><text x="400" y="116" font-size="12">（CPU 不参与）</text>
+  <line x1="300" y1="188" x2="300" y2="64" class="arrow" marker-end="url(#mk36-3)"/>
+  <text x="292" y="165" text-anchor="end" font-size="12">① 编程 DMA：</text><text x="292" y="181" text-anchor="end" font-size="12">地址、长度、目标设备</text>
+  <line x1="340" y1="64" x2="340" y2="188" class="arrow" style="stroke-dasharray:5 4" marker-end="url(#mk36-3)"/>
+  <text x="348" y="165" font-size="12">③ 传完了：</text><text x="348" y="181" font-size="12">DMA 控制器发中断</text>
+  </g>
+</svg>
+<figcaption>DMA：OS 只负责"下订单"（①），搬运（②）由 DMA 引擎完成，结束时用中断（③）通知 OS</figcaption>
+</figure>
+<p>要把数据送到设备，OS 只需告诉 DMA 引擎数据在内存的什么位置、拷多少、送到哪个设备，然后 OS 就可以去做别的事了。DMA 完成后，DMA 控制器发出中断，OS 就知道传输结束了。对比时间线 ④：拷贝（c）挪到了 DMA 那一行，CPU 在这段时间里运行进程 2，于是进程 2 得到了<strong>更多</strong>的 CPU 时间（8 个单位而不是 5 个）。</p>
+
+<h2><span class="num">7</span>模拟器：轮询、中断、PIO 与 DMA</h2>
+<section class="sim" id="sim-io">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>I/O 时间线：CPU 在等设备时都干了什么？</h3>
+    <div class="desc">先点"原书示例"复现四张时间线，再调设备时间和切换开销。重点观察：快设备时中断反而让进程 1 更晚完成；两阶段混合怎样两头兼顾；DMA 把 c 从 CPU 行挪走后进程 2 多得了多少 CPU。</div></div>
+  <div class="sim-body">
+    <div class="presets">
+      <button data-p="b1">原书①轮询</button><button data-p="b2">原书②中断</button><button data-p="b3">原书③PIO 写</button><button data-p="b4">原书④DMA 写</button>
+      <button data-p="fast">快设备：中断更慢</button><button data-p="slow">慢设备 + 真实开销</button><button data-p="hyb">两阶段混合</button><button data-p="pior">PIO 读（中断中拷贝）</button>
+    </div>
+    <div class="controls">
+      <label>等待方式 <select id="io-wait"><option value="poll">轮询</option><option value="intr">中断</option><option value="hybrid">两阶段混合</option></select></label>
+      <label>数据搬运 <select id="io-xfer"><option value="pio">PIO（CPU 拷贝）</option><option value="dma">DMA</option></select></label>
+      <label>方向 <select id="io-dir"><option value="read">读</option><option value="write">写</option></select></label>
+      <span class="sep"></span>
+      <label>设备服务时间 <input type="number" id="io-dev" min="1" max="30" value="5"></label>
+      <label>拷贝量 c <input type="number" id="io-copy" min="0" max="20" value="0"></label>
+    </div>
+    <div class="controls">
+      <label>上下文切换 s <input type="number" id="io-sw" min="0" max="6" value="0"></label>
+      <label>中断处理 i <input type="number" id="io-ih" min="0" max="6" value="0"></label>
+      <label>混合：自旋上限 <input type="number" id="io-spin" min="0" max="20" value="2"></label>
+      <label>I/O 前运行 <input type="number" id="io-run1" min="1" max="10" value="5"></label>
+      <label>I/O 后运行 <input type="number" id="io-after" min="1" max="10" value="5"></label>
+      <label><input type="checkbox" id="io-p2" checked> 进程 2 有活可干</label>
+    </div>
+    <div id="io-step"></div>
+    <div class="stage" id="io-stage"></div>
+    <div class="tl-legend">
+      <span><i style="background:var(--c1)"></i>1 进程 1</span><span><i style="background:var(--c2)"></i>2 进程 2</span>
+      <span><i style="background:var(--warn-soft);border-color:var(--warn)"></i>p 轮询空转</span><span><i style="background:var(--c4)"></i>c 拷贝数据</span>
+      <span><i style="background:var(--c8)"></i>s 上下文切换</span><span><i style="background:var(--bad)"></i>i 中断处理</span>
+      <span><i style="background:var(--surface-2)"></i>· CPU 空闲</span><span>⚡ 设备/DMA 完成（发中断）</span>
+    </div>
+    <div class="narrate" id="io-narr"></div>
+    <div class="stats" id="io-stats"></div>
+    <h4 style="margin:16px 0 4px;font-size:15px">同一组参数下，三种等待方式的对比</h4>
+    <div class="table-wrap"><table class="cmp-table" id="io-cmp"></table></div>
+  </div>
+</section>
+<p class="small muted">模型说明：时间以"格"为单位离散化；设备完成时刻若恰逢 CPU 正在上下文切换，中断要等切换结束才被处理；"两阶段混合"在设备（含 DMA 搬运）完成时间 ≤ 自旋上限时等同于轮询，否则先轮询满自旋上限再转为中断。原书示例假设切换与中断处理开销为 0。</p>
+
+<h2><span class="num">8</span>中断合并与活锁</h2>
+<p>上面的模拟器里只有一次 I/O。网络设备可不一样：包是源源不断到来的。每个包一次中断，每次中断都有固定开销（保存现场、进入 ISR、应答中断控制器、返回……），外加在中断上下文里做的协议处理。中断的优先级高于任何用户进程，于是到达率一高，CPU 就被中断"吃光"——这就是<strong>接收活锁（receive livelock）</strong>：系统看起来 100% 忙碌，却一个请求也没服务完。</p>
+<div class="key">
+<p><strong>本模拟器的简化模型</strong>（到达率 λ 以"千包/秒"计，等价于"包/毫秒"；时间单位 µs）：</p>
+<ul>
+  <li>每次中断固定开销 <code>h</code>，每包协议处理 <code>c</code>（在中断上下文，优先于用户态），用户进程服务每包需要 <code>u</code>。</li>
+  <li><strong>逐包中断</strong>：中断率 = λ；内核占用 = λ(h + c)/1000；剩给用户的 CPU = 1 − 内核占用；完成率 = min(λ, 剩余 CPU × 1000 / u)。在 λ = 1000/(h+c+u) 达到峰值，在 λ = 1000/(h+c) 降到 0。</li>
+  <li><strong>中断合并（窗口 W）</strong>：第一个包到达后设备再等 W 才发中断，期间到达的包一起处理。平均每次中断处理 1 + λW/1000 个包，中断率 = λ /(1 + λW/1000)；额外延迟 ≈ (W + n·W/2)/(1+n)，n = λW/1000。</li>
+  <li><strong>轮询/NAPI 式混合</strong>：负载低时逐包中断；负载升高后关中断、由内核按预算轮询，超出处理能力的包直接在网卡丢弃（不进 CPU）。完成率 = min(λ, 1000/(c+u))，不会塌陷。</li>
+</ul>
+</div>
+<section class="sim" id="sim-ll">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>中断合并（coalescing）与接收活锁（livelock）</h3>
+    <div class="desc">拖动到达率 λ，看三条"完成率-到达率"曲线：逐包中断在过载后急剧塌陷到 0；合并推迟了塌陷但付出延迟；轮询式混合保持在上限。下方时间条展示 400µs 内 CPU 被怎样切分。</div></div>
+  <div class="sim-body">
+    <div class="presets">
+      <button data-l="10">轻负载 λ=10</button><button data-l="28">接近峰值 λ=28</button><button data-l="60">过载 λ=60</button><button data-l="90">活锁 λ=90</button>
+    </div>
+    <div class="controls rng-row">
+      <label>到达率 λ <input type="range" id="ll-lam" min="1" max="150" value="28"><output id="ll-lam-o"></output></label>
+      <label>合并窗口 W <input type="range" id="ll-W" min="0" max="200" step="5" value="50"><output id="ll-W-o"></output></label>
+    </div>
+    <div class="controls rng-row">
+      <label>中断固定开销 h <input type="range" id="ll-h" min="1" max="30" value="10"><output id="ll-h-o"></output></label>
+      <label>每包协议处理 c <input type="range" id="ll-c" min="1" max="20" value="5"><output id="ll-c-o"></output></label>
+      <label>每包用户服务 u <input type="range" id="ll-u" min="5" max="60" value="20"><output id="ll-u-o"></output></label>
+    </div>
+    <div class="stage" id="ll-chart"></div>
+    <div class="stage" id="ll-bars" style="margin-top:10px"></div>
+    <div class="stage" id="ll-strip" style="margin-top:10px"></div>
+    <div class="narrate" id="ll-narr"></div>
+    <div class="stats" id="ll-stats"></div>
+  </div>
+</section>
+
+<h2><span class="num">9</span>与设备通信的两种方法</h2>
+<div class="crux"><p><strong>如何与设备通信？</strong>硬件应该怎样与设备通信？需要专门的指令吗？还是有别的办法？</p><p class="small muted">How should the hardware communicate with a device? Should there be explicit instructions? Or are there other ways to do it?</p></div>
+<p>到目前为止我们还没说 OS 究竟<strong>怎样</strong>读写设备寄存器。历史上形成了两种主要方法：</p>
+<figure class="fig">
+<svg viewBox="0 0 700 290" width="700" role="img" aria-label="显式 I/O 指令与内存映射 I/O 对比">
+  <defs><marker id="mk36-5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <g font-size="13">
+  <text x="170" y="20" text-anchor="middle" font-weight="700">显式 I/O 指令（x86 in / out）</text>
+  <rect x="20" y="40" width="110" height="60" rx="8" class="accent-soft"/><text x="75" y="64" text-anchor="middle" font-weight="650">CPU</text><text x="75" y="84" text-anchor="middle" font-size="11" class="mono">outb 0x1F7</text>
+  <text x="200" y="45" text-anchor="middle" font-size="12" class="t-muted">内存地址空间</text>
+  <rect x="160" y="52" width="80" height="150" rx="4" class="box"/><text x="200" y="130" text-anchor="middle" font-size="12">RAM</text>
+  <text x="290" y="45" text-anchor="middle" font-size="12" class="t-muted">I/O 端口空间</text>
+  <rect x="250" y="52" width="80" height="150" rx="4" class="box"/>
+  <rect x="250" y="100" width="80" height="40" class="warn-soft"/><text x="290" y="117" text-anchor="middle" font-size="11" class="mono">0x1F0–</text><text x="290" y="132" text-anchor="middle" font-size="11" class="mono">0x1F7 IDE</text>
+  <rect x="250" y="150" width="80" height="22" class="warn-soft"/><text x="290" y="166" text-anchor="middle" font-size="11" class="mono">0x3F6</text>
+  <path d="M130,80 C200,90 210,120 248,120" class="arrow" marker-end="url(#mk36-5)"/>
+  <text x="20" y="232" font-size="12">• 独立的"端口"地址空间，专用指令访问</text>
+  <text x="20" y="252" font-size="12">• 指令是<tspan font-weight="700">特权</tspan>的：只有 OS 能直接碰设备</text>
+  <line x1="350" y1="30" x2="350" y2="270" style="stroke:var(--border);stroke-dasharray:4 4"/>
+  <text x="530" y="20" text-anchor="middle" font-weight="700">内存映射 I/O（memory-mapped I/O）</text>
+  <rect x="370" y="40" width="120" height="60" rx="8" class="accent-soft"/><text x="430" y="64" text-anchor="middle" font-weight="650">CPU</text><text x="430" y="84" text-anchor="middle" font-size="11" class="mono">store → 地址 X</text>
+  <text x="600" y="45" text-anchor="middle" font-size="12" class="t-muted">统一的物理地址空间</text>
+  <rect x="550" y="52" width="100" height="150" rx="4" class="box"/><text x="600" y="85" text-anchor="middle" font-size="12">RAM</text>
+  <rect x="550" y="110" width="100" height="40" class="warn-soft"/><text x="600" y="127" text-anchor="middle" font-size="11">设备寄存器</text><text x="600" y="142" text-anchor="middle" font-size="11" class="mono">地址 X …</text>
+  <text x="600" y="180" text-anchor="middle" font-size="12">RAM</text>
+  <path d="M490,80 C520,90 520,130 548,130" class="arrow" marker-end="url(#mk36-5)"/>
+  <text x="370" y="232" font-size="12">• 普通 load/store，硬件把该地址路由到设备</text>
+  <text x="370" y="252" font-size="12">• 不需要新指令；保护靠地址映射/权限</text>
+  </g>
+</svg>
+<figcaption>两种访问设备寄存器的方式，今天都还在使用</figcaption>
+</figure>
+<ul>
+  <li><strong>显式 I/O 指令（explicit I/O instructions）</strong>：最古老的方法（IBM 大型机用了很多年）。x86 上的 <code>in</code> 和 <code>out</code> 指令就是例子：要把数据送给设备，调用者把数据放在某个寄存器里，并指定一个命名该设备的<strong>端口（port）</strong>。这些指令通常是<strong>特权指令</strong>——想象一下任何程序都能直接读写磁盘：完全失控，任何用户程序都能借此夺取整台机器。</li>
+  <li><strong>内存映射 I/O（memory-mapped I/O）</strong>：硬件让设备寄存器看起来就像内存单元。OS 对某个地址发出 load（读）或 store（写），硬件把这个访问路由到设备而不是主存。</li>
+</ul>
+<p>两者没有谁有压倒性优势。内存映射的好处是不需要新指令，但两种方法今天都在用。</p>
+
+<h2><span class="num">10</span>融入 OS：设备驱动</h2>
+<div class="crux"><p><strong>如何构建设备无关的 OS？</strong>怎样让 OS 的大部分保持设备中立，把设备交互的细节从主要子系统中隐藏起来？</p><p class="small muted">How can we keep most of the OS device-neutral, thus hiding the details of device interactions from major OS subsystems?</p></div>
+<p>我们希望文件系统在 SCSI 盘、IDE 盘、USB 闪存盘上都能工作，而且对"怎样给不同类型的盘发读写请求"一无所知。解决办法是古老的<strong>抽象</strong>：在最底层，OS 中有一块软件必须详细了解设备如何工作，我们叫它<strong>设备驱动（device driver）</strong>，所有设备交互的细节都封装在里面。</p>
+<figure class="fig">
+<svg viewBox="0 0 700 380" width="700" role="img" aria-label="Linux 文件系统栈">
+  <defs><marker id="mk36-6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <g font-size="13">
+  <rect x="60" y="15" width="360" height="42" rx="7" class="box-strong"/><text x="240" y="41" text-anchor="middle" font-weight="650">应用程序 Application</text>
+  <text x="445" y="78" font-size="12" class="t-muted">POSIX API [open, read, write, close …]</text>
+  <line x1="20" y1="86" x2="680" y2="86" style="stroke:var(--bad);stroke-dasharray:7 5;stroke-width:1.5"/>
+  <text x="24" y="78" font-size="12" style="fill:var(--bad)">用户态 user</text><text x="24" y="102" font-size="12" style="fill:var(--bad)">内核态 kernel mode</text>
+  <rect x="60" y="112" width="240" height="44" rx="7" class="accent-soft"/><text x="180" y="139" text-anchor="middle" font-weight="650">文件系统 File System</text>
+  <rect x="315" y="112" width="105" height="44" rx="7" class="warn-soft"/><text x="367" y="139" text-anchor="middle" font-weight="650">Raw 接口</text>
+  <line x1="180" y1="57" x2="180" y2="110" class="arrow" marker-end="url(#mk36-6)"/><line x1="367" y1="57" x2="367" y2="110" class="arrow" marker-end="url(#mk36-6)"/>
+  <text x="445" y="182" font-size="12" class="t-muted">通用块接口 [block read/write]</text>
+  <rect x="60" y="192" width="360" height="44" rx="7" class="box"/><text x="240" y="219" text-anchor="middle" font-weight="650">通用块层 Generic Block Layer</text>
+  <line x1="180" y1="156" x2="180" y2="190" class="arrow" marker-end="url(#mk36-6)"/><line x1="367" y1="156" x2="367" y2="190" class="arrow" marker-end="url(#mk36-6)"/>
+  <text x="445" y="262" font-size="12" class="t-muted">特定块接口 [protocol-specific read/write]</text>
+  <rect x="60" y="272" width="360" height="44" rx="7" class="ok-soft"/><text x="240" y="299" text-anchor="middle" font-weight="650">设备驱动 Device Driver [SCSI, ATA …]</text>
+  <line x1="240" y1="236" x2="240" y2="270" class="arrow" marker-end="url(#mk36-6)"/>
+  <line x1="240" y1="316" x2="240" y2="336" class="arrow" marker-end="url(#mk36-6)"/>
+  <rect x="100" y="338" width="80" height="30" rx="5" class="box"/><text x="140" y="358" text-anchor="middle" font-size="12">SCSI 盘</text>
+  <rect x="200" y="338" width="80" height="30" rx="5" class="box"/><text x="240" y="358" text-anchor="middle" font-size="12">SATA 盘</text>
+  <rect x="300" y="338" width="80" height="30" rx="5" class="box"/><text x="340" y="358" text-anchor="middle" font-size="12">USB 盘</text>
+  <text x="445" y="130" font-size="12">← 不知道底下是哪类盘</text>
+  <text x="445" y="146" font-size="12">　 只发"读/写第 n 块"</text>
+  <text x="445" y="300" font-size="12">← 唯一懂设备细节的地方</text>
+  </g>
+</svg>
+<figcaption>图 36.4 文件系统栈（The File System Stack，Linux 的粗略示意）</figcaption>
+</figure>
+<p>文件系统（更别提上面的应用）完全不关心用的是哪类磁盘，它只向<strong>通用块层</strong>发出块读写请求，通用块层把请求转给合适的设备驱动，由驱动处理发出具体请求的细节。图中还有一个<strong>raw 接口</strong>：让文件系统检查器（fsck，后面会讲）、磁盘碎片整理工具等特殊程序绕过文件抽象，直接读写块。大多数系统都提供这类接口来支持底层存储管理程序。</p>
+<p>封装也有代价。如果某设备有很多特殊能力，却必须向内核其余部分呈现通用接口，这些能力就用不上了。Linux 中的 SCSI 设备就是一例：SCSI 有非常丰富的错误报告，但因为其他块设备（如 ATA/IDE）的错误处理简单得多，上层软件最终只能收到一个笼统的 <code>EIO</code>（generic I/O error），SCSI 提供的额外细节对文件系统来说全丢了。</p>
+<figure class="fig">
+<svg viewBox="0 0 600 70" width="600" role="img" aria-label="Linux 内核代码中设备驱动约占 70%">
+  <rect x="10" y="12" width="406" height="30" rx="4" style="fill:var(--c1)"/><text x="213" y="32" text-anchor="middle" font-size="13" style="fill:#fff;font-weight:600">设备驱动 &gt; 70%</text>
+  <rect x="418" y="12" width="172" height="30" rx="4" style="fill:var(--c8)"/><text x="504" y="32" text-anchor="middle" font-size="13" style="fill:#fff;font-weight:600">其余内核代码</text>
+  <text x="10" y="62" font-size="12" class="t-muted">对 Linux 内核的研究：超过 70% 的 OS 代码在设备驱动里 [C01]</text>
+</svg>
+<figcaption>"操作系统有几百万行代码"，其实大多是驱动代码</figcaption>
+</figure>
+<p>因为你可能插进系统的每一种设备都需要驱动，驱动逐渐占据了内核代码的<strong>绝大部分</strong>：研究表明 Linux 内核超过 70% 的代码在设备驱动里，Windows 大概也差不多。当然，对某一台具体机器，大部分驱动代码并不活跃（同时连着的设备只有几个）。更让人沮丧的是，驱动常常由"业余者"而非全职内核开发者编写，bug 多得多（一项研究发现驱动的 bug 率约是内核主线代码的 7 倍），是内核崩溃的主要来源。</p>
+
+<h2><span class="num">11</span>案例：一个简单的 IDE 磁盘驱动</h2>
+<p>来看一个真实设备：IDE 磁盘。它的接口由四类寄存器组成：控制、命令块、状态、错误。在 x86 上用 <code>in</code>/<code>out</code> 指令读写特定"I/O 地址"（如 0x3F6）来访问它们。</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>端口地址</th><th>寄存器</th><th>用途</th></tr></thead>
+  <tbody>
+  <tr><td class="mono"><code>0x3F6</code></td><td>控制寄存器 Control</td><td>= 0x08（0000 1RE0）：R = reset；E = 0 表示<strong>允许中断</strong></td></tr>
+  <tr><td><code>0x1F0</code></td><td>数据端口 Data Port</td><td>PIO 读写扇区数据</td></tr>
+  <tr><td><code>0x1F1</code></td><td>错误 Error</td><td>状态中 ERROR=1 时查看</td></tr>
+  <tr><td><code>0x1F2</code></td><td>扇区数 Sector Count</td><td>本次要读写几个扇区</td></tr>
+  <tr><td><code>0x1F3</code></td><td>LBA 低字节</td><td rowspan="3">逻辑块地址（LBA）的各个字节</td></tr>
+  <tr><td><code>0x1F4</code></td><td>LBA 中字节</td></tr>
+  <tr><td><code>0x1F5</code></td><td>LBA 高字节</td></tr>
+  <tr><td><code>0x1F6</code></td><td>1B1D TOP4LBA</td><td>B = LBA 模式，D = 驱动器号（主 0x00 / 从 0x10），低 4 位是 LBA 最高 4 位</td></tr>
+  <tr><td><code>0x1F7</code></td><td>命令 / 状态</td><td>写 = 命令（READ/WRITE），读 = 状态</td></tr>
+  </tbody>
+</table></div>
+<p><strong>状态寄存器（0x1F7）</strong>的 8 个位（7 → 0）：</p>
+<div class="bits"><div class="hot">BUSY</div><div class="hot">READY</div><div>FAULT</div><div>SEEK</div><div class="hot">DRQ</div><div>CORR</div><div>IDDEX</div><div class="hot">ERROR</div></div>
+<p><strong>错误寄存器（0x1F1）</strong>，ERROR = 1 时检查（7 → 0）：</p>
+<div class="bits"><div>BBK</div><div>UNC</div><div>MC</div><div>IDNF</div><div>MCR</div><div>ABRT</div><div>T0NF</div><div>AMNF</div></div>
+<p class="small muted">BBK 坏块；UNC 不可纠正的数据错误；MC 介质已更换；IDNF 找不到 ID 标记；MCR 请求更换介质；ABRT 命令中止；T0NF 找不到 0 号磁道；AMNF 找不到地址标记。（图 36.5 IDE 接口）</p>
+<p>假设设备已初始化，与它交互的基本协议是：</p>
+<ol>
+  <li><strong>等驱动器就绪</strong>：读状态寄存器（0x1F7），直到 READY 且不 BUSY。</li>
+  <li><strong>把参数写入命令寄存器</strong>：扇区数、要访问扇区的 LBA、驱动器号（IDE 只允许两个驱动器：主 0x00、从 0x10），写到 0x1F2–0x1F6。</li>
+  <li><strong>启动 I/O</strong>：把 READ 或 WRITE 命令写入 0x1F7。</li>
+  <li><strong>数据传输（写）</strong>：等状态为 READY 且 DRQ（驱动器请求数据），把数据写进数据端口。</li>
+  <li><strong>处理中断</strong>：最简单时每传一个扇区处理一次中断；复杂些的做法可以批量，整个传输结束才发一次中断。</li>
+  <li><strong>错误处理</strong>：每次操作后读状态寄存器；若 ERROR 位为 1，读错误寄存器了解详情。</li>
+</ol>
+<p>xv6 的 IDE 驱动（简化版，图 36.6）几乎完整体现了这个协议：</p>
+<pre><code>static int ide_wait_ready() {
+  while (((int r = inb(0x1f7)) &amp; IDE_BSY) || !(r &amp; IDE_DRDY))
+    ;                                  // 轮询：直到不 BUSY 且 READY
+}
+static void ide_start_request(struct buf *b) {
+  ide_wait_ready();
+  outb(0x3f6, 0);                      // 允许中断（E=0）
+  outb(0x1f2, 1);                      // 几个扇区？
+  outb(0x1f3, b-&gt;sector &amp; 0xff);       // LBA 低字节
+  outb(0x1f4, (b-&gt;sector &gt;&gt; 8) &amp; 0xff); // LBA 中字节
+  outb(0x1f5, (b-&gt;sector &gt;&gt; 16) &amp; 0xff);// LBA 高字节
+  outb(0x1f6, 0xe0 | ((b-&gt;dev&amp;1)&lt;&lt;4) | ((b-&gt;sector&gt;&gt;24)&amp;0x0f));
+  if (b-&gt;flags &amp; B_DIRTY) {
+    outb(0x1f7, IDE_CMD_WRITE);        // 写命令
+    outsl(0x1f0, b-&gt;data, 512/4);      // 写：顺便用 PIO 把数据送过去
+  } else {
+    outb(0x1f7, IDE_CMD_READ);         // 读命令（此时不传数据）
+  }
+}
+void ide_rw(struct buf *b) {
+  acquire(&amp;ide_lock);
+  for (struct buf **pp = &amp;ide_queue; *pp; pp = &amp;(*pp)-&gt;qnext)
+    ;                                  // 走到队尾
+  *pp = b;                             // 请求入队
+  if (ide_queue == b)                  // 队列原本为空？
+    ide_start_request(b);              // 直接发给磁盘
+  while ((b-&gt;flags &amp; (B_VALID|B_DIRTY)) != B_VALID)
+    sleep(b, &amp;ide_lock);               // 睡眠，等中断唤醒
+  release(&amp;ide_lock);
+}
+void ide_intr() {
+  acquire(&amp;ide_lock);
+  struct buf *b = ide_queue;
+  if (!(b-&gt;flags &amp; B_DIRTY) &amp;&amp; ide_wait_ready() &gt;= 0)
+    insl(0x1f0, b-&gt;data, 512/4);       // 读：在中断处理中取数据（PIO）
+  b-&gt;flags |= B_VALID;
+  b-&gt;flags &amp;= ~B_DIRTY;
+  wakeup(b);                           // 唤醒等待的进程
+  if ((ide_queue = b-&gt;qnext) != 0)     // 还有请求？
+    ide_start_request(ide_queue);      // 发出下一个
+  release(&amp;ide_lock);
+}</code></pre>
+<ul>
+  <li><strong><code>ide_wait_ready()</code></strong>：就是标准协议里的轮询循环。注意驱动在"发命令前"这种很短的等待上仍用轮询——磁盘此时通常马上就绪，用中断反而不划算。</li>
+  <li><strong><code>ide_start_request()</code></strong>：用 <code>outb</code> 依次写 0x3F6（开中断）、0x1F2（扇区数）、0x1F3–0x1F6（LBA 与驱动器号），最后写 0x1F7 启动。写请求紧接着用 <code>outsl</code> 以 PIO 方式送出 512 字节。</li>
+  <li><strong><code>ide_rw()</code></strong>：把请求挂到队尾；若队列原本为空就立即发给磁盘；然后调用进程<strong>睡眠</strong>，直到请求完成（B_VALID 置位且不再 DIRTY）——这就是"中断 + 睡眠"而非轮询等待。</li>
+  <li><strong><code>ide_intr()</code></strong>：中断处理程序。读请求时用 <code>insl</code> 从数据端口取回数据（仍是 PIO），标记完成，<code>wakeup</code> 唤醒等待进程；若队列里还有请求，立刻发出下一个，让磁盘不闲着。</li>
+</ul>
+
+<h2><span class="num">12</span>历史注记</h2>
+<p>中断是一个非常古老的想法，最早的机器上就有：20 世纪 50 年代初的 UNIVAC 已有某种形式的中断向量。至于谁最先引入 DMA 还有争论：Knuth 等人认为是 DYSEAC（一台"移动"计算机——当时的意思是能装在拖车里拉走），也有人认为是 IBM SAGE。无论如何，到 50 年代中期，已经存在能与内存直接通信、完成后中断 CPU 的 I/O 设备系统。这些想法其实相当"显然"：CPU 快、设备慢，让 CPU 在慢 I/O 进行时去做别的事，是那个年代的工程师自然会想到的。</p>
+
+<h2><span class="num">13</span>先预测，再验证</h2>
+<div class="exercise"><div class="q">载入"原书①轮询"和"原书②中断"。两者进程 1 的完成时间分别是多少？CPU 有用工作时间（1 和 2 的格数）各是多少？先写下预测再运行。</div>
+<details class="reveal"><summary>看答案</summary><div>进程 1 都在第 15 格完成——在零开销的理想情况下，中断<strong>并不会让进程 1 更快</strong>。区别在于 CPU 的用途：轮询时 5 格被 p 浪费，有用工作 10 格；中断时这 5 格给了进程 2，有用工作 15 格（利用率 100%）。中断提升的是<strong>整体利用率/吞吐</strong>，而不是单个 I/O 的延迟。</div></details></div>
+<div class="exercise"><div class="q">设备服务时间 1，上下文切换 s = 2，中断处理 i = 1，读、无拷贝。分别用轮询和中断，进程 1 何时完成？</div>
+<details class="reveal"><summary>看答案</summary><div>轮询：1×5、p、1×5，第 <strong>11</strong> 格完成。中断：1×5 后先花 2 格切换（设备在第 6 格就完成了，中断只能等切换做完），再 1 格中断处理、2 格切回，最后 1×5，第 <strong>15</strong> 格完成，而且进程 2 一格也没跑上。这就是"快设备用中断反而更慢"（点"快设备：中断更慢"预设验证）。</div></details></div>
+<div class="exercise"><div class="q">保持 s = 2、i = 1，把设备服务时间改成 12（"慢设备 + 真实开销"）。三种方式中哪种让进程 1 最早完成？哪种让进程 2 得到最多 CPU？</div>
+<details class="reveal"><summary>看答案</summary><div>轮询：进程 1 在 22 完成，进程 2 得 0 格，浪费 12 格 p。中断：进程 1 在 25 完成（多了 2+1+2 的开销），但进程 2 得到 10 格。两阶段（自旋上限 2）：同样 25 完成，进程 2 得 8 格（前 2 格轮询白转）。结论：对单个 I/O 的延迟，轮询始终最低；中断的价值是把等待时间"还"给其他进程。慢设备时这笔账划算，快设备时不划算。</div></details></div>
+<div class="exercise"><div class="q">写方向、拷贝量 c = 10、设备时间 5、中断、零开销、I/O 后运行 2。PIO 和 DMA 下进程 1 的完成时间与进程 2 得到的 CPU 各是多少？</div>
+<details class="reveal"><summary>看答案</summary><div>两者进程 1 都在第 22 格完成（拷贝 10 + 设备 5 的串行路径不变），但 PIO 时 CPU 花 10 格做 c，进程 2 只得 5 格；DMA 时拷贝交给 DMA 引擎，进程 2 得到 15 格。DMA 同样不缩短这次 I/O，本身，它省下的是 CPU。</div></details></div>
+<div class="exercise"><div class="q">两阶段混合：设备时间 3，s = 2，i = 1。自旋上限分别设为 2 和 4，进程 1 各在何时完成？自旋上限该怎么选？</div>
+<details class="reveal"><summary>看答案</summary><div>上限 4：设备 3 格内完成，等同轮询，第 <strong>13</strong> 格完成。上限 2：白转 2 格后仍转中断，付出 2+1+2 的开销，第 <strong>17</strong> 格完成，比纯轮询和纯中断都差。经验法则：自旋上限大约取"一次中断 + 两次切换"的代价——等待不超过这个量，轮询更省；超过了，再切换也不亏太多（类似第 28/32 章讨论的"先自旋后睡眠"锁）。</div></details></div>
+<div class="exercise"><div class="q">在活锁模拟器中取默认 h = 10、c = 5、u = 20 µs。先算：逐包中断的完成率在 λ 为多少时达到峰值？λ 为多少时降为 0？轮询式混合的上限是多少？再拖动滑块验证。</div>
+<details class="reveal"><summary>看答案</summary><div>峰值 λ = 1000/(10+5+20) ≈ <strong>28.6</strong> 千包/秒；降为 0 于 λ = 1000/(10+5) ≈ <strong>66.7</strong>（此后 CPU 100% 在处理中断：活锁）。轮询式混合的上限 = 1000/(5+20) = <strong>40</strong> 千包/秒，之后保持平稳，多余的包在网卡处被丢弃。合并窗口 W = 50 时，λ = 60 下完成率约 27.5，比逐包中断的 5 好得多，但每个包平均多等约 31 µs。</div></details></div>
+
+<h2><span class="num">14</span>动手实验：轮询 vs 阻塞等待</h2>
+<div class="lab">
+<p>用户态程序摸不到真实的设备寄存器，但我们可以用一个"慢设备"来模仿：子进程睡眠一段时间后往管道写 1 个字节（相当于设备完成）。父进程用三种方式等待它：</p>
+<ul>
+  <li><code>poll</code>：把管道设成非阻塞，反复 <code>read()</code> 直到读到数据——就是"读状态寄存器，BUSY 就再读"的轮询；</li>
+  <li><code>block</code>：阻塞 <code>read()</code>，进程睡眠，数据到了由内核唤醒——相当于中断驱动；</li>
+  <li><code>hybrid</code>：先自旋 <code>spin_us</code> 微秒，还没好就改为阻塞——两阶段混合。</li>
+</ul>
+<p>程序用 <code>getrusage()</code> 统计父进程等待期间消耗的 CPU 时间（用户态 + 内核态），用 <code>clock_gettime()</code> 统计墙钟时间。</p>
+<pre><code><span class="cmd">cd labs/36-io-devices &amp;&amp; make</span>
+<span class="cmd">./wait-io poll 500</span>      # 设备延迟 500ms，轮询
+<span class="cmd">./wait-io block 500</span>     # 阻塞等待
+<span class="cmd">./wait-io hybrid 500 100</span># 先自旋 100µs 再阻塞
+<span class="cmd">make run</span>                # 一次跑完，含 1ms 快设备的对比</code></pre>
+<p>示例输出（WSL2 + gcc 14 实测；你的机器上数字会不同）：</p>
+<pre><code>mode=poll   device=500ms  wall=  502.4 ms  cpu(user+sys)=  466.2 ms  ( 92.8% of wall)  polls=811443
+mode=block  device=500ms  wall=  500.7 ms  cpu(user+sys)=    0.1 ms  (  0.0% of wall)  polls=0
+mode=hybrid device=500ms  wall=  502.4 ms  cpu(user+sys)=    0.1 ms  (  0.0% of wall)  polls=180
+--- 快设备（1ms）---
+mode=poll   device=1ms  wall=    7.3 ms  cpu(user+sys)=    3.3 ms  ( 45.4% of wall)  polls=6229
+mode=block  device=1ms  wall=    3.1 ms  cpu(user+sys)=    0.1 ms  (  3.0% of wall)  polls=0</code></pre>
+<p><strong>该观察到什么：</strong>三种方式的墙钟时间几乎一样（都要等"设备" 500ms），但轮询把约 93% 的时间花在 CPU 上、做了八十多万次无用的 <code>read()</code>；阻塞等待几乎不耗 CPU——这段 CPU 可以给别的进程用。混合方式只在开头自旋了 180 次，之后睡眠，CPU 消耗和阻塞一样低。</p>
+<p><strong>为什么快设备那组没显示"轮询更快"？</strong>在用户态，"设备"本身是个要被调度、要唤醒的进程，<code>fork</code> 和定时器的误差（毫秒级）远大于一次中断/切换的开销（微秒级），所以这个实验只能清楚展示"轮询浪费 CPU"这一面。"快设备时轮询延迟更低"要在内核里才明显——Linux 的 NVMe 驱动为此提供了 <code>io_poll</code>（高优先级 I/O 走轮询），网卡驱动的 NAPI 也是在高负载时从中断切到轮询。</p>
+</div>
+
+<h2><span class="num">15</span>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="0"><div class="q">为什么系统要把总线分成内存总线、通用 I/O 总线、外围总线几层？</div>
+  <div class="opts"><button>A. 越快的总线必须越短、造价越高，所以只把高性能部件放近，慢设备放远并能挂很多</button><button>B. 为了让 OS 能区分用户态和内核态</button><button>C. 为了让每个设备都能直接和 CPU 相连</button><button>D. 因为外围设备必须使用不同的电压</button></div>
+  <div class="explain">原书的答案是"物理和成本"：高速总线短、贵、插槽少；分层让高性能部件（如显卡）靠近 CPU，慢设备（磁盘、键鼠）挂在外围总线上，而且可以挂很多。</div></div>
+<div class="mcq" data-answer="3"><div class="q">一个设备几乎总在第一次轮询时就已完成。对它使用中断会怎样？</div>
+  <div class="opts"><button>A. 一样：中断和轮询只是实现风格不同</button><button>B. 更快：中断总能让计算与 I/O 重叠</button><button>C. 会导致活锁</button><button>D. 更慢：切换到其他进程、处理中断、再切回的开销超过了等待时间</button></div>
+  <div class="explain">对快设备，中断带来的上下文切换和中断处理开销比设备本身还贵。书中的建议：快设备轮询，慢设备中断，不确定时两阶段混合。</div></div>
+<div class="mcq" data-answer="2"><div class="q">关于 DMA，下列哪项说法正确？</div>
+  <div class="opts"><button>A. DMA 完成后，OS 必须轮询 DMA 引擎才能知道结束了</button><button>B. DMA 让单次 I/O 的完成时间大大缩短</button><button>C. OS 告诉 DMA 引擎数据地址、长度和目标设备后就去做别的事，传输完成时 DMA 控制器发中断</button><button>D. DMA 需要 CPU 逐字把数据写入设备的数据寄存器</button></div>
+  <div class="explain">DMA 卸下的是 CPU 的搬运工作（PIO 的 c），CPU 可以运行别的进程；完成时靠中断通知。单次 I/O 的串行路径（拷贝 + 设备服务）并不因此变短。</div></div>
+<div class="mcq" data-answer="2"><div class="q">"接收活锁（receive livelock）"指的是：</div>
+  <div class="opts"><button>A. 网卡缓冲区满导致丢包</button><button>B. 设备驱动在中断处理程序中睡眠</button><button>C. 大量数据包各自触发中断，OS 忙于处理中断，用户进程得不到运行，请求一个都服务不完</button><button>D. 两个进程互相等待对方释放锁</button></div>
+  <div class="explain">活锁时系统很"忙"却没有进展。中断优先级高于用户进程，到达率足够高时 CPU 全部花在中断上。对策：高负载时改为轮询（控制节奏），或中断合并。</div></div>
+<div class="mcq" data-answer="0"><div class="q">中断合并（interrupt coalescing）的代价是什么？</div>
+  <div class="opts"><button>A. 设备要先等一会儿再发中断，单个请求的延迟会增加</button><button>B. 中断次数变多</button><button>C. 需要额外的 DMA 引擎</button><button>D. 只能用于磁盘，不能用于网卡</button></div>
+  <div class="explain">合并用"等一等"换来"少中断几次"，典型的延迟 vs 开销权衡；等太久延迟就不可接受。</div></div>
+<div class="mcq" data-answer="1"><div class="q">关于内存映射 I/O，正确的是：</div>
+  <div class="opts"><button>A. 它比显式 I/O 指令有压倒性的性能优势，所以后者已被淘汰</button><button>B. 设备寄存器表现为内存地址，OS 用普通 load/store 访问，硬件把它路由到设备</button><button>C. 它让用户程序可以随意访问设备</button><button>D. 它需要 x86 的 in/out 指令</button></div>
+  <div class="explain">内存映射 I/O 的好处是不需要新指令；原书强调两种方法没有谁有压倒性优势，今天都在用。访问权限仍由 OS 通过地址映射控制。</div></div>
+<div class="mcq" data-answer="3"><div class="q">Linux 中 SCSI 设备丰富的错误信息为何到文件系统那里只剩一个 EIO？</div>
+  <div class="opts"><button>A. SCSI 协议不支持错误报告</button><button>B. EIO 是 SCSI 规范规定的唯一错误码</button><button>C. 文件系统主动丢弃了错误信息以提升性能</button><button>D. 驱动必须向上呈现通用块接口，而其他块设备（ATA/IDE）的错误处理简单得多，特殊能力在抽象中丢失</button></div>
+  <div class="explain">这是抽象/封装的代价：为了设备无关，上层只能看到所有设备的"最大公约数"。</div></div>
+<div class="mcq" data-answer="1"><div class="q">在 xv6 IDE 驱动中，<code>ide_rw()</code> 发出请求后调用进程如何等待完成？</div>
+  <div class="opts"><button>A. 在 ide_wait_ready() 中一直轮询状态寄存器直到数据到来</button><button>B. 调用 sleep() 睡眠，由中断处理程序 ide_intr() 中的 wakeup() 唤醒</button><button>C. 由 DMA 引擎直接把进程放回就绪队列</button><button>D. 反复调用 ide_start_request() 重发请求</button></div>
+  <div class="explain">ide_rw() 把请求入队（必要时立即发出），然后 sleep；磁盘完成后产生中断，ide_intr() 取数据（读时）、标记完成、wakeup 等待者并发出队列中的下一个请求。ide_wait_ready() 的轮询只用于发命令前的短暂等待。</div></div>
+
+<h2><span class="num">16</span>常见误区与本章小结</h2>
+<div class="warn">
+<ul>
+  <li><strong>"中断总比轮询好。"</strong>不对。中断只对慢设备划算；快设备用中断会因切换和中断处理开销变得更慢；海量中断还可能引发活锁。</li>
+  <li><strong>"中断/DMA 让 I/O 本身更快。"</strong>它们缩短的是 CPU 的<strong>浪费</strong>，让别的进程有活干；单个 I/O 的延迟不变甚至略增（多了切换开销）。</li>
+  <li><strong>"PIO 就是轮询。"</strong>两者是不同维度：轮询/中断说的是<strong>怎样得知设备完成</strong>，PIO/DMA 说的是<strong>谁来搬数据</strong>。xv6 驱动就是"中断 + PIO"的组合。</li>
+  <li><strong>"内存映射 I/O 意味着设备数据存放在内存里。"</strong>不是。只是设备的<strong>寄存器</strong>占用了一段物理地址，load/store 会被硬件路由到设备。</li>
+  <li><strong>"操作系统几百万行代码，大部分是调度和内存管理。"</strong>其实七成以上是设备驱动，而且驱动是 bug 和崩溃的主要来源。</li>
+</ul>
+</div>
+<div class="key">
+<p><strong>本章要点</strong></p>
+<ul>
+  <li>总线按"越快越短越贵"分层；现代系统用芯片组与点对点互连（DMI、PCIe、eSATA、USB）。</li>
+  <li>标准设备 = 接口（状态/命令/数据寄存器）+ 内部实现；标准协议 = 轮询 → 写数据（PIO）→ 写命令 → 轮询。</li>
+  <li>两种提升效率的技术：<strong>中断</strong>（计算与 I/O 重叠；快设备用轮询，未知时两阶段；合并；警惕活锁）和 <strong>DMA</strong>（把数据搬运从 CPU 卸载）。</li>
+  <li>两种访问设备寄存器的方法：<strong>显式 I/O 指令</strong>（特权的 in/out）和<strong>内存映射 I/O</strong>。</li>
+  <li><strong>设备驱动</strong>封装设备细节，使 OS 其余部分设备无关；代价是特殊能力丢失（EIO），而且驱动代码量巨大、bug 多。</li>
+</ul>
+<p><strong>承上启下：</strong>本章讲的是"OS 怎样和任何设备打交道"。下一章（第 37 章）深入最重要的持久化设备——<strong>硬盘</strong>：它的接口（扇区数组）、几何结构（盘片、磁道、磁头）、I/O 时间 = 寻道 + 旋转 + 传输，以及磁盘调度。此后的 RAID、文件系统都建立在这两章的模型之上。</p>
+</div>
+
+</main>
+<script>
+// ===== 核心 1：I/O 时间线 =====
+function buildTimeline(o) {
+  // o: {run1, after, dev, copy, dir:'write'|'read', xfer:'pio'|'dma', wait:'poll'|'intr'|'hybrid', spin, sw, ih, p2}
+  const cpu = [], dma = [], disk = [], ev = {};
+  const fill = (lane, a, b, ch) => { for (let t = a; t < b; t++) lane[t] = ch; };
+  const note = (t, s) => { (ev[t] = ev[t] || []).push(s); };
+  let t = 0;
+  fill(cpu, 0, o.run1, "1"); note(0, "进程 1 在 CPU 上运行（用户态计算）。");
+  t = o.run1;
+  let cpuFree, readyAt, pioAfter = 0;
+  note(t, `进程 1 发起 I/O 请求（${o.dir === "write" ? "写：数据要从内存送到设备" : "读：数据要从设备取回内存"}）。`);
+  if (o.dir === "write") {
+    if (o.xfer === "pio" && o.copy > 0) {
+      fill(cpu, t, t + o.copy, "c"); note(t, `PIO：CPU 亲自把数据一个字一个字写进设备的数据寄存器，共 ${o.copy} 个时间单位。`);
+      t += o.copy; cpuFree = t;
+    } else {
+      cpuFree = t;
+      if (o.copy > 0) { fill(dma, t, t + o.copy, "c"); note(t, `DMA：OS 只需告诉 DMA 引擎"数据在哪、多大、送给谁"，拷贝由 DMA 完成（${o.copy} 个单位），CPU 空出来了。`); t += o.copy; }
+    }
+    fill(disk, t, t + o.dev, "1"); note(t, `设备开始服务进程 1 的请求，需要 ${o.dev} 个单位。`);
+    readyAt = t + o.dev;
+  } else {
+    fill(disk, t, t + o.dev, "1"); note(t, `设备开始服务进程 1 的读请求，需要 ${o.dev} 个单位。`);
+    cpuFree = t; readyAt = t + o.dev;
+    if (o.copy > 0) {
+      if (o.xfer === "dma") { fill(dma, readyAt, readyAt + o.copy, "c"); note(readyAt, `设备读完，DMA 引擎把数据搬回内存（${o.copy} 个单位）。`); readyAt += o.copy; }
+      else pioAfter = o.copy;
+    }
+  }
+  note(readyAt, o.xfer === "dma" && o.copy > 0 ? "DMA 传输完成，DMA 控制器发出中断（轮询模式下则由下一次轮询发现）。" : "设备完成请求：状态寄存器不再 BUSY；若开启中断，设备此刻发出中断。");
+  let mode = o.wait;
+  if (mode === "hybrid") mode = readyAt - cpuFree <= o.spin ? "poll" : "hybrid-intr";
+  let pStart = cpuFree;
+  if (mode === "poll") {
+    if (readyAt > cpuFree) { fill(cpu, cpuFree, readyAt, "p"); note(cpuFree, o.wait === "hybrid" ? `两阶段：先轮询（最多 ${o.spin} 个单位）……` : "轮询：CPU 反复读状态寄存器，BUSY 就继续转圈（p）。这段 CPU 时间被白白浪费。"); }
+    t = Math.max(readyAt, cpuFree);
+    if (o.wait === "hybrid") note(t, "两阶段：在自旋期限内设备就完成了，省掉了中断与切换的开销。");
+  } else {
+    let s = cpuFree;
+    if (mode === "hybrid-intr") { fill(cpu, s, s + o.spin, "p"); note(s, `两阶段：先轮询 ${o.spin} 个单位，设备还没好……`); s += o.spin; note(s, "……自旋期限到了，改用中断：让进程 1 睡眠，切换到别的进程。"); }
+    if (o.sw > 0) { fill(cpu, s, s + o.sw, "s"); note(s, `OS 让进程 1 睡眠并上下文切换（s，${o.sw} 个单位的开销）。`); }
+    const runFrom = s + o.sw;
+    if (readyAt > runFrom) { fill(cpu, runFrom, readyAt, o.p2 ? "2" : "·"); note(runFrom, o.p2 ? "CPU 运行进程 2：计算与 I/O 重叠（overlap），两者都没闲着。" : "没有其他就绪进程，CPU 空闲（至少没在空转浪费电）。"); }
+    const h0 = Math.max(readyAt, runFrom);
+    if (h0 > readyAt) note(h0, "中断其实早已到达，但 CPU 还在做上下文切换，处理被推迟。");
+    t = h0;
+    if (o.ih > 0) { fill(cpu, t, t + o.ih, "i"); note(t, `CPU 跳进中断处理程序（ISR，i，${o.ih} 个单位）：读结果/错误码，唤醒进程 1。`); t += o.ih; }
+    if (pioAfter) { fill(cpu, t, t + pioAfter, "c"); note(t, `PIO 读：中断处理程序中由 CPU 把数据从设备数据寄存器逐字搬回内存（${pioAfter} 个单位）。`); t += pioAfter; pioAfter = 0; }
+    if (o.sw > 0) { fill(cpu, t, t + o.sw, "s"); note(t, `再次上下文切换回进程 1（s，${o.sw} 个单位）。`); t += o.sw; }
+  }
+  if (pioAfter) { fill(cpu, t, t + pioAfter, "c"); note(t, `PIO 读：CPU 把数据从设备逐字搬回内存（${pioAfter} 个单位）。`); t += pioAfter; }
+  fill(cpu, t, t + o.after, "1"); note(t, "进程 1 拿到 I/O 结果，继续运行。");
+  const T = t + o.after;
+  for (const L of [cpu, dma, disk]) for (let k = 0; k < T; k++) if (!L[k]) L[k] = " ";
+  const cnt = (ch) => cpu.filter((x) => x === ch).length;
+  const stats = { T, p1: cnt("1"), p2: cnt("2"), poll: cnt("p"), copy: cnt("c"), sw: cnt("s"), isr: cnt("i"), idle: cnt("·") };
+  stats.useful = stats.p1 + stats.p2;
+  return { cpu, dma, disk, ev, stats, T, readyAt, cpuFree, mode };
+}
+// ===== 核心 2：中断合并 / 活锁 流体模型 =====
+// lam: 到达率（千包/秒 = 包/毫秒）；h: 每次中断固定开销(µs)；c: 每包协议处理(µs, 在中断上下文)；u: 每包用户态服务(µs)；W: 合并窗口(µs)
+function livelock(lam, h, c, u, W) {
+  const r = {};
+  const one = (irqRate, perPktKernel, accepted) => {
+    const k = Math.min(1, (irqRate * h + accepted * perPktKernel) / 1000);
+    const user = 1 - k;
+    const good = Math.min(accepted, (user * 1000) / u);
+    return { irq: irqRate, kernel: k, user: (good * u) / 1000, idle: Math.max(0, user - (good * u) / 1000), good };
+  };
+  r.intr = one(lam, c, lam);
+  const batch = 1 + (lam * W) / 1000;
+  r.coal = one(lam / batch, c, lam);
+  r.coal.batch = batch;
+  r.coal.extraLatency = (W + ((lam * W) / 1000) * (W / 2)) / batch;
+  const cap = 1000 / (c + u);
+  const acc = Math.min(lam, cap);
+  r.napi = one(lam <= cap * 0.5 ? acc : 0, c, acc);
+  r.napi.dropped = lam - acc;
+  return r;
+}
+// ===== 核心 3：逐包时间条（确定性到达，用于直观展示中断如何"吃掉"CPU） =====
+function stripSim(mode, lam, h, c, u, W, H) {
+  const gap = 1000 / lam, arrivals = [];
+  for (let t = gap / 2; t < H; t += gap) arrivals.push(t);
+  const jobs = [];
+  if (mode === "intr") arrivals.forEach((a) => jobs.push({ rel: a, dur: h + c, n: 1 }));
+  else {
+    let i = 0;
+    while (i < arrivals.length) {
+      const ws = arrivals[i]; let j = i;
+      while (j < arrivals.length && arrivals[j] <= ws + W) j++;
+      jobs.push({ rel: ws + W, dur: h + (j - i) * c, n: j - i }); i = j;
+    }
+  }
+  const segs = []; let t = 0, userQ = 0, served = 0, ji = 0;
+  while (t < H) {
+    if (ji < jobs.length && jobs[ji].rel <= t) {
+      const jb = jobs[ji++]; const e = Math.min(H, t + jb.dur);
+      segs.push({ k: "k", s: t, e }); userQ += jb.n * u; t = t + jb.dur;
+    } else {
+      const nr = ji < jobs.length ? Math.min(H, jobs[ji].rel) : H;
+      if (userQ > 1e-9) { const e = Math.min(nr, t + userQ); segs.push({ k: "u", s: t, e }); served += (e - t) / u; userQ -= e - t; t = e; }
+      else { segs.push({ k: "idle", s: t, e: nr }); t = nr; }
+    }
+  }
+  return { arrivals, irqs: jobs.filter((j) => j.rel < H).map((j) => j.rel), segs, served };
+}
+if (typeof module !== "undefined") module.exports = { buildTimeline, livelock, stripSim };
+
+(function () {
+  "use strict";
+  const { h, s } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  const CH = {
+    "1": { fill: "var(--c1)", txt: "#fff" }, "2": { fill: "var(--c2)", txt: "#fff" },
+    p: { fill: "var(--warn-soft)", stroke: "var(--warn)", txt: "var(--warn)" }, c: { fill: "var(--c4)", txt: "#fff" },
+    s: { fill: "var(--c8)", txt: "#fff" }, i: { fill: "var(--bad)", txt: "#fff" }, "·": { fill: "var(--surface-2)", txt: "var(--muted)" },
+  };
+  // 画一张时间线 SVG；upto：当前步（之后的格子变淡），-1 表示全部正常显示
+  function drawTL(r, upto, opt) {
+    opt = opt || {};
+    const cw = opt.cw || 24, ch = 24, gap = 6, lx = 48;
+    const lanes = [["CPU", r.cpu]];
+    if (opt.alwaysDma || r.dma.some((x) => x !== " ")) lanes.push(["DMA", r.dma]);
+    lanes.push(["Disk", r.disk]);
+    const top = opt.irq ? 16 : 4;
+    const W = lx + r.T * cw + 12, H = top + lanes.length * (ch + gap) + 22;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "I/O 时间线" });
+    if (upto >= 0 && upto < r.T) svg.append(s("rect", { x: lx + upto * cw - 1, y: top - 3, width: cw + 2, height: lanes.length * (ch + gap) + 2, rx: 4, style: "fill:var(--accent-soft);stroke:var(--accent)" }));
+    lanes.forEach(([name, arr], li) => {
+      const y = top + li * (ch + gap);
+      svg.append(s("text", { x: lx - 8, y: y + ch / 2 + 4, "text-anchor": "end", "font-size": 12, class: "t-muted", text: name }));
+      for (let t = 0; t < r.T; t++) {
+        const c = arr[t];
+        if (c === " ") continue;
+        const st = name === "CPU" ? CH[c] : name === "DMA" ? CH.c : CH["1"];
+        const fade = upto >= 0 && t > upto ? "opacity:.18;" : "";
+        svg.append(s("rect", { x: lx + t * cw + 1, y, width: cw - 2, height: ch, rx: 3, style: `${fade}fill:${st.fill};stroke:${st.stroke || "none"}` }));
+        if (c !== "·") svg.append(s("text", { x: lx + t * cw + cw / 2, y: y + ch / 2 + 4, "text-anchor": "middle", "font-size": 12, class: "mono", style: `${fade}fill:${st.txt};font-weight:600`, text: c }));
+      }
+    });
+    if (opt.irq && r.mode !== "poll" && (upto < 0 || r.readyAt <= upto)) {
+      svg.append(s("text", { x: lx + r.readyAt * cw, y: 12, "text-anchor": "middle", "font-size": 12, text: "⚡" }));
+    }
+    const ay = top + lanes.length * (ch + gap) + 12;
+    for (let t = 0; t <= r.T; t += 5) svg.append(s("text", { x: lx + t * cw, y: ay, "text-anchor": "middle", "font-size": 11, class: "t-muted mono", text: t }));
+    return svg;
+  }
+
+  // ---------- 原书四张时间线（静态图） ----------
+  const BASE = { run1: 5, after: 5, dev: 5, copy: 0, dir: "read", xfer: "pio", wait: "poll", spin: 2, sw: 0, ih: 0, p2: true };
+  const BOOK = {
+    b1: { ...BASE },
+    b2: { ...BASE, wait: "intr" },
+    b3: { ...BASE, wait: "intr", dir: "write", copy: 3, after: 2 },
+    b4: { ...BASE, wait: "intr", dir: "write", copy: 3, after: 2, xfer: "dma" },
+  };
+  const bookHost = $("book-tl");
+  [["① 轮询：CPU 空转等磁盘", "b1"], ["② 中断：等待期间运行进程 2", "b2"], ["③ PIO 写：CPU 先逐字拷贝（c）再让磁盘工作", "b3"], ["④ DMA 写：拷贝交给 DMA，CPU 运行进程 2", "b4"]].forEach(([t, k]) => {
+    bookHost.append(h("div", {}, h("h4", {}, t), drawTL(buildTimeline(BOOK[k]), -1, { cw: 22 })));
+  });
+
+  // ---------- 模拟器 1 ----------
+  const PRE = {
+    ...BOOK,
+    fast: { ...BASE, dev: 1, sw: 2, ih: 1, wait: "intr" },
+    slow: { ...BASE, dev: 12, sw: 2, ih: 1, wait: "intr" },
+    hyb: { ...BASE, dev: 3, sw: 2, ih: 1, wait: "hybrid", spin: 4 },
+    pior: { ...BASE, dev: 6, copy: 3, sw: 1, ih: 1, wait: "intr" },
+  };
+  const ids = ["wait", "xfer", "dir", "dev", "copy", "sw", "ih", "spin", "run1", "after"];
+  function readParams() {
+    const o = {};
+    ids.forEach((k) => { const el = $("io-" + k); o[k] = el.type === "number" ? Math.max(Number(el.min), Math.min(Number(el.max), Math.round(Number(el.value) || 0))) : el.value; });
+    o.p2 = $("io-p2").checked;
+    return o;
+  }
+  function setParams(o) { ids.forEach((k) => ($("io-" + k).value = o[k])); $("io-p2").checked = o.p2; }
+  const DESC = { "1": "进程 1 继续运行。", "2": "进程 2 在运行——它的计算与设备工作重叠。", p: "仍在轮询：读状态寄存器 → BUSY → 再读……", c: "CPU 仍在逐字搬运数据（PIO）。", s: "上下文切换进行中（保存/恢复寄存器、切换地址空间……）。", i: "中断处理程序运行中。", "·": "CPU 空闲。" };
+  let cur = buildTimeline(readParams());
+  const stat = (v, l) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+  function render(k) {
+    const r = cur;
+    $("io-stage").replaceChildren(drawTL(r, k >= r.T ? -1 : k, { irq: true, alwaysDma: true }));
+    let txt;
+    if (k >= r.T) {
+      const st = r.stats;
+      txt = `结束：进程 1 在第 ${r.T} 格完成。CPU 共 ${r.T} 格，其中有用计算 ${st.useful} 格（进程 1：${st.p1}，进程 2：${st.p2}），` +
+        `轮询浪费 ${st.poll} 格，CPU 拷贝 ${st.copy} 格，切换 ${st.sw} 格，中断处理 ${st.isr} 格，空闲 ${st.idle} 格。`;
+    } else {
+      const evs = r.ev[k];
+      txt = `t = ${k}：` + (evs ? evs.join(" ") : DESC[r.cpu[k]] + (r.disk[k] === "1" ? "（设备正在工作）" : r.dma[k] === "c" ? "（DMA 正在搬数据）" : ""));
+    }
+    $("io-narr").textContent = txt;
+    const st = r.stats;
+    $("io-stats").replaceChildren(
+      stat(r.T, "进程 1 完成时间"), stat(st.p2, "进程 2 得到的 CPU"), stat(st.poll + st.copy, "CPU 浪费在轮询/拷贝"),
+      stat(st.sw + st.isr, "切换 + 中断处理开销"), stat(Math.round((100 * st.useful) / r.T) + "%", "CPU 有用工作占比"));
+  }
+  function renderCmp() {
+    const o = readParams();
+    const rows = [["轮询", "poll"], ["中断", "intr"], [`两阶段（自旋 ≤ ${o.spin}）`, "hybrid"]].map(([n, w]) => [n, buildTimeline({ ...o, wait: w })]);
+    const bestT = Math.min(...rows.map((x) => x[1].T)), bestP2 = Math.max(...rows.map((x) => x[1].stats.p2));
+    const tb = $("io-cmp");
+    tb.replaceChildren(h("thead", {}, h("tr", {}, h("th", {}, "等待方式"), h("th", { class: "num" }, "进程 1 完成"), h("th", { class: "num" }, "进程 2 得到 CPU"), h("th", { class: "num" }, "轮询 p"), h("th", { class: "num" }, "拷贝 c"), h("th", { class: "num" }, "切换+中断"), h("th", {}, "CPU 时间线"))),
+      h("tbody", {}, rows.map(([n, r]) => h("tr", {}, h("td", {}, n), h("td", { class: "num" + (r.T === bestT ? " best" : "") }, r.T), h("td", { class: "num" + (r.stats.p2 === bestP2 && bestP2 > 0 ? " best" : "") }, r.stats.p2),
+        h("td", { class: "num" }, r.stats.poll), h("td", { class: "num" }, r.stats.copy), h("td", { class: "num" }, r.stats.sw + r.stats.isr), h("td", {}, h("code", { style: { whiteSpace: "pre" } }, r.cpu.join("")))))));
+  }
+  const stp = OSTEP.stepper($("io-step"), { steps: () => cur.T + 1, render, autoplayMs: 700 });
+  function update() { cur = buildTimeline(readParams()); renderCmp(); stp.reset(); }
+  document.querySelectorAll("#sim-io input, #sim-io select").forEach((el) => el.addEventListener("change", update));
+  document.querySelectorAll("#sim-io .presets button").forEach((b) => b.addEventListener("click", () => { setParams(PRE[b.dataset.p]); update(); }));
+  renderCmp();
+
+  // ---------- 模拟器 2：合并与活锁 ----------
+  const LL = ["lam", "W", "h", "c", "u"];
+  const unit = { lam: " kpps", W: " µs", h: " µs", c: " µs", u: " µs" };
+  const P = () => { const o = {}; LL.forEach((k) => { o[k] = Number($("ll-" + k).value); $("ll-" + k + "-o").textContent = o[k] + unit[k]; }); return o; };
+  const COL = { intr: "var(--bad)", coal: "var(--warn)", napi: "var(--ok)" };
+  const NAME = { intr: "逐包中断", coal: "中断合并", napi: "轮询式混合（NAPI）" };
+  function chart(o) {
+    const W = 640, H = 280, L = 46, R = 16, T = 26, B = 62, LMAX = 150;
+    let ymax = 0;
+    for (let l = 1; l <= LMAX; l++) { const r = livelock(l, o.h, o.c, o.u, o.W); ymax = Math.max(ymax, r.intr.good, r.coal.good, r.napi.good); }
+    ymax = Math.ceil((ymax * 1.15) / 10) * 10 || 10;
+    const X = (l) => L + (l / LMAX) * (W - L - R), Y = (v) => H - B - (v / ymax) * (H - T - B);
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "完成率随到达率变化" });
+    for (let v = 0; v <= ymax; v += ymax / 5) {
+      svg.append(s("line", { x1: L, x2: W - R, y1: Y(v), y2: Y(v), style: "stroke:var(--border)" }));
+      svg.append(s("text", { x: L - 6, y: Y(v) + 4, "text-anchor": "end", "font-size": 11, class: "t-muted mono", text: Math.round(v) }));
+    }
+    for (let l = 0; l <= LMAX; l += 25) svg.append(s("text", { x: X(l), y: H - B + 16, "text-anchor": "middle", "font-size": 11, class: "t-muted mono", text: l }));
+    svg.append(s("text", { x: (L + W - R) / 2, y: H - B + 32, "text-anchor": "middle", "font-size": 12, class: "t-muted", text: "到达率 λ（千包/秒）" }));
+    svg.append(s("text", { x: 8, y: 12, "font-size": 12, class: "t-muted", text: "完成率（千包/秒）" }));
+    svg.append(s("line", { x1: X(0), y1: Y(0), x2: X(Math.min(LMAX, ymax)), y2: Y(Math.min(LMAX, ymax)), style: "stroke:var(--muted);stroke-dasharray:4 4" }));
+    for (const m of ["napi", "coal", "intr"]) {
+      const pts = [];
+      for (let l = 0.5; l <= LMAX; l += 0.5) pts.push(`${X(l).toFixed(1)},${Y(livelock(l, o.h, o.c, o.u, o.W)[m].good).toFixed(1)}`);
+      svg.append(s("polyline", { points: pts.join(" "), style: `fill:none;stroke:${COL[m]};stroke-width:2.5` }));
+    }
+    svg.append(s("line", { x1: X(o.lam), x2: X(o.lam), y1: T, y2: H - B, style: "stroke:var(--accent);stroke-width:1.5" }));
+    const r = livelock(o.lam, o.h, o.c, o.u, o.W);
+    for (const m of ["intr", "coal", "napi"]) svg.append(s("circle", { cx: X(o.lam), cy: Y(r[m].good), r: 4.5, style: `fill:${COL[m]};stroke:var(--surface);stroke-width:1.5` }));
+    let lx = L; const ly = H - 8;
+    for (const m of ["intr", "coal", "napi"]) {
+      svg.append(s("line", { x1: lx, x2: lx + 18, y1: ly - 4, y2: ly - 4, style: `stroke:${COL[m]};stroke-width:3` }));
+      const t = NAME[m] + (m === "coal" ? `（W=${o.W}）` : "");
+      svg.append(s("text", { x: lx + 23, y: ly, "font-size": 12, text: t })); lx += 36 + t.length * 12;
+    }
+    svg.append(s("text", { x: lx, y: ly, "font-size": 11, class: "t-muted", text: "虚线：理想" }));
+    return svg;
+  }
+  function bars(o, r) {
+    const W = 640, rowH = 26, L = 150, H = 3 * (rowH + 10) + 26;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "CPU 时间分解" });
+    ["intr", "coal", "napi"].forEach((m, i) => {
+      const x = r[m], y = 4 + i * (rowH + 10);
+      let irqP = (x.irq * o.h) / 1000, proP = (Math.min(o.lam, m === "napi" ? 1000 / (o.c + o.u) : o.lam) * o.c) / 1000;
+      const tot = irqP + proP; if (tot > 1) { irqP /= tot; proP /= tot; }
+      const parts = [[irqP, "var(--bad)", "中断开销"], [proP, "var(--warn)", "协议处理"], [x.user, "var(--ok)", "用户服务"], [Math.max(0, 1 - Math.min(1, tot) - x.user), "var(--surface-2)", "空闲"]];
+      svg.append(s("text", { x: L - 8, y: y + rowH / 2 + 4, "text-anchor": "end", "font-size": 12, text: NAME[m] }));
+      let cx = L; const span = W - L - 10;
+      for (const [f, col] of parts) {
+        const w = f * span; if (w < 0.5) continue;
+        svg.append(s("rect", { x: cx, y, width: w, height: rowH, style: `fill:${col};stroke:var(--border)` }));
+        if (w > 34) svg.append(s("text", { x: cx + w / 2, y: y + rowH / 2 + 4, "text-anchor": "middle", "font-size": 11, style: col.includes("surface") ? "" : "fill:#fff;font-weight:600", text: Math.round(f * 100) + "%" }));
+        cx += w;
+      }
+    });
+    let lx = L; const ly = H - 8;
+    for (const [col, n] of [["var(--bad)", "中断固定开销 h"], ["var(--warn)", "协议处理 c"], ["var(--ok)", "用户态服务 u"], ["var(--surface-2)", "空闲"]]) {
+      svg.append(s("rect", { x: lx, y: ly - 10, width: 12, height: 12, rx: 2, style: `fill:${col};stroke:var(--border)` }));
+      svg.append(s("text", { x: lx + 16, y: ly, "font-size": 11, text: n })); lx += 110;
+    }
+    return svg;
+  }
+  function strip(o) {
+    const Hh = 400, W = 640, L = 70, span = W - L - 10, X = (t) => L + (t / Hh) * span;
+    const svg = s("svg", { viewBox: `0 0 ${W} 150`, width: W, height: 150, role: "img", "aria-label": "400 微秒内的 CPU 时间条" });
+    const res = [];
+    [["intr", "逐包中断"], ["coal", "中断合并"]].forEach(([m, n], i) => {
+      const y = 22 + i * 56, r = stripSim(m, o.lam, o.h, o.c, o.u, o.W, Hh); res.push(r);
+      svg.append(s("text", { x: L - 8, y: y + 15, "text-anchor": "end", "font-size": 12, text: n }));
+      for (const g of r.segs) svg.append(s("rect", { x: X(g.s), y, width: Math.max(0.5, X(g.e) - X(g.s)), height: 22, style: `fill:${g.k === "k" ? "var(--bad)" : g.k === "u" ? "var(--ok)" : "var(--surface-2)"}` }));
+      for (const a of r.arrivals) svg.append(s("line", { x1: X(a), x2: X(a), y1: y - 7, y2: y - 1, style: "stroke:var(--muted);stroke-width:1" }));
+      for (const q of r.irqs) svg.append(s("text", { x: X(q), y: y + 36, "text-anchor": "middle", "font-size": 10, text: "⚡" }));
+    });
+    for (let t = 0; t <= Hh; t += 100) svg.append(s("text", { x: X(t), y: 146, "text-anchor": t === Hh ? "end" : "middle", "font-size": 11, class: "t-muted mono", text: t + "µs" }));
+    svg.append(s("text", { x: L, y: 10, "font-size": 11, class: "t-muted", text: "竖线 = 包到达，⚡ = 中断，红 = 中断上下文，绿 = 用户进程服务请求" }));
+    return { svg, res };
+  }
+  function llRender() {
+    const o = P(), r = livelock(o.lam, o.h, o.c, o.u, o.W);
+    $("ll-chart").replaceChildren(chart(o));
+    $("ll-bars").replaceChildren(bars(o, r));
+    const st = strip(o);
+    $("ll-strip").replaceChildren(st.svg);
+    const peak = 1000 / (o.h + o.c + o.u), zero = 1000 / (o.h + o.c), cap = 1000 / (o.c + o.u);
+    let msg;
+    if (r.intr.good >= o.lam - 1e-9) msg = `λ = ${o.lam} 低于逐包中断的峰值 ${peak.toFixed(1)}：三种方式都能服务全部请求。合并只是减少了中断次数（${r.intr.irq.toFixed(1)} → ${r.coal.irq.toFixed(1)} 千次/秒），代价是每包平均多等约 ${r.coal.extraLatency.toFixed(1)} µs。`;
+    else if (r.intr.good > 0.01) msg = `λ = ${o.lam} 已超过峰值 ${peak.toFixed(1)}：逐包中断的内核占用达 ${(r.intr.kernel * 100).toFixed(0)}%，完成率反而跌到 ${r.intr.good.toFixed(1)}——到达越多，完成越少。合并把完成率拉回 ${r.coal.good.toFixed(1)}；轮询式混合稳定在上限 ${cap.toFixed(1)}，多出的 ${r.napi.dropped.toFixed(1)} 千包/秒在网卡直接丢弃。`;
+    else msg = `λ = ${o.lam} ≥ ${zero.toFixed(1)}：逐包中断<strong>活锁</strong>——CPU 100% 在处理中断，用户进程得不到一点时间，完成率为 0（看时间条：红色铺满）。合并仍能完成 ${r.coal.good.toFixed(1)}，轮询式混合保持 ${r.napi.good.toFixed(1)}。`;
+    $("ll-narr").innerHTML = msg;
+    $("ll-stats").replaceChildren(
+      stat(r.intr.good.toFixed(1), "逐包中断 完成率 (kpps)"), stat(r.coal.good.toFixed(1), "合并 完成率 (kpps)"), stat(r.napi.good.toFixed(1), "轮询式混合 完成率 (kpps)"),
+      stat(`${r.intr.irq.toFixed(0)} → ${r.coal.irq.toFixed(1)}`, "中断次数 (千次/秒)：逐包 → 合并"), stat(r.coal.extraLatency.toFixed(1) + " µs", "合并带来的平均额外延迟"),
+      stat(((100 * r.napi.dropped) / o.lam).toFixed(0) + "%", "轮询式混合 丢包率"));
+  }
+  document.querySelectorAll("#sim-ll input").forEach((el) => el.addEventListener("input", llRender));
+  document.querySelectorAll("#sim-ll .presets button").forEach((b) => b.addEventListener("click", () => { $("ll-lam").value = b.dataset.l; llRender(); }));
+  llRender();
+})();
+</script>
+</body></html>

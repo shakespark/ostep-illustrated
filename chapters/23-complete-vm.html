@@ -1,0 +1,1019 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 23 章 · 完整的虚拟内存系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+.bits { display: flex; flex-wrap: nowrap; gap: 0; font: 12px var(--mono); margin: 6px 0; }
+.bits .grp { display: flex; flex-direction: column; align-items: stretch; border: 1px solid var(--border); border-right: none; }
+.bits .grp:last-child { border-right: 1px solid var(--border); }
+.bits .grp .b { display: flex; }
+.bits .grp .b span { width: 11px; text-align: center; padding: 3px 0; }
+.bits .grp .blab { font: 11.5px var(--font); text-align: center; padding: 2px 4px; border-top: 1px solid var(--border); white-space: nowrap; }
+.bits .grp .val { font: 12px var(--mono); text-align: center; padding: 2px 4px; border-top: 1px dashed var(--border); font-weight: 700; }
+.walk { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px; font-size: 13px; }
+.walk .lv { border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; background: var(--surface); text-align: center; min-width: 96px; }
+.walk .lv b { display: block; font-size: 12px; color: var(--muted); font-weight: 600; }
+.walk .lv code { font-size: 12.5px; }
+.walk .arr { color: var(--muted); }
+.lists { display: grid; gap: 8px; }
+.lists .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.lists .row > b { width: 9.5em; font-size: 13px; font-weight: 600; flex-shrink: 0; }
+.lists .cell { min-width: 42px; }
+.cell.P { box-shadow: inset 0 -3px 0 var(--c1); }
+.cell.Q { box-shadow: inset 0 -3px 0 var(--c2); }
+.cell.empty { color: var(--faint); background: var(--surface-2); }
+.dm { font-size: 9.5px; color: var(--warn); margin-left: 2px; vertical-align: super; }
+.twocol { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 14px; }
+.twocol h4 { margin: 0 0 6px; font-size: 14.5px; }
+.runs { font: 13px/1.6 var(--mono); background: var(--code-bg); border-radius: 8px; padding: 10px 12px; min-height: 80px; white-space: pre-wrap; overflow-x: auto; }
+.runs .diff { color: var(--accent); font-weight: 700; }
+.tiny { font-size: 12.5px; color: var(--muted); }
+</style>
+</head>
+<body data-chapter="23">
+<main>
+
+<h2>这一章要解决什么</h2>
+<div class="crux">
+  <p><strong>如何构建一个完整的虚拟内存系统？</strong>实现一个完整的 VM 系统需要哪些特性？它们如何提高性能、增强安全性，或以其他方式改进系统？</p>
+  <p class="muted small">What features are needed to realize a complete virtual memory system? How do they improve performance, increase security, or otherwise improve the system?</p>
+</div>
+<p>虚拟化内存的部分即将结束。前面各章分别讲了页表设计（第 18、20 章）、TLB（第 19 章）、换页机制与替换策略（第 21、22 章）。本章把零件装成整机，看两个真实系统：</p>
+<ul>
+  <li><strong>VAX/VMS</strong>（1970 年代末～1980 年代初，主要架构师 Dave Cutler，后来主导了 Windows NT）：最早的"现代"虚拟内存管理器之一，许多技巧沿用至今，也是"用软件弥补硬件缺陷"的典范。</li>
+  <li><strong>Linux</strong>（x86 平台）：从手机到数据中心都要跑得好，特性由真实生产问题驱动，并且在<strong>安全</strong>上比老系统投入多得多。</li>
+</ul>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>分段 + 分页混合</h4><p>VAX 把 32 位地址空间分成 P0（代码/堆）、P1（栈）、S（系统），各有页表，省掉中间空洞的页表空间。</p></div>
+  <div class="card"><h4>第 0 页不可访问</h4><p>代码从不从地址 0 开始；访问空指针会陷入 OS，便于调试。</p></div>
+  <div class="card"><h4>内核映射进每个地址空间</h4><p>OS 像一个受保护的"库"，方便在内核与用户数据之间拷贝，也便于换出内核自己的页。</p></div>
+  <div class="card"><h4>分段 FIFO + 二次机会</h4><p>VMS 没有引用位：每进程 FIFO 限制 RSS，被踢的页先进全局干净/脏链表，还能被找回。</p></div>
+  <div class="card"><h4>按需清零 / 写时复制</h4><p>两种"懒惰"优化：页真正被用到时才清零；fork 时共享只读页，写时才复制。</p></div>
+  <div class="card"><h4>内核逻辑地址 vs 内核虚拟地址</h4><p>kmalloc 的内存与物理内存直接线性映射（可用于 DMA）；vmalloc 的内存只保证虚拟连续。</p></div>
+  <div class="card"><h4>x86-64 四级页表与大页</h4><p>48 位虚拟地址 = 4×9 位索引 + 12 位偏移；2MB/1GB 大页减少 TLB 未命中。</p></div>
+  <div class="card"><h4>页缓存与 2Q</h4><p>统一页缓存；用 inactive/active 两个链表抵抗大文件循环扫描。</p></div>
+  <div class="card"><h4>安全：NX、ROP、ASLR、KPTI</h4><p>防缓冲区溢出注入代码；ROP 绕过 NX；ASLR 随机化布局；KPTI 应对 Meltdown。</p></div>
+</div>
+
+<h2>VAX/VMS：硬件与真实的地址空间</h2>
+<p>VAX-11 为每个进程提供 <strong>32 位虚拟地址空间</strong>，页大小只有 <strong>512 字节</strong>。于是虚拟地址 = 23 位 VPN + 9 位偏移。VPN 的最高两位用来区分页属于哪个<strong>段</strong>，所以它是第 16、20 章讨论过的<strong>分段与分页的混合</strong>：</p>
+<ul>
+  <li>低半部分是<strong>进程空间（process space）</strong>，每个进程各不相同：前一半 <strong>P0</strong> 放用户程序和向下增长的堆（按原书图中地址 0 在上的画法），后一半 <strong>P1</strong> 放向上增长的栈；</li>
+  <li>高半部分是<strong>系统空间（S）</strong>，只用了一半：受保护的 OS 代码和数据放在这里，并被所有进程共享。</li>
+</ul>
+<figure class="fig">
+<svg viewBox="0 0 640 420" width="640" role="img" aria-label="VAX/VMS 地址空间（Figure 23.1）">
+  <g id="vax-fig"></g>
+</svg>
+<figcaption>复刻原书 Figure 23.1：VAX/VMS 地址空间。地址 0 在上；第 0 页无效；P0 与 P1 之间、S 的后半部分都没有使用，不需要页表项。</figcaption>
+</figure>
+<h3>页表太大怎么办</h3>
+<p>512 字节的小页让线性页表极其庞大：2<sup>23</sup> 个 PTE × 4 字节 = <strong>32 MB</strong>，每个进程一份！VMS 的设计者首要目标之一就是别让页表压垮内存，他们用了两招：</p>
+<ol>
+  <li><strong>分段</strong>：P0 和 P1 各有一个页表（每进程两个），用基址/界限寄存器描述：基址寄存器存该段页表的地址，界限寄存器存页表大小（PTE 个数）。于是栈和堆之间的空洞不占页表空间。</li>
+  <li><strong>把用户页表放在内核虚拟内存里</strong>：分配或增长页表时，内核从自己的虚拟内存（S 段）中分配；内存紧张时，内核甚至可以把这些页表的页<strong>换出到磁盘</strong>。</li>
+</ol>
+<p>代价是地址转换更复杂：要翻译 P0/P1 中的地址，硬件先要找到该页在 P0/P1 页表中的 PTE；而那个页表本身位于 S 段的虚拟地址上，所以硬件可能先得查<strong>系统页表</strong>（它在物理内存中）来翻译"页表所在的地址"，最后才能访问目标数据。好在 VAX 有硬件管理的 TLB，通常能跳过这番折腾。</p>
+<figure class="fig">
+<svg viewBox="0 0 700 170" width="700" role="img" aria-label="VAX 地址转换：用户页表位于内核虚拟内存">
+  <g id="vax-walk"></g>
+</svg>
+<figcaption>TLB 未命中时的最坏路径：用户 VA → 需要 P0 页表中的 PTE → 该 PTE 的地址在 S 段 → 先查物理内存中的系统页表 → 得到页表页的物理地址 → 取出 PTE → 得到数据的物理地址。</figcaption>
+</figure>
+
+<section class="sim" id="sim-vax">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>VAX 虚拟地址拆解</h3><div class="desc">输入一个 32 位地址，看它落在哪个段、段内 VPN 和偏移是多少、由哪个页表翻译，以及为什么地址 0 会陷入 OS。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>虚拟地址 <input type="text" id="vx-addr" value="0x00000000" style="width:9em"></label>
+      <button data-a="0x00000000">NULL 指针</button><button data-a="0x00000234">P0 代码</button><button data-a="0x7FFFFA10">P1 栈</button><button data-a="0x80003C08">S 内核</button><button data-a="0xC0000000">保留区</button>
+    </div>
+    <div class="stage"><div id="vx-bits"></div></div>
+    <div class="narrate" id="vx-n"></div>
+  </div>
+</section>
+
+<div class="aside" data-title="旁注：为什么空指针访问会导致段错误">
+<pre><code>int *p = NULL; // set p = 0
+*p = 10;       // try to store 10 to virtual addr 0</code></pre>
+<p>进程生成虚拟地址 0。硬件查 TLB（VPN 0）未命中，查页表发现 VPN 0 的 PTE 被标记为<strong>无效</strong>，于是这是非法访问，控制转给 OS。UNIX 系统会向进程发送信号（SIGSEGV），进程可以处理它；如果没处理，进程被杀死。</p>
+</div>
+
+<h3>内核在每个地址空间里</h3>
+<p>上下文切换时，OS 改写 P0、P1 寄存器指向新进程的页表，但<strong>不改</strong> S 段的基址/界限寄存器，所以"同一份"内核结构被映射进每个用户地址空间。好处：</p>
+<ul>
+  <li>用户程序把指针交给内核（比如 <code>write()</code> 系统调用）时，内核可以直接从这个指针拷贝数据；内核代码可以自然地编写、编译，不用操心数据从哪来；</li>
+  <li>如果内核完全在物理内存里，换出页表的页之类的事就很难做；如果内核有自己独立的地址空间，用户与内核之间搬数据又会很麻烦。</li>
+</ul>
+<p>于是内核对应用程序来说几乎像一个<strong>库</strong>——只不过是受保护的。保护靠页表中的<strong>保护位</strong>：它规定 CPU 必须处于哪个特权级才能访问该页。用户代码访问系统页会陷入 OS，进程多半被终止。</p>
+<div class="aside" data-title="旁注：通用性的诅咒（the curse of generality）">
+  <p>OS 要支持一大类应用和系统，结果往往哪个都支持得不够好。VMS 要跑在从廉价到高端的一整个 VAX 家族上；今天的 Linux 要在手机、电视盒、笔记本、台式机和跑着上千进程的云服务器上都表现良好。</p>
+</div>
+
+<h2>VMS 的页替换：分段 FIFO 与二次机会链表</h2>
+<p>VAX 的 PTE 包含：有效位、4 位保护字段、修改（脏）位、5 位 OS 保留字段、PFN。细心的读者会发现：<strong>没有引用位（reference bit）</strong>！所以 VMS 的替换算法得在没有硬件帮助判断"哪些页活跃"的情况下工作。设计者还担心<strong>内存霸占者（memory hogs）</strong>：用很多内存、让其他程序难以运行的程序。前面学的多数策略（比如全局 LRU）都不能在进程间公平地分配内存。</p>
+<div class="aside" data-title="旁注：用保护位模拟引用位">
+  <p>Babaoglu 和 Joy 在 1980 年代初证明：可以用 VAX 的保护位<strong>模拟</strong>引用位。把页表中所有页标为不可访问（把真实权限记在 PTE 的"OS 保留字段"里）；进程访问某页时陷入 OS，OS 检查它本应可访问，就恢复正常权限。替换时，仍标记为不可访问的页就是最近没被用过的。关键是平衡：标得太勤开销太大；标得太少，所有页最终都被"引用"，又分辨不出该踢谁。</p>
+</div>
+<p>VMS 的解法是<strong>分段 FIFO（segmented FIFO）</strong>：</p>
+<ol>
+  <li>每个进程有一个能驻留内存的最大页数，即<strong>驻留集大小（resident set size，RSS）</strong>；这些页按 FIFO 链起来。进程超过 RSS 时，踢出"先进"的那一页。纯 FIFO 不需要任何硬件支持。</li>
+  <li>纯 FIFO 表现不好，于是加两个<strong>二次机会链表（second-chance lists）</strong>：全局的<strong>干净页空闲链表</strong>和<strong>脏页链表</strong>。进程 P 超过 RSS 时，被移出 FIFO 的页若干净就放到干净链表尾部，若脏就放到脏链表尾部。</li>
+  <li>另一个进程 Q 需要空闲页时，从干净链表<strong>头部</strong>取一页。但如果 P 在这页被真正回收前又访问了它，P 可以直接从空闲（或脏）链表<strong>找回（reclaim）</strong>，省掉一次昂贵的磁盘访问。</li>
+</ol>
+<p>二次机会链表越大，分段 FIFO 就越接近 LRU。此外，为了弥补小页导致的磁盘 I/O 低效，VMS 使用<strong>聚集（clustering）</strong>：从全局脏链表中成批取出页，一次写到磁盘（写完它们就变干净了）。因为页可以放在交换空间的任何位置，OS 可以自由地把页分组，做更少、更大的写。</p>
+
+<section class="sim" id="sim-sfifo">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>分段 FIFO + 全局干净/脏链表</h3><div class="desc">两个进程 P、Q 共享 N 个物理页框。每步访问一页（<code>P3w</code> 表示 P 写它的第 3 页）。观察：超过 RSS 的页先进入二次机会链表；被再次访问时从链表找回（不读磁盘）；Q 需要页框时从干净链表头部拿走别人的页；脏链表攒够一批后聚集写回。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>访问序列 <input type="text" id="sf-seq" value="P1 P2w P3w P4 P5 P1 Q1 Q2 Q3 Q4 P3 Q5 Q6 P2 Q1 P1" style="width:22em"></label>
+      <label>页框数 <input type="number" id="sf-n" value="8" min="2" max="20"></label>
+      <label>每进程 RSS <input type="number" id="sf-rss" value="3" min="1" max="10"></label>
+      <label>聚集大小 <input type="number" id="sf-cl" value="2" min="1" max="10"></label>
+      <button class="primary" id="sf-apply">载入</button>
+    </div>
+    <div id="sf-step"></div>
+    <div class="stage"><div class="lists" id="sf-vis"></div></div>
+    <div class="narrate" id="sf-nr"></div>
+    <div class="stats" id="sf-stats"></div>
+  </div>
+</section>
+
+<h2>懒惰的技巧：按需清零与写时复制</h2>
+<div class="tip"><p><strong>要懒惰（Be lazy）。</strong>推迟工作有两个好处：一是降低当前操作的延迟、提高响应速度（例如 OS 常常立即报告文件写入成功，稍后才在后台写盘）；二是有时根本不必做了（例如写入的文件很快被删除）。不过交作业还是别太懒。</p></div>
+<h3>按需清零（demand zeroing）</h3>
+<p>考虑往堆里添加一页。朴素做法：找一个物理页，<strong>清零</strong>（为了安全，否则你能看到别的进程以前留在这页上的数据！），再映射进地址空间。如果进程根本没用这页，这些工作就白做了。按需清零的做法：添加页时只在页表里放一个标为<strong>不可访问</strong>的条目；进程读或写这页时陷入 OS，OS 通过 PTE 的"OS 保留"位发现这是一个按需清零页，<strong>这时</strong>才找物理页、清零、映射。进程若从不访问，这些工作全省了。</p>
+<h3>写时复制（copy-on-write，COW）</h3>
+<p>思想至少可追溯到 TENEX：OS 需要把一页从一个地址空间复制到另一个时，不真的复制，而是把它映射进目标地址空间，并在<strong>两边都标为只读</strong>。如果双方都只读，就什么也不用做，快速"复制"了而没有搬任何数据。若一方试图写，就陷入 OS；OS 发现这是 COW 页，于是（懒惰地）分配新页、填入数据、映射到出错进程的地址空间，进程继续执行并拥有了私有副本。</p>
+<p>COW 对共享库很有用（许多进程以 COW 方式映射同一个库，省内存）。对 UNIX 更关键：<code>fork()</code> 要复制调用者的整个地址空间，又慢又费数据搬运；而多数情况下紧接着的 <code>exec()</code> 会把地址空间整个覆盖掉。COW 版的 <code>fork()</code> 保留了正确语义，又避免了大部分无谓的复制。</p>
+
+<section class="sim" id="sim-cow">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>按需清零 + fork 后的写时复制，逐步动画</h3><div class="desc">左边是父进程页表，右边是子进程页表，中间是物理页框（右上角数字是引用计数）。每一步观察 PTE 的权限位、映射线和页框内容如何变化。</div></div>
+  <div class="sim-body">
+    <div id="cw-step"></div>
+    <div class="stage"><svg id="cw-svg" viewBox="0 0 760 330" width="760" role="img" aria-label="COW 状态"></svg></div>
+    <div class="narrate" id="cw-n"></div>
+    <div class="stats" id="cw-stats"></div>
+  </div>
+</section>
+
+<h2>Linux 的地址空间</h2>
+<p>和其他现代系统（以及 VAX/VMS）一样，Linux 虚拟地址空间分为<strong>用户部分</strong>（代码、栈、堆等）和<strong>内核部分</strong>（内核代码、内核栈、内核堆等）。上下文切换时用户部分改变，内核部分在各进程间相同；用户态程序不能访问内核页，只有陷入内核、切到特权模式才行。（原书脚注：这是 KPTI 出现之前的情况，见后文。）</p>
+<p>经典 32 位 Linux 在 <code>0xC0000000</code>（地址空间的 3/4 处）划分：<code>0</code> ～ <code>0xBFFFFFFF</code> 是用户虚拟地址，<code>0xC0000000</code> ～ <code>0xFFFFFFFF</code> 属于内核。64 位 Linux 有类似的划分，只是位置不同。</p>
+<figure class="fig">
+<svg viewBox="0 0 760 420" width="760" role="img" aria-label="Linux 32 位与 64 位地址空间">
+  <g id="linux-as"></g>
+</svg>
+<figcaption>左：原书 Figure 23.2 的 32 位 Linux 地址空间，内核逻辑地址直接线性映射到物理内存开头；内核虚拟地址（vmalloc）的页可以散落在物理内存各处。右：x86-64 上 48 位地址的规范形式（canonical）布局。</figcaption>
+</figure>
+<h3>两种内核地址</h3>
+<ul>
+  <li><strong>内核逻辑地址（kernel logical addresses）</strong>：内核"普通"的虚拟地址空间，用 <code>kmalloc</code> 获取。页表、每进程内核栈等大多数内核数据结构都在这里，并且<strong>不能被换出到磁盘</strong>。它与物理内存的开头部分<strong>直接映射</strong>：逻辑地址 <code>0xC0000000</code> 对应物理 <code>0x00000000</code>，<code>0xC0000FFF</code> 对应 <code>0x00000FFF</code>……于是两者互相转换极其简单（常被当成物理地址看待）；逻辑上连续的内存物理上也连续，适合需要物理连续内存的操作，比如设备的<strong>直接内存访问（DMA）</strong>。</li>
+  <li><strong>内核虚拟地址（kernel virtual addresses）</strong>：用 <code>vmalloc</code> 获取，只保证<strong>虚拟连续</strong>，每个页可以映射到不连续的物理页（因此不适合 DMA），但更容易分配，适合大缓冲区。在 32 位 Linux 里它还有一个作用：让内核能使用超过（大约）1 GB 的内存。64 位 Linux 中内核不再局限于最后 1 GB 虚拟空间，这个需求就不那么迫切了。</li>
+</ul>
+<div class="controls"><label>32 位内核逻辑地址 <input type="text" id="kl-addr" value="0xC0000FFF" style="width:9em"></label><span class="readout" id="kl-out" style="margin:0"></span></div>
+
+<h2>x86-64 页表：四级，48 位</h2>
+<p>x86 提供硬件管理的多级页表，每进程一个；OS 在内存中建好映射，把一个特权寄存器（CR3）指向页目录的起点，其余交给硬件。OS 只在进程创建、删除和上下文切换时介入，确保 MMU 用的是正确的页表。</p>
+<p>从 32 位 x86 到 64 位 x86 是近年最大的变化：32 位地址空间终于不够用了。64 位 x86 使用<strong>四级页表</strong>，但目前只用虚拟地址的<strong>低 48 位</strong>：</p>
+<figure class="fig">
+<svg viewBox="0 0 720 110" width="720" role="img" aria-label="x86-64 虚拟地址格式">
+  <g id="x64-fmt"></g>
+</svg>
+<figcaption>原书的地址格式：最高 16 位不用（不参与转换），最低 12 位是 4KB 页内偏移，中间 36 位分成 P1～P4 四个 9 位索引。P1 索引最顶层的页目录，逐级向下，P4 索引最后一级页表，得到 PTE。</figcaption>
+</figure>
+<p>内存继续变大，更多地址位会被启用，于是有了<strong>五级</strong>、将来也许<strong>六级</strong>页表——仅仅为了找出某个数据在内存哪里，就要走六级查找。（Linux 各级名称：P1 = PGD，P2 = PUD，P3 = PMD，P4 = PTE。严格说硬件要求第 48～63 位都等于第 47 位，这叫"规范地址（canonical address）"，否则访问会出错。）</p>
+
+<section class="sim" id="sim-x64">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>x86-64 地址拆分器</h3><div class="desc">输入一个 64 位虚拟地址（十六进制），查看各级页表索引与偏移；切换页大小，看大页如何少走一级、偏移变长。默认值取自原书 ASLR 示例打印出的栈地址。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>虚拟地址 <input type="text" id="x64-addr" value="0x7ffd3e55d2b4" style="width:14em"></label>
+      <label>页大小 <select id="x64-ps"><option value="4K">4 KB（四级）</option><option value="2M">2 MB 大页（三级）</option><option value="1G">1 GB 大页（两级）</option></select></label>
+    </div>
+    <div class="controls">
+      <button data-x="0x7ffd3e55d2b4">原书栈地址</button><button data-x="0x0000000000400000">tcsh 代码（pmap）</button><button data-x="0x00007f4e7cf06000">libc（pmap）</button><button data-x="0xffffffff81000000">内核代码</button><button data-x="0x0000800000000000">非规范地址</button><button data-x="0x0">NULL</button>
+    </div>
+    <div class="stage"><div id="x64-bits" style="overflow-x:auto"></div><div class="walk" id="x64-walk"></div></div>
+    <div class="narrate" id="x64-n"></div>
+  </div>
+</section>
+
+<h2>大页（huge pages）</h2>
+<p>Intel x86 支持多种页大小：除 4KB 外，近来的设计在硬件上支持 <strong>2MB</strong> 甚至 <strong>1GB</strong> 的页。Linux 逐渐允许应用使用这些<strong>大页（huge pages）</strong>。大页能减少页表中需要的映射数量，但这<strong>不是</strong>主要动力；主要动力是<strong>更好的 TLB 行为</strong>：</p>
+<ul>
+  <li>进程大量使用内存时，很快就把 TLB 填满。如果翻译都是 4KB 页的，不引起 TLB 未命中就能访问的内存非常少。对运行在数 GB 内存上的"大内存"负载，性能代价明显：有研究表明某些应用 <strong>10%</strong> 的 CPU 周期花在处理 TLB 未命中上。</li>
+  <li>大页用更少的 TLB 槽位覆盖大片内存；此外 TLB 未命中路径更短（少走一级），分配在某些场景下也更快。</li>
+</ul>
+
+<section class="sim" id="sim-reach">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>TLB 覆盖范围（TLB reach）计算器</h3><div class="desc">TLB 能"覆盖"的内存 = 条目数 × 页大小。对比工作集大小，看 4KB 页和大页的差距。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>TLB 条目数 <input type="number" id="tr-n" value="1536" min="8" max="65536"></label>
+      <label>工作集 <input type="number" id="tr-ws" value="8" min="0.001" step="0.5"> GB</label>
+      <button data-tr="64">L1 DTLB 64 项</button><button data-tr="1536">L2 STLB 1536 项</button>
+    </div>
+    <div class="table-wrap"><table id="tr-table"></table></div>
+    <div class="narrate" id="tr-n2"></div>
+  </div>
+</section>
+<p>Linux 对大页的支持是<strong>渐进</strong>的：起初开发者认为只有少数应用（比如有严苛性能需求的大型数据库）需要，于是只允许应用通过 <code>mmap()</code> 或 <code>shmget()</code> <strong>显式</strong>申请大页，大多数应用不受影响。后来越来越多应用需要更好的 TLB 行为，Linux 加入了<strong>透明大页（transparent huge pages，THP）</strong>：开启后 OS 自动寻找机会分配大页（通常 2MB，有些系统 1GB），应用无需修改。</p>
+<p>大页也有代价：最大的是<strong>内部碎片</strong>（页很大却只用了一点点），会让内存被大而少用的页填满；换页与大页配合不佳，有时会大大放大 I/O；分配开销在某些情况下也可能很糟。总之，4KB 这个服务多年的页大小已不再是万能解。</p>
+<div class="tip"><p><strong>考虑渐进主义（incrementalism）。</strong>人们常鼓励"想大事、改变世界"。但很多时候，慢一点、渐进的方式才对：Linux 没有宣称"大页才是未来"，而是先提供专门的支持，了解利弊，等真有理由了再加通用支持。渐进常带来缓慢但深思熟虑、合乎情理的进步。</p></div>
+
+<h2>页缓存与 2Q 替换</h2>
+<p>为降低访问持久存储的代价，Linux 和其他系统一样使用激进的缓存。Linux 的<strong>页缓存（page cache）是统一的</strong>，保存三类来源的页：<strong>内存映射文件</strong>、来自设备的文件数据和元数据（通常通过 <code>read()</code>/<code>write()</code> 访问文件系统）、组成每个进程的堆和栈页（叫<strong>匿名内存（anonymous memory）</strong>，因为下面没有具名文件，只有交换空间）。这些页放在一个页缓存<strong>哈希表</strong>中以便快速查找。</p>
+<p>页缓存记录每页是干净还是<strong>脏</strong>（被修改）。脏数据由后台线程（<code>pdflush</code>）定期写回后备存储（文件数据写回文件，匿名数据写到交换空间）：要么过了一段时间，要么脏页太多（两个参数都可配置）。</p>
+<p>内存不足时，Linux 使用修改版的 <strong>2Q 替换</strong>算法。动机：标准 LRU 很有效，但会被某些常见访问模式破坏。比如一个进程反复读一个很大的文件（接近或超过内存大小），LRU 会把其他所有文件都踢出内存；更糟的是，留着这个大文件的部分页也没用，因为它们在被再次访问前就被踢掉了。</p>
+<p>Linux 的 2Q 保持两个链表并在它们之间划分内存：页第一次被访问时放进一个队列（原论文叫 A1，Linux 叫 <strong>inactive 链表</strong>）；再次被访问时提升到另一个队列（原论文 Aq，Linux 叫 <strong>active 链表</strong>）。替换时从 inactive 链表选牺牲者。Linux 还会周期性地把 active 链表底部的页移到 inactive 链表，使 active 链表约占页缓存的 <strong>2/3</strong>。理想情况下两个链表都按完美 LRU 排序，但那太贵，实际用的是类似时钟算法的近似。</p>
+
+<section class="sim" id="sim-2q">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>LRU vs 2Q：一次大文件扫描的冲击</h3><div class="desc">同一访问序列同时喂给容量相同的 LRU 缓存和 2Q 缓存（active 最多占 2/3）。先反复访问热页 A、B、C，再顺序扫描一个大文件（页 1…8，只读一次），最后回到热页。看谁还留着热页。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>访问序列 <input type="text" id="q2-seq" value="A B C A B C A B C 1 2 3 4 5 6 7 8 A B C" style="width:22em"></label>
+      <label>缓存页数 <input type="number" id="q2-c" value="6" min="2" max="16"></label>
+      <button class="primary" id="q2-apply">载入</button>
+    </div>
+    <div id="q2-step"></div>
+    <div class="stage"><div class="twocol" id="q2-vis"></div></div>
+    <div class="narrate" id="q2-n"></div>
+    <div class="stats" id="q2-stats"></div>
+  </div>
+</section>
+
+<div class="aside" data-title="旁注：无处不在的内存映射">
+<p>内存映射早于 Linux 就有了。对一个已打开的文件描述符调用 <code>mmap()</code>，进程得到一个指向虚拟内存区域开头的指针，文件内容"好像"就在那里；之后用普通的指针解引用就能访问文件的任意部分。访问尚未调入内存的部分会触发页错误，OS 调入相应数据并更新页表（即按需分页）。每个普通 Linux 进程都在用内存映射文件，即使 <code>main()</code> 没直接调用 <code>mmap()</code>——可执行文件和共享库的代码就是这样装入的。下面是原书中 <code>pmap</code> 对 tcsh 的（高度删节的）输出，四列分别是虚拟地址、大小、保护位、映射来源：</p>
+<pre><code>0000000000400000  372K r-x-- tcsh
+00000000019d5000 1780K rw--- [anon ]
+00007f4e7cf06000 1792K r-x-- libc-2.23.so
+00007f4e7d2d0000   36K r-x-- libcrypt-2.23.so
+00007f4e7d508000  148K r-x-- libtinfo.so.5.9
+00007f4e7d731000  152K r-x-- ld-2.23.so
+00007f4e7d932000   16K rw--- [stack ]</code></pre>
+<p>tcsh 自己的代码，libc、libcrypt、libtinfo 和动态链接器 ld.so 的代码都被映射进地址空间；还有两个匿名区域：堆（第二行 anon）和栈。内存映射文件为 OS 构造现代地址空间提供了直接而高效的方式。</p>
+</div>
+
+<h2>安全：缓冲区溢出、NX、ROP 与 ASLR</h2>
+<p>现代 VM 系统（Linux、Solaris、BSD）与古老系统（VAX/VMS）最大的区别，大概就是对<strong>安全</strong>的重视。机器之间前所未有地互联，开发者实现了各种防御手段来阻止狡猾的攻击者夺取系统控制权。</p>
+<p>一大威胁是<strong>缓冲区溢出（buffer overflow）攻击</strong>，既能针对普通用户程序，也能针对内核。攻击者找到一个 bug，借此把任意数据注入目标的地址空间。这类漏洞往往源于开发者（错误地）假设输入不会太长，于是（信任地）把输入拷进缓冲区；输入其实太长，溢出缓冲区，覆盖了目标内存。看似无害的代码就能出问题：</p>
+<pre><code>int some_function(char *input) {
+    char dest_buffer[100];
+    strcpy(dest_buffer, input); // oops, unbounded copy!
+}</code></pre>
+<p>很多时候溢出只会让程序崩溃。但恶意程序员可以精心构造溢出输入，<strong>注入自己的代码</strong>，从而接管系统：在联网的用户程序上成功，就能执行任意计算甚至出租被攻陷机器的算力；在 OS 上成功，就能访问更多资源，这叫<strong>特权提升（privilege escalation）</strong>（用户代码获得内核权限）。</p>
+<ul>
+  <li><strong>第一道防线：NX 位（No-eXecute）</strong>。AMD 在其 x86 版本中引入（Intel 有类似的 XD 位）：PTE 中设置了该位的页不能执行代码。攻击者注入到栈上的代码就无法运行。</li>
+  <li><strong>攻击者的回应：面向返回的编程（return-oriented programming，ROP）</strong>。程序地址空间里本来就有大量代码片段（ROP 术语叫 <strong>gadget</strong>），链接了庞大 C 库的程序尤其多。攻击者覆盖栈，让当前函数的返回地址指向某个想要的恶意指令（或指令序列），后面跟一条 return 指令；把大量 gadget 串起来（确保每次 return 都跳到下一个 gadget），就能执行任意代码。其早期形式叫 <strong>return-to-libc</strong> 攻击。</li>
+  <li><strong>再防御：地址空间布局随机化（ASLR）</strong>。OS 不再把代码、栈、堆放在固定位置，而是随机化它们的位置，使构造 ROP 所需的精确地址序列变得非常困难。多数针对漏洞用户程序的攻击因此只会导致崩溃，而无法控制程序。内核也用了同样的思路，叫 <strong>KASLR</strong>。</li>
+</ul>
+
+<section class="sim" id="sim-bof">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>栈溢出攻击与防御，逐步演示</h3><div class="desc">画出 <code>some_function</code> 的栈帧（高地址在上）。一步一步看：正常调用 → 溢出覆盖返回地址 → 注入代码 → NX 阻止执行 → ROP 复用 libc 中的 gadget → ASLR 让地址失效。</div></div>
+  <div class="sim-body">
+    <div id="bof-step"></div>
+    <div class="stage"><svg id="bof-svg" viewBox="0 0 760 360" width="760" role="img" aria-label="栈帧与溢出"></svg></div>
+    <div class="narrate" id="bof-n"></div>
+  </div>
+</section>
+
+<section class="sim" id="sim-aslr">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>多运行几次：ASLR 下地址每次都变</h3><div class="desc">模拟原书的 <code>./random</code> 程序（打印栈上变量的地址），以及本章实验 <code>./aslr</code> 打印的多个区域。关闭 ASLR（相当于 <code>setarch -R</code>）后再运行，地址固定不变。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <button class="primary" id="as-run">运行一次 ./aslr</button>
+      <label><input type="checkbox" id="as-off"> 关闭 ASLR（setarch -R）</label>
+      <button id="as-clear">清空</button>
+    </div>
+<pre><code>int main(int argc, char *argv[]) {
+    int stack = 0;
+    printf("%p\n", &amp;stack);
+    return 0;
+}</code></pre>
+    <div class="runs" id="as-out"></div>
+    <div class="narrate" id="as-n">点"运行"，比较每次输出中变化的十六进制位（蓝色）。</div>
+  </div>
+</section>
+<p class="small muted">页面里的随机地址是按 Linux x86-64 的典型布局生成的示意（栈在 <code>0x7ff…</code> 附近，PIE 代码和堆在 <code>0x55…/0x56…</code> 附近，mmap 与共享库在 <code>0x7f…</code> 附近）；真实输出见下方"动手实验"。</p>
+
+<h2>Meltdown、Spectre 与 KPTI</h2>
+<p>原书写作时（2018 年 8 月），系统安全界被两个相关的新攻击颠覆了：<strong>Meltdown</strong> 和 <strong>Spectre</strong>。它们几乎同时被四组研究者/工程师发现，让人们深刻怀疑硬件和 OS 所提供的基本保护。Spectre 被认为更难对付。</p>
+<p>两者利用的共同弱点是：现代 CPU 在幕后做各种疯狂的优化。核心之一是<strong>推测执行（speculative execution）</strong>：CPU 猜测接下来会执行哪些指令并提前执行。猜对了程序更快；猜错了，CPU 撤销它们对<strong>架构状态</strong>（例如寄存器）的影响，再走正确的路。问题在于推测往往会在系统其他部分留下痕迹，比如<strong>处理器缓存</strong>、分支预测器等。攻击者由此可以推断出内存内容，<strong>甚至是我们以为受 MMU 保护的内存</strong>。</p>
+<figure class="fig">
+<svg viewBox="0 0 740 250" width="740" role="img" aria-label="推测执行在缓存中留下痕迹">
+  <g id="spec-fig"></g>
+</svg>
+<figcaption>简化示意：推测执行的指令被"撤销"，寄存器恢复原状，但它们带进缓存的数据仍在。攻击者测量访问时间，就能知道哪个缓存行被加载过，从而推出秘密值。</figcaption>
+</figure>
+<p>加强内核保护的一个途径是：从每个用户进程中尽量<strong>移除内核地址空间</strong>，为大部分内核数据使用<strong>单独的内核页表</strong>，这叫<strong>内核页表隔离（kernel page-table isolation，KPTI）</strong>。进程中只保留最低限度的内核映射；进入内核时需要切换到内核页表。这提升了安全、堵住了一些攻击途径，但有代价：<strong>性能</strong>，切换页表很昂贵（例如 TLB 中的翻译可能要作废）。安全的代价：便利与性能。</p>
+<figure class="fig">
+<svg viewBox="0 0 740 280" width="740" role="img" aria-label="KPTI 前后对比">
+  <g id="kpti-fig"></g>
+</svg>
+<figcaption>左：KPTI 之前，用户态运行时页表里也映射着整个内核（只靠 U/S 保护位拦住访问，而 Meltdown 能借推测执行越过它）。右：KPTI 之后，用户态页表只保留进入内核所需的极少量代码；陷入内核时切换 CR3 到完整的内核页表。</figcaption>
+</figure>
+<p>KPTI 并没有解决上面所有安全问题，只解决了一部分。而简单粗暴的办法（比如关闭推测执行）没有意义，系统会慢上千倍。要真正理解这些攻击，得先深入学习现代计算机体系结构（尤其是推测及其实现机制），再去读 Meltdown 和 Spectre 的论文（spectreattack.com），它们其实也包含了不错的推测执行入门。还有哪些问题没被发现？谁知道呢。</p>
+
+<h2>先预测再验证</h2>
+<div class="exercise"><div class="q">在 VAX 地址拆解器中输入 <code>0x00000000</code> 和 <code>0x00000200</code>。它们的段内 VPN 各是多少？为什么前者会陷入 OS 而后者可能正常？</div>
+<details class="reveal"><summary>看答案</summary><div>页大小 512 = 2<sup>9</sup> 字节，所以 VPN = 地址 &gt;&gt; 9。<code>0x0</code> 的 VPN 为 0，<code>0x200</code> 的 VPN 为 1。VMS 把 P0 的第 0 页标为无效，代码从第 1 页开始，所以空指针解引用在查页表时发现 PTE 无效，陷入 OS。</div></details></div>
+
+<div class="exercise"><div class="q">在分段 FIFO 模拟器中（默认序列，8 个页框，RSS=3，聚集大小 2），预测：第 6 步 P 再次访问 <code>P1</code> 时要不要读磁盘？P2、P3 被移出驻留集后各去了哪里、最后命运如何？</div>
+<details class="reveal"><summary>看答案</summary><div>第 4 步 P 装入第 4 个页，超过 RSS，干净的 P1 进干净链表尾部；第 5 步写过的 P2 被移出，进<strong>脏链表</strong>。第 6 步访问 P1 时它还在干净链表上，于是被<strong>找回</strong>，不读磁盘；同时 P3（也写过）被移出进脏链表，脏链表凑够 2 页，P2、P3 被<strong>聚集成一次磁盘写</strong>，变成干净页挂到干净链表尾部。之后 Q 需要页框：先用空页框，用完后从干净链表头部拿走了 P2 所在的页框，P2 被真正回收（第 14 步 P 再访问 P2 只能读磁盘）；而 P3 在被拿走之前又被 P 访问（第 11 步），再次被找回。整个序列 13 次磁盘读，没有二次机会链表的纯 FIFO 要 15 次。</div></details></div>
+
+<div class="exercise"><div class="q">在 COW 动画中，fork 之后、任何一方写之前，物理内存里有几个页框被使用？父进程写第 1 页之后呢？子进程随后也写第 1 页时，还需要复制吗？</div>
+<details class="reveal"><summary>看答案</summary><div>fork 后仍然只有 4 个页框（代码、数据、堆、按需清零得到的新堆页），全部被两个进程共享，引用计数为 2。父进程写第 1 页 → 复制出第 5 个页框。子进程再写第 1 页时，原页框的引用计数已经降为 1，只有它自己在用，OS 只需把 PTE 改回可写，<strong>不必复制</strong>（这是 Linux 等系统的常见优化）。</div></details></div>
+
+<div class="exercise"><div class="q">在 x86-64 拆分器中输入 <code>0x7ffd3e55d2b4</code>，先手算 P1～P4 索引再验证。切到 2MB 大页，偏移变成多少位？</div>
+<details class="reveal"><summary>看答案</summary><div>4KB 页：P1 = 255，P2 = 500，P3 = 498，P4 = 349，偏移 = 0x2b4。2MB 大页时最后一级不再需要，偏移变为 21 位（0x15d2b4），只走 PML4 → PDPT → PD 三级。</div></details></div>
+
+<div class="exercise"><div class="q">在 LRU vs 2Q 模拟器中，预测最后三次访问 A、B、C 各自在两种缓存里是否命中。</div>
+<details class="reveal"><summary>看答案</summary><div>LRU：扫描的 8 个页把 A、B、C 全部挤出，最后三次全部未命中。2Q：A、B、C 在第二次访问时已被提升到 active 链表；扫描页只进 inactive 链表并从那里被淘汰，所以最后三次全部命中。</div></details></div>
+
+<div class="exercise"><div class="q">运行实验里的 <code>./cow</code>。为什么 fork 只花了不到 1 毫秒，而子进程第一遍写 64 MB 却要几十毫秒，第二遍又不到 1 毫秒？</div>
+<details class="reveal"><summary>看答案</summary><div>fork 只复制页表并把可写页标为只读 COW，不复制数据。子进程第一遍写时每页触发一次页错误（16384 次 minor fault），OS 分配新页并复制 4KB；第二遍这些页已经是私有可写的，没有页错误，只剩普通内存写入。smaps 中的 Shared_Dirty 变为 Private_Dirty 也印证了这一点。</div></details></div>
+
+<h2>动手实验</h2>
+<div class="lab">
+  <p>三个小程序分别观察写时复制、ASLR、按需分页（含按需清零与大页）。</p>
+  <pre><code><span class="cmd">cd labs/23-complete-vm &amp;&amp; make</span>
+<span class="cmd">./cow</span>
+<span class="cmd">for i in 1 2 3; do ./aslr; done; setarch -R ./aslr</span>
+<span class="cmd">./mmap_touch</span></code></pre>
+  <p><strong>① 写时复制</strong>（示例输出，本机 WSL2 实际运行；你的机器上数字会不同）：</p>
+  <pre><code>parent: 64 MB touched (16384 pages)
+  [parent before fork] smaps: Rss  65536 kB   Shared_Dirty      0 kB   Private_Dirty  65536 kB
+child : fork() returned after 0.86 ms (only page tables copied, pages shared read-only)
+  [child  after fork ] smaps: Rss  65536 kB   Shared_Dirty  65536 kB   Private_Dirty      0 kB
+child : 1st write pass   46.14 ms, minor faults 16384   &lt;- copy-on-write
+child : 2nd write pass    0.28 ms, minor faults 0
+  [child  after write] smaps: Rss  65536 kB   Shared_Dirty      0 kB   Private_Dirty  65536 kB
+parent: buf[0] is still 1 (child's writes went to its private copies)</code></pre>
+  <p>fork 后 64 MB 全部是 <em>Shared_Dirty</em>（与父进程共享）；子进程第一遍写触发 16384 次 COW 页错误（正好每页一次），第二遍零次；之后全部变成 <em>Private_Dirty</em>，而父进程看到的数据不受影响。</p>
+  <p><strong>② ASLR</strong>：</p>
+  <pre><code>stack  0x7ffdad221ecc   heap  0x57848527e2a0   mmap  0x737423de7000   code(main)  0x57845ff1f149   data  0x57845ff22020   libc(printf)  0x737423c45900
+stack  0x7ffddb1dbbbc   heap  0x645f3a9c52a0   mmap  0x7d0f9a399000   code(main)  0x645f305ee149   data  0x645f305f1020   libc(printf)  0x7d0f9a1f7900
+stack  0x7ffface0655c   heap  0x5567cda802a0   mmap  0x7549ab765000   code(main)  0x5567af4d2149   data  0x5567af4d5020   libc(printf)  0x7549ab5c3900
+--- setarch -R（关闭 ASLR）
+stack  0x7fffffffdc0c   heap  0x5555555592a0   mmap  0x7ffff7fbe000   code(main)  0x555555555149   data  0x555555558020   libc(printf)  0x7ffff7e1c900
+stack  0x7fffffffdc0c   heap  0x5555555592a0   mmap  0x7ffff7fbe000   code(main)  0x555555555149   data  0x555555558020   libc(printf)  0x7ffff7e1c900</code></pre>
+  <p>注意：每次运行地址都不同，但<strong>页内偏移（低 12 位）不变</strong>（比如 main 总以 <code>…149</code> 结尾），因为随机化以页为单位；同一区域内的相对距离也不变（data − main 始终是 <code>0x2ed7</code>）。这就是为什么攻击者只要泄露<strong>一个</strong>地址，ASLR 往往就被攻破。</p>
+  <p><strong>③ 按需分页、按需清零与大页</strong>：</p>
+  <pre><code>== 4KB pages (demand paging + demand zeroing) ==
+  after mmap          : RSS    1408 kB
+  wrote  25% of pages : RSS   66944 kB   minor faults so far  16385   (34.9 ms)
+  wrote  50% of pages : RSS  132608 kB   minor faults so far  32770   (68.8 ms)
+  wrote 100% of pages : RSS  263680 kB   minor faults so far  65538   (135.7 ms)
+== read-only touch of 256 MB ==
+  minor faults 65536, RSS grew 0 kB, sum of bytes = 0 (all zero)
+== 2MB transparent huge pages (MADV_HUGEPAGE) ==
+  after mmap          : RSS    1640 kB
+  wrote  25% of pages : RSS   67708 kB   minor faults so far    165   (42.8 ms)
+  wrote  50% of pages : RSS  133244 kB   minor faults so far    197   (85.3 ms)
+  wrote 100% of pages : RSS  263676 kB   minor faults so far    639   (179.9 ms)</code></pre>
+  <p>mmap 256 MB 后 RSS 几乎不变——只分配了虚拟空间。写多少页，RSS 就长多少，每页一次 minor fault（按需分配 + 清零）。只读不写时每页也有一次页错误，但 RSS <strong>一点没长</strong>：Linux 把所有只读的零页映射到同一个共享的"零页"，读到的全是 0，真正写的时候才分配（又一次懒惰）。用 2MB 透明大页时页错误从 65538 次降到几百次（理想是 256MB/2MB = 128 次；部分区域因对齐或分配失败退回 4KB 页）；每次页错误要清零 2MB，所以这里总时间并没有变短——大页的主要收益在之后的 TLB 命中率。</p>
+</div>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="0"><div class="q">VAX-11 的虚拟地址由哪几部分组成？</div>
+<div class="opts"><button>A. 23 位 VPN（最高 2 位选择段）+ 9 位偏移</button><button>B. 22 位 VPN + 10 位偏移</button><button>C. 20 位 VPN + 12 位偏移</button><button>D. 4 级各 9 位索引 + 12 位偏移</button></div>
+<div class="explain">32 位地址，页大小 512 = 2<sup>9</sup> 字节，所以 9 位偏移、23 位 VPN；VPN 最高两位区分 P0/P1/S 段。D 是 x86-64。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">VMS 为什么把用户页表放在内核虚拟内存（S 段）中？</div>
+<div class="opts"><button>A. 因为 VAX 没有物理内存寻址能力</button><button>B. 内存紧张时可以把页表的页换出到磁盘，减少页表对物理内存的压力</button><button>C. 为了防止用户修改页表</button><button>D. 为了让 TLB 更快</button></div>
+<div class="explain">页表从内核虚拟内存分配后，也可以被换出。代价是地址转换可能要先查系统页表。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">关于 VMS 的分段 FIFO，哪项是错的？</div>
+<div class="opts"><button>A. 被移出的干净页进全局干净链表，脏页进脏链表</button><button>B. 每个进程有 RSS 上限，超出时按 FIFO 移出一页</button><button>C. 如果原进程在页被回收前再次访问它，可以从链表找回而不读磁盘</button><button>D. 它依赖硬件引用位来判断哪些页活跃</button></div>
+<div class="explain">VAX 的 PTE 根本没有引用位，这正是 VMS 采用 FIFO + 二次机会链表的原因。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">按需清零（demand zeroing）在什么时候真正清零一个物理页？</div>
+<div class="opts"><button>A. 进程退出时</button><button>B. 交换守护进程空闲时</button><button>C. 进程第一次访问该页、陷入 OS 时</button><button>D. 进程调用 malloc 时</button></div>
+<div class="explain">添加页时只放一个不可访问的 PTE；第一次读写触发陷入，OS 才找页、清零、映射。从不访问就不做。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">fork() 使用写时复制后，下列哪种情况会真正复制一个页？</div>
+<div class="opts"><button>A. 父子进程任一方第一次写一个仍被共享的页时</button><button>B. 子进程调用 exec() 时</button><button>C. fork() 返回时</button><button>D. 子进程读取该页时</button></div>
+<div class="explain">共享页在两边都是只读的；写入触发保护陷阱，OS 识别为 COW 页，才分配新页并复制。exec 会丢弃整个旧地址空间，根本不需要复制。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">Linux 内核逻辑地址（kmalloc）与内核虚拟地址（vmalloc）的关键区别是？</div>
+<div class="opts"><button>A. 逻辑地址可以被换出，vmalloc 的不能</button><button>B. vmalloc 的内存一定物理连续</button><button>C. 逻辑地址与物理内存直接线性映射、物理上连续，适合 DMA；vmalloc 只保证虚拟连续</button><button>D. 两者没有区别</button></div>
+<div class="explain">kmalloc 内存与物理内存开头直接映射（0xC0000000 → 0x0），不可换出；vmalloc 的每页可以映射到任意物理页，更易分配大块，但不适合 DMA。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">x86-64 使用 4KB 页时，48 位虚拟地址 <code>0x7ffd3e55d2b4</code> 的最高级索引（P1）是多少？</div>
+<div class="opts"><button>A. 511</button><button>B. 255</button><button>C. 127</button><button>D. 0</button></div>
+<div class="explain">P1 = 地址 &gt;&gt; 39 的低 9 位 = 0x7ffd3e55d2b4 &gt;&gt; 39 = 0xFF = 255。用模拟器验证。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">大页（huge pages）的<strong>主要</strong>动力是什么？</div>
+<div class="opts"><button>A. 减少内部碎片</button><button>B. 更好的 TLB 行为：同样的 TLB 条目覆盖多得多的内存</button><button>C. 让换页更高效</button><button>D. 减少页表项数量</button></div>
+<div class="explain">原书明确说减少映射数"不是驱动力"，主要是 TLB。大页反而会增加内部碎片（A 错），与换页配合也不好（C 错）。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">Linux 的 2Q 替换如何应对"反复读一个超大文件"的负载？</div>
+<div class="opts"><button>A. 首次访问的页只进 inactive 链表，替换也从 inactive 选；扫描页不会冲掉 active 链表里的热页</button><button>B. 把大文件的页直接放进 active 链表</button><button>C. 使用 MRU 替换</button><button>D. 完全不缓存文件页</button></div>
+<div class="explain">只有被再次访问的页才提升到 active。循环扫描的大文件页在被再访问前就从 inactive 被踢走，不会冲掉热页。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">ASLR 主要是为了防御哪类攻击？</div>
+<div class="opts"><button>A. TLB 未命中</button><button>B. 抖动</button><button>C. 物理内存耗尽</button><button>D. ROP / return-to-libc：让攻击者难以知道 gadget 的精确地址</button></div>
+<div class="explain">NX 阻止执行注入的代码后，攻击者转而复用已有代码（ROP）。ASLR 随机化代码、栈、堆的位置，使这些地址难以预测。</div></div>
+
+<h2>常见误区与小结</h2>
+<div class="warn">
+  <ul>
+    <li><strong>"fork 会复制整个地址空间"</strong>——有 COW 后，fork 只复制页表；真正的复制推迟到写入时，并且只复制被写的页。</li>
+    <li><strong>"mmap 一大块内存就立刻占用那么多物理内存"</strong>——按需分页：只有被触碰（写）的页才分配物理页框；只读未写的匿名页甚至共享同一个零页。</li>
+    <li><strong>"内核有自己独立的地址空间"</strong>——传统上（VMS、KPTI 之前的 Linux）内核被映射进每个进程地址空间的上半部分，靠保护位隔离；KPTI 之后用户态只保留极少内核映射。</li>
+    <li><strong>"大页只有好处"</strong>——内部碎片、与换页配合差、某些情况下分配开销大。</li>
+    <li><strong>"有了 NX 就安全了"</strong>——ROP 复用程序中已有的代码片段，完全绕过 NX；还需要 ASLR 等防御，而单个地址泄露就可能让 ASLR 失效。</li>
+    <li><strong>"x86-64 用满了 64 位地址"</strong>——目前只用低 48 位（四级页表），高 16 位必须是第 47 位的符号扩展。</li>
+  </ul>
+</div>
+<div class="key">
+  <ul>
+    <li>VAX/VMS：32 位地址、512B 小页 → 用分段（P0/P1/S）和把用户页表放在可换出的内核虚拟内存来控制页表大小；第 0 页无效捕获空指针；内核映射进每个地址空间。</li>
+    <li>没有引用位的 VMS 用分段 FIFO（每进程 RSS）+ 全局干净/脏二次机会链表近似 LRU，并聚集脏页写回。</li>
+    <li>懒惰优化：按需清零、写时复制（COW 让 fork+exec 几乎不复制数据）。</li>
+    <li>Linux：用户/内核划分（32 位在 0xC0000000）；内核逻辑地址（直接映射，可 DMA）与内核虚拟地址（vmalloc）；x86-64 四级页表，48 位地址 = 4×9 + 12；大页改善 TLB 覆盖，经历了从显式申请到透明大页的渐进过程。</li>
+    <li>统一页缓存 + 2Q（inactive/active）抵抗大文件扫描；pdflush 后台写回脏页。</li>
+    <li>安全：缓冲区溢出 → NX → ROP → ASLR/KASLR；Meltdown/Spectre 利用推测执行的痕迹，KPTI 用独立内核页表换取安全，代价是性能。</li>
+    <li>至此"虚拟化"中的内存部分结束。下一部分进入<strong>并发</strong>（第 26 章起）：多个线程共享同一个地址空间时会发生什么。</li>
+  </ul>
+</div>
+
+</main>
+<script>
+(function () {
+"use strict";
+const { h, s } = OSTEP;
+const $ = (id) => document.getElementById(id);
+const hx = (n, w) => "0x" + n.toString(16).padStart(w || 1, "0");
+
+// CORE-BEGIN
+// ---- VAX 地址拆解 ----
+function vaxDecode(a) {
+  a = a >>> 0;
+  const seg = a >>> 30, vpn = a >>> 9, segVpn = vpn & 0x1fffff, off = a & 0x1ff;
+  return { seg, segName: ["P0", "P1", "S", "保留（未用）"][seg], vpn, segVpn, off };
+}
+// ---- x86-64 拆分（BigInt）----
+function x64Split(str, ps) {
+  let v;
+  try { v = BigInt(str.trim().replace(/_/g, "")); } catch (e) { return null; }
+  if (v < 0n || v >= (1n << 64n)) return null;
+  const b47 = (v >> 47n) & 1n, hi = v >> 48n;
+  const canonical = b47 ? hi === 0xffffn : hi === 0n;
+  const idx = (sh) => Number((v >> BigInt(sh)) & 0x1ffn);
+  const levels = ps === "1G" ? 2 : ps === "2M" ? 3 : 4;
+  const offBits = ps === "1G" ? 30 : ps === "2M" ? 21 : 12;
+  return { v, canonical, hi: Number(hi), p: [idx(39), idx(30), idx(21), idx(12)].slice(0, levels), levels, offBits, off: v & ((1n << BigInt(offBits)) - 1n) };
+}
+// ---- VMS 分段 FIFO ----
+function parseSF(t) {
+  return String(t).split(/[\s,，]+/).filter(Boolean).map((x) => { const m = /^([PQpq])(\d+)([wW])?$/.exec(x); return m ? { proc: m[1].toUpperCase(), pg: Number(m[2]), w: !!m[3] } : null; }).filter(Boolean);
+}
+function segFifo(seq, N, RSS, CL) {
+  // frame: {key, proc, pg, dirty} 或 null（空页框）；链表里放页框号
+  const frames = new Array(N).fill(null);
+  const fifo = { P: [], Q: [] }, clean = [...Array(N).keys()], dirty = [];
+  const st = { hits: 0, reclaim: 0, reads: 0, clusterWrites: 0, pagesWritten: 0 };
+  const steps = [];
+  const snap = (a, text, hl) => steps.push({ a, text, hl: hl || {}, frames: frames.map((f) => f && { ...f }), fifo: { P: fifo.P.slice(), Q: fifo.Q.slice() }, clean: clean.slice(), dirty: dirty.slice(), st: { ...st } });
+  const name = (f) => frames[f] ? frames[f].proc + frames[f].pg : "空";
+  const flushDirty = (why) => {
+    const batch = dirty.splice(0, Math.max(CL, 1));
+    batch.forEach((f) => { frames[f].dirty = false; clean.push(f); });
+    st.clusterWrites++; st.pagesWritten += batch.length;
+    return `${why}：把脏链表头部的 ${batch.map(name).join("、")} <strong>聚集成一次磁盘写</strong>，写完它们变干净，移到干净链表尾部。`;
+  };
+  const enforce = (X) => {
+    const out = [];
+    while (fifo[X].length > RSS) {
+      const f = fifo[X].shift();
+      if (frames[f].dirty) dirty.push(f); else clean.push(f);
+      out.push(`${name(f)}（${frames[f].dirty ? "脏 → 脏链表" : "干净 → 干净链表"}）`);
+    }
+    let t = out.length ? ` ${X} 超过 RSS=${RSS}，按 FIFO 移出最先进入的 ${out.join("、")}。` : "";
+    if (dirty.length >= CL && CL > 0) t += " " + flushDirty(`脏链表攒够 ${CL} 页`);
+    return t;
+  };
+  snap(null, `初始：${N} 个空页框都在干净空闲链表上；P、Q 的驻留集为空。RSS 上限 ${RSS}，聚集大小 ${CL}。`);
+  for (const a of seq) {
+    const X = a.proc, key = X + a.pg;
+    let f = fifo[X].find((k) => frames[k] && frames[k].proc + frames[k].pg === key);
+    let text;
+    if (f !== undefined) {
+      st.hits++;
+      if (a.w) frames[f].dirty = true;
+      text = `${X} 访问 ${key}${a.w ? "（写）" : ""}：在 ${X} 的驻留集中，<strong>命中</strong>。注意 FIFO 不会因为命中而调整顺序。`;
+      snap(a, text, { f });
+      continue;
+    }
+    const inClean = clean.findIndex((k) => frames[k] && frames[k].proc + frames[k].pg === key);
+    const inDirty = dirty.findIndex((k) => frames[k] && frames[k].proc + frames[k].pg === key);
+    if (inClean >= 0 || inDirty >= 0) {
+      st.reclaim++;
+      f = inClean >= 0 ? clean.splice(inClean, 1)[0] : dirty.splice(inDirty, 1)[0];
+      if (a.w) frames[f].dirty = true;
+      fifo[X].push(f);
+      text = `${X} 访问 ${key}：不在驻留集，但还在<strong>${inClean >= 0 ? "干净" : "脏"}链表</strong>上——页错误时直接<strong>找回（reclaim）</strong>，放回 ${X} 的 FIFO 尾部，<strong>不需要读磁盘</strong>。` + enforce(X);
+      snap(a, text, { f });
+      continue;
+    }
+    // 硬缺页
+    let pre = "";
+    if (!clean.length) pre = flushDirty("干净链表为空") + " ";
+    f = clean.shift();
+    const old = frames[f];
+    st.reads++;
+    frames[f] = { proc: X, pg: a.pg, dirty: a.w };
+    fifo[X].push(f);
+    text = `${X} 访问 ${key}：驻留集和两个链表里都没有，<strong>从磁盘读入</strong>。${pre}从干净链表<strong>头部</strong>取页框 ${f}` +
+      (old ? `——它原来装着 ${old.proc}${old.pg}，这页现在被真正回收了，${old.proc} 以后再访问它就得读磁盘。` : "（空页框）。") + enforce(X);
+    snap(a, text, { f });
+  }
+  return steps;
+}
+function pureFifoReads(seq, RSS) {
+  const fifo = { P: [], Q: [] }; let reads = 0;
+  for (const a of seq) { const L = fifo[a.proc]; if (L.includes(a.pg)) continue; reads++; L.push(a.pg); if (L.length > RSS) L.shift(); }
+  return reads;
+}
+// ---- LRU 与 2Q ----
+function runLRU(seq, C) {
+  const L = []; const out = []; let hits = 0;
+  for (const x of seq) {
+    const i = L.indexOf(x), hit = i >= 0; let ev = null;
+    if (hit) { L.splice(i, 1); hits++; } else if (L.length >= C) ev = L.shift();
+    L.push(x);
+    out.push({ x, hit, ev, list: L.slice(), hits });
+  }
+  return out;
+}
+function run2Q(seq, C) {
+  const maxA = Math.max(1, Math.floor((2 * C) / 3));
+  const act = [], ina = []; const out = []; let hits = 0;   // 数组尾部 = 最近（MRU）
+  for (const x of seq) {
+    let hit = false, ev = null, note = "";
+    const ia = act.indexOf(x), ii = ina.indexOf(x);
+    if (ia >= 0) { hit = true; act.splice(ia, 1); act.push(x); note = "active 命中"; }
+    else if (ii >= 0) {
+      hit = true; ina.splice(ii, 1); act.push(x); note = "inactive 命中 → 提升到 active";
+      if (act.length > maxA) { const d = act.shift(); ina.push(d); note += `；active 超过 ${maxA}，把最旧的 ${d} 降到 inactive`; }
+    } else {
+      ina.push(x); note = "未命中 → 放入 inactive";
+      if (act.length + ina.length > C) { ev = ina.length > 1 ? ina.shift() : act.shift(); note += `；缓存满，从 inactive 淘汰 ${ev}`; }
+    }
+    if (hit) hits++;
+    out.push({ x, hit, ev, act: act.slice(), ina: ina.slice(), hits, note, maxA });
+  }
+  return out;
+}
+// CORE-END
+
+// ---------------- VAX 地址空间图 ----------------
+(function vaxFig() {
+  const g = $("vax-fig");
+  const X = 150, W = 260;
+  const segs = [
+    ["Page 0: Invalid", 0, 22, "bad-soft"], ["User Code", 22, 60, "accent-soft"], ["User Heap ↓", 60, 100, "accent-soft"], ["", 100, 170, "box"],
+    ["User Stack ↑", 170, 190, "accent-soft"],
+    ["Trap Tables", 190, 212, "warn-soft"], ["Kernel Data", 212, 240, "warn-soft"], ["Kernel Code", 240, 268, "warn-soft"], ["Kernel Heap", 268, 290, "warn-soft"], ["Unused", 290, 370, "box"],
+  ];
+  const y0 = 20;
+  segs.forEach(([t, a, b, c]) => {
+    g.append(s("rect", { x: X, y: y0 + a, width: W, height: b - a, class: c }));
+    if (t) g.append(s("text", { x: X + W / 2, y: y0 + (a + b) / 2 + 4, "text-anchor": "middle", "font-size": 12.5, text: t }));
+  });
+  g.append(s("text", { x: X + W / 2, y: y0 + 118, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", text: "（未使用，不需要页表项）" }));
+  [[0, "0"], [100 + 30, "2³⁰"], [190, "2³¹"], [370, "2³²"]].forEach(([y, t], k) => {
+    const yy = k === 1 ? y0 + 130 : y0 + y;
+    g.append(s("text", { x: X - 10, y: yy + 4, "text-anchor": "end", "font-size": 12.5, class: "mono", text: t }));
+    g.append(s("line", { x1: X - 6, x2: X, y1: yy, y2: yy, class: "stroke" }));
+  });
+  g.append(s("line", { x1: X, x2: X + W, y1: y0 + 130, y2: y0 + 130, style: "stroke:var(--fg);stroke-dasharray:4 3" }));
+  const brace = (a, b, t, sub) => {
+    const x = X + W + 14;
+    g.append(s("path", { d: `M${x},${y0 + a + 2} h8 V${y0 + b - 2} h-8`, fill: "none", class: "stroke" }));
+    g.append(s("text", { x: x + 16, y: y0 + (a + b) / 2, "font-size": 13, "font-weight": 600, text: t }));
+    if (sub) g.append(s("text", { x: x + 16, y: y0 + (a + b) / 2 + 17, "font-size": 11.5, class: "t-muted", text: sub }));
+  };
+  brace(0, 130, "User (P0)", "代码 + 堆；每进程不同");
+  brace(130, 190, "User (P1)", "栈；每进程不同");
+  brace(190, 370, "System (S)", "内核；所有进程共享");
+})();
+(function vaxWalk() {
+  const g = $("vax-walk");
+  const box = (x, y, w, t, sub, c) => { g.append(s("rect", { x, y, width: w, height: 46, rx: 7, class: c || "box" })); g.append(s("text", { x: x + w / 2, y: y + 20, "text-anchor": "middle", "font-size": 12.5, text: t })); if (sub) g.append(s("text", { x: x + w / 2, y: y + 37, "text-anchor": "middle", "font-size": 11, class: "t-muted", text: sub })); };
+  box(10, 20, 120, "用户 VA", "P0/P1 段", "accent-soft");
+  box(170, 20, 150, "P0 页表中的 PTE", "地址位于 S 段（虚拟）");
+  box(360, 20, 150, "系统页表", "在物理内存中", "warn-soft");
+  box(550, 20, 140, "页表页的物理地址", "");
+  box(360, 100, 150, "取出用户 PTE", "得到 PFN");
+  box(550, 100, 140, "数据的物理地址", "", "ok-soft");
+  const ar = (x1, y1, x2, y2) => g.append(s("line", { x1, y1, x2, y2, class: "arrow", "marker-end": "url(#a23)" }));
+  ar(130, 43, 168, 43); ar(320, 43, 358, 43); ar(510, 43, 548, 43); ar(620, 66, 520, 108); ar(510, 123, 548, 123);
+  g.append(s("defs", {}, s("marker", { id: "a23", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto" }, s("path", { d: "M0,0 L10,5 L0,10 z", style: "fill:var(--muted)" }))));
+  g.append(s("text", { x: 10, y: 150, "font-size": 12, class: "t-muted", text: "TLB 命中时整条路径都被跳过。" }));
+})();
+
+// ---------------- VAX 拆解器 ----------------
+function bitBoxes(groups) {
+  // groups: [{bits:"0101", label, value, color}]
+  return h("div", { class: "bits" }, groups.map((g) => h("div", { class: "grp", style: g.color ? { background: `color-mix(in srgb, ${g.color} 16%, transparent)` } : {} },
+    h("div", { class: "b" }, [...g.bits].map((c) => h("span", {}, c))), h("div", { class: "blab" }, g.label), h("div", { class: "val" }, g.value))));
+}
+(function vaxSim() {
+  function upd() {
+    const raw = $("vx-addr").value.trim();
+    const a = Number(raw.startsWith("0x") || raw.startsWith("0X") ? raw : "0x" + raw);
+    if (!Number.isFinite(a) || a < 0 || a > 0xffffffff) { $("vx-n").textContent = "请输入 0x0 ～ 0xFFFFFFFF 之间的地址。"; return; }
+    const d = vaxDecode(a), b = OSTEP.bin(a, 32);
+    $("vx-bits").replaceChildren(bitBoxes([
+      { bits: b.slice(0, 2), label: "段", value: d.segName, color: "var(--c4)" },
+      { bits: b.slice(2, 23), label: "段内 VPN（21 位）", value: hx(d.segVpn), color: "var(--c1)" },
+      { bits: b.slice(23), label: "偏移（9 位）", value: hx(d.off, 3), color: "var(--c3)" },
+    ]));
+    const pt = { 0: "P0 页表（基址寄存器 P0BR、界限 P0LR；页表本身位于 S 段虚拟内存）", 1: "P1 页表（P1BR/P1LR；也在 S 段虚拟内存）", 2: "系统页表（SBR/SLR，位于物理内存）", 3: "无" }[d.seg];
+    let t = `地址 <code>${hx(a, 8)}</code>：最高 2 位 = ${b.slice(0, 2)} → <strong>${d.segName}</strong> 段；完整 VPN = ${hx(d.vpn)}（23 位），段内 VPN = ${d.segVpn}，偏移 = ${d.off}。由 ${pt} 翻译。`;
+    if (d.seg === 0 && d.segVpn === 0) t += ` <strong>第 0 页被标记为无效</strong>：这正是空指针解引用会陷入 OS（段错误）的原因。`;
+    if (d.seg === 3) t += ` 系统空间只用了一半，这一区域没有映射，访问会出错。`;
+    if (d.seg === 2) t += ` 这是内核空间：页表保护位要求更高的特权级，用户态访问会陷入 OS。`;
+    if (d.seg === 1) t += ` P1 是栈所在的段；上下文切换时 P0/P1 寄存器改指新进程的页表。`;
+    $("vx-n").innerHTML = t;
+  }
+  $("vx-addr").addEventListener("input", upd);
+  document.querySelectorAll("#sim-vax [data-a]").forEach((b) => b.onclick = () => { $("vx-addr").value = b.dataset.a; upd(); });
+  upd();
+})();
+
+// ---------------- 分段 FIFO ----------------
+(function sfSim() {
+  let steps = [], seq = [], cfg = {};
+  function load() {
+    seq = parseSF($("sf-seq").value);
+    cfg = { N: Math.max(2, Math.min(20, Number($("sf-n").value) || 8)), RSS: Math.max(1, Number($("sf-rss").value) || 3), CL: Math.max(1, Number($("sf-cl").value) || 2) };
+    steps = segFifo(seq, cfg.N, cfg.RSS, cfg.CL);
+  }
+  function cell(stp, f, extra) {
+    const fr = stp.frames[f];
+    const hl = stp.hl.f === f;
+    if (!fr) return h("span", { class: "cell empty" + (hl ? " on" : "") }, "空·" + f);
+    return h("span", { class: "cell " + fr.proc + (hl ? (stp.text.includes("命中") ? " hit" : stp.text.includes("找回") ? " on" : " miss") : "") + (extra || ""), title: "页框 " + f }, fr.proc + fr.pg, fr.dirty ? h("span", { class: "dm" }, "D") : null);
+  }
+  function render(i) {
+    const stp = steps[i];
+    const row = (label, arr, note) => h("div", { class: "row" }, h("b", {}, label), ...(arr.length ? arr.map((f) => cell(stp, f)) : [h("span", { class: "tiny" }, "（空）")]), note ? h("span", { class: "tiny" }, note) : null);
+    $("sf-vis").replaceChildren(
+      row(`P 的 FIFO（≤${cfg.RSS}）`, stp.fifo.P, "← 先进在左"),
+      row(`Q 的 FIFO（≤${cfg.RSS}）`, stp.fifo.Q, ""),
+      row("全局干净链表", stp.clean, "← 从头部取空闲页框"),
+      row("全局脏链表", stp.dirty, "← 聚集写回"));
+    $("sf-nr").innerHTML = stp.a ? `第 ${i} 步：` + stp.text : stp.text;
+    const S = stp.st;
+    $("sf-stats").replaceChildren(
+      h("div", { class: "stat" }, h("div", { class: "v" }, S.hits), h("div", { class: "l" }, "驻留集命中")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, S.reclaim), h("div", { class: "l" }, "从链表找回（无磁盘 I/O）")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, S.reads), h("div", { class: "l" }, "磁盘读")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, S.clusterWrites + " 次 / " + S.pagesWritten + " 页"), h("div", { class: "l" }, "聚集写回")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, pureFifoReads(seq, cfg.RSS)), h("div", { class: "l" }, "对照：无二次机会链表的纯 FIFO，全序列磁盘读")));
+  }
+  load();
+  const stp = OSTEP.stepper($("sf-step"), { steps: () => steps.length, render, autoplayMs: 1400 });
+  $("sf-apply").onclick = () => { load(); stp.reset(); };
+})();
+
+// ---------------- COW 动画 ----------------
+(function cowSim() {
+  // 状态：父/子页表 4 项：{frame, perm, note}；页框：{content, ref}
+  const S0 = () => ({
+    par: [{ f: 0, perm: "r-x", tag: "代码" }, { f: 1, perm: "rw-", tag: "数据" }, { f: 2, perm: "rw-", tag: "堆" }, null],
+    chi: null, frames: [{ c: "code", ref: 1 }, { c: "A", ref: 1 }, { c: "B", ref: 1 }, null, null, null],
+    copies: 0, zeroed: 0, faults: 0,
+  });
+  const clone = (o) => JSON.parse(JSON.stringify(o));
+  const steps = [];
+  let st = S0();
+  const push = (text, hl) => steps.push({ text, hl: hl || {}, st: clone(st) });
+  push("初始：父进程有 3 个页：VPN 0 代码（r-x，页框 0），VPN 1 数据（内容 A，页框 1），VPN 2 堆（内容 B，页框 2）。", {});
+  st.par[3] = { f: null, perm: "---", tag: "DZ" };
+  push("父进程让堆增长一页（VPN 3）。<strong>按需清零</strong>：OS 只在页表放一个<strong>不可访问</strong>的 PTE，并在 OS 保留位里记下\"这是按需清零页（DZ）\"。没有分配页框，也没有清零。", { par: 3 });
+  st.faults++;
+  push("父进程第一次写 VPN 3：PTE 不可访问 → <strong>陷入 OS</strong>。OS 查看保留位，发现是按需清零页。", { par: 3, trap: "par" });
+  st.frames[3] = { c: "0000", ref: 1 }; st.par[3] = { f: 3, perm: "rw-", tag: "堆" }; st.zeroed++;
+  push("OS 此时才找一个空闲页框（页框 3），<strong>清零</strong>（安全要求：不能让你看到别人留下的数据），映射为 rw-，然后重试指令。", { par: 3, frame: 3 });
+  st.frames[3].c = "C";
+  push("重试成功：父进程在 VPN 3 写入 C。如果它从不访问这一页，上面的所有工作都省掉了。", { par: 3, frame: 3 });
+  st.chi = st.par.map((e) => ({ ...e }));
+  st.par.forEach((e, k) => { if (e.perm === "rw-") { e.perm = "r--"; e.cow = 1; st.chi[k].perm = "r--"; st.chi[k].cow = 1; } });
+  st.frames.forEach((fr) => { if (fr) fr.ref = 2; });
+  push("父进程调用 <code>fork()</code>。<strong>写时复制</strong>：OS 只复制页表，子进程的 PTE 指向同样的页框；所有可写页在<strong>两边</strong>都改为只读并标记 COW，页框引用计数变为 2。没有复制任何数据页。", { cow: 1 });
+  push("子进程读 VPN 1：只读映射允许读，直接读到 A。<strong>不发生任何复制</strong>。如果双方都只读，这就是一次零成本的\"复制\"。", { chi: 1, frame: 1 });
+  st.faults++;
+  push("父进程写 VPN 1：PTE 是只读的 → <strong>保护陷阱</strong>，陷入 OS。OS 发现这是 COW 页（不是真正的非法写）。", { par: 1, trap: "par" });
+  st.frames[4] = { c: "A", ref: 1 }; st.frames[1].ref = 1; st.par[1] = { f: 4, perm: "rw-", tag: "数据" }; st.copies++;
+  push("OS（懒惰地）分配新页框 4，把页框 1 的内容 A <strong>复制</strong>过去，映射到父进程的 VPN 1 并设为可写；页框 1 的引用计数降为 1（只剩子进程）。", { par: 1, frame: 4 });
+  st.frames[4].c = "A′";
+  push("父进程重试写入成功：它的 VPN 1 现在是 A′，而子进程看到的仍是 A——语义与真正复制完全一致。", { par: 1, frame: 4 });
+  st.faults++;
+  push("子进程写 VPN 1：同样是只读 → 陷入 OS。但页框 1 的引用计数已是 1，只有子进程在用。", { chi: 1, trap: "chi" });
+  st.chi[1].perm = "rw-"; delete st.chi[1].cow; st.frames[1].c = "A″";
+  push("OS <strong>不必复制</strong>，直接把子进程的 PTE 改回可写（Linux 等系统的常见优化），重试写入 A″。", { chi: 1, frame: 1 });
+  st.chi.forEach((e) => { if (e.f != null) st.frames[e.f].ref--; });
+  st.frames = st.frames.map((fr) => (fr && fr.ref <= 0 ? null : fr));
+  st.chi = [{ f: 5, perm: "r-x", tag: "新程序" }, null, null, null];
+  st.frames[5] = { c: "ls", ref: 1 };
+  st.par.forEach((e) => { if (e && e.cow && st.frames[e.f] && st.frames[e.f].ref === 1) { e.perm = "rw-"; delete e.cow; } });
+  push("子进程调用 <code>exec(\"ls\")</code>：旧地址空间被整个丢弃，引用计数随之减少（页框 1 被释放），新程序的代码按需装入。父进程剩余 COW 页的引用计数回到 1，下次写时 OS 只需改回可写。整个 fork+exec 过程只真正复制了 <strong>1</strong> 个页。", { chi: 0, frame: 5 });
+
+  const svg = $("cw-svg");
+  function draw(stp) {
+    const st = stp.st, hl = stp.hl;
+    svg.replaceChildren();
+    svg.append(s("defs", {}, s("marker", { id: "a23c", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto" }, s("path", { d: "M0,0 L10,5 L0,10 z", style: "fill:var(--muted)" }))));
+    const PX = 20, CX = 560, FX = 300, rowH = 50, T = 50;
+    const table = (x, pt, who) => {
+      svg.append(s("text", { x, y: 30, "font-weight": 700, text: who === "par" ? "父进程页表" : "子进程页表" }));
+      if (!pt) { svg.append(s("text", { x, y: T + 30, class: "t-muted", "font-size": 13, text: "（尚未 fork）" })); return; }
+      pt.forEach((e, k) => {
+        const y = T + k * rowH;
+        const on = hl[who] === k, trap = hl.trap === who && on;
+        svg.append(s("rect", { x, y, width: 180, height: 40, rx: 6, class: trap ? "bad-soft" : on ? "warn-soft" : "box" }));
+        svg.append(s("text", { x: x + 8, y: y + 17, "font-size": 12, class: "mono", text: `VPN ${k}` }));
+        if (!e) { svg.append(s("text", { x: x + 8, y: y + 33, "font-size": 11.5, class: "t-muted", text: "（未映射）" })); return; }
+        svg.append(s("text", { x: x + 62, y: y + 17, "font-size": 12, class: "mono", text: e.perm + (e.cow ? " COW" : "") }));
+        svg.append(s("text", { x: x + 8, y: y + 33, "font-size": 11.5, class: "t-muted", text: e.tag === "DZ" ? "按需清零·无页框" : e.tag + (e.f != null ? ` → 页框 ${e.f}` : "") }));
+      });
+    };
+    table(PX, st.par, "par");
+    table(CX, st.chi, "chi");
+    svg.append(s("text", { x: FX, y: 30, "font-weight": 700, text: "物理页框" }));
+    st.frames.forEach((fr, k) => {
+      const y = T - 6 + k * 44;
+      const on = hl.frame === k;
+      svg.append(s("rect", { x: FX, y, width: 150, height: 36, rx: 6, class: !fr ? "box" : on ? "ok-soft" : "accent-soft", "stroke-dasharray": fr ? null : "4 3" }));
+      svg.append(s("text", { x: FX + 8, y: y + 23, "font-size": 12, class: "mono", text: `#${k} ` + (fr ? fr.c : "空闲") }));
+      if (fr) { svg.append(s("circle", { cx: FX + 136, cy: y + 18, r: 11, style: `fill:${fr.ref > 1 ? "var(--c2)" : "var(--c8)"}` })); svg.append(s("text", { x: FX + 136, y: y + 22, "text-anchor": "middle", "font-size": 11.5, style: "fill:#fff;font-weight:700", text: fr.ref })); }
+    });
+    const link = (pt, x1, side) => pt && pt.forEach((e, k) => {
+      if (!e || e.f == null) return;
+      const y1 = T + k * rowH + 20, y2 = T - 6 + e.f * 44 + 18;
+      const x2 = side === "l" ? FX : FX + 150;
+      svg.append(s("line", { x1, y1, x2: side === "l" ? x2 - 2 : x2 + 2, y2, style: `stroke:${e.cow ? "var(--c2)" : "var(--muted)"};stroke-width:1.5${e.cow ? ";stroke-dasharray:5 3" : ""}`, "marker-end": "url(#a23c)" }));
+    });
+    link(st.par, PX + 180, "l");
+    link(st.chi, CX, "r");
+    svg.append(s("text", { x: 20, y: 322, "font-size": 11.5, class: "t-muted", text: "橙色虚线 = COW 只读共享映射；圆圈数字 = 页框引用计数（橙色表示被共享）" }));
+  }
+  function render(i) {
+    const stp = steps[i];
+    draw(stp);
+    $("cw-n").innerHTML = stp.text;
+    const used = stp.st.frames.filter(Boolean).length;
+    $("cw-stats").replaceChildren(
+      h("div", { class: "stat" }, h("div", { class: "v" }, used), h("div", { class: "l" }, "在用的物理页框")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, stp.st.copies), h("div", { class: "l" }, "真正复制的页")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, stp.st.zeroed), h("div", { class: "l" }, "按需清零的页")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, stp.st.faults), h("div", { class: "l" }, "陷入 OS 次数")));
+  }
+  OSTEP.stepper($("cw-step"), { steps: steps.length, render, autoplayMs: 1800 });
+})();
+
+// ---------------- Linux 地址空间图 ----------------
+(function linuxFig() {
+  const g = $("linux-as");
+  const col = (x, y, w, parts) => parts.forEach(([t, a, b, c]) => { g.append(s("rect", { x, y: y + a, width: w, height: b - a, class: c })); if (t) g.append(s("text", { x: x + w / 2, y: y + (a + b) / 2 + 4, "text-anchor": "middle", "font-size": 12, text: t })); });
+  g.append(s("text", { x: 20, y: 22, "font-weight": 700, text: "32 位 Linux（Figure 23.2）" }));
+  col(90, 36, 150, [["Page 0: Invalid", 0, 20, "bad-soft"], ["User Code", 20, 50, "accent-soft"], ["User Heap ↓", 50, 80, "accent-soft"], ["", 80, 170, "box"], ["User Stack ↑", 170, 200, "accent-soft"], ["Kernel (Logical)", 200, 250, "warn-soft"], ["Kernel (Virtual)", 250, 300, "ok-soft"]]);
+  [["0x00000000", 0], ["0xC0000000", 200], ["0xFFFFFFFF", 300]].forEach(([t, y]) => g.append(s("text", { x: 84, y: 36 + y + 4, "text-anchor": "end", "font-size": 10.5, class: "mono", text: t })));
+  g.append(s("text", { x: 165, y: 356, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", text: "用户 3GB | 内核 1GB" }));
+  // 物理内存
+  g.append(s("text", { x: 300, y: 22, "font-weight": 700, "font-size": 13, text: "物理内存" }));
+  const PY = 36, PH = 300;
+  g.append(s("rect", { x: 300, y: PY, width: 70, height: PH, class: "box" }));
+  g.append(s("rect", { x: 300, y: PY, width: 70, height: 110, class: "warn-soft" }));
+  g.append(s("text", { x: 335, y: PY + 60, "text-anchor": "middle", "font-size": 11, text: "直接映射" }));
+  [175, 230, 290].forEach((y) => g.append(s("rect", { x: 300, y: PY + y, width: 70, height: 14, class: "ok-soft" })));
+  g.append(s("text", { x: 335, y: PY + PH + 16, "text-anchor": "middle", "font-size": 10.5, class: "t-muted", text: "物理地址 0 在上" }));
+  g.append(s("path", { d: `M240,${36 + 200} L300,${PY}`, style: "stroke:var(--warn);stroke-width:1.5" }));
+  g.append(s("path", { d: `M240,${36 + 250} L300,${PY + 110}`, style: "stroke:var(--warn);stroke-width:1.5" }));
+  [[262, 175], [275, 290], [290, 230]].forEach(([y, py]) => g.append(s("path", { d: `M240,${36 + y} C270,${36 + y} 270,${PY + py + 7} 298,${PY + py + 7}`, fill: "none", style: "stroke:var(--ok);stroke-width:1.5;stroke-dasharray:4 3" })));
+  // 64-bit
+  const X2 = 470;
+  g.append(s("text", { x: X2, y: 22, "font-weight": 700, text: "x86-64（48 位，规范形式）" }));
+  col(X2 + 120, 36, 150, [["用户空间 128 TB", 0, 120, "accent-soft"], ["非规范空洞", 120, 200, "box"], ["内核空间 128 TB", 200, 300, "warn-soft"]]);
+  [["0x0000000000000000", 0], ["0x00007FFFFFFFFFFF", 120], ["0xFFFF800000000000", 200], ["0xFFFFFFFFFFFFFFFF", 300]].forEach(([t, y]) => g.append(s("text", { x: X2 + 114, y: 36 + y + 4, "text-anchor": "end", "font-size": 10, class: "mono", text: t })));
+  g.append(s("text", { x: X2 + 195, y: 36 + 180, "text-anchor": "middle", "font-size": 10.5, class: "t-muted", text: "（访问即出错）" }));
+  g.append(s("text", { x: X2 + 120, y: 358, "font-size": 11.5, class: "t-muted", text: "第 48～63 位必须等于第 47 位" }));
+  g.append(s("text", { x: 20, y: 380, "font-size": 11.5, class: "t-muted", text: "橙实线：kmalloc（逻辑地址，线性、连续）；绿虚线：vmalloc（虚拟连续，物理分散）" }));
+})();
+(function klConv() {
+  function upd() {
+    const a = Number($("kl-addr").value.trim());
+    if (!Number.isFinite(a) || a < 0 || a > 0xffffffff) { $("kl-out").textContent = "请输入 32 位地址"; return; }
+    $("kl-out").textContent = a >= 0xc0000000 ? `物理地址 = ${hx(a, 8)} − 0xC0000000 = ${hx(a - 0xc0000000, 8)}（仅对直接映射的逻辑地址成立）` : "这是用户空间地址（< 0xC0000000），需要走进程页表";
+  }
+  $("kl-addr").addEventListener("input", upd); upd();
+})();
+
+// ---------------- x86-64 格式图 + 拆分器 ----------------
+(function x64Fmt() {
+  const g = $("x64-fmt");
+  const parts = [["Unused", 16, "box"], ["P1", 9, "accent-soft"], ["P2", 9, "accent-soft"], ["P3", 9, "accent-soft"], ["P4", 9, "accent-soft"], ["Offset", 12, "ok-soft"]];
+  let bit = 64, x = 20; const k = 10.4;
+  parts.forEach(([t, n, c]) => {
+    const w = n * k;
+    g.append(s("rect", { x, y: 30, width: w, height: 36, class: c }));
+    g.append(s("text", { x: x + w / 2, y: 53, "text-anchor": "middle", "font-size": 13, "font-weight": 600, text: t }));
+    g.append(s("text", { x: x + 2, y: 24, "font-size": 10.5, class: "mono t-muted", text: bit - 1 }));
+    g.append(s("text", { x: x + w / 2, y: 86, "text-anchor": "middle", "font-size": 11, class: "t-muted", text: n + " 位" }));
+    bit -= n; x += w;
+  });
+  g.append(s("text", { x: x - 8, y: 24, "font-size": 10.5, class: "mono t-muted", text: 0 }));
+})();
+(function x64Sim() {
+  const NAMES = ["PML4 (PGD)", "PDPT (PUD)", "PD (PMD)", "PT (PTE)"];
+  function upd() {
+    const ps = $("x64-ps").value, r = x64Split($("x64-addr").value, ps);
+    if (!r) { $("x64-n").textContent = "请输入合法的 64 位十六进制地址，如 0x7ffd3e55d2b4。"; $("x64-bits").replaceChildren(); $("x64-walk").replaceChildren(); return; }
+    const b = r.v.toString(2).padStart(64, "0");
+    const groups = [{ bits: b.slice(0, 16), label: "63–48 符号扩展", value: hx(r.hi, 4), color: r.canonical ? "var(--c8)" : "var(--bad)" }];
+    const lvNames = ["P1", "P2", "P3", "P4"];
+    let pos = 16;
+    r.p.forEach((ix, k) => { groups.push({ bits: b.slice(pos, pos + 9), label: `${lvNames[k]}（${47 - 9 * k}–${39 - 9 * k}）`, value: ix, color: OSTEP.color(k) }); pos += 9; });
+    groups.push({ bits: b.slice(pos), label: `偏移（${r.offBits} 位）`, value: "0x" + r.off.toString(16), color: "var(--c3)" });
+    $("x64-bits").replaceChildren(bitBoxes(groups));
+    const walk = [h("div", { class: "lv" }, h("b", {}, "CR3"), "页表根")];
+    r.p.forEach((ix, k) => { walk.push(h("span", { class: "arr" }, "→")); walk.push(h("div", { class: "lv", style: { borderColor: OSTEP.color(k) } }, h("b", {}, NAMES[k]), h("code", {}, `[${ix}]`))); });
+    walk.push(h("span", { class: "arr" }, "→"));
+    walk.push(h("div", { class: "lv", style: { borderColor: "var(--c3)" } }, h("b", {}, ps === "4K" ? "4KB 页" : ps === "2M" ? "2MB 大页" : "1GB 大页"), h("code", {}, "+ 0x" + r.off.toString(16))));
+    $("x64-walk").replaceChildren(...walk);
+    const user = (r.v >> 47n) === 0n;
+    let t = `${r.levels} 次页表访问（${r.p.map((x, k) => lvNames[k] + "=" + x).join("，")}），偏移 ${r.offBits} 位 = 0x${r.off.toString(16)}。`;
+    t += r.canonical ? (user ? " 规范地址，位于<strong>用户空间</strong>（第 47 位为 0）。" : " 规范地址，位于<strong>内核空间</strong>（第 47 位为 1，高 16 位全 1）。")
+      : " <strong>非规范地址</strong>：高 16 位不等于第 47 位的符号扩展，CPU 会直接产生一般保护错误，根本不会查页表。";
+    if (r.v === 0n) t += " 地址 0：用户空间第 0 页通常不映射，空指针解引用会出错（和 VAX 一样）。";
+    if (ps !== "4K") t += ` 大页：每少一级就少一次内存访问，一个 TLB 条目覆盖 ${ps === "2M" ? "2MB（= 512 个 4KB 页）" : "1GB（= 262144 个 4KB 页）"}。`;
+    $("x64-n").innerHTML = t;
+  }
+  $("x64-addr").addEventListener("input", upd);
+  $("x64-ps").addEventListener("change", upd);
+  document.querySelectorAll("#sim-x64 [data-x]").forEach((b) => b.onclick = () => { $("x64-addr").value = b.dataset.x; upd(); });
+  upd();
+})();
+
+// ---------------- TLB reach ----------------
+(function reach() {
+  function fmt(bytes) { const u = ["B", "KB", "MB", "GB", "TB"]; let k = 0; while (bytes >= 1024 && k < 4) { bytes /= 1024; k++; } return (bytes >= 100 ? bytes.toFixed(0) : bytes.toFixed(bytes >= 10 ? 1 : 2)) + " " + u[k]; }
+  function upd() {
+    const n = Math.max(1, Number($("tr-n").value) || 64), ws = Math.max(0, Number($("tr-ws").value) || 0) * 2 ** 30;
+    const rows = [["4 KB", 4096], ["2 MB", 2 ** 21], ["1 GB", 2 ** 30]].map(([nm, sz]) => {
+      const reach = n * sz, cov = ws ? Math.min(1, reach / ws) : 1;
+      return h("tr", {}, h("td", {}, nm), h("td", { class: "num" }, fmt(reach)), h("td", { class: "num" }, ws ? Math.ceil(ws / sz).toLocaleString() : "0"), h("td", { class: "num" }, (cov * 100).toFixed(cov < 0.01 ? 3 : 1) + "%"));
+    });
+    $("tr-table").replaceChildren(h("tr", {}, h("th", {}, "页大小"), h("th", { class: "num" }, "TLB 覆盖范围"), h("th", { class: "num" }, "工作集需要的页数"), h("th", { class: "num" }, "工作集被 TLB 覆盖的比例")), ...rows);
+    const r4 = n * 4096;
+    $("tr-n2").innerHTML = `${n} 个条目、4KB 页只能覆盖 ${fmt(r4)}；工作集 ${fmt(ws)} 时，随机访问几乎每次都会 TLB 未命中（覆盖率 ${(Math.min(1, r4 / (ws || 1)) * 100).toFixed(3)}%）。换成 2MB 大页，覆盖范围扩大 512 倍到 ${fmt(n * 2 ** 21)}。这就是"大内存"负载在 TLB 未命中上花掉约 10% 周期、而大页能显著改善的原因。`;
+  }
+  ["tr-n", "tr-ws"].forEach((id) => $(id).addEventListener("input", upd));
+  document.querySelectorAll("#sim-reach [data-tr]").forEach((b) => b.onclick = () => { $("tr-n").value = b.dataset.tr; upd(); });
+  upd();
+})();
+
+// ---------------- LRU vs 2Q ----------------
+(function q2Sim() {
+  let seq = [], C = 6, L = [], Q = [];
+  function load() { seq = $("q2-seq").value.split(/[\s,，]+/).filter(Boolean); C = Math.max(2, Math.min(16, Number($("q2-c").value) || 6)); L = runLRU(seq, C); Q = run2Q(seq, C); }
+  const hot = (x) => /^[A-Za-z]/.test(x);
+  const cells = (arr, cur, hit) => arr.length ? arr.map((x) => h("span", { class: "cell" + (x === cur ? (hit ? " hit" : " miss") : hot(x) ? " on" : "") }, x)) : [h("span", { class: "tiny" }, "（空）")];
+  function render(i) {
+    if (!seq.length) return;
+    const l = L[i], q = Q[i];
+    const hist = (R) => h("div", { class: "tiny", style: { fontFamily: "var(--mono)", marginTop: "6px", wordBreak: "break-all" } }, R.slice(0, i + 1).map((r) => r.hit ? "H" : "·").join(""));
+    $("q2-vis").replaceChildren(
+      h("div", {}, h("h4", {}, `LRU（${C} 页）`), h("div", { class: "lists" }, h("div", { class: "row" }, h("b", {}, "LRU → MRU"), ...cells(l.list, l.x, l.hit))), hist(L)),
+      h("div", {}, h("h4", {}, `2Q（${C} 页，active ≤ ${q.maxA}）`), h("div", { class: "lists" },
+        h("div", { class: "row" }, h("b", {}, "active（旧→新）"), ...cells(q.act, q.x, q.hit)),
+        h("div", { class: "row" }, h("b", {}, "inactive（旧→新）"), ...cells(q.ina, q.x, q.hit))), hist(Q)));
+    $("q2-n").innerHTML = `第 ${i} 次访问 <strong>${l.x}</strong>：LRU ${l.hit ? "命中" : "未命中"}${l.ev ? `，淘汰 ${l.ev}` : ""}；2Q ${q.note}。`;
+    $("q2-stats").replaceChildren(
+      h("div", { class: "stat" }, h("div", { class: "v" }, l.hits + " / " + (i + 1)), h("div", { class: "l" }, "LRU 命中")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, q.hits + " / " + (i + 1)), h("div", { class: "l" }, "2Q 命中")));
+  }
+  load();
+  const stp = OSTEP.stepper($("q2-step"), { steps: () => Math.max(1, seq.length), render });
+  $("q2-apply").onclick = () => { load(); stp.reset(); };
+})();
+
+// ---------------- 栈溢出 / ROP ----------------
+(function bofSim() {
+  const svg = $("bof-svg");
+  // 栈槽（高地址在上）：caller, ret, rbp, buf(3 段)
+  const S = [
+    { title: "正常调用", slots: ["调用者的栈帧", "返回地址 → main+0x2a", "保存的 rbp", "dest_buffer[100]（空）"], hl: [], mark: {}, text: "调用 <code>some_function(input)</code>：栈上依次是调用者的帧、<strong>返回地址</strong>（函数结束时 <code>ret</code> 跳去的地方）、保存的帧指针，然后是 100 字节的 <code>dest_buffer</code>。栈向低地址增长，而 <code>strcpy</code> 从缓冲区低地址向高地址写。" },
+    { title: "短输入", slots: ["调用者的栈帧", "返回地址 → main+0x2a", "保存的 rbp", "\"hello\\0\" ……"], hl: [3], mark: {}, text: "输入 \"hello\"：只占缓冲区的一小部分，函数正常返回。" },
+    { title: "溢出", slots: ["调用者的栈帧", "返回地址 → 0x7ffd…d000 (!)", "AAAAAAAA", "[shellcode] + AAAA…（>100 字节）"], hl: [1, 2, 3], mark: { 1: "bad" }, text: "攻击者提供超过 100 字节的精心构造的输入：<code>strcpy</code> 不检查长度，一路写过缓冲区末尾，覆盖了保存的 rbp 和<strong>返回地址</strong>。新的返回地址指向缓冲区里攻击者注入的机器码（shellcode）。" },
+    { title: "注入代码执行", slots: ["调用者的栈帧", "返回地址 → 0x7ffd…d000", "AAAAAAAA", "[shellcode] ← CPU 正在执行"], hl: [3], mark: { 3: "bad" }, text: "函数执行 <code>ret</code>，跳到栈上的 shellcode。如果栈页可执行，攻击者的代码就以该进程的权限运行了；若目标是内核，就是<strong>特权提升</strong>。" },
+    { title: "NX 位", slots: ["调用者的栈帧", "返回地址 → 0x7ffd…d000", "AAAAAAAA", "[shellcode]  栈页 PTE: NX=1"], hl: [3], mark: { 3: "ok" }, text: "防御：栈页的 PTE 设置了 <strong>NX（No-eXecute）位</strong>（Intel 叫 XD）。CPU 取指时发现该页不可执行，产生页错误，进程被终止——注入的代码跑不起来。" },
+    { title: "ROP", slots: ["&amp;system (libc)", "&amp;\"/bin/sh\" (libc)", "gadget: pop rdi; ret (libc)", "AAAA…（填满缓冲区和 rbp）"], hl: [0, 1, 2], mark: { 0: "bad", 1: "bad", 2: "bad" }, text: "攻击者改用 <strong>ROP</strong>：不注入代码，而是把返回地址及其上方覆盖成一串<strong>已有代码</strong>的地址。<code>ret</code> 先跳到 libc 里的 gadget \"pop rdi; ret\"，它把 \"/bin/sh\" 的地址弹进参数寄存器，再 <code>ret</code> 到 <code>system</code>——执行的全是合法的、可执行页里的代码，NX 拦不住。" },
+    { title: "ASLR", slots: ["0x7f3a…? 还是 0x7c11…?", "0x7f3a…? 还是 0x7c11…?", "gadget 地址每次运行都不同", "AAAA…"], hl: [0, 1, 2], mark: { 0: "ok", 1: "ok", 2: "ok" }, text: "防御：<strong>ASLR</strong> 每次运行都随机放置 libc、栈、堆和代码。攻击者硬编码的 gadget 地址大概率是错的，程序只会崩溃，而不会被接管。（前提是攻击者无法先泄露出某个真实地址。）" },
+  ];
+  function draw(i) {
+    const st = S[i];
+    svg.replaceChildren();
+    svg.append(s("text", { x: 20, y: 26, "font-weight": 700, text: `${i + 1}. ${st.title}` }));
+    svg.append(s("text", { x: 20, y: 52, "font-size": 12, class: "t-muted", text: "高地址 ↑" }));
+    svg.append(s("text", { x: 20, y: 340, "font-size": 12, class: "t-muted", text: "低地址 ↓（栈向下增长）" }));
+    const hs = [50, 50, 50, 110], X = 130, W = 360;
+    let y = 60;
+    st.slots.forEach((t, k) => {
+      const m = st.mark[k], on = st.hl.includes(k);
+      svg.append(s("rect", { x: X, y, width: W, height: hs[k] - 4, rx: 6, class: m === "bad" ? "bad-soft" : m === "ok" ? "ok-soft" : on ? "warn-soft" : "box" }));
+      const tx = s("text", { x: X + 14, y: y + hs[k] / 2 + 2, "font-size": 13, class: "mono" }); tx.innerHTML = t; svg.append(tx);
+      y += hs[k];
+    });
+    if (i >= 1) {
+      const top = i >= 2 ? 60 : 60 + 150 + 60;
+      svg.append(s("line", { x1: X + W + 30, y1: 60 + 260 - 10, x2: X + W + 30, y2: top + 6, style: `stroke:${i >= 2 ? "var(--bad)" : "var(--ok)"};stroke-width:3`, "marker-end": "url(#a23b)" }));
+      svg.append(s("text", { x: X + W + 42, y: 200, "font-size": 12, text: "strcpy 写入方向" }));
+    }
+    svg.append(s("defs", {}, s("marker", { id: "a23b", viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto" }, s("path", { d: "M0,0 L10,5 L0,10 z", style: "fill:var(--muted)" }))));
+    svg.append(s("text", { x: X + W + 42, y: 225, "font-size": 12, class: "t-muted", text: "（从 dest_buffer 起向高地址）" }));
+  }
+  OSTEP.stepper($("bof-step"), { steps: S.length, render: (i) => { draw(i); $("bof-n").innerHTML = S[i].text; }, autoplayMs: 2600 });
+})();
+
+// ---------------- ASLR 多次运行 ----------------
+(function aslr() {
+  const out = $("as-out"); let prev = null, n = 0;
+  const r = (bits) => { let v = 0n; for (let k = 0; k < bits; k += 16) v = (v << 16n) | BigInt(Math.floor(Math.random() * 65536)); return v & ((1n << BigInt(bits)) - 1n); };
+  function gen(off) {
+    if (off) return { stack: 0x7fffffffdc0cn, heap: 0x5555555592a0n, mmap: 0x7ffff7fbe000n, main: 0x555555555149n, libc: 0x7ffff7e1c900n };
+    const pie = 0x550000000000n + ((r(28) << 12n) % 0x1000000000n); // 0x55… 附近，页对齐
+    const mmapBase = 0x700000000000n + ((r(28) << 12n) % 0x0fff00000000n);
+    const stack = 0x7ffc00000000n + ((r(30) << 4n) % 0x3ffffffff0n) + 0xcn;
+    return { stack, heap: pie + 0x28000000n + (r(13) << 12n) + 0x2a0n, mmap: mmapBase + 0x1a2000n, main: pie + 0x1149n, libc: mmapBase + 0x0n + 0x900n };
+  }
+  function colorize(cur, old) {
+    const a = cur.toString(16), b = old ? old.toString(16) : "";
+    return h("span", {}, "0x", ...[...a].map((c, k) => (old && (a.length !== b.length || b[k] !== c)) ? h("span", { class: "diff" }, c) : c));
+  }
+  $("as-run").onclick = () => {
+    const off = $("as-off").checked, v = gen(off);
+    const line = h("div", {}, h("span", { class: "tiny" }, `#${++n}${off ? "（ASLR 关）" : ""} `),
+      "stack ", colorize(v.stack, prev && prev.stack), "  heap ", colorize(v.heap, prev && prev.heap), "  libc ", colorize(v.libc, prev && prev.libc), "  main ", colorize(v.main, prev && prev.main));
+    out.append(line); out.scrollTop = out.scrollHeight;
+    $("as-n").innerHTML = off ? "关闭 ASLR 后，每次运行地址完全相同（与本机 <code>setarch -R ./aslr</code> 的真实输出一致）：攻击者可以放心地硬编码地址。" :
+      "开启 ASLR：栈、堆、libc、代码的基址每次都不同（蓝色为与上一次不同的位），但低 12 位（页内偏移）不变——随机化以页为单位。";
+    prev = v;
+  };
+  $("as-clear").onclick = () => { out.replaceChildren(); prev = null; n = 0; };
+  $("as-run").click(); $("as-run").click();
+})();
+
+// ---------------- 推测执行 & KPTI 图 ----------------
+(function specFig() {
+  const g = $("spec-fig");
+  const box = (x, y, w, hgt, t, c, fs) => { g.append(s("rect", { x, y, width: w, height: hgt, rx: 6, class: c || "box" })); const lines = t.split("\n"); lines.forEach((ln, k) => g.append(s("text", { x: x + w / 2, y: y + hgt / 2 + 4 + (k - (lines.length - 1) / 2) * 16, "text-anchor": "middle", "font-size": fs || 12, text: ln }))); };
+  box(20, 20, 200, 50, "① if (检查失败的条件) …\nCPU 猜\"会通过\"，先往下执行", "accent-soft", 11.5);
+  box(20, 90, 200, 50, "② 推测地读取秘密字节 s\n再访问 array[s × 4096]", "warn-soft", 11.5);
+  box(20, 160, 200, 50, "③ 发现猜错：撤销\n寄存器恢复原状", "ok-soft", 11.5);
+  g.append(s("text", { x: 260, y: 30, "font-size": 12.5, "font-weight": 600, text: "但缓存里留下了痕迹：" }));
+  for (let k = 0; k < 8; k++) {
+    const hit = k === 5;
+    g.append(s("rect", { x: 260 + k * 56, y: 44, width: 50, height: 40, rx: 4, class: hit ? "bad-soft" : "box" }));
+    g.append(s("text", { x: 285 + k * 56, y: 68, "text-anchor": "middle", "font-size": 11, class: "mono", text: `行 ${k}` }));
+  }
+  g.append(s("text", { x: 260, y: 108, "font-size": 12, text: "④ 攻击者逐一计时访问 array[i × 4096]：" }));
+  for (let k = 0; k < 8; k++) {
+    const hit = k === 5, hh = hit ? 14 : 70;
+    g.append(s("rect", { x: 270 + k * 56, y: 200 - hh, width: 30, height: hh, rx: 3, style: `fill:${hit ? "var(--c2)" : "var(--c8)"}` }));
+  }
+  g.append(s("text", { x: 260, y: 222, "font-size": 11.5, class: "t-muted", text: "访问时间（越短越可能在缓存中）→ 第 5 行特别快 ⇒ 秘密 s = 5" }));
+  g.append(s("line", { x1: 120, y1: 70, x2: 120, y2: 88, class: "arrow", "marker-end": "url(#a23)" }));
+  g.append(s("line", { x1: 120, y1: 140, x2: 120, y2: 158, class: "arrow", "marker-end": "url(#a23)" }));
+})();
+(function kptiFig() {
+  const g = $("kpti-fig");
+  const as = (x, title, parts) => {
+    g.append(s("text", { x, y: 22, "font-weight": 700, "font-size": 13, text: title }));
+    parts.forEach(([t, y, hh, c, dash]) => { g.append(s("rect", { x, y, width: 150, height: hh, class: c, "stroke-dasharray": dash ? "4 3" : null })); t.split("\n").forEach((ln, k, arr) => g.append(s("text", { x: x + 75, y: y + hh / 2 + 4 + (k - (arr.length - 1) / 2) * 15, "text-anchor": "middle", "font-size": 11.5, text: ln }))); });
+  };
+  as(20, "KPTI 之前：一张页表", [["用户代码/堆/栈", 36, 100, "accent-soft"], ["整个内核\n（U/S 位 = 仅内核）", 136, 120, "warn-soft"]]);
+  g.append(s("text", { x: 180, y: 190, "font-size": 11.5, style: "fill:var(--bad)", text: "← Meltdown：推测执行" }));
+  g.append(s("text", { x: 180, y: 206, "font-size": 11.5, style: "fill:var(--bad)", text: "可越过 U/S 检查读取" }));
+  as(360, "KPTI 之后：用户态页表", [["用户代码/堆/栈", 36, 100, "accent-soft"], ["入口跳板\n（极少量内核）", 136, 36, "warn-soft"], ["（内核未映射）", 172, 84, "box", true]]);
+  as(570, "陷入内核后：内核页表", [["用户代码/堆/栈", 36, 100, "accent-soft"], ["整个内核", 136, 120, "warn-soft"]]);
+  g.append(s("line", { x1: 512, y1: 150, x2: 568, y2: 150, class: "arrow", "marker-end": "url(#a23)" }));
+  g.append(s("text", { x: 540, y: 142, "text-anchor": "middle", "font-size": 11, text: "切换 CR3" }));
+  g.append(s("text", { x: 360, y: 274, "font-size": 11.5, class: "t-muted", text: "每次系统调用/中断都要切换页表：更安全，但更慢" }));
+})();
+})();
+</script>
+</body></html>

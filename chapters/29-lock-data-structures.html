@@ -1,0 +1,1157 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 29 章 · 基于锁的并发数据结构</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+.trace-box { max-height: 280px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; margin-top: 12px; }
+.trace-box table { font: 13px/1.4 var(--mono); border-radius: 0; }
+.trace-box th, .trace-box td { padding: 4px 10px; text-align: center; white-space: nowrap; }
+.trace-box tr.cur td { background: var(--accent-soft); font-weight: 700; }
+.trace-box td.xfer { color: var(--warn); font-weight: 700; }
+.trace-box td.inc { color: var(--accent); }
+.two-col { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.thread-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+.thread-panel .tp-head { font-weight: 700; margin-bottom: 4px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.thread-panel .sw { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+.codeline { font: 12.5px/1.6 var(--mono); padding: 0 6px; border-left: 3px solid transparent; white-space: pre; overflow-x: auto; }
+.codeline.cur { background: var(--accent-soft); border-left-color: var(--accent); }
+.codeline.wait { background: var(--bad-soft); border-left-color: var(--bad); }
+.codeline.done { color: var(--muted); }
+.legend-row { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; color: var(--muted); margin-top: 8px; }
+.legend-row .sw { width: 14px; height: 4px; border-radius: 2px; display: inline-block; vertical-align: middle; margin-right: 6px; }
+.cmp-table td:first-child { white-space: nowrap; font-weight: 600; }
+</style>
+</head>
+<body data-chapter="29">
+<main>
+
+<h2>一句话 + 关键问题</h2>
+<div class="crux">
+<p><strong>给定一个数据结构，该怎样给它加锁，才能让它正确工作？进一步，怎样加锁才能让它性能好——让许多线程能同时（并发地）访问它？</strong></p>
+<p class="small muted">CRUX: HOW TO ADD LOCKS TO DATA STRUCTURES — When given a particular data structure, how should we add locks to it, in order to make it work correctly? Further, how do we add locks such that the data structure yields high performance, enabling many threads to access the structure at once, i.e., concurrently?</p>
+</div>
+<p>上一章我们亲手造出了锁；这一章换个角度：<strong>拿着锁去用</strong>。给数据结构加上锁、让多个线程可以安全地使用它，这叫让它变成<strong>线程安全（thread safe）</strong>的。锁加在哪里、加几把，同时决定了<strong>正确性</strong>和<strong>性能</strong>。</p>
+<p>本章依次看四种常见结构：计数器、链表、队列、哈希表。每一种都先用"一把大锁"得到正确版本，再看怎样提升并发度——以及什么时候<strong>不值得</strong>提升。下一章（条件变量）会在本章的队列基础上，造出能"队列空就等待"的有界队列。</p>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>线程安全（thread safe）</h4><p>加了锁、多个线程同时调用也能正确工作的数据结构。最简单的做法：每个操作进入时加锁，返回时解锁。</p></div>
+  <div class="card"><h4>完美扩展（perfect scaling）</h4><p>多个处理器上的多个线程做了 N 倍的工作，花的时间却和一个线程在一个处理器上做 1 份一样多。</p></div>
+  <div class="card"><h4>近似计数器（approximate / sloppy counter）</h4><p>每个 CPU 一个局部计数器 + 一个全局计数器；局部值达到阈值 S 才转移到全局。更新几乎无争用，读数会"滞后"。</p></div>
+  <div class="card"><h4>阈值 S</h4><p>S 小：更准，但频繁抢全局锁，接近不可扩展的计数器；S 大：扩展性好，但全局值最多落后约 CPU 数 × S。</p></div>
+  <div class="card"><h4>手递手锁（hand-over-hand locking）</h4><p>又叫锁耦合（lock coupling）：链表每个节点一把锁，遍历时先拿下一个节点的锁、再放当前节点的锁。并发度高，但锁开销常常得不偿失。</p></div>
+  <div class="card"><h4>双锁队列（Michael &amp; Scott）</h4><p>头一把锁、尾一把锁，再加一个哑节点（dummy node），让入队和出队通常互不干扰。</p></div>
+  <div class="card"><h4>每桶一把锁</h4><p>并发哈希表的每个桶是一条带锁的链表，不同桶上的操作完全并行，扩展性极好。</p></div>
+  <div class="card"><h4>避免过早优化（Knuth 定律）</h4><p>先用一把大锁做对；确实慢了再细化。Linux 早年的大内核锁（BKL）就是这么走过来的。</p></div>
+</div>
+
+<h2>并发计数器：从一把锁开始</h2>
+<p>计数器是最简单的数据结构。先看没有任何同步的版本（Figure 29.1）：</p>
+<pre><code>typedef struct __counter_t {
+    int value;
+} counter_t;
+
+void init(counter_t *c)      { c-&gt;value = 0; }
+void increment(counter_t *c) { c-&gt;value++; }   // 读-改-写，三条指令，会竞争！
+void decrement(counter_t *c) { c-&gt;value--; }
+int  get(counter_t *c)       { return c-&gt;value; }</code></pre>
+<p><code>c-&gt;value++</code> 正是第 26 章那个 <code>counter = counter + 1</code>：一次读、一次加、一次写，两个线程交错执行就会丢更新。修法同样直接——加一把锁（Figure 29.2）：</p>
+<pre><code>typedef struct __counter_t {
+    int             value;
+    pthread_mutex_t lock;         // ① 锁和数据放在一起
+} counter_t;
+
+void init(counter_t *c) {
+    c-&gt;value = 0;
+    Pthread_mutex_init(&amp;c-&gt;lock, NULL);
+}
+void increment(counter_t *c) {
+    Pthread_mutex_lock(&amp;c-&gt;lock);    // ② 进入操作时加锁
+    c-&gt;value++;
+    Pthread_mutex_unlock(&amp;c-&gt;lock);  // ③ 离开时解锁
+}
+int get(counter_t *c) {
+    Pthread_mutex_lock(&amp;c-&gt;lock);    // ④ 连读也要加锁，保证读到一致的值
+    int rc = c-&gt;value;
+    Pthread_mutex_unlock(&amp;c-&gt;lock);
+    return rc;
+}</code></pre>
+<p>这是最基本的并发数据结构设计模式：<strong>调用操作时获取一把锁，返回时释放</strong>。它和管程（monitor）很像——管程在调用和返回对象方法时自动加锁和解锁。</p>
+<p>它是<strong>正确</strong>的。问题在于<strong>性能</strong>：原书在一台 4 核 iMac 上让每个线程把计数器加 100 万次，1 个线程大约 0.03 秒，2 个线程并发却要 5 秒以上，线程越多越糟。原因见下图——所有线程都挤在同一把锁上，临界区被完全串行化了；更糟的是，锁和 <code>value</code> 所在的缓存行在各个 CPU 之间来回搬运。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 760 250" width="760" role="img" aria-label="精确计数器与近似计数器的时间线对比">
+  <text x="10" y="18" font-size="13" font-weight="700">精确计数器：所有 CPU 抢同一把锁 → 同一时刻只有一个在干活</text>
+  <g font-size="12">
+    <text x="10" y="44">CPU 1</text><text x="10" y="68">CPU 2</text><text x="10" y="92">CPU 3</text><text x="10" y="116">CPU 4</text>
+  </g>
+  <g>
+    <rect x="70" y="32" width="40" height="16" rx="3" style="fill:var(--c1)"/><rect x="230" y="32" width="40" height="16" rx="3" style="fill:var(--c1)"/><rect x="390" y="32" width="40" height="16" rx="3" style="fill:var(--c1)"/><rect x="550" y="32" width="40" height="16" rx="3" style="fill:var(--c1)"/>
+    <rect x="110" y="56" width="40" height="16" rx="3" style="fill:var(--c2)"/><rect x="270" y="56" width="40" height="16" rx="3" style="fill:var(--c2)"/><rect x="430" y="56" width="40" height="16" rx="3" style="fill:var(--c2)"/><rect x="590" y="56" width="40" height="16" rx="3" style="fill:var(--c2)"/>
+    <rect x="150" y="80" width="40" height="16" rx="3" style="fill:var(--c3)"/><rect x="310" y="80" width="40" height="16" rx="3" style="fill:var(--c3)"/><rect x="470" y="80" width="40" height="16" rx="3" style="fill:var(--c3)"/><rect x="630" y="80" width="40" height="16" rx="3" style="fill:var(--c3)"/>
+    <rect x="190" y="104" width="40" height="16" rx="3" style="fill:var(--c4)"/><rect x="350" y="104" width="40" height="16" rx="3" style="fill:var(--c4)"/><rect x="510" y="104" width="40" height="16" rx="3" style="fill:var(--c4)"/><rect x="670" y="104" width="40" height="16" rx="3" style="fill:var(--c4)"/>
+  </g>
+  <g class="t-muted" font-size="11"><text x="70" y="136">彩色块 = 持锁执行 value++；空白 = 在锁上等待（其他 CPU 在用）</text></g>
+  <text x="10" y="170" font-size="13" font-weight="700">近似计数器：各 CPU 只碰自己的局部计数器，偶尔（每 S 次）才碰一次全局锁</text>
+  <g>
+    <rect x="70" y="182" width="640" height="10" rx="3" style="fill:var(--c1)"/>
+    <rect x="70" y="196" width="640" height="10" rx="3" style="fill:var(--c2)"/>
+    <rect x="70" y="210" width="640" height="10" rx="3" style="fill:var(--c3)"/>
+    <rect x="70" y="224" width="640" height="10" rx="3" style="fill:var(--c4)"/>
+    <rect x="300" y="180" width="6" height="14" style="fill:var(--warn)"/><rect x="520" y="194" width="6" height="14" style="fill:var(--warn)"/><rect x="420" y="208" width="6" height="14" style="fill:var(--warn)"/><rect x="610" y="222" width="6" height="14" style="fill:var(--warn)"/>
+  </g>
+  <g font-size="12"><text x="10" y="191">CPU 1</text><text x="10" y="205">CPU 2</text><text x="10" y="219">CPU 3</text><text x="10" y="233">CPU 4</text></g>
+  <text x="716" y="212" font-size="11" class="t-muted">橙色 = 转移到全局</text>
+</svg>
+<figcaption>一把锁把 4 个 CPU 变成了"排队办事"；近似计数器让它们各干各的，只在局部值攒够 S 时才短暂地碰一次全局锁。</figcaption>
+</figure>
+
+<div class="aside" data-title="理想目标：完美扩展">
+<p>理想情况是：线程在多个处理器上做了更多的工作，完成时间却和单线程在单处理器上一样——工作是并行做的，所以总时间不增加。这叫<strong>完美扩展（perfect scaling）</strong>。一把锁的计数器离这个目标差得很远；近似计数器则相当接近。</p>
+</div>
+
+<h2>可扩展的计数：近似计数器</h2>
+<p>研究者为"可扩展计数"下了多年功夫，而且它真的重要：对 Linux 在多核上的性能分析发现，没有可扩展的计数器，一些负载会遭遇严重的扩展性问题。本章介绍其中一种方法：<strong>近似计数器（approximate counter）</strong>，Linux 社区也叫它 <em>sloppy counter</em>。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 720 260" width="720" role="img" aria-label="近似计数器结构">
+  <g font-size="13">
+    <rect x="20" y="20" width="140" height="36" rx="6" class="box"/><text x="90" y="43" text-anchor="middle">CPU 0 上的线程</text>
+    <rect x="190" y="20" width="140" height="36" rx="6" class="box"/><text x="260" y="43" text-anchor="middle">CPU 1 上的线程</text>
+    <rect x="360" y="20" width="140" height="36" rx="6" class="box"/><text x="430" y="43" text-anchor="middle">CPU 2 上的线程</text>
+    <rect x="530" y="20" width="140" height="36" rx="6" class="box"/><text x="600" y="43" text-anchor="middle">CPU 3 上的线程</text>
+  </g>
+  <g class="arrow"><line x1="90" y1="56" x2="90" y2="88"/><line x1="260" y1="56" x2="260" y2="88"/><line x1="430" y1="56" x2="430" y2="88"/><line x1="600" y1="56" x2="600" y2="88"/></g>
+  <g font-size="12" class="t-muted"><text x="96" y="76">update()</text></g>
+  <g>
+    <rect x="30" y="90" width="120" height="50" rx="6" class="accent-soft"/><text x="90" y="112" text-anchor="middle" class="mono" font-size="13">local[0]</text><text x="90" y="130" text-anchor="middle" font-size="11" class="t-muted">+ llock[0]</text>
+    <rect x="200" y="90" width="120" height="50" rx="6" class="accent-soft"/><text x="260" y="112" text-anchor="middle" class="mono" font-size="13">local[1]</text><text x="260" y="130" text-anchor="middle" font-size="11" class="t-muted">+ llock[1]</text>
+    <rect x="370" y="90" width="120" height="50" rx="6" class="accent-soft"/><text x="430" y="112" text-anchor="middle" class="mono" font-size="13">local[2]</text><text x="430" y="130" text-anchor="middle" font-size="11" class="t-muted">+ llock[2]</text>
+    <rect x="540" y="90" width="120" height="50" rx="6" class="accent-soft"/><text x="600" y="112" text-anchor="middle" class="mono" font-size="13">local[3]</text><text x="600" y="130" text-anchor="middle" font-size="11" class="t-muted">+ llock[3]</text>
+  </g>
+  <g style="stroke:var(--warn);fill:none;stroke-width:1.6;stroke-dasharray:5 4">
+    <path d="M90 140 C 90 180, 300 175, 330 200"/><path d="M260 140 C 260 175, 320 180, 340 200"/><path d="M430 140 C 430 175, 390 180, 380 200"/><path d="M600 140 C 600 180, 420 175, 390 200"/>
+  </g>
+  <text x="520" y="186" font-size="12" style="fill:var(--warn)">local ≥ S 时：拿 glock，加到 global，local 清零</text>
+  <rect x="280" y="200" width="160" height="46" rx="6" class="warn-soft"/>
+  <text x="360" y="220" text-anchor="middle" class="mono" font-size="13">global + glock</text>
+  <text x="360" y="238" text-anchor="middle" font-size="11" class="t-muted">get() 只读这里 → 近似值</text>
+</svg>
+<figcaption>逻辑上的一个计数器 = 每 CPU 一个局部计数器（各带一把局部锁）+ 一个全局计数器（带全局锁）。原书机器有 4 个 CPU，所以是 4 个局部计数器。</figcaption>
+</figure>
+
+<p>工作方式：</p>
+<ol>
+<li>运行在某个核上的线程要加计数时，只加<strong>本核的局部计数器</strong>，用对应的局部锁同步。各 CPU 的局部计数器互不相干，更新<strong>没有争用</strong>，因此可扩展。</li>
+<li>为了让全局计数器保持"大致最新"（万一有线程要读），局部值会<strong>周期性地转移</strong>到全局：拿全局锁，把局部值加进全局，然后把局部计数器清零。</li>
+<li>多久转移一次由<strong>阈值 S</strong> 决定。S 越小，越像前面那个不可扩展的计数器；S 越大，越可扩展，但全局值可能偏离真实计数越远。</li>
+</ol>
+<p>为什么还需要局部锁？原书脚注解释：因为一个核上可能运行不止一个线程。如果保证每核只有一个线程，局部锁就可以省掉。想得到精确值也可以：按固定顺序（避免死锁）拿齐所有局部锁和全局锁再求和——但这就不可扩展了。</p>
+
+<h3>原书追踪表（Figure 29.3）</h3>
+<p>S = 5，4 个 CPU 上的线程各自更新 L1…L4，时间向下增长。每一步某些局部计数器 +1；某个局部值达到 S 时，就转移到全局 G 并清零。</p>
+<div class="table-wrap"><table class="small" style="text-align:center">
+<thead><tr><th>Time</th><th>L1</th><th>L2</th><th>L3</th><th>L4</th><th>G</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
+<tr><td>1</td><td>0</td><td>0</td><td>1</td><td>1</td><td>0</td></tr>
+<tr><td>2</td><td>1</td><td>0</td><td>2</td><td>1</td><td>0</td></tr>
+<tr><td>3</td><td>2</td><td>0</td><td>3</td><td>1</td><td>0</td></tr>
+<tr><td>4</td><td>3</td><td>0</td><td>3</td><td>2</td><td>0</td></tr>
+<tr><td>5</td><td>4</td><td>1</td><td>3</td><td>3</td><td>0</td></tr>
+<tr><td>6</td><td><strong>5 → 0</strong></td><td>1</td><td>3</td><td>4</td><td><strong>5</strong>（来自 L1）</td></tr>
+<tr><td>7</td><td>0</td><td>2</td><td>4</td><td><strong>5 → 0</strong></td><td><strong>10</strong>（来自 L4）</td></tr>
+</tbody></table></div>
+<p>注意第 7 步结束时：真实计数是 0+2+4+0+10 = <strong>16</strong>，而 <code>get()</code> 只会返回 G = <strong>10</strong>——滞后了 6。下面的模拟器可以逐步复现这张表，并让你改 CPU 数和 S，观察滞后怎样随 S 变化。</p>
+
+<section class="sim" id="sim-approx">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>近似计数器：局部攒够 S，再交给全局</h3>
+    <div class="desc">每一步随机若干个 CPU 的局部计数器 +1；达到阈值 S 就拿全局锁转移。观察：全局值 G 比真实值落后多少？和 S、CPU 数是什么关系？全局锁被拿了几次？</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <button class="primary" id="ac-book">载入原书 Figure 29.3</button>
+      <span class="sep"></span>
+      <label>CPU 数 <select id="ac-ncpu"></select></label>
+      <label>阈值 S <input type="number" id="ac-S" min="1" max="64" value="5"></label>
+      <label>每步更新概率 <input type="range" id="ac-p" min="0.1" max="1" step="0.1" value="0.5"><span id="ac-pv" class="mono">0.5</span></label>
+      <label>步数 <input type="number" id="ac-T" min="5" max="300" value="40"></label>
+      <label>种子 <input type="number" id="ac-seed" min="1" value="7"></label>
+      <button id="ac-gen">随机生成</button>
+    </div>
+    <div id="ac-step"></div>
+    <div class="stage"><div id="ac-svg"></div><div id="ac-spark"></div></div>
+    <div class="narrate" id="ac-nar"></div>
+    <div class="stats" id="ac-stats"></div>
+    <div class="trace-box" id="ac-trace"></div>
+  </div>
+</section>
+
+<p>把模拟器里 S 调大调小，你会看到原书说的这个<strong>准确度/性能权衡</strong>：</p>
+<ul>
+<li><strong>S 很小</strong>（极端 S = 1）：每次更新都转移，全局锁获取次数 = 更新次数，和一把锁的精确计数器一样争用激烈，但 G 永远准确。</li>
+<li><strong>S 很大</strong>：全局锁几乎不被碰到，性能极好；但 G 落后得多。原书说滞后"至多为 CPU 数乘以 S"。更精确地说，每个局部计数器在两次转移之间最多攒到 S−1（攒到 S 立即转移），所以滞后上界是 <strong>CPU 数 × (S − 1)</strong>。</li>
+</ul>
+
+<p>下面是原书的实现（Figure 29.4），关键行已标注：</p>
+<pre><code>typedef struct __counter_t {
+    int             global;           // 全局计数
+    pthread_mutex_t glock;            // 全局锁
+    int             local[NUMCPUS];   // 每 CPU 局部计数
+    pthread_mutex_t llock[NUMCPUS];   // ……和各自的锁
+    int             threshold;        // 转移频率 S
+} counter_t;
+
+void update(counter_t *c, int threadID, int amt) {
+    int cpu = threadID % NUMCPUS;              // ① 线程 → 哪个局部计数器
+    pthread_mutex_lock(&amp;c-&gt;llock[cpu]);       // ② 只拿局部锁：通常无人争用
+    c-&gt;local[cpu] += amt;
+    if (c-&gt;local[cpu] &gt;= c-&gt;threshold) {       // ③ 攒够了：
+        pthread_mutex_lock(&amp;c-&gt;glock);         //    才去拿全局锁
+        c-&gt;global += c-&gt;local[cpu];
+        pthread_mutex_unlock(&amp;c-&gt;glock);
+        c-&gt;local[cpu] = 0;                     //    局部清零（假设 amt &gt; 0）
+    }
+    pthread_mutex_unlock(&amp;c-&gt;llock[cpu]);
+}
+
+int get(counter_t *c) {
+    pthread_mutex_lock(&amp;c-&gt;glock);
+    int val = c-&gt;global;                       // ④ 只读全局值
+    pthread_mutex_unlock(&amp;c-&gt;glock);
+    return val;                                // 只是近似值！
+}</code></pre>
+<p>原书的测量（Figure 29.5）：S = 1024 时，4 个线程在 4 个处理器上共更新 400 万次，耗时和 1 个线程在 1 个处理器上更新 100 万次相差无几；而精确计数器随线程数急剧变慢。Figure 29.6 则固定 4 线程、改变 S：S 小时性能差（但全局值总是很准），S 大时性能极好（但全局值有滞后）。本页"动手实验"一节会在本机重做这两个实验。</p>
+
+<div class="tip">
+<p><strong>更多并发不一定更快。</strong>如果你的设计引入了大量额外开销（比如频繁加锁解锁而不是只加一次），那么它"更并发"这件事可能根本不重要。简单的方案往往表现不错，尤其当它很少调用昂贵的操作时。唯一可靠的办法：两种都实现出来，<strong>测</strong>。性能上没法作弊——你的点子要么更快，要么不更快。</p>
+</div>
+
+<h2>并发链表</h2>
+<p>先只关注插入和查找（删除留给读者思考）。最基本的做法仍然是一把大锁：插入入口加锁、出口解锁（Figure 29.7）：</p>
+<div class="two-col">
+<pre><code>// Figure 29.7：最初版本
+int List_Insert(list_t *L, int key) {
+    pthread_mutex_lock(&amp;L-&gt;lock);
+    node_t *new = malloc(sizeof(node_t));
+    if (new == NULL) {
+        perror("malloc");
+<span class="hl">        pthread_mutex_unlock(&amp;L-&gt;lock);  // 失败路径也得记得解锁</span>
+        return -1;
+    }
+    new-&gt;key  = key;
+    new-&gt;next = L-&gt;head;
+    L-&gt;head   = new;
+    pthread_mutex_unlock(&amp;L-&gt;lock);
+    return 0;
+}
+int List_Lookup(list_t *L, int key) {
+    pthread_mutex_lock(&amp;L-&gt;lock);
+    node_t *curr = L-&gt;head;
+    while (curr) {
+        if (curr-&gt;key == key) {
+<span class="hl">            pthread_mutex_unlock(&amp;L-&gt;lock); // 第二个出口</span>
+            return 0;
+        }
+        curr = curr-&gt;next;
+    }
+    pthread_mutex_unlock(&amp;L-&gt;lock);
+    return -1;
+}</code></pre>
+<pre><code>// Figure 29.8：重写后
+int List_Insert(list_t *L, int key) {
+    // 不需要同步：malloc 本身线程安全
+    node_t *new = malloc(sizeof(node_t));
+    if (new == NULL) {
+        perror("malloc");
+        return -1;          // 此时还没拿锁，直接返回
+    }
+    new-&gt;key = key;
+<span class="hl">    pthread_mutex_lock(&amp;L-&gt;lock);    // 只锁真正的临界区</span>
+    new-&gt;next = L-&gt;head;
+    L-&gt;head   = new;
+    pthread_mutex_unlock(&amp;L-&gt;lock);
+    return 0;
+}
+int List_Lookup(list_t *L, int key) {
+    int rv = -1;
+    pthread_mutex_lock(&amp;L-&gt;lock);
+    node_t *curr = L-&gt;head;
+    while (curr) {
+        if (curr-&gt;key == key) {
+<span class="hl">            rv = 0; break;   // 跳出循环，走唯一出口</span>
+        }
+        curr = curr-&gt;next;
+    }
+    pthread_mutex_unlock(&amp;L-&gt;lock);
+    return rv;
+}</code></pre>
+</div>
+<p>第一版有个小麻烦：<code>malloc()</code> 失败时，必须在返回前记得解锁。这种罕见的异常控制流非常容易出错——一项对 Linux 内核补丁的研究发现，近 40% 的 bug 出现在这类很少走到的代码路径上。</p>
+<p>重写的思路有两点：</p>
+<ul>
+<li><strong>插入：只锁真正的临界区。</strong>假设 <code>malloc()</code> 本身是线程安全的，分配和填充新节点就不需要锁；只有修改共享链表（改 <code>head</code>）时才需要持锁。于是失败路径上根本没有锁要放。</li>
+<li><strong>查找：单一出口。</strong>找到后用 <code>break</code> 跳出循环，统一走到函数末尾解锁并返回。加锁/解锁点越少，越不容易"忘了解锁就 return"。</li>
+</ul>
+
+<figure class="fig">
+<svg viewBox="0 0 720 150" width="720" role="img" aria-label="控制流与锁">
+  <text x="10" y="18" font-size="13" font-weight="700">Figure 29.7 的查找：两条返回路径，各自负责解锁</text>
+  <g font-size="12">
+    <rect x="10" y="30" width="70" height="28" rx="5" class="accent-soft"/><text x="45" y="49" text-anchor="middle">lock</text>
+    <rect x="110" y="30" width="90" height="28" rx="5" class="box"/><text x="155" y="49" text-anchor="middle">遍历</text>
+    <rect x="240" y="30" width="110" height="28" rx="5" class="bad-soft"/><text x="295" y="49" text-anchor="middle">找到：unlock</text>
+    <rect x="380" y="30" width="90" height="28" rx="5" class="box"/><text x="425" y="49" text-anchor="middle">return 0</text>
+    <rect x="240" y="66" width="110" height="28" rx="5" class="bad-soft"/><text x="295" y="85" text-anchor="middle">没找到：unlock</text>
+    <rect x="380" y="66" width="90" height="28" rx="5" class="box"/><text x="425" y="85" text-anchor="middle">return -1</text>
+  </g>
+  <g class="arrow"><line x1="80" y1="44" x2="110" y2="44"/><line x1="200" y1="44" x2="240" y2="44"/><line x1="200" y1="50" x2="240" y2="78"/><line x1="350" y1="44" x2="380" y2="44"/><line x1="350" y1="80" x2="380" y2="80"/></g>
+  <text x="490" y="62" font-size="12" style="fill:var(--bad)">每多一条出口，就多一处可能漏写 unlock</text>
+  <text x="10" y="120" font-size="13" font-weight="700">Figure 29.8：break → 唯一出口</text>
+  <g font-size="12">
+    <rect x="10" y="126" width="70" height="22" rx="5" class="accent-soft"/><text x="45" y="141" text-anchor="middle">lock</text>
+    <rect x="110" y="126" width="140" height="22" rx="5" class="box"/><text x="180" y="141" text-anchor="middle">遍历（找到就 break）</text>
+    <rect x="280" y="126" width="80" height="22" rx="5" class="ok-soft"/><text x="320" y="141" text-anchor="middle">unlock</text>
+    <rect x="390" y="126" width="90" height="22" rx="5" class="box"/><text x="435" y="141" text-anchor="middle">return rv</text>
+  </g>
+  <g class="arrow"><line x1="80" y1="137" x2="110" y2="137"/><line x1="250" y1="137" x2="280" y2="137"/><line x1="360" y1="137" x2="390" y2="137"/></g>
+</svg>
+<figcaption>小心锁与控制流：函数开头拿了锁、分配了内存或做了其他有状态的操作，出错返回时就必须一一撤销。尽量把代码组织成不需要这样做的形状。</figcaption>
+</figure>
+
+<h3>让链表扩展：手递手锁</h3>
+<p>一把锁的链表同样扩展性差。研究者探索过一种提高并发度的技术：<strong>手递手锁（hand-over-hand locking）</strong>，也叫<strong>锁耦合（lock coupling）</strong>。思路很简单：不再给整个链表一把锁，而是<strong>每个节点一把锁</strong>；遍历时，<strong>先拿下一个节点的锁，再放当前节点的锁</strong>——像双手交替抓绳子往前爬。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 720 160" width="720" role="img" aria-label="手递手锁示意">
+  <defs><marker id="ah29" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" style="fill:var(--muted)"/></marker></defs>
+  <g font-size="13">
+    <rect x="20" y="60" width="80" height="40" rx="6" class="box"/><text x="60" y="85" text-anchor="middle">n0</text>
+    <rect x="150" y="60" width="80" height="40" rx="6" class="box"/><text x="190" y="85" text-anchor="middle">n1</text>
+    <rect x="280" y="60" width="80" height="40" rx="6" style="fill:var(--surface);stroke:var(--c1);stroke-width:2"/><text x="320" y="85" text-anchor="middle">n2</text>
+    <rect x="410" y="60" width="80" height="40" rx="6" style="fill:var(--surface);stroke:var(--c1);stroke-width:2"/><text x="450" y="85" text-anchor="middle">n3</text>
+    <rect x="540" y="60" width="80" height="40" rx="6" class="box"/><text x="580" y="85" text-anchor="middle">n4</text>
+  </g>
+  <g class="arrow" marker-end="url(#ah29)"><line x1="100" y1="80" x2="148" y2="80" marker-end="url(#ah29)"/><line x1="230" y1="80" x2="278" y2="80" marker-end="url(#ah29)"/><line x1="360" y1="80" x2="408" y2="80" marker-end="url(#ah29)"/><line x1="490" y1="80" x2="538" y2="80" marker-end="url(#ah29)"/></g>
+  <g font-size="12">
+    <rect x="300" y="34" width="40" height="18" rx="4" style="fill:var(--c1)"/><text x="320" y="47" text-anchor="middle" style="fill:#fff;font-weight:600">T1</text>
+    <rect x="430" y="34" width="40" height="18" rx="4" style="fill:var(--c1)"/><text x="450" y="47" text-anchor="middle" style="fill:#fff;font-weight:600">T1</text>
+    <text x="320" y="24" text-anchor="middle">② 然后放开 n2</text>
+    <text x="450" y="24" text-anchor="middle">① 先拿住 n3</text>
+    <rect x="40" y="108" width="40" height="18" rx="4" style="fill:var(--c2)"/><text x="60" y="121" text-anchor="middle" style="fill:#fff;font-weight:600">T2</text>
+  </g>
+  <text x="20" y="150" font-size="12" class="t-muted">T1 在前面爬，T2 可以同时在后面的节点上工作——多个遍历可以"流水线"式地并行进行。</text>
+</svg>
+<figcaption>手递手锁：任何时刻一个线程最多同时持有两把相邻节点的锁，先拿后放，保证链表结构不会在它脚下被改动。</figcaption>
+</figure>
+<p>概念上这很合理，它允许链表操作有很高的并发度。但原书指出：<strong>实践中很难让它比一把锁更快</strong>——遍历时对每个节点都要加锁、解锁，这些开销大得惊人。即使链表很长、线程很多，允许多个遍历同时进行带来的并发收益，也不太可能超过"拿一把锁、做完、放掉"的简单做法。也许某种混合方案（每隔若干个节点才换一把锁）值得研究。下面的模拟器让你调"加锁代价"和"每个节点的工作量"，亲眼看看手递手什么时候赢、什么时候输。</p>
+
+<section class="sim" id="sim-hoh">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>手递手遍历 vs 一把大锁</h3>
+    <div class="desc">两个线程（在两个 CPU 上）同时在 8 个节点的链表里查找。每次加锁/解锁耗 c 拍，检查一个节点耗 w 拍。单步看每个节点的锁被谁持有；最后比较两种方案谁先把两个查找都做完。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>T1 查找第几个节点 <select id="hh-k1"></select></label>
+      <label>T2 查找第几个节点 <select id="hh-k2"></select></label>
+      <label>T2 晚到 <input type="number" id="hh-d" min="0" max="20" value="1"> 拍</label>
+      <label>加锁/解锁代价 c <input type="number" id="hh-c" min="1" max="10" value="2"></label>
+      <label>每节点工作量 w <input type="number" id="hh-w" min="1" max="10" value="1"></label>
+      <button id="hh-p1">预设：锁很贵（c=3,w=1）</button>
+      <button id="hh-p2">预设：节点工作很重（c=1,w=6）</button>
+    </div>
+    <div id="hh-step"></div>
+    <div class="stage"><div id="hh-svg"></div></div>
+    <div class="narrate" id="hh-nar"></div>
+    <div class="stats" id="hh-stats"></div>
+  </div>
+</section>
+
+<h2>并发队列：Michael &amp; Scott 双锁队列</h2>
+<p>给队列加一把大锁的做法留给你自己想。这里看一个并发度稍高的设计，来自 Michael 和 Scott（Figure 29.9）。它有<strong>两把锁</strong>：一把管队头（<code>head_lock</code>），一把管队尾（<code>tail_lock</code>）。目的是让入队和出队可以并发：通常情况下，入队只碰尾锁，出队只碰头锁。</p>
+<pre><code>typedef struct __node_t { int value; struct __node_t *next; } node_t;
+typedef struct __queue_t {
+    node_t         *head, *tail;
+    pthread_mutex_t head_lock, tail_lock;     // ① 头尾各一把锁
+} queue_t;
+
+void Queue_Init(queue_t *q) {
+    node_t *tmp = malloc(sizeof(node_t));    // ② 哑节点（dummy）
+    tmp-&gt;next = NULL;
+    q-&gt;head = q-&gt;tail = tmp;
+    pthread_mutex_init(&amp;q-&gt;head_lock, NULL);
+    pthread_mutex_init(&amp;q-&gt;tail_lock, NULL);
+}
+
+void Queue_Enqueue(queue_t *q, int value) {
+    node_t *tmp = malloc(sizeof(node_t));    // ③ 锁外准备新节点
+    assert(tmp != NULL);
+    tmp-&gt;value = value;
+    tmp-&gt;next  = NULL;
+    pthread_mutex_lock(&amp;q-&gt;tail_lock);       // ④ 只拿尾锁
+    q-&gt;tail-&gt;next = tmp;
+    q-&gt;tail       = tmp;
+    pthread_mutex_unlock(&amp;q-&gt;tail_lock);
+}
+
+int Queue_Dequeue(queue_t *q, int *value) {
+    pthread_mutex_lock(&amp;q-&gt;head_lock);       // ⑤ 只拿头锁
+    node_t *tmp      = q-&gt;head;              //    head 永远指向哑节点
+    node_t *new_head = tmp-&gt;next;
+    if (new_head == NULL) {
+        pthread_mutex_unlock(&amp;q-&gt;head_lock);
+        return -1;                           //    只有哑节点 = 队列空
+    }
+    *value  = new_head-&gt;value;               // ⑥ 真正的队首是哑节点的下一个
+    q-&gt;head = new_head;                      //    它变成新的哑节点
+    pthread_mutex_unlock(&amp;q-&gt;head_lock);
+    free(tmp);                               // ⑦ 旧哑节点在锁外释放
+    return 0;
+}</code></pre>
+
+<figure class="fig">
+<svg viewBox="0 0 720 190" width="720" role="img" aria-label="双锁队列">
+  <defs><marker id="ah29b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" style="fill:var(--muted)"/></marker></defs>
+  <g font-size="13">
+    <rect x="120" y="80" width="90" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--muted);stroke-dasharray:4 3"/><text x="165" y="100" text-anchor="middle">哑节点</text><text x="165" y="117" text-anchor="middle" font-size="11" class="t-muted">值无意义</text>
+    <rect x="270" y="80" width="90" height="44" rx="6" class="box-strong"/><text x="315" y="107" text-anchor="middle" class="mono">5</text>
+    <rect x="420" y="80" width="90" height="44" rx="6" class="box-strong"/><text x="465" y="107" text-anchor="middle" class="mono">7</text>
+    <text x="545" y="107" class="mono t-muted">NULL</text>
+  </g>
+  <g class="arrow"><line x1="210" y1="102" x2="268" y2="102" marker-end="url(#ah29b)"/><line x1="360" y1="102" x2="418" y2="102" marker-end="url(#ah29b)"/><line x1="510" y1="102" x2="540" y2="102" marker-end="url(#ah29b)"/></g>
+  <g font-size="13">
+    <text x="165" y="40" text-anchor="middle" font-weight="700">head</text><line x1="165" y1="46" x2="165" y2="78" class="arrow" marker-end="url(#ah29b)"/>
+    <text x="465" y="40" text-anchor="middle" font-weight="700">tail</text><line x1="465" y1="46" x2="465" y2="78" class="arrow" marker-end="url(#ah29b)"/>
+    <rect x="20" y="24" width="100" height="26" rx="5" style="fill:var(--c2)"/><text x="70" y="42" text-anchor="middle" style="fill:#fff;font-weight:600">head_lock</text>
+    <rect x="560" y="24" width="100" height="26" rx="5" style="fill:var(--c1)"/><text x="610" y="42" text-anchor="middle" style="fill:#fff;font-weight:600">tail_lock</text>
+  </g>
+  <g font-size="12">
+    <text x="20" y="160">出队者：拿 head_lock，读 head-&gt;next（值 5），head 前移 → 节点 5 成为新哑节点</text>
+    <text x="20" y="180">入队者：拿 tail_lock，把新节点挂在 tail 后面，tail 后移</text>
+  </g>
+</svg>
+<figcaption>head 永远指向哑节点，真正的队首是哑节点的下一个。出队只动 head 一侧，入队只动 tail 一侧，两把锁通常互不干扰。</figcaption>
+</figure>
+
+<p><strong>哑节点（dummy node）</strong>是 Michael 和 Scott 的关键技巧：它在初始化时分配，使头部操作和尾部操作得以分离。如果没有哑节点，空队列时 <code>head = tail = NULL</code>，第一次入队必须同时改 <code>head</code> 和 <code>tail</code>、最后一次出队也必须同时改两者——两个操作就又得碰两把锁了。有了哑节点，队列里至少永远有一个节点，入队只改 <code>tail</code> 和 <code>tail-&gt;next</code>，出队只改 <code>head</code>。</p>
+<p>原书也提醒：只用锁的队列往往不能完全满足多线程程序的需要。更完整的<strong>有界队列</strong>——队列空或满时能让线程等待——是下一章条件变量的重点。</p>
+
+<section class="sim" id="sim-msq">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>双锁队列逐行执行</h3>
+    <div class="desc">选一个场景，用"调度串"决定每一步由哪个线程执行一行（和 x86.py 的 -P 类似，如 1122 表示 T1 走两步、T2 走两步）。观察：入队和出队能否同时持锁？两个入队者会怎样？哑节点如何"移动"？</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>场景 <select id="mq-sc"></select></label>
+      <label>调度串 <input type="text" id="mq-sched" size="18"></label>
+      <button id="mq-run" class="primary">按此调度运行</button>
+    </div>
+    <div id="mq-step"></div>
+    <div class="stage"><div id="mq-svg"></div></div>
+    <div class="two-col" id="mq-threads" style="margin-top:10px"></div>
+    <div class="narrate" id="mq-nar"></div>
+  </div>
+</section>
+
+<div class="aside" data-title="细节：空队列时两把锁碰到同一个节点">
+<p>队列为空时，<code>head</code> 和 <code>tail</code> 都指向哑节点。这时入队者（持尾锁）写 <code>dummy-&gt;next</code>，出队者（持头锁）读 <code>dummy-&gt;next</code>——两个线程没有持同一把锁却访问了同一个字段。原书没有展开这一点。算法之所以仍然成立，是因为一个对齐指针的读写是原子的：出队者要么读到 NULL（认为队列空，返回 −1），要么读到已经完整初始化的新节点（value 和 next 在拿锁之前就写好了）。在现代弱内存模型的机器上，这还依赖锁操作自带的内存屏障；自己改写这类代码时要格外小心。在模拟器的"空队列"场景里可以看到这一刻。</p>
+</div>
+
+<h2>并发哈希表</h2>
+<p>最后是一个简单又非常实用的结构：不需要扩容的哈希表（Figure 29.10）。它直接用前面的并发链表搭成：</p>
+<pre><code>#define BUCKETS (101)
+typedef struct __hash_t { list_t lists[BUCKETS]; } hash_t;   // 每个桶是一条带锁的链表
+
+void Hash_Init(hash_t *H) {
+    for (int i = 0; i &lt; BUCKETS; i++) List_Init(&amp;H-&gt;lists[i]);
+}
+int Hash_Insert(hash_t *H, int key) { return List_Insert(&amp;H-&gt;lists[key % BUCKETS], key); }
+int Hash_Lookup(hash_t *H, int key) { return List_Lookup(&amp;H-&gt;lists[key % BUCKETS], key); }</code></pre>
+
+<figure class="fig">
+<svg viewBox="0 0 720 230" width="720" role="img" aria-label="每桶一把锁的哈希表">
+  <g font-size="12">
+    <text x="10" y="20" font-weight="700" font-size="13">101 个桶，每桶一把锁、一条链表</text>
+  </g>
+  <g font-size="12">
+    <g><rect x="120" y="36" width="70" height="26" rx="4" class="box-strong"/><text x="155" y="54" text-anchor="middle" class="mono">桶 0</text><rect x="196" y="40" width="18" height="18" rx="3" class="box"/></g>
+    <g><rect x="120" y="72" width="70" height="26" rx="4" class="box-strong"/><text x="155" y="90" text-anchor="middle" class="mono">桶 1</text><rect x="196" y="76" width="18" height="18" rx="3" style="fill:var(--c1)"/></g>
+    <g><rect x="120" y="108" width="70" height="26" rx="4" class="box-strong"/><text x="155" y="126" text-anchor="middle" class="mono">桶 2</text><rect x="196" y="112" width="18" height="18" rx="3" style="fill:var(--c2)"/></g>
+    <g><rect x="120" y="144" width="70" height="26" rx="4" class="box-strong"/><text x="155" y="162" text-anchor="middle" class="mono">桶 3</text><rect x="196" y="148" width="18" height="18" rx="3" style="fill:var(--c3)"/></g>
+    <text x="155" y="190" text-anchor="middle" class="t-muted">⋮</text>
+    <g><rect x="120" y="196" width="70" height="26" rx="4" class="box-strong"/><text x="155" y="214" text-anchor="middle" class="mono">桶 100</text><rect x="196" y="200" width="18" height="18" rx="3" class="box"/></g>
+  </g>
+  <g font-size="12" class="mono">
+    <rect x="240" y="72" width="50" height="26" rx="4" class="box"/><text x="265" y="90" text-anchor="middle">102</text>
+    <rect x="310" y="72" width="50" height="26" rx="4" class="box"/><text x="335" y="90" text-anchor="middle">1</text>
+    <rect x="240" y="108" width="50" height="26" rx="4" class="box"/><text x="265" y="126" text-anchor="middle">204</text>
+    <rect x="240" y="144" width="50" height="26" rx="4" class="box"/><text x="265" y="162" text-anchor="middle">3</text>
+    <rect x="310" y="144" width="50" height="26" rx="4" class="box"/><text x="335" y="162" text-anchor="middle">407</text>
+  </g>
+  <g class="arrow"><line x1="214" y1="85" x2="240" y2="85"/><line x1="290" y1="85" x2="310" y2="85"/><line x1="214" y1="121" x2="240" y2="121"/><line x1="214" y1="157" x2="240" y2="157"/><line x1="290" y1="157" x2="310" y2="157"/></g>
+  <g font-size="12">
+    <rect x="10" y="74" width="70" height="22" rx="4" style="fill:var(--c1)"/><text x="45" y="89" text-anchor="middle" style="fill:#fff;font-weight:600">T1: 1</text>
+    <rect x="10" y="110" width="70" height="22" rx="4" style="fill:var(--c2)"/><text x="45" y="125" text-anchor="middle" style="fill:#fff;font-weight:600">T2: 204</text>
+    <rect x="10" y="146" width="70" height="22" rx="4" style="fill:var(--c3)"/><text x="45" y="161" text-anchor="middle" style="fill:#fff;font-weight:600">T3: 407</text>
+    <rect x="10" y="180" width="70" height="22" rx="4" style="fill:var(--c4)"/><text x="45" y="195" text-anchor="middle" style="fill:#fff;font-weight:600">T4: 3</text>
+  </g>
+  <g class="arrow"><line x1="80" y1="85" x2="118" y2="85"/><line x1="80" y1="121" x2="118" y2="121"/><line x1="80" y1="157" x2="118" y2="157"/><path d="M80 191 C 100 191, 100 165, 118 162" /></g>
+  <g font-size="12">
+    <text x="400" y="80">T1、T2、T3 落在不同的桶 → 三把不同的锁，完全并行</text>
+    <text x="400" y="104">T4 的键 3 和 T3 的 407 同落桶 3（407 mod 101 = 3）</text>
+    <text x="400" y="124">→ 只有它们俩需要排队</text>
+    <text x="400" y="160" class="t-muted">相比之下，一把锁的链表：四个线程全排一队</text>
+  </g>
+</svg>
+<figcaption>每个桶一把锁，而不是整个结构一把锁：落在不同桶上的操作可以同时进行。</figcaption>
+</figure>
+<p>它性能好的原因就是<strong>每个桶一把锁</strong>，而不是整个结构一把锁，于是大量并发操作可以同时进行。原书 Figure 29.11 在同一台 4 核 iMac 上测试：4 个线程各做 1 万到 5 万次并发插入，并发哈希表的耗时几乎不随插入量增长（扩展性"极好"），而一把锁的链表耗时则随插入量迅速上升。</p>
+
+<div class="aside" data-title="避免过早优化（Knuth 定律）与大内核锁">
+<p>构建并发数据结构时，先从最基本的方法开始：加一把大锁提供同步访问。这样你很可能先得到一个<strong>正确</strong>的版本；如果之后发现它有性能问题，再去细化——只在需要时才让它更快。正如 Knuth 所说："过早优化是万恶之源（Premature optimization is the root of all evil）。"</p>
+<p>许多操作系统刚转向多处理器时都只用一把锁，包括 Sun OS 和 Linux；Linux 里这把锁甚至有名字：<strong>大内核锁（big kernel lock，BKL）</strong>。多年里这是个不错的选择；但当多 CPU 成为常态，内核里同一时刻只允许一个活动线程就成了瓶颈。Linux 采取了直接的办法：把一把锁换成许多把；Sun 则更激进：从头构建一个把并发作为根本设计的新系统——Solaris。</p>
+</div>
+
+<h2>先预测再验证</h2>
+<div class="exercise"><div class="q">在近似计数器模拟器里点"载入原书 Figure 29.3"。<strong>先不要单步</strong>：G 第一次变成非零是在第几步？那一刻的真实计数是多少、滞后多少？</div>
+<details class="reveal"><summary>看答案</summary><div>第 6 步 L1 从 4 变 5，达到 S=5，转移后 G = 5。此时真实计数 = 0 + 1 + 3 + 4 + 5 = 13，滞后 8。第 7 步 L4 转移后 G = 10，真实计数 16，滞后 6。滞后不会单调增长：每次转移都会把它"清掉"一部分。</div></details></div>
+
+<div class="exercise"><div class="q">4 个 CPU、S = 5，把"每步更新概率"拉到 1（每个 CPU 每步都 +1）。预测滞后的变化规律和最大值，再运行验证。滞后最大可能是多少？</div>
+<details class="reveal"><summary>看答案</summary><div>所有局部计数器同步地 1,2,3,4，然后同时到 5 并转移。滞后依次是 4, 8, 12, 16, 0, 4, 8…，最大 16 = 4 × (5 − 1)，恰好碰到上界 CPU 数 × (S − 1)。这也说明上界是可以达到的：读者在最坏时刻读 <code>get()</code>，会少看到 16。</div></details></div>
+
+<div class="exercise"><div class="q">把 S 设成 1。预测：全局锁获取次数和"精确计数器的锁获取次数"是什么关系？这时近似计数器还有什么优势吗？</div>
+<details class="reveal"><summary>看答案</summary><div>两者完全相等——每次更新都立刻转移，每次都要拿全局锁，滞后永远是 0。此时近似计数器比精确计数器还多拿一把局部锁，纯属额外开销。本页 C 实验里 S = 1 的耗时（约 0.1 秒）甚至比 4 线程精确计数器（约 0.06 秒）还慢，就是这个原因。</div></details></div>
+
+<div class="exercise"><div class="q">在双锁队列模拟器选"T1 入队 ‖ T2 出队"，用默认调度串运行。预测：有没有某一步两把锁同时被持有？如果换成"两个入队者"场景呢？</div>
+<details class="reveal"><summary>看答案</summary><div>入队 ‖ 出队：会出现 T1 持 tail_lock、T2 持 head_lock 的时刻，两者都不等待——这正是双锁的意义。两个入队者：它们都要 tail_lock，后到的那个会在 lock 行上等待（narrate 会标红），直到前者解锁。入队者之间、出队者之间依然是串行的。</div></details></div>
+
+<div class="exercise"><div class="q">在手递手模拟器里，先用默认参数，再分别点两个预设。预测：哪种参数下手递手比一把大锁先完成？为什么原书说"实践中很难更快"？</div>
+<details class="reveal"><summary>看答案</summary><div>加锁代价 c 相对每节点工作量 w 越大，手递手越吃亏：它每前进一个节点都要一次加锁 + 一次解锁，总锁开销约为 2c × 节点数，而一把锁只有 2c。只有当每个节点上的工作很重（w 远大于 c）、两个线程又能在链表不同位置"流水线"并行时，手递手才能赢。真实系统里比较一个 key 只要几纳秒，而加锁解锁（尤其涉及缓存行在 CPU 之间迁移）贵得多，所以很难赢。</div></details></div>
+
+<div class="exercise"><div class="q">（C 实验）运行 <code>./counters</code> 之前先预测：16 个线程的近似计数器（S=1024）总共做 1600 万次更新，耗时大约是 1 个线程做 100 万次的几倍？精确计数器呢？</div>
+<details class="reveal"><summary>看答案</summary><div>本机实测：近似计数器 1 线程 0.007 秒、16 线程 0.017 秒，只增长到约 2.4 倍，工作量却是 16 倍——接近完美扩展（没有完全做到，是因为 16 线程用满了 8 个物理核的全部超线程）。精确计数器从 0.005 秒涨到 0.273 秒，约 55 倍，比串行做 1600 万次（约 0.08 秒）还慢得多：争用和缓存行来回搬运的代价远超计数本身。</div></details></div>
+
+<h2>动手实验：精确计数器 vs 近似计数器</h2>
+<div class="lab">
+<p>程序 <code>counters.c</code> 实现了 Figure 29.2 的精确计数器和 Figure 29.4 的近似计数器，重做原书两个实验：线程数扫描（Figure 29.5 风格，每线程 100 万次，S=1024）和阈值扫描（Figure 29.6 风格，固定 4 线程）。每项跑 3 次取中位数。</p>
+<pre><code><span class="cmd">cd labs/29-lock-data-structures &amp;&amp; make</span>
+<span class="cmd">./counters</span>            # 完整实验，约 2~3 秒
+<span class="cmd">./counters-nopad</span>      # 原书写法：局部计数器不做缓存行填充
+<span class="cmd">./counters approx 4 1000000 1024</span>   # 单独跑一个配置</code></pre>
+<p>程序用 <code>sysconf(_SC_NPROCESSORS_ONLN)</code> 取 <code>NUMCPUS</code>，线程 <code>i</code> 使用局部计数器 <code>i % NUMCPUS</code>。与原书的唯一区别：每个局部计数器和它的锁单独占一条 64 字节缓存行（<code>counters-nopad</code> 是不填充的原书版本，用来对比）。</p>
+</div>
+<p>示例输出（本机：AMD Ryzen 7 8745H，8 核 16 线程，WSL2，gcc 14 <code>-O2</code>；<strong>你的机器上数字会不同</strong>）：</p>
+<pre><code>$ ./counters
+NUMCPUS (online) = 16, 每线程 1000000 次递增, 每项取 3 次运行的中位数
+
+== 实验一：线程数扫描（Figure 29.5 风格，近似计数器 S=1024）==
+ threads   precise(s)    approx(s)  precise get()   approx get()
+       1        0.005        0.007        1000000         999424
+       2        0.033        0.007        2000000        1998848
+       4        0.064        0.007        4000000        3997696
+       8        0.154        0.010        8000000        7995392
+      16        0.273        0.017       16000000       15990784
+
+== 实验二：阈值 S 扫描（Figure 29.6 风格，4 线程）==
+       S    approx(s)   approx get()          lag
+       1        0.096        4000000            0
+       2        0.066        4000000            0
+       4        0.038        4000000            0
+       8        0.012        4000000            0
+      16        0.009        4000000            0
+      32        0.008        4000000            0
+      64        0.009        4000000            0
+     128        0.010        3999744          256
+     256        0.010        3999744          256
+     512        0.009        3999744          256
+    1024        0.008        3997696         2304</code></pre>
+<pre><code>$ ./counters-nopad
+[NOPAD 未填充缓存行] NUMCPUS (online) = 16, 每线程 1000000 次递增, 每项取 3 次运行的中位数
+
+== 实验一：线程数扫描（Figure 29.5 风格，近似计数器 S=1024）==
+ threads   precise(s)    approx(s)  precise get()   approx get()
+       1        0.005        0.007        1000000         999424
+       2        0.030        0.007        2000000        1998848
+       4        0.059        0.048        4000000        3997696
+       8        0.138        0.050        8000000        7995392
+      16        0.257        0.052       16000000       15990784
+
+== 实验二：阈值 S 扫描（Figure 29.6 风格，4 线程）==
+       S    approx(s)   approx get()          lag
+       1        0.122        4000000            0
+       2        0.087        4000000            0
+       4        0.077        4000000            0
+       8        0.067        4000000            0
+      16        0.060        4000000            0
+      32        0.056        4000000            0
+      64        0.052        4000000            0
+     128        0.048        3999744          256
+     256        0.053        3999744          256
+     512        0.048        3999744          256
+    1024        0.049        3997696         2304</code></pre>
+
+<figure class="fig"><div id="chart-threads"></div><div id="chart-S"></div>
+<figcaption>把上面的真实输出画成图（鼠标悬停数据点看数值）。上：总耗时 vs 线程数；下：4 线程时耗时 vs 阈值 S（横轴按 2 的幂等距）。</figcaption></figure>
+
+<p>怎么读这些数字：</p>
+<ul>
+<li><strong>精确计数器不扩展。</strong>1 线程 0.005 秒；2 线程已是 0.033 秒（约 6.6 倍），16 线程 0.273 秒。趋势和原书一致，但幅度小得多——原书 2 线程超过 5 秒。十几年后的 glibc 互斥锁基于 futex（第 28 章），无争用时只是一条原子指令，争用时的处理也高效得多；CPU 间缓存一致性也更快。但"线程越多越慢"这个本质没变：临界区是串行的，还要为锁和 <code>value</code> 所在的缓存行在核之间反复搬运付出代价。</li>
+<li><strong>近似计数器接近完美扩展。</strong>1、2、4 线程耗时几乎相同（0.007 秒），而总工作量翻了 4 倍。8 线程、16 线程时略有上升：本机只有 8 个物理核，16 个线程意味着两个超线程共用一个核的执行单元；加上线程没有绑核、WSL2 虚拟化的调度噪声，扩展性打了点折扣。</li>
+<li><strong>1 线程时近似计数器反而稍慢</strong>（0.007 vs 0.005）：它每次多做一次数组下标计算和阈值比较。这就是"更并发 ≠ 更快"的一个小例子——没有争用时，简单方案赢。</li>
+<li><strong>S 的权衡</strong>：S = 1 时 0.096 秒（每次都抢全局锁，比精确计数器还慢）；S 增到 8 左右耗时就降到底了——本机的全局锁在每 8 次更新才碰一次时就不再是瓶颈（原书那台机器要到更大的 S 才饱和）。代价是滞后：S = 1024 时 <code>get()</code> 少了 2304。</li>
+<li><strong>滞后为什么正好是 2304？</strong>每个线程更新 1,000,000 次，1,000,000 = 976 × 1024 + 576，所以每个局部计数器最后剩 576 没转移，4 个共 4 × 576 = 2304。同理 S = 128 时 1,000,000 mod 128 = 64，滞后 4 × 64 = 256。而 1,000,000 = 2<sup>6</sup> × 15625，能被 1、2、4……64 整除，所以 S ≤ 64 时恰好没有余数、滞后为 0。无论如何，滞后都不超过 NUMCPUS × (S − 1)。</li>
+<li><strong>NUMCPUS 应该取本机核数。</strong>原书 iMac 是 4 核，<code>NUMCPUS = 4</code>；本机有 16 个逻辑 CPU，所以程序取 16。如果 NUMCPUS 比线程数少，多个线程会共享一个局部计数器和局部锁，又产生争用；取多了只是浪费一点内存。更好的实现会按线程<strong>实际所在的 CPU</strong>（如 <code>sched_getcpu()</code>）选局部计数器，而不是简单地用线程号取模。</li>
+<li><strong>伪共享（false sharing）。</strong><code>counters-nopad</code> 按原书写法把 <code>local[]</code> 紧挨着放，几个局部计数器落在同一条 64 字节缓存行里。4 线程时耗时从 0.007 秒涨到 0.048 秒，接近 7 倍——虽然逻辑上互不相干，硬件却仍要让这条缓存行在各 CPU 间来回搬运。这是原书没提、但在真实机器上非常重要的一点。</li>
+</ul>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+
+<div class="mcq" data-answer="0"><div class="q">1. 给计数器的每个操作加一把锁（Figure 29.2）之后，下列说法正确的是：</div>
+<div class="opts"><button>A. 它正确，但多个 CPU 上的线程并发更新时总耗时会明显上升</button><button>B. 它只有在单处理器上才正确</button><button>C. 它正确，而且线程越多总耗时越短</button><button>D. 它仍然会丢失更新，因为 get() 没有必要加锁</button></div>
+<div class="explain">一把锁的计数器是正确的（选项 D 错：丢更新的是 increment，而它已加锁）。但所有更新被串行化，外加缓存行在 CPU 间搬运，原书中 2 线程就比 1 线程慢了一百多倍，本机也慢了约 6 倍。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">2. 近似计数器中，4 个 CPU，阈值 S = 1024。任意时刻 get() 返回值比真实计数少多少（最多）？</div>
+<div class="opts"><button>A. 至多 4 × 1023 = 4092（原书粗略说"至多 CPU 数 × S"）</button><button>B. 至多 1024 × 1024</button><button>C. 永远是 0，因为每次更新都会拿全局锁</button><button>D. 至多 1023</button></div>
+<div class="explain">每个局部计数器最多攒到 S − 1 而未转移（攒到 S 立即转移），4 个局部加起来最多 4 × 1023。原书用"至多 CPU 数乘以 S"作近似上界。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">3. 近似计数器的阈值 S 从 1024 调到 1，最可能出现：</div>
+<div class="opts"><button>A. 更快，并且 get() 更准</button><button>B. 更慢，但 get() 更不准</button><button>C. 性能不变，只是 get() 更准</button><button>D. 更慢（每次都抢全局锁，像精确计数器一样争用），但 get() 永远准确</button></div>
+<div class="explain">S = 1 时每次更新都要转移，全局锁获取次数等于更新次数；再加上多拿的局部锁，甚至比精确计数器还慢。换来的是零滞后。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">4. 把 Figure 29.7 的 List_Insert 改写成 Figure 29.8，主要收益是什么？</div>
+<div class="opts"><button>A. 把 malloc 放进锁内，防止 malloc 的竞争条件</button><button>B. 锁只包住真正修改共享链表的两行；malloc 失败的路径上没有锁要释放，减少"忘记解锁"类 bug</button><button>C. 去掉了锁，改用原子指令</button><button>D. 改成每个节点一把锁，提高并发度</button></div>
+<div class="explain">改写的前提是 malloc 本身线程安全，所以可以移到锁外。临界区更短，而且错误返回路径不再持锁。查找则用 break 走唯一出口。它仍然是一把锁的链表。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">5. 关于手递手锁（hand-over-hand locking），哪一项与原书一致？</div>
+<div class="opts"><button>A. 它总是比一把锁的链表快，因为并发度更高</button><button>B. 遍历时先放开当前节点的锁，再拿下一个节点的锁</button><button>C. 概念上并发度高，但每个节点都要加锁解锁，实践中很难比一把锁更快</button><button>D. 它需要硬件提供 load-linked/store-conditional</button></div>
+<div class="explain">正确顺序是先拿下一个、再放当前（B 顺序反了，会出现一瞬间什么都没锁住、链表可能被改动）。原书明确说实践中很难让它比简单的单锁方法更快。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">6. Michael &amp; Scott 队列里的哑节点（dummy node）的作用是：</div>
+<div class="opts"><button>A. 作为 head_lock 和 tail_lock 共用的第三把锁</button><button>B. 防止 malloc 失败</button><button>C. 存放队列当前的元素个数</button><button>D. 让队列里永远至少有一个节点，从而入队只改 tail 一侧、出队只改 head 一侧，头尾操作得以分离</button></div>
+<div class="explain">没有哑节点时，空队列 head = tail = NULL，首次入队和最后一次出队都得同时改 head 和 tail，就要同时拿两把锁。哑节点消除了这种情况。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">7. 双锁队列中，一个线程在入队、另一个线程在出队（队列非空）。它们：</div>
+<div class="opts"><button>A. 不需要任何锁</button><button>B. 通常可以同时进行，因为分别只拿 tail_lock 和 head_lock</button><button>C. 必须串行，因为都要拿 head_lock</button><button>D. 必须串行，因为都要拿 tail_lock</button></div>
+<div class="explain">这正是两把锁的设计目的：通常情况下入队只访问尾锁，出队只访问头锁。两个入队者之间（或两个出队者之间）仍然串行。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">8. 为什么 Figure 29.10 的并发哈希表扩展性极好？</div>
+<div class="opts"><button>A. 它用了近似计数器记录元素个数</button><button>B. 它使用手递手锁遍历每个桶</button><button>C. 每个桶一把锁（每桶是一条并发链表），落在不同桶上的操作可以并行</button><button>D. 它完全不用锁</button></div>
+<div class="explain">不再是整个结构一把锁，而是 101 把锁。只有落到同一个桶的操作才会互相等待。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">9. 关于 Knuth 定律与大内核锁（BKL），哪一项最贴近原书的建议？</div>
+<div class="opts"><button>A. 先用一把大锁得到正确的实现；确实出现性能问题时再细化</button><button>B. 应该尽量用无锁数据结构代替锁</button><button>C. 一把大锁永远够用，不需要细化</button><button>D. 一开始就应该为每个字段设计独立的锁，避免以后返工</button></div>
+<div class="explain">"过早优化是万恶之源。"Linux 早期的 BKL 多年间都是好选择，直到多 CPU 普及它才成为瓶颈，于是被拆成许多把锁。</div></div>
+
+<h2>常见误区与本章小结</h2>
+<div class="warn">
+<ul>
+<li><strong>"锁越多、越细，就越快。"</strong>不一定。手递手锁和本机 S = 1 的近似计数器都说明：额外的加锁开销可能吃掉全部并发收益。要测。</li>
+<li><strong>"近似计数器的 get() 是准确的。"</strong>它只读全局值，最多落后约 CPU 数 × S。需要精确值得按固定顺序拿齐所有锁再求和——那就不可扩展了。</li>
+<li><strong>"读操作不用加锁。"</strong>Figure 29.2 的 get() 也加锁：读和写可能同时发生，不加锁可能读到不一致的状态（对更复杂的结构尤其如此）。</li>
+<li><strong>"函数开头加锁就行，出错时直接 return。"</strong>每条提前返回的路径都要撤销已持有的锁和资源，这类罕见路径是 bug 高发区；尽量缩小临界区、使用单一出口。</li>
+<li><strong>"每个 CPU 一个变量就不会争用。"</strong>如果它们挤在同一条缓存行，硬件层面仍然争用（伪共享）——本机实测 4 线程慢了约 7 倍。</li>
+<li><strong>"双锁队列里入队和出队永远不会碰到同一个节点。"</strong>队列为空时它们都指向哑节点；算法依赖指针读写的原子性和锁的内存屏障才成立。</li>
+</ul>
+</div>
+<div class="key">
+<p><strong>本章要点</strong></p>
+<ul>
+<li>让数据结构线程安全的标准起点：<strong>一把锁</strong>，操作入口加锁、出口解锁。先做对。</li>
+<li>一把锁的问题是<strong>扩展性</strong>。目标是尽量接近<strong>完美扩展</strong>。</li>
+<li><strong>近似计数器</strong>：每 CPU 局部计数 + 全局计数，阈值 S 在<strong>性能</strong>与<strong>准确度</strong>之间权衡，滞后 ≤ CPU 数 × (S − 1)。</li>
+<li><strong>链表</strong>：缩小临界区、单一出口，减少控制流带来的 bug；手递手锁概念上并发高，实践中难以更快。</li>
+<li><strong>队列</strong>：Michael &amp; Scott 用头尾两把锁 + 哑节点，让入队与出队并发。</li>
+<li><strong>哈希表</strong>：每桶一把锁，扩展性极好。</li>
+<li>三条教训：小心锁与控制流；更多并发不一定更快；只在真正存在性能问题时才优化（Knuth 定律）。</li>
+</ul>
+<p>接下来：本章的队列在空的时候只能返回 −1。如果想让消费者"等到有数据再继续"，锁就不够用了——第 30 章<strong>条件变量</strong>会构建能等待的有界队列（生产者/消费者问题）。第 32 章还会简要接触不用传统锁的<strong>非阻塞（non-blocking）</strong>数据结构。</p>
+</div>
+
+</main>
+<script>
+(function () {
+  "use strict";
+  const { h, s, color, rng, stepper } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+
+  /* ================= 模拟器 1：近似计数器 ================= */
+  // 原书 Figure 29.3：每个时刻哪些 CPU 的局部计数器 +1（0 基：L1 = 0）
+  const BOOK_SCHEDULE = [[2, 3], [0, 2], [0, 2], [0, 3], [0, 1, 3], [0, 3], [1, 2, 3]];
+
+  // 核心算法：与 Figure 29.4 的 update() 一致：local += 1；若 local >= S 则转移到 global 并清零
+  function approxTrace(ncpu, S, schedule) {
+    const local = new Array(ncpu).fill(0);
+    let G = 0, total = 0, gLocks = 0;
+    const rows = [{ t: 0, inc: [], local: local.slice(), transfers: [], G, total, gLocks, lag: 0 }];
+    schedule.forEach((incs, k) => {
+      const transfers = [];
+      for (const c of incs) {
+        local[c] += 1; total += 1;
+        if (local[c] >= S) { transfers.push({ cpu: c, amt: local[c] }); G += local[c]; gLocks += 1; local[c] = 0; }
+      }
+      rows.push({ t: k + 1, inc: incs.slice(), local: local.slice(), transfers, G, total, gLocks, lag: total - G });
+    });
+    return rows;
+  }
+  function randomSchedule(ncpu, T, p, seed) {
+    const r = rng(seed), out = [];
+    for (let t = 0; t < T; t++) { const inc = []; for (let c = 0; c < ncpu; c++) if (r() < p) inc.push(c); out.push(inc); }
+    return out;
+  }
+
+  const ac = { ncpu: 4, S: 5, rows: [], mode: "book" };
+  const selN = $("ac-ncpu");
+  for (let i = 1; i <= 8; i++) selN.append(h("option", { value: i }, i));
+  selN.value = 4;
+
+  function acBuild(mode) {
+    ac.mode = mode;
+    if (mode === "book") {
+      ac.ncpu = 4; ac.S = 5; selN.value = 4; $("ac-S").value = 5;
+      ac.rows = approxTrace(4, 5, BOOK_SCHEDULE);
+    } else {
+      ac.ncpu = +selN.value;
+      ac.S = Math.max(1, Math.min(64, +$("ac-S").value || 1));
+      const T = Math.max(5, Math.min(300, +$("ac-T").value || 40));
+      const p = +$("ac-p").value, seed = +$("ac-seed").value || 1;
+      ac.rows = approxTrace(ac.ncpu, ac.S, randomSchedule(ac.ncpu, T, p, seed));
+    }
+    acBuildTable();
+    acStep.reset();
+  }
+
+  function acBuildTable() {
+    const n = ac.ncpu;
+    const head = h("tr", {}, h("th", {}, "Time"), Array.from({ length: n }, (_, i) => h("th", {}, "L" + (i + 1))), h("th", {}, "G"));
+    const body = ac.rows.map((r, idx) => {
+      const cells = [];
+      for (let c = 0; c < n; c++) {
+        const tr = r.transfers.find((x) => x.cpu === c);
+        if (tr) cells.push(h("td", { class: "xfer" }, tr.amt + " → 0"));
+        else cells.push(h("td", { class: r.inc.includes(c) ? "inc" : "" }, r.local[c]));
+      }
+      const from = r.transfers.map((x) => "L" + (x.cpu + 1)).join("、");
+      const gCell = h("td", { class: r.transfers.length ? "xfer" : "" }, r.G + (from ? "（来自 " + from + "）" : ""));
+      return h("tr", { "data-i": idx }, h("td", {}, r.t), cells, gCell);
+    });
+    $("ac-trace").replaceChildren(h("table", {}, h("thead", {}, head), h("tbody", {}, body)));
+  }
+
+  function acRender(i) {
+    const r = ac.rows[i], n = ac.ncpu, S = ac.S;
+    const colW = 72, base = 190, maxH = 140, W = 40 + n * colW + 210, H = 230;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "近似计数器状态" });
+    const thY = base - maxH;
+    svg.append(s("line", { x1: 20, x2: 30 + n * colW, y1: thY, y2: thY, style: "stroke:var(--warn);stroke-dasharray:5 4;stroke-width:1.5" }));
+    svg.append(s("text", { x: 24, y: thY - 6, "font-size": 12, style: "fill:var(--warn)", text: "阈值 S = " + S }));
+    const gx = 50 + n * colW, gy = 60;
+    for (let c = 0; c < n; c++) {
+      const x = 34 + c * colW, bw = 44;
+      const tr = r.transfers.find((t) => t.cpu === c);
+      const inc = r.inc.includes(c);
+      svg.append(s("rect", { x, y: thY, width: bw, height: maxH, rx: 4, class: "box" }));
+      if (tr) svg.append(s("rect", { x, y: thY, width: bw, height: maxH, rx: 4, class: "warn-soft", "stroke-dasharray": "4 3" }));
+      const hgt = (r.local[c] / S) * maxH;
+      if (hgt > 0) svg.append(s("rect", { x, y: base - hgt, width: bw, height: hgt, rx: 4, style: `fill:${color(c)}` }));
+      svg.append(s("text", { x: x + bw / 2, y: base + 18, "text-anchor": "middle", "font-size": 13, "font-weight": 700, text: "L" + (c + 1) }));
+      svg.append(s("text", { x: x + bw / 2, y: Math.min(base - hgt - 6, base - 6), "text-anchor": "middle", "font-size": 13, class: "mono", text: tr ? tr.amt + "→0" : r.local[c] }));
+      if (inc) svg.append(s("text", { x: x + bw / 2, y: base + 34, "text-anchor": "middle", "font-size": 12, style: "fill:var(--accent);font-weight:700", text: "+1" }));
+      if (tr) {
+        svg.append(s("path", { d: `M${x + bw / 2} ${thY} C ${x + bw / 2} 20, ${gx - 30} 30, ${gx} ${gy + 20}`, style: "stroke:var(--warn);fill:none;stroke-width:2" }));
+        svg.append(s("text", { x: x + bw / 2 + 6, y: thY - 22, "font-size": 12, style: "fill:var(--warn);font-weight:700", text: "+" + tr.amt + " → G" }));
+      }
+    }
+    svg.append(s("rect", { x: gx, y: gy, width: 170, height: 64, rx: 8, class: r.transfers.length ? "warn-soft" : "box-strong" }));
+    svg.append(s("text", { x: gx + 85, y: gy + 22, "text-anchor": "middle", "font-size": 12, class: "t-muted", text: "全局 G（get() 读到的）" }));
+    svg.append(s("text", { x: gx + 85, y: gy + 50, "text-anchor": "middle", "font-size": 24, "font-weight": 700, class: "mono", text: r.G }));
+    svg.append(s("text", { x: gx, y: gy + 92, "font-size": 13, text: "真实总数 = " + r.total }));
+    svg.append(s("text", { x: gx, y: gy + 114, "font-size": 13, style: "fill:var(--bad)", text: "滞后 = " + r.lag }));
+    svg.append(s("text", { x: gx, y: gy + 136, "font-size": 12, class: "t-muted", text: "上界 " + n + "×(S−1) = " + n * (S - 1) }));
+    $("ac-svg").replaceChildren(svg);
+
+    // 滞后随时间变化
+    const SW = 640, SH = 96, pad = 30, N = ac.rows.length;
+    const bound = n * (S - 1);
+    const maxLag = Math.max(1, bound, ...ac.rows.map((x) => x.lag));
+    const xOf = (k) => pad + (N <= 1 ? 0 : (k / (N - 1)) * (SW - pad - 10));
+    const yOf = (v) => SH - 18 - (v / maxLag) * (SH - 30);
+    const sp = s("svg", { viewBox: `0 0 ${SW} ${SH}`, width: SW, role: "img", "aria-label": "滞后随时间变化" });
+    sp.append(s("line", { x1: pad, x2: SW - 10, y1: yOf(0), y2: yOf(0), class: "stroke", "stroke-width": 1 }));
+    sp.append(s("line", { x1: pad, x2: SW - 10, y1: yOf(bound), y2: yOf(bound), style: "stroke:var(--bad);stroke-dasharray:5 4;stroke-width:1" }));
+    sp.append(s("text", { x: SW - 12, y: yOf(bound) - 4, "text-anchor": "end", "font-size": 11, style: "fill:var(--bad)", text: "上界 " + bound }));
+    sp.append(s("text", { x: 2, y: 12, "font-size": 11, class: "t-muted", text: "滞后（真实 − G）随时间" }));
+    const pts = ac.rows.slice(0, i + 1).map((x, k) => xOf(k) + "," + yOf(x.lag)).join(" ");
+    sp.append(s("polyline", { points: pts, style: "fill:none;stroke:var(--c1);stroke-width:2" }));
+    sp.append(s("circle", { cx: xOf(i), cy: yOf(r.lag), r: 4, style: "fill:var(--c1)" }));
+    sp.append(s("text", { x: pad, y: SH - 4, "font-size": 11, class: "t-muted mono", text: "t=0" }));
+    sp.append(s("text", { x: SW - 10, y: SH - 4, "text-anchor": "end", "font-size": 11, class: "t-muted mono", text: "t=" + (N - 1) }));
+    $("ac-spark").replaceChildren(sp);
+
+    // 解说
+    let msg;
+    if (i === 0) msg = `初始：${n} 个局部计数器和全局计数器 G 都是 0。阈值 S = ${S}。`;
+    else {
+      const incNames = r.inc.map((c) => "L" + (c + 1)).join("、");
+      msg = `时刻 ${r.t}：` + (r.inc.length ? `${incNames} 各 +1（各自只拿自己的局部锁，互不争用）。` : "这一步没有 CPU 更新。");
+      for (const tr of r.transfers) msg += ` L${tr.cpu + 1} 达到 S = ${S}：拿全局锁，把 ${tr.amt} 加到 G，然后 L${tr.cpu + 1} 清零。`;
+      msg += ` 现在 G = ${r.G}，真实计数 = ${r.total}，get() 少看到 ${r.lag}。`;
+      if (ac.mode === "book" && i === ac.rows.length - 1) msg += " ——这正是原书 Figure 29.3 的最后一行。";
+    }
+    $("ac-nar").textContent = msg;
+    const stat = (v, l) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+    $("ac-stats").replaceChildren(
+      stat(r.total, "真实总数（更新次数）"), stat(r.G, "全局 G = get()"), stat(r.lag, "滞后"),
+      stat(n * (S - 1), "滞后上界 CPU×(S−1)"), stat(r.gLocks, "近似：全局锁获取次数"), stat(r.total, "精确计数器：同一把锁的获取次数"));
+    // 表格高亮
+    const box = $("ac-trace");
+    box.querySelectorAll("tr.cur").forEach((tr) => tr.classList.remove("cur"));
+    const row = box.querySelector(`tr[data-i="${i}"]`);
+    if (row) { row.classList.add("cur"); box.scrollTop = Math.max(0, row.offsetTop - box.clientHeight / 2); }
+  }
+
+  const acStep = stepper($("ac-step"), { steps: () => ac.rows.length, render: acRender, autoplayMs: 700 });
+  $("ac-book").onclick = () => acBuild("book");
+  $("ac-gen").onclick = () => acBuild("random");
+  ["ac-ncpu", "ac-S", "ac-T", "ac-seed"].forEach((id) => $(id).addEventListener("change", () => acBuild("random")));
+  $("ac-p").addEventListener("input", () => { $("ac-pv").textContent = (+$("ac-p").value).toFixed(1); });
+  $("ac-p").addEventListener("change", () => acBuild("random"));
+  acBuild("book");
+
+  /* ================= 模拟器 2：手递手遍历 ================= */
+  const HH_N = 8;
+  for (const id of ["hh-k1", "hh-k2"]) for (let k = 0; k < HH_N; k++) $(id).append(h("option", { value: k }, "n" + k));
+  $("hh-k1").value = 6; $("hh-k2").value = 4;
+
+  // 生成手递手查找的操作序列：lock n0；check n0；(lock n(i+1)；unlock n(i)；check n(i+1))*；unlock 最后一个
+  function hohOps(target) {
+    const ops = [{ a: "lock", n: 0 }, { a: "check", n: 0 }];
+    for (let i = 0; i < target; i++) ops.push({ a: "lock", n: i + 1 }, { a: "unlock", n: i }, { a: "check", n: i + 1 });
+    ops.push({ a: "unlock", n: target });
+    return ops;
+  }
+  // 按"拍"推进的两 CPU 模拟：加/解锁耗 c 拍，检查耗 w 拍；锁被别人持有就等待
+  function hohSim(k1, k2, delay, c, w) {
+    const th = [
+      { ops: hohOps(k1), pc: 0, left: 0, start: 0, done: -1, locks: 0, wait: 0 },
+      { ops: hohOps(k2), pc: 0, left: 0, start: delay, done: -1, locks: 0, wait: 0 },
+    ];
+    const owner = new Array(HH_N).fill(-1);
+    const frames = [{ tick: 0, owner: owner.slice(), act: ["", ""], pos: [-1, -1], th: th.map((t) => ({ locks: 0, done: -1 })) }];
+    for (let tick = 1; tick <= 1000; tick++) {
+      const act = ["", ""];
+      for (let k = 0; k < 2; k++) {
+        const t = th[k];
+        if (t.pc >= t.ops.length) { act[k] = "done"; continue; }
+        if (tick <= t.start) { act[k] = "notyet"; continue; }
+        const op = t.ops[t.pc];
+        if (t.left === 0) {
+          if (op.a === "lock") {
+            if (owner[op.n] !== -1 && owner[op.n] !== k) { t.wait++; act[k] = "wait:" + op.n; continue; }
+            owner[op.n] = k; t.locks++; t.left = c;
+          } else t.left = op.a === "check" ? w : c;
+        }
+        t.left--;
+        act[k] = op.a + ":" + op.n + ":" + (op.a === "check" ? w - t.left : c - t.left) + "/" + (op.a === "check" ? w : c);
+        if (t.left === 0) {
+          if (op.a === "unlock") owner[op.n] = -1;
+          t.pc++;
+          if (t.pc >= t.ops.length) t.done = tick;
+        }
+      }
+      const pos = th.map((t) => {
+        if (t.pc >= t.ops.length || tick <= t.start) return -1;
+        return t.ops[t.pc].n;
+      });
+      frames.push({ tick, owner: owner.slice(), act, pos, th: th.map((t) => ({ locks: t.locks, done: t.done })) });
+      if (th.every((t) => t.pc >= t.ops.length)) break;
+    }
+    // 一把大锁：lock(c) + 检查 (k+1) 个节点 × w + unlock(c)；T2 要等 T1 整个解锁完
+    const big1 = 2 * c + (k1 + 1) * w;
+    const t2start = Math.max(delay, big1);
+    const big2 = t2start + 2 * c + (k2 + 1) * w;
+    return { frames, big: [big1, big2], hoh: th.map((t) => t.done), locks: th.map((t) => t.locks) };
+  }
+
+  let hh = null;
+  function hhBuild() {
+    const k1 = +$("hh-k1").value, k2 = +$("hh-k2").value;
+    const d = Math.max(0, Math.min(20, +$("hh-d").value || 0));
+    const c = Math.max(1, Math.min(10, +$("hh-c").value || 1));
+    const w = Math.max(1, Math.min(10, +$("hh-w").value || 1));
+    hh = Object.assign(hohSim(k1, k2, d, c, w), { k1, k2, d, c, w });
+    hhStep.reset();
+  }
+  function describe(a, k) {
+    if (a === "done") return `T${k + 1} 已完成`;
+    if (a === "notyet") return `T${k + 1} 还没开始`;
+    if (!a) return "";
+    const [op, n, prog] = a.split(":");
+    if (op === "wait") return `T${k + 1} 想拿 n${n} 的锁，但它被另一个线程持有 → 等待`;
+    const name = { lock: "拿 n" + n + " 的锁", unlock: "放开 n" + n + " 的锁", check: "检查 n" + n + " 的 key" }[op];
+    return `T${k + 1} ${name}（${prog} 拍）`;
+  }
+  function hhRender(i) {
+    const f = hh.frames[i], W = 40 + HH_N * 84, H = 150;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "手递手遍历状态" });
+    for (let n = 0; n < HH_N; n++) {
+      const x = 20 + n * 84;
+      const own = f.owner[n];
+      const tgt1 = n === hh.k1, tgt2 = n === hh.k2;
+      svg.append(s("rect", { x, y: 55, width: 60, height: 38, rx: 6, class: "box-strong", style: own >= 0 ? `stroke:${color(own)};stroke-width:3` : "" }));
+      svg.append(s("text", { x: x + 30, y: 79, "text-anchor": "middle", "font-size": 13, class: "mono", text: "n" + n }));
+      if (n < HH_N - 1) svg.append(s("line", { x1: x + 60, y1: 74, x2: x + 84, y2: 74, class: "arrow" }));
+      if (own >= 0) {
+        svg.append(s("rect", { x: x + 38, y: 44, width: 26, height: 18, rx: 4, style: `fill:${color(own)}` }));
+        svg.append(s("text", { x: x + 51, y: 57, "text-anchor": "middle", "font-size": 11, style: "fill:#fff;font-weight:600", text: "T" + (own + 1) }));
+      }
+      if (tgt1) svg.append(s("text", { x: x + 30, y: 108, "text-anchor": "middle", "font-size": 11, style: `fill:${color(0)}`, text: "T1 目标" }));
+      if (tgt2) svg.append(s("text", { x: x + 30, y: tgt1 ? 122 : 108, "text-anchor": "middle", "font-size": 11, style: `fill:${color(1)}`, text: "T2 目标" }));
+    }
+    f.pos.forEach((p, k) => {
+      if (p < 0) return;
+      const x = 20 + p * 84 + 30, y = k === 0 ? 22 : 140;
+      svg.append(s("text", { x, y, "text-anchor": "middle", "font-size": 12, style: `fill:${color(k)};font-weight:700`, text: (k === 0 ? "▼ T1" : "▲ T2") }));
+    });
+    svg.append(s("text", { x: W - 10, y: 16, "text-anchor": "end", "font-size": 12, class: "t-muted mono", text: "第 " + f.tick + " 拍" }));
+    $("hh-svg").replaceChildren(svg);
+    $("hh-nar").textContent = i === 0
+      ? `两个线程将分别查找 n${hh.k1} 和 n${hh.k2}。T2 晚 ${hh.d} 拍开始。每次加/解锁 ${hh.c} 拍，检查一个节点 ${hh.w} 拍。任何时刻一个线程最多持有两把相邻的锁。`
+      : [describe(f.act[0], 0), describe(f.act[1], 1)].filter(Boolean).join("；") + "。";
+    const hohEnd = Math.max(...hh.hoh), bigEnd = Math.max(...hh.big);
+    const stat = (v, l) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+    $("hh-stats").replaceChildren(
+      stat(f.th[0].locks + " / " + f.th[1].locks, "已加锁次数 T1 / T2（一把锁：各 1 次）"),
+      stat(hohEnd, "手递手：两者都完成的拍数"),
+      stat(bigEnd, "一把大锁：两者都完成的拍数"),
+      stat(hohEnd < bigEnd ? "手递手" : hohEnd > bigEnd ? "一把大锁" : "平手", "更快的是"));
+  }
+  const hhStep = stepper($("hh-step"), { steps: () => hh.frames.length, render: hhRender, autoplayMs: 500 });
+  ["hh-k1", "hh-k2", "hh-d", "hh-c", "hh-w"].forEach((id) => $(id).addEventListener("change", hhBuild));
+  $("hh-p1").onclick = () => { $("hh-c").value = 3; $("hh-w").value = 1; hhBuild(); };
+  $("hh-p2").onclick = () => { $("hh-c").value = 1; $("hh-w").value = 6; hhBuild(); };
+  hhBuild();
+
+  /* ================= 模拟器 3：Michael & Scott 双锁队列 ================= */
+  const CODE = {
+    enq: ["tmp = malloc(); tmp->value = v; tmp->next = NULL;", "pthread_mutex_lock(&q->tail_lock);", "q->tail->next = tmp;", "q->tail = tmp;", "pthread_mutex_unlock(&q->tail_lock);"],
+    deq: ["pthread_mutex_lock(&q->head_lock);", "tmp = q->head; new_head = tmp->next;", "if (new_head == NULL) { unlock; return -1; }", "*value = new_head->value; q->head = new_head;", "pthread_mutex_unlock(&q->head_lock);", "free(tmp); return 0;"],
+  };
+  const SCENARIOS = [
+    { name: "T1 入队 7 ‖ T2 出队（队列里已有 5）", init: [5], th: [{ op: "enq", v: 7 }, { op: "deq" }], sched: "12121212121" },
+    { name: "两个入队者争 tail_lock", init: [5], th: [{ op: "enq", v: 7 }, { op: "enq", v: 8 }], sched: "112212222111" },
+    { name: "两个出队者争 head_lock", init: [5, 6], th: [{ op: "deq" }, { op: "deq" }], sched: "1122121111222222" },
+    { name: "空队列：T1 出队 ‖ T2 入队 9", init: [], th: [{ op: "deq" }, { op: "enq", v: 9 }], sched: "1122211222" },
+  ];
+  const scSel = $("mq-sc");
+  SCENARIOS.forEach((sc, k) => scSel.append(h("option", { value: k }, sc.name)));
+
+  function mqInit(sc) {
+    const st = { nodes: [], chain: [], head: 0, tail: 0, locks: { head: -1, tail: -1 }, th: [] };
+    const mk = (v) => { st.nodes.push({ id: st.nodes.length, val: v, next: -1, freed: false, linked: false }); return st.nodes.length - 1; };
+    let prev = mk(null);
+    st.nodes[prev].linked = true; st.chain.push(prev);
+    for (const v of sc.init) { const n = mk(v); st.nodes[prev].next = n; st.nodes[n].linked = true; st.chain.push(n); prev = n; }
+    st.head = 0; st.tail = prev;
+    st.th = sc.th.map((sp) => ({ op: sp.op, v: sp.v, pc: 0, tmp: -1, nh: -1, done: false, ret: null, out: null, waiting: false }));
+    return st;
+  }
+  // 执行线程 k 的一行；返回中文解说
+  function mqStep(st, k) {
+    const t = st.th[k], T = "T" + (k + 1);
+    t.waiting = false;
+    if (t.done) return `${T} 已经完成，这一步空转。`;
+    let msg = "";
+    if (t.op === "enq") {
+      switch (t.pc) {
+        case 0: {
+          st.nodes.push({ id: st.nodes.length, val: t.v, next: -1, freed: false, linked: false });
+          t.tmp = st.nodes.length - 1;
+          msg = `${T} 在锁外 malloc 新节点并填好 value=${t.v}、next=NULL。分配和初始化私有节点不需要任何锁。`; break;
+        }
+        case 1:
+          if (st.locks.tail !== -1 && st.locks.tail !== k) { t.waiting = true; return `${T} 想拿 tail_lock，但它被 T${st.locks.tail + 1} 持有 → ${T} 等待（停在这一行）。`; }
+          st.locks.tail = k;
+          msg = `${T} 拿到 tail_lock。` + (st.locks.head !== -1 ? ` 此时 head_lock 被 T${st.locks.head + 1} 持有——两把锁同时被不同线程持有，互不阻塞。` : ""); break;
+        case 2: {
+          const tailNode = st.tail;
+          st.nodes[tailNode].next = t.tmp; st.nodes[t.tmp].linked = true; st.chain.push(t.tmp);
+          msg = `${T} 执行 tail->next = tmp：把新节点 ${t.v} 挂到当前尾节点后面。` + (tailNode === st.head ? " 注意：此时尾节点就是哑节点（队列原本为空），出队者读的正是这个 next 字段。" : ""); break;
+        }
+        case 3: st.tail = t.tmp; msg = `${T} 执行 tail = tmp：tail 指向新节点 ${t.v}。`; break;
+        case 4: st.locks.tail = -1; t.done = true; msg = `${T} 释放 tail_lock，入队完成。`; break;
+      }
+    } else {
+      switch (t.pc) {
+        case 0:
+          if (st.locks.head !== -1 && st.locks.head !== k) { t.waiting = true; return `${T} 想拿 head_lock，但它被 T${st.locks.head + 1} 持有 → ${T} 等待（停在这一行）。`; }
+          st.locks.head = k;
+          msg = `${T} 拿到 head_lock。` + (st.locks.tail !== -1 ? ` 此时 tail_lock 被 T${st.locks.tail + 1} 持有——入队与出队并发进行。` : ""); break;
+        case 1: {
+          t.tmp = st.head; t.nh = st.nodes[st.head].next;
+          msg = `${T} 读 tmp = head（哑节点），new_head = tmp->next = ` + (t.nh === -1 ? "NULL。" : `节点 ${st.nodes[t.nh].val}。`); break;
+        }
+        case 2:
+          if (t.nh === -1) { st.locks.head = -1; t.done = true; t.ret = -1; return `${T} 发现 new_head == NULL：只有哑节点，队列为空。释放 head_lock，返回 -1。`; }
+          msg = `${T}：new_head 不为 NULL，队列非空，继续。`; break;
+        case 3:
+          t.out = st.nodes[t.nh].val; st.head = t.nh;
+          msg = `${T} 读出 value = ${t.out}，并让 head 前移到该节点——它成为新的哑节点（它的值已被取走，从此无意义）。`; break;
+        case 4: st.locks.head = -1; msg = `${T} 释放 head_lock。`; break;
+        case 5: st.nodes[t.tmp].freed = true; t.done = true; t.ret = 0; msg = `${T} 在锁外 free 旧哑节点，返回 0（取到 ${t.out}）。free 不需要持锁：这个节点已经没有任何人能从队列里访问到。`; break;
+      }
+    }
+    t.pc++;
+    return msg;
+  }
+  let mq = null;
+  function mqBuild(useInput) {
+    const sc = SCENARIOS[+scSel.value];
+    if (!useInput) $("mq-sched").value = sc.sched;
+    const sched = [...$("mq-sched").value].filter((ch) => ch === "1" || ch === "2").map((ch) => +ch - 1);
+    let st = mqInit(sc);
+    const states = [{ st: structuredClone(st), msg: "初始状态：head 与 tail 都从哑节点开始。" + (sc.init.length ? `队列里有 ${sc.init.join("、")}。` : "队列为空，只有哑节点。"), who: -1 }];
+    for (const k of sched) { const msg = mqStep(st, k); states.push({ st: structuredClone(st), msg, who: k }); }
+    let guard = 0, rr = 0;
+    while (st.th.some((t) => !t.done) && guard++ < 60) {
+      const k = rr % 2; rr++;
+      if (st.th[k].done) continue;
+      const msg = "（调度串用完，自动轮转补全）" + mqStep(st, k);
+      states.push({ st: structuredClone(st), msg, who: k });
+    }
+    mq = { sc, states };
+    mqStep_.reset();
+  }
+  function mqRender(i) {
+    const { st, msg, who } = mq.states[i];
+    const chainPos = new Map(st.chain.map((id, k) => [id, k]));
+    const unlinked = st.nodes.filter((n) => !n.linked);
+    const bw = 76, gap = 34, W = Math.max(560, 30 + (st.chain.length + unlinked.length) * (bw + gap)), H = unlinked.length ? 230 : 160;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "双锁队列状态" });
+    svg.append(s("defs", {}, s("marker", { id: "mqah", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto" }, s("path", { d: "M0 0 L10 5 L0 10 z", style: "fill:var(--muted)" }))));
+    const xOf = (id) => chainPos.has(id) ? 20 + chainPos.get(id) * (bw + gap) : 20 + (st.chain.length + unlinked.indexOf(st.nodes[id])) * (bw + gap);
+    const yOf = (id) => chainPos.has(id) ? 80 : 160;
+    const headIdx = chainPos.get(st.head);
+    // 锁徽章
+    const lockBadge = (x, name, holder) => {
+      svg.append(s("rect", { x, y: 6, width: 150, height: 22, rx: 5, style: holder >= 0 ? `fill:${color(holder)}` : "fill:var(--surface-2);stroke:var(--border)" }));
+      svg.append(s("text", { x: x + 75, y: 21, "text-anchor": "middle", "font-size": 12, style: holder >= 0 ? "fill:#fff;font-weight:600" : "", text: name + "：" + (holder >= 0 ? "T" + (holder + 1) + " 持有" : "空闲") }));
+    };
+    lockBadge(10, "head_lock", st.locks.head);
+    lockBadge(170, "tail_lock", st.locks.tail);
+    for (const n of st.nodes) {
+      const x = xOf(n.id), y = yOf(n.id);
+      const isHead = n.id === st.head;
+      const gone = chainPos.has(n.id) && chainPos.get(n.id) < headIdx;
+      let cls = "box-strong", extra = "";
+      if (!n.linked) { cls = "accent-soft"; }
+      if (isHead) { extra = "stroke-dasharray:4 3"; cls = "box"; }
+      if (gone || n.freed) { extra = "stroke-dasharray:3 3;opacity:.45"; cls = "box"; }
+      svg.append(s("rect", { x, y, width: bw, height: 40, rx: 6, class: cls, style: extra }));
+      const label = n.freed ? "已 free" : isHead ? "哑节点" : (n.val === null ? "—" : String(n.val));
+      svg.append(s("text", { x: x + bw / 2, y: y + (isHead && n.val !== null && !n.freed ? 18 : 25), "text-anchor": "middle", "font-size": isHead || n.freed ? 12 : 15, class: isHead || n.freed ? "" : "mono", text: label }));
+      if (isHead && n.val !== null && !n.freed) svg.append(s("text", { x: x + bw / 2, y: y + 34, "text-anchor": "middle", "font-size": 10, class: "t-muted mono", text: "(旧值 " + n.val + ")" }));
+      if (gone && !n.freed) svg.append(s("text", { x: x + bw / 2, y: y - 4, "text-anchor": "middle", "font-size": 10, class: "t-muted", text: "已出队，待 free" }));
+      if (!n.linked) svg.append(s("text", { x: x + bw / 2, y: y + 54, "text-anchor": "middle", "font-size": 10, class: "t-muted", text: "尚未链接" }));
+      if (n.next >= 0) {
+        const nx = xOf(n.next), ny = yOf(n.next);
+        svg.append(s("line", { x1: x + bw, y1: y + 20, x2: nx - 2, y2: ny + 20, class: "arrow", "marker-end": "url(#mqah)" }));
+      } else if (n.linked && !n.freed) {
+        svg.append(s("text", { x: x + bw + 4, y: y + 25, "font-size": 11, class: "t-muted mono", text: "∅" }));
+      }
+    }
+    // head / tail 指针
+    const ptr = (id, name, dx) => {
+      const x = xOf(id) + bw / 2 + dx;
+      svg.append(s("text", { x, y: 50, "text-anchor": "middle", "font-size": 13, "font-weight": 700, text: name }));
+      svg.append(s("line", { x1: x, y1: 54, x2: x, y2: 78, class: "arrow", "marker-end": "url(#mqah)" }));
+    };
+    const same = st.head === st.tail;
+    ptr(st.head, "head", same ? -18 : 0);
+    ptr(st.tail, "tail", same ? 18 : 0);
+    // 线程局部指针
+    const below = new Map();
+    st.th.forEach((t, k) => {
+      const add = (id, nm) => {
+        if (id < 0 || !st.nodes[id]) return;
+        const cnt = below.get(id) || 0; below.set(id, cnt + 1);
+        const x = xOf(id) + bw / 2, y = yOf(id) + (st.nodes[id].linked ? 58 : 68) + cnt * 14;
+        svg.append(s("text", { x, y, "text-anchor": "middle", "font-size": 11, style: `fill:${color(k)};font-weight:600`, text: "T" + (k + 1) + "." + nm }));
+      };
+      if (!t.done || t.op === "enq") add(t.tmp, "tmp");
+      if (t.op === "deq" && !t.done) add(t.nh, "new_head");
+    });
+    $("mq-svg").replaceChildren(svg);
+    // 线程代码面板
+    $("mq-threads").replaceChildren(...st.th.map((t, k) => {
+      const lines = CODE[t.op].map((ln, j) => {
+        let cls = "codeline";
+        if (t.done) cls += " done";
+        else if (j === t.pc) cls += t.waiting ? " wait" : " cur";
+        return h("div", { class: cls }, (j === t.pc && !t.done ? "→ " : "  ") + ln);
+      });
+      const status = t.done ? (t.op === "enq" ? "完成" : t.ret === 0 ? `完成，取到 ${t.out}` : "完成，返回 -1（空）") : t.waiting ? "等待锁" : "运行中";
+      return h("div", { class: "thread-panel", style: who === k ? { borderColor: "var(--accent)" } : null },
+        h("div", { class: "tp-head" }, h("span", { class: "sw", style: { background: color(k) } }), `T${k + 1}：` + (t.op === "enq" ? `Queue_Enqueue(q, ${t.v})` : "Queue_Dequeue(q, &v)"), h("span", { class: "pill" }, status)),
+        lines);
+    }));
+    $("mq-nar").textContent = msg;
+  }
+  const mqStep_ = stepper($("mq-step"), { steps: () => mq.states.length, render: mqRender, autoplayMs: 900 });
+  scSel.addEventListener("change", () => mqBuild(false));
+  $("mq-run").onclick = () => mqBuild(true);
+  mqBuild(false);
+
+  /* ================= 实测数据折线图 ================= */
+  function lineChart(host, o) {
+    const W = 680, H = 260, L = 56, R = 120, T = 20, B = 44;
+    const n = o.xlabels.length;
+    const ymax = o.ymax;
+    const xOf = (k) => L + (k / (n - 1)) * (W - L - R);
+    const yOf = (v) => T + (1 - v / ymax) * (H - T - B);
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": o.title });
+    svg.append(s("text", { x: L, y: 12, "font-size": 12.5, "font-weight": 700, text: o.title }));
+    for (let g = 0; g <= 4; g++) {
+      const v = (ymax * g) / 4, y = yOf(v);
+      svg.append(s("line", { x1: L, x2: W - R, y1: y, y2: y, style: "stroke:var(--border);stroke-width:1" }));
+      svg.append(s("text", { x: L - 6, y: y + 4, "text-anchor": "end", "font-size": 11, class: "t-muted mono", text: v.toFixed(v < 0.1 ? 3 : 2) }));
+    }
+    o.xlabels.forEach((lb, k) => svg.append(s("text", { x: xOf(k), y: H - B + 16, "text-anchor": "middle", "font-size": 11, class: "t-muted mono", text: lb })));
+    svg.append(s("text", { x: (L + W - R) / 2, y: H - 6, "text-anchor": "middle", "font-size": 12, class: "t-muted", text: o.xlabel }));
+    svg.append(s("text", { x: 12, y: T + (H - T - B) / 2, "font-size": 12, class: "t-muted", transform: `rotate(-90 12 ${T + (H - T - B) / 2})`, "text-anchor": "middle", text: "耗时（秒）" }));
+    o.series.forEach((se, si) => {
+      const pts = se.ys.map((v, k) => xOf(k) + "," + yOf(v)).join(" ");
+      svg.append(s("polyline", { points: pts, style: `fill:none;stroke:${se.color};stroke-width:2${se.dash ? ";stroke-dasharray:6 4" : ""}` }));
+      se.ys.forEach((v, k) => {
+        const g = s("g", {}, s("circle", { cx: xOf(k), cy: yOf(v), r: 4.5, style: `fill:${se.color};stroke:var(--surface);stroke-width:2` }),
+          s("circle", { cx: xOf(k), cy: yOf(v), r: 11, style: "fill:transparent" }),
+          s("title", { text: `${se.name}，${o.xname} = ${o.xlabels[k]}：${v.toFixed(3)} 秒` }));
+        svg.append(g);
+      });
+      const lastY = yOf(se.ys[n - 1]) + 4 + (se.nudge || 0);
+      svg.append(s("text", { x: W - R + 8, y: lastY, "font-size": 12, text: se.name }));
+      svg.append(s("rect", { x: W - R + 8, y: lastY + 4, width: 22, height: 3, rx: 1.5, style: `fill:${se.color}` }));
+    });
+    host.replaceChildren(svg);
+  }
+  lineChart($("chart-threads"), {
+    title: "每线程 100 万次递增：总耗时 vs 线程数", xlabel: "线程数", xname: "线程数",
+    xlabels: ["1", "2", "4", "8", "16"], ymax: 0.3,
+    series: [
+      { name: "近似 S=1024", color: "var(--c1)", ys: [0.007, 0.007, 0.007, 0.010, 0.017], nudge: 6 },
+      { name: "精确（一把锁）", color: "var(--c2)", ys: [0.005, 0.033, 0.064, 0.154, 0.273] },
+      { name: "近似·不填充", color: "var(--c3)", ys: [0.007, 0.007, 0.048, 0.050, 0.052], dash: true, nudge: -6 },
+    ],
+  });
+  lineChart($("chart-S"), {
+    title: "4 线程近似计数器：总耗时 vs 阈值 S", xlabel: "阈值 S", xname: "S",
+    xlabels: ["1", "2", "4", "8", "16", "32", "64", "128", "256", "512", "1024"], ymax: 0.14,
+    series: [
+      { name: "填充缓存行", color: "var(--c1)", ys: [0.096, 0.066, 0.038, 0.012, 0.009, 0.008, 0.009, 0.010, 0.010, 0.009, 0.008], nudge: 8 },
+      { name: "不填充（原书）", color: "var(--c3)", ys: [0.122, 0.087, 0.077, 0.067, 0.060, 0.056, 0.052, 0.048, 0.053, 0.048, 0.049], dash: true, nudge: -4 },
+    ],
+  });
+})();
+</script>
+</body></html>

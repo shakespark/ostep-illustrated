@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 13 章 · 抽象：地址空间</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+  .as-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+  .goal { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; background: var(--surface); }
+  .goal b { display: block; margin-bottom: 4px; }
+  .goal.t { border-top: 4px solid var(--c1); }
+  .goal.e { border-top: 4px solid var(--c3); }
+  .goal.p { border-top: 4px solid var(--c2); }
+  .proc-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+  .proc-btns button.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+  #ts-gantt { min-height: 70px; }
+</style>
+</head>
+<body data-chapter="13">
+<main>
+
+<h2><span class="num">1</span>一句话 + 关键问题</h2>
+<div class="crux">
+  <p><strong>如何虚拟化内存？</strong>操作系统怎样在<strong>一块</strong>物理内存之上，为多个同时运行的进程各自构建一个<strong>私有的、可能很大的地址空间</strong>这一抽象？</p>
+  <p class="small muted">原文：How can the OS build this abstraction of a private, potentially large address space for multiple running processes (all sharing memory) on top of a single, physical memory?</p>
+</div>
+<p>前面几章我们把 <strong>CPU</strong> 虚拟化了：每个进程都以为自己独占处理器。本章开始虚拟化<strong>内存</strong>：每个进程都以为自己独占一大片从 0 开始的内存。这一章只做一件事——定义这个抽象，叫做<strong>地址空间（address space）</strong>，并说清楚实现它要达到的三个目标。</p>
+<p>具体"怎么做"留给后面的章节：第 15 章的基址/界限（base and bounds）、第 16 章的分段（segmentation）、第 18 章起的分页（paging）。可以把本章看成整个内存虚拟化部分的"需求说明书"。</p>
+
+<h2><span class="num">2</span>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>地址空间（address space）</h4><p>运行中的程序"看到"的内存：代码、栈、堆等全部内存状态。它是 OS 提供的抽象，不是物理事实。</p></div>
+  <div class="card"><h4>虚拟地址（virtual address）</h4><p>程序使用、打印出来的地址。由 OS + 硬件翻译成真实的物理地址（physical address）。</p></div>
+  <div class="card"><h4>代码 / 堆 / 栈</h4><p>代码（code）静态不变；堆（heap）存 malloc 的数据，向高地址长；栈（stack）存局部变量、参数、返回值，向低地址长。</p></div>
+  <div class="card"><h4>多道程序（multiprogramming）</h4><p>内存里同时放多个就绪进程，一个做 I/O 时切换到另一个，提高 CPU 利用率。</p></div>
+  <div class="card"><h4>时分共享（time sharing）</h4><p>多个用户交互式地共用一台机器。让进程常驻内存、快速切换，才能高效实现。</p></div>
+  <div class="card"><h4>透明（transparency）</h4><p>程序感觉不到内存被虚拟化，好像独占一块私有物理内存。</p></div>
+  <div class="card"><h4>效率（efficiency）</h4><p>时间上不能让程序变慢太多，空间上不能为虚拟化浪费太多内存；需要硬件（如 TLB）帮忙。</p></div>
+  <div class="card"><h4>保护 / 隔离（protection / isolation）</h4><p>一个进程不能读写别的进程或 OS 的内存；一个出错不会殃及其他。</p></div>
+</div>
+
+<h2><span class="num">3</span>图解：从"没有抽象"到"地址空间"</h2>
+
+<h3>3.1 早期系统：内存里只有 OS 和一个程序</h3>
+<p>最早的机器几乎不提供内存抽象。物理内存就像图 13.1：OS 是一组例程（其实更像一个库），放在从物理地址 0 开始的位置；唯一正在运行的程序放在 64KB 处，用掉剩下的所有内存。程序用的地址就是物理地址，没什么"幻觉"可言——用户也不指望 OS 做更多。</p>
+<figure class="fig">
+<svg viewBox="0 0 460 250" width="460" role="img" aria-label="早期系统内存布局">
+  <text x="40" y="22" class="t-muted" font-size="12" text-anchor="end">0KB</text>
+  <text x="40" y="92" class="t-muted" font-size="12" text-anchor="end">64KB</text>
+  <text x="40" y="238" class="t-muted" font-size="12" text-anchor="end">max</text>
+  <rect x="50" y="16" width="200" height="72" rx="4" style="fill:var(--c8)"/>
+  <text x="150" y="48" text-anchor="middle" font-size="14" style="fill:#fff;font-weight:600">Operating System</text>
+  <text x="150" y="68" text-anchor="middle" font-size="12" style="fill:#fff">(code, data, etc.)</text>
+  <rect x="50" y="88" width="200" height="146" rx="4" style="fill:var(--c1)"/>
+  <text x="150" y="156" text-anchor="middle" font-size="14" style="fill:#fff;font-weight:600">Current Program</text>
+  <text x="150" y="176" text-anchor="middle" font-size="12" style="fill:#fff">(code, data, etc.)</text>
+  <text x="270" y="50" font-size="12.5">OS 像一个库，从物理地址 0 开始</text>
+  <text x="270" y="140" font-size="12.5">唯一的程序从 64KB 开始，</text>
+  <text x="270" y="158" font-size="12.5">独占剩下的全部内存；</text>
+  <text x="270" y="176" font-size="12.5">程序地址 = 物理地址</text>
+</svg>
+<figcaption>图 13.1 早期的操作系统：一个 OS，一个程序，没有任何内存抽象</figcaption>
+</figure>
+
+<h3>3.2 多道程序与时分共享：内存里同时住着好几个进程</h3>
+<p>机器太贵（动辄几十万甚至上百万美元），于是出现了<strong>多道程序（multiprogramming）</strong>：多个进程同时处于就绪状态，一个进程发起 I/O 时 OS 就切换到另一个，CPU 利用率因此提高。后来人们又要求<strong>交互性</strong>——程序员受够了批处理漫长的"提交—调试"循环，于是有了<strong>时分共享（time sharing）</strong>：很多用户同时使用一台机器，每人都期待及时响应。</p>
+<p>实现时分共享，一个"笨办法"是：让一个进程独占全部内存跑一小会儿，然后把它的<strong>全部状态（包括整块物理内存）存到磁盘</strong>，再从磁盘装入另一个进程……问题是太慢了。保存/恢复寄存器（PC、通用寄存器等）很快，但把整块内存写到磁盘"慢得残忍"（brutally non-performant），而且内存越大越慢。</p>
+<figure class="fig">
+<svg viewBox="0 0 680 210" width="680" role="img" aria-label="两种时分共享实现对比">
+  <defs><marker id="m13a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="165" y="18" text-anchor="middle" font-size="13.5" style="font-weight:600">做法一：切换时把整块内存换到磁盘</text>
+  <rect x="20" y="34" width="120" height="120" rx="4" style="fill:var(--c1)"/>
+  <text x="80" y="90" text-anchor="middle" font-size="13" style="fill:#fff;font-weight:600">进程 A</text>
+  <text x="80" y="108" text-anchor="middle" font-size="11" style="fill:#fff">独占全部内存</text>
+  <rect x="210" y="60" width="100" height="70" rx="10" class="box"/>
+  <text x="260" y="92" text-anchor="middle" font-size="13">磁盘</text>
+  <text x="260" y="110" text-anchor="middle" font-size="11" class="t-muted">B、C 的内存镜像</text>
+  <path d="M142 80 L206 80" class="arrow" marker-end="url(#m13a)"/>
+  <path d="M206 112 L142 112" class="arrow" marker-end="url(#m13a)"/>
+  <text x="174" y="74" text-anchor="middle" font-size="10.5" class="t-muted">存 A</text>
+  <text x="174" y="126" text-anchor="middle" font-size="10.5" class="t-muted">装 B</text>
+  <text x="165" y="180" text-anchor="middle" font-size="12" style="fill:var(--bad)">每次切换都要搬运整块内存：极慢</text>
+  <line x1="340" y1="20" x2="340" y2="195" style="stroke:var(--border)"/>
+  <text x="510" y="18" text-anchor="middle" font-size="13.5" style="font-weight:600">做法二：进程常驻内存，只切换寄存器</text>
+  <rect x="400" y="34" width="120" height="30" rx="3" style="fill:var(--c1)"/><text x="460" y="54" text-anchor="middle" font-size="12" style="fill:#fff">进程 A（运行）</text>
+  <rect x="400" y="66" width="120" height="30" rx="3" style="fill:var(--c2)"/><text x="460" y="86" text-anchor="middle" font-size="12" style="fill:#fff">进程 B（就绪）</text>
+  <rect x="400" y="98" width="120" height="30" rx="3" style="fill:var(--c3)"/><text x="460" y="118" text-anchor="middle" font-size="12" style="fill:#fff">进程 C（就绪）</text>
+  <rect x="400" y="130" width="120" height="24" rx="3" class="box"/><text x="460" y="147" text-anchor="middle" font-size="11" class="t-muted">OS</text>
+  <rect x="560" y="70" width="90" height="50" rx="6" class="accent-soft"/>
+  <text x="605" y="92" text-anchor="middle" font-size="12">CPU 寄存器</text>
+  <text x="605" y="108" text-anchor="middle" font-size="10.5" class="t-muted">PC、SP…</text>
+  <path d="M556 95 L524 50" class="arrow" marker-end="url(#m13a)"/>
+  <text x="510" y="180" text-anchor="middle" font-size="12" style="fill:var(--ok)">切换只需保存/恢复寄存器：很快</text>
+  <text x="510" y="198" text-anchor="middle" font-size="12" style="fill:var(--warn)">新问题：进程之间必须互相保护</text>
+</svg>
+<figcaption>时分共享的两种实现：搬整块内存 vs. 让进程常驻内存（图 13.2 采用后者）</figcaption>
+</figure>
+<p>所以我们更愿意让所有进程<strong>都留在内存里</strong>，切换时只换寄存器。图 13.2 就是这样：512KB 的物理内存里，OS 占 0–64KB，进程 A、B、C 各自分到一小块。单 CPU 下 OS 选择运行其中一个（比如 A），B 和 C 在就绪队列中等待。</p>
+<figure class="fig">
+<svg viewBox="0 0 420 330" width="420" role="img" aria-label="三个进程共享 512KB 物理内存">
+  <g font-size="11.5" class="t-muted" text-anchor="end">
+    <text x="58" y="20">0KB</text><text x="58" y="58">64KB</text><text x="58" y="96">128KB</text><text x="58" y="134">192KB</text>
+    <text x="58" y="172">256KB</text><text x="58" y="210">320KB</text><text x="58" y="248">384KB</text><text x="58" y="286">448KB</text><text x="58" y="324">512KB</text>
+  </g>
+  <rect x="66" y="16" width="200" height="38" rx="3" style="fill:var(--c8)"/><text x="166" y="33" text-anchor="middle" font-size="12.5" style="fill:#fff;font-weight:600">Operating System</text><text x="166" y="48" text-anchor="middle" font-size="10.5" style="fill:#fff">(code, data, etc.)</text>
+  <rect x="66" y="54" width="200" height="38" rx="3" class="box"/><text x="166" y="77" text-anchor="middle" font-size="12" class="t-muted">(free)</text>
+  <rect x="66" y="92" width="200" height="38" rx="3" style="fill:var(--c3)"/><text x="166" y="109" text-anchor="middle" font-size="12.5" style="fill:#fff;font-weight:600">Process C</text><text x="166" y="124" text-anchor="middle" font-size="10.5" style="fill:#fff">(code, data, etc.)</text>
+  <rect x="66" y="130" width="200" height="38" rx="3" style="fill:var(--c2)"/><text x="166" y="147" text-anchor="middle" font-size="12.5" style="fill:#fff;font-weight:600">Process B</text><text x="166" y="162" text-anchor="middle" font-size="10.5" style="fill:#fff">(code, data, etc.)</text>
+  <rect x="66" y="168" width="200" height="38" rx="3" class="box"/><text x="166" y="191" text-anchor="middle" font-size="12" class="t-muted">(free)</text>
+  <rect x="66" y="206" width="200" height="38" rx="3" style="fill:var(--c1)"/><text x="166" y="223" text-anchor="middle" font-size="12.5" style="fill:#fff;font-weight:600">Process A</text><text x="166" y="238" text-anchor="middle" font-size="10.5" style="fill:#fff">(code, data, etc.)</text>
+  <rect x="66" y="244" width="200" height="38" rx="3" class="box"/><text x="166" y="267" text-anchor="middle" font-size="12" class="t-muted">(free)</text>
+  <rect x="66" y="282" width="200" height="38" rx="3" class="box"/><text x="166" y="305" text-anchor="middle" font-size="12" class="t-muted">(free)</text>
+  <text x="280" y="229" font-size="12">← 正在运行</text>
+  <text x="280" y="152" font-size="12" class="t-muted">← 就绪</text>
+  <text x="280" y="114" font-size="12" class="t-muted">← 就绪</text>
+</svg>
+<figcaption>图 13.2 三个进程共享内存（与原书相同的布局：A 在 320KB，B 在 192KB，C 在 128KB）</figcaption>
+</figure>
+<p>内存里同时住着多个程序，<strong>保护（protection）</strong>就成了大问题：你肯定不希望一个进程能读，更不用说写，别的进程的内存。</p>
+
+<h3>3.3 地址空间：程序眼中的内存</h3>
+<p>为了照顾"讨厌的用户"，OS 需要为物理内存造一个<strong>易用的抽象</strong>，这就是<strong>地址空间</strong>：运行中程序所看到的系统内存。理解它是理解内存虚拟化的关键。地址空间包含运行程序的<strong>全部内存状态</strong>，目前我们只关心三块：</p>
+<ul>
+  <li><strong>代码（code）</strong>：程序的指令必须放在内存某处，所以在地址空间里。</li>
+  <li><strong>栈（stack）</strong>：记录函数调用链走到了哪里，分配局部变量，传递参数和返回值。</li>
+  <li><strong>堆（heap）</strong>：动态分配、由用户管理的内存，比如 C 的 <code>malloc()</code>、C++/Java 的 <code>new</code>。</li>
+</ul>
+<p>（还有静态初始化的变量等，暂且忽略。）原书用一个只有 16KB 的"玩具"地址空间来画图——作者直言：画 32 位地址空间太痛苦，数学也更难，"我们喜欢简单的数学"。</p>
+<figure class="fig">
+<svg viewBox="0 0 560 330" width="560" role="img" aria-label="16KB 地址空间示例">
+  <defs><marker id="m13b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <g font-size="11.5" class="t-muted" text-anchor="end">
+    <text x="58" y="22">0KB</text><text x="58" y="42">1KB</text><text x="58" y="62">2KB</text><text x="58" y="288">15KB</text><text x="58" y="310">16KB</text>
+  </g>
+  <rect x="66" y="18" width="170" height="20" rx="2" style="fill:var(--c4)"/><text x="151" y="32" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">Program Code</text>
+  <rect x="66" y="38" width="170" height="20" rx="2" style="fill:var(--c3)"/><text x="151" y="52" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">Heap</text>
+  <rect x="66" y="58" width="170" height="226" rx="2" class="box" style="stroke-dasharray:4 3"/>
+  <text x="151" y="176" text-anchor="middle" font-size="12" class="t-muted">(free)</text>
+  <rect x="66" y="284" width="170" height="22" rx="2" style="fill:var(--c2)"/><text x="151" y="299" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">Stack</text>
+  <path d="M151 64 L151 104" class="arrow" marker-end="url(#m13b)"/>
+  <text x="160" y="92" font-size="11" class="t-muted">堆向下（高地址）长</text>
+  <path d="M151 278 L151 238" class="arrow" marker-end="url(#m13b)"/>
+  <text x="160" y="256" font-size="11" class="t-muted">栈向上（低地址）长</text>
+  <text x="252" y="26" font-size="12">代码段：指令所在，静态不变，</text>
+  <text x="252" y="42" font-size="12">放在开头（0–1KB）</text>
+  <text x="252" y="62" font-size="12">堆段：malloc 得到的数据、</text>
+  <text x="252" y="78" font-size="12">动态数据结构（it grows positively）</text>
+  <text x="252" y="282" font-size="12">栈段：局部变量、函数参数、</text>
+  <text x="252" y="298" font-size="12">返回值等（it grows negatively）</text>
+</svg>
+<figcaption>图 13.3 一个 16KB 的地址空间示例：代码在 0–1KB，堆从 1KB 开始往下长，栈从 16KB 开始往上长</figcaption>
+</figure>
+<p>为什么这样摆？代码是<strong>静态的</strong>，大小不变，放在最上面最省事。堆和栈都可能在运行时增长（和收缩），把它们放在<strong>两头、相向增长</strong>，中间的空闲区就能被两者按需分享。不过这只是一种<strong>约定</strong>，你完全可以换一种排法；后面讲多线程时会看到，多个线程共存于一个地址空间时，这种"一头一尾"的划分就不再适用了。</p>
+
+<h3>3.4 "幻觉"与真相：虚拟地址 vs. 物理地址</h3>
+<p>我们描述地址空间时，描述的是 <strong>OS 提供给程序的抽象</strong>。程序实际上<strong>并不</strong>在物理地址 0–16KB 处；它被装载到某个任意的物理地址。看图 13.2 的 A、B、C，各自都在不同位置。于是问题来了：当进程 A 对地址 0 做一次 load（这个 0 称为<strong>虚拟地址</strong>），OS 必须和硬件配合，保证这次 load 实际访问的是物理地址 <strong>320KB</strong>（A 被装载的地方），而不是物理地址 0。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 260" width="640" role="img" aria-label="进程 A 的虚拟地址 0 映射到物理地址 320KB">
+  <defs><marker id="m13c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker></defs>
+  <text x="110" y="18" text-anchor="middle" font-size="13" style="font-weight:600">进程 A 以为的内存</text>
+  <text x="46" y="42" font-size="11" class="t-muted" text-anchor="end">0</text>
+  <text x="46" y="226" font-size="11" class="t-muted" text-anchor="end">64KB</text>
+  <rect x="52" y="30" width="116" height="200" rx="4" style="fill:var(--c1);opacity:.9"/>
+  <text x="110" y="126" text-anchor="middle" font-size="12.5" style="fill:#fff;font-weight:600">A 的地址空间</text>
+  <text x="110" y="144" text-anchor="middle" font-size="11" style="fill:#fff">从 0 开始，私有</text>
+  <circle cx="62" cy="38" r="4" style="fill:var(--warn)"/>
+  <text x="330" y="70" text-anchor="middle" font-size="12.5">load 虚拟地址 0</text>
+  <text x="330" y="88" text-anchor="middle" font-size="11" class="t-muted">OS + 硬件在背后翻译</text>
+  <rect x="270" y="100" width="120" height="44" rx="8" class="accent-soft"/>
+  <text x="330" y="127" text-anchor="middle" font-size="12.5">地址转换</text>
+  <path d="M172 38 C 230 40, 250 90, 268 118" class="arrow" style="stroke:var(--accent)" marker-end="url(#m13c)"/>
+  <path d="M392 122 C 440 130, 460 170, 486 176" class="arrow" style="stroke:var(--accent)" marker-end="url(#m13c)"/>
+  <text x="540" y="18" text-anchor="middle" font-size="13" style="font-weight:600">物理内存（真相）</text>
+  <g font-size="10.5" class="t-muted" text-anchor="end">
+    <text x="484" y="36">0KB</text><text x="484" y="176">320KB</text><text x="484" y="250">512KB</text>
+  </g>
+  <rect x="490" y="30" width="110" height="24" rx="2" style="fill:var(--c8)"/><text x="545" y="46" text-anchor="middle" font-size="10.5" style="fill:#fff">OS</text>
+  <rect x="490" y="54" width="110" height="24" class="box"/>
+  <rect x="490" y="78" width="110" height="24" style="fill:var(--c3)"/><text x="545" y="94" text-anchor="middle" font-size="10.5" style="fill:#fff">C</text>
+  <rect x="490" y="102" width="110" height="24" style="fill:var(--c2)"/><text x="545" y="118" text-anchor="middle" font-size="10.5" style="fill:#fff">B</text>
+  <rect x="490" y="126" width="110" height="24" class="box"/>
+  <rect x="490" y="150" width="110" height="24" style="fill:var(--c1)"/><text x="545" y="166" text-anchor="middle" font-size="10.5" style="fill:#fff">A</text>
+  <rect x="490" y="174" width="110" height="24" class="box"/>
+  <rect x="490" y="198" width="110" height="46" class="box"/>
+  <circle cx="496" cy="156" r="4" style="fill:var(--warn)"/>
+</svg>
+<figcaption>虚拟化内存：进程以为自己从地址 0 开始、拥有一大片私有内存；真实数据在物理内存的别处</figcaption>
+</figure>
+<p>当 OS 做到这一点，我们就说 OS 在<strong>虚拟化内存（virtualizing memory）</strong>：运行的程序以为自己被装载在某个特定地址（比如 0），并拥有一个可能非常大的地址空间（比如 32 位或 64 位）；而现实完全不同。这是当今世界上每一台计算机内存虚拟化的基础。</p>
+
+<h3>3.5 虚拟内存（VM）系统的三个目标</h3>
+<div class="as-grid">
+  <div class="goal t"><b>① 透明（transparency）</b>程序不应察觉内存被虚拟化，表现得就像拥有自己私有的物理内存。幕后由 OS 和硬件完成把内存"复用"给许多作业的全部工作。<br><span class="small muted">注意：这里的"透明"是"看不见"，不是"公开透明"。透明的系统是让你难以察觉的系统。</span></div>
+  <div class="goal e"><b>② 效率（efficiency）</b><strong>时间上</strong>不让程序跑得慢很多，<strong>空间上</strong>不为支持虚拟化的数据结构耗费太多内存。要做到时间高效，OS 必须依赖硬件支持，比如以后要学的 TLB。</div>
+  <div class="goal p"><b>③ 保护（protection）</b>保护进程彼此不受影响，也保护 OS 不受进程影响。一个进程的 load、store、取指令不能访问或影响任何其他进程或 OS 的内存（即它地址空间以外的任何东西）。保护带来<strong>隔离（isolation）</strong>。</div>
+</div>
+<figure class="fig">
+<svg viewBox="0 0 620 170" width="620" role="img" aria-label="隔离示意">
+  <rect x="20" y="30" width="170" height="110" rx="12" style="fill:var(--c1);opacity:.18;stroke:var(--c1)"/>
+  <text x="105" y="56" text-anchor="middle" font-size="13" style="font-weight:600">进程 A 的"茧"</text>
+  <text x="105" y="80" text-anchor="middle" font-size="11.5">只能碰自己的</text>
+  <text x="105" y="96" text-anchor="middle" font-size="11.5">代码 / 堆 / 栈</text>
+  <rect x="225" y="30" width="170" height="110" rx="12" style="fill:var(--c2);opacity:.18;stroke:var(--c2)"/>
+  <text x="310" y="56" text-anchor="middle" font-size="13" style="font-weight:600">进程 B 的"茧"</text>
+  <text x="310" y="84" text-anchor="middle" font-size="11.5" style="fill:var(--bad)">B 崩溃了 ✗</text>
+  <text x="310" y="104" text-anchor="middle" font-size="11.5">也不影响 A 和 OS</text>
+  <rect x="430" y="30" width="170" height="110" rx="12" style="fill:var(--c8);opacity:.18;stroke:var(--c8)"/>
+  <text x="515" y="56" text-anchor="middle" font-size="13" style="font-weight:600">操作系统</text>
+  <text x="515" y="80" text-anchor="middle" font-size="11.5">进程无法读写</text>
+  <text x="515" y="96" text-anchor="middle" font-size="11.5">OS 的内存</text>
+  <text x="310" y="162" text-anchor="middle" font-size="12" class="t-muted">隔离原则：两个实体隔离良好，一个失败不会影响另一个</text>
+</svg>
+<figcaption>保护带来隔离：每个进程在自己隔离的"茧"里运行，免受出错甚至恶意进程的破坏</figcaption>
+</figure>
+<div class="aside" data-title="TIP · 隔离原则（The Principle of Isolation）">
+  <p>隔离是构建可靠系统的关键原则。OS 力求让进程彼此隔离；借助内存隔离，OS 还能保证运行的程序影响不到底层 OS。有些现代 OS 走得更远，把 OS 的各部分也彼此隔开——这类<strong>微内核（microkernel）</strong>可能比典型的宏内核（monolithic kernel）更可靠。</p>
+</div>
+
+<h3>3.6 你看到的每个地址都是虚拟的</h3>
+<p>写过打印指针的 C 程序吗？打印出来的那个（通常很大、十六进制的）数就是<strong>虚拟地址</strong>。代码在哪里？也能打印出来——同样是虚拟地址。事实上，作为用户态程序员<strong>你能看到的任何地址都是虚拟地址</strong>。只有 OS（和硬件）知道这些指令和数据真正躺在物理内存的哪里。原书的小程序 <code>va.c</code>：</p>
+<pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+int main(int argc, char *argv[]) {
+    printf("location of code : %p\n", main);           // 代码：main 函数的地址
+    printf("location of heap : %p\n", malloc(100e6));  // 堆：malloc 返回的地址
+    int x = 3;
+    printf("location of stack: %p\n", &amp;x);             // 栈：局部变量 x 的地址
+    return x;
+}</code></pre>
+<p>书中在 64 位 Mac 上的输出：</p>
+<pre><code>location of code : 0x1095afe50
+location of heap : 0x1096008c0
+location of stack: 0x7fff691aea64</code></pre>
+<p>可以看出：代码最先，然后是堆，而栈远在这个巨大虚拟空间的另一端。这些都是虚拟地址，每次访问都要由 OS 和硬件翻译成物理地址。第 6 节会在 Linux 上亲手跑一遍，还会看到两个进程打印出<strong>同一个</strong>地址却装着<strong>不同</strong>的值。</p>
+
+<h2><span class="num">4</span>模拟器：多个进程共享一块物理内存</h2>
+
+<section class="sim" id="sim-share">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>虚拟视图 ↔ 物理位置</h3>
+    <div class="desc">512KB 物理内存按 64KB 一格划分（和图 13.2 一样），每个进程拥有一个 64KB 的地址空间。点击进程查看它"以为"的内存（左）和真实位置（右）；输入虚拟地址，单步看它落到物理内存哪里；试试越界地址，看看没有保护会发生什么。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <span class="muted">选择进程：</span><span class="proc-btns" id="sh-procs"></span>
+      <span class="sep"></span>
+      <button id="sh-new">＋ 新建进程</button>
+      <button id="sh-kill">结束选中进程</button>
+      <button id="sh-run">让选中进程上 CPU</button>
+    </div>
+    <div class="controls">
+      <label>虚拟地址 <input type="text" id="sh-va" value="0" style="width:8em"></label>
+      <span class="muted small">可写 1234、15K、0x3C00</span>
+      <button id="sh-go" class="primary">翻译</button>
+      <span class="sep"></span>
+      <button id="sh-book">载入原书示例：A load 地址 0</button>
+      <button id="sh-oob">试试越界：C 访问 70K</button>
+      <button id="sh-reset">恢复图 13.2 布局</button>
+    </div>
+    <div id="sh-step"></div>
+    <div class="stage"><div id="sh-svg"></div></div>
+    <div class="narrate" id="sh-narrate"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="sh-s1">3</div><div class="l">内存中的进程数</div></div>
+      <div class="stat"><div class="v" id="sh-s2">–</div><div class="l">正在 CPU 上运行</div></div>
+      <div class="stat"><div class="v" id="sh-s3">–</div><div class="l">选中进程的物理起点</div></div>
+      <div class="stat"><div class="v" id="sh-s4">–</div><div class="l">物理内存使用率</div></div>
+    </div>
+  </div>
+</section>
+
+<section class="sim" id="sim-ts">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>时分共享的代价：换出整块内存 vs. 常驻内存</h3>
+    <div class="desc">A、B、C 三个进程轮流运行。比较两种切换方式下，CPU 有多少时间花在"有用的工作"上。数字是示意性的，重点看比例如何随内存大小变化。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>切换方式 <select id="ts-mode"><option value="swap">做法一：整块内存换到磁盘</option><option value="resident" selected>做法二：常驻内存，只换寄存器</option></select></label>
+      <label>每个进程内存 <input type="number" id="ts-mem" value="448" min="16" step="16"> KB</label>
+      <label>磁盘带宽 <input type="number" id="ts-bw" value="1000" min="10" step="10"> KB/ms</label>
+      <label>时间片 <input type="number" id="ts-q" value="10" min="1"> ms</label>
+    </div>
+    <div id="ts-step"></div>
+    <div class="stage"><div id="ts-gantt"></div></div>
+    <div class="narrate" id="ts-narrate"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="ts-s1">–</div><div class="l">已用总时间（ms）</div></div>
+      <div class="stat"><div class="v" id="ts-s2">–</div><div class="l">其中切换开销（ms）</div></div>
+      <div class="stat"><div class="v" id="ts-s3">–</div><div class="l">CPU 有效利用率</div></div>
+    </div>
+  </div>
+</section>
+
+<h2><span class="num">5</span>先预测，再验证</h2>
+<div class="exercise"><div class="q">在"虚拟视图 ↔ 物理位置"模拟器中，恢复图 13.2 布局。进程 A 读虚拟地址 <code>15K</code>，物理地址是多少？进程 B 读同一个虚拟地址 <code>15K</code> 呢？先算，再用模拟器验证。</div>
+<details class="reveal"><summary>看答案</summary><div>A 从物理 320KB 开始，所以 PA = 320KB + 15KB = <strong>335KB</strong>（343040）。B 从 192KB 开始，PA = 192KB + 15KB = <strong>207KB</strong>（211968）。同一个虚拟地址，在不同进程里指向完全不同的物理位置——这正是"每个进程有私有地址空间"的含义。</div></details></div>
+<div class="exercise"><div class="q">进程 C（物理起点 128KB）访问虚拟地址 <code>70K</code>，已经超出了它 64KB 的地址空间。如果硬件<strong>不做任何检查</strong>，只是简单地加上起点，这次访问会落在谁的内存里？</div>
+<details class="reveal"><summary>看答案</summary><div>128KB + 70KB = 198KB，落在 192–256KB 之间，也就是<strong>进程 B</strong> 的内存！C 如果是写操作，B 的数据就被悄悄破坏了。这就是为什么"保护"必须是 VM 的目标之一；第 15 章会用一个<strong>界限寄存器（bounds register）</strong>来挡住这类访问。</div></details></div>
+<div class="exercise"><div class="q">在"时分共享的代价"模拟器里，选"做法一"，每个进程内存 448KB、磁盘带宽 1000 KB/ms、时间片 10ms。预测 CPU 有效利用率大约是多少？把内存调到 4480KB 再预测一次。</div>
+<details class="reveal"><summary>看答案</summary><div>每次切换要把旧进程的 448KB 写出、新进程的 448KB 读入：896KB ÷ 1000 KB/ms ≈ 0.9ms。每个周期 10ms 有效工作 + 0.9ms 开销，稳态利用率约 10 ÷ 10.9 ≈ <strong>92%</strong>（模拟器走完 9 个时间片显示 92.6%，因为最后一片之后还没有切换）。内存变成 4480KB 后，每次切换约 9ms，稳态利用率掉到约 <strong>53%</strong>（模拟器显示 55.7%）。原书说的正是这个：内存越大，这个办法越慢。而做法二的开销与内存大小无关。</div></details></div>
+<div class="exercise"><div class="q">（原书作业 2–4）先运行 <code>free -m</code> 记下 <code>used</code>，再运行 <code>./memory-user 1000 5</code>，在它运行期间再执行一次 <code>free -m</code>。预测 <code>used</code> 会增加多少？程序退出后呢？</div>
+<details class="reveal"><summary>看答案</summary><div>大约增加 1000MB（本机实测 3417 → 4405，多了 988MB），程序退出后回落（→ 3403）。进程退出时 OS 回收它的整个地址空间。注意：只 <code>malloc</code> 而不去"触摸"数组的话，增加量可能远小于 1000MB——Linux 要等到第一次访问某一页时才真正分配物理内存（后续章节会讲按需分配）。系统里别的进程也会让数字有些噪声。</div></details></div>
+<div class="exercise"><div class="q">（原书作业 7）对任意一个进程运行 <code>pmap -x &lt;pid&gt;</code>。除了代码、堆、栈，现代进程的地址空间里还有哪些东西？</div>
+<details class="reveal"><summary>看答案</summary><div>会看到：可执行文件本身被分成好几段（只读头部 <code>r----</code>、代码 <code>r-x--</code>、只读数据、可写数据 <code>rw---</code>）；<code>[ anon ]</code> 匿名映射（brk 堆、大块 malloc 走的 mmap 区域）；共享库 <code>libc.so.6</code>、动态链接器 <code>ld-linux-x86-64.so.2</code>，它们也各有代码/只读/可写几段；<code>[ stack ]</code>；以及内核提供的 vdso 等。原书"代码/堆/栈"三段模型是一个简化。第 6 节有真实的 pmap 输出。</div></details></div>
+
+<h2><span class="num">6</span>动手实验：打印虚拟地址</h2>
+<div class="lab">
+  <p>实验目录 <code>labs/13-address-space/</code>，共 4 个程序：</p>
+  <ul>
+    <li><code>va.c</code>：原书程序，打印代码、堆、栈的地址；</li>
+    <li><code>va2.c</code>：按从低到高排出代码、数据、bss、小块堆、大块 mmap、栈；</li>
+    <li><code>va-fork.c</code>：fork 出两个进程，打印同一个变量的地址和值；</li>
+    <li><code>memory-user.c</code>：原书作业第 3 题，占用指定 MB 内存并不停访问，配合 <code>free</code>、<code>pmap</code> 观察。</li>
+  </ul>
+<pre><code><span class="cmd">cd labs/13-address-space &amp;&amp; make</span>
+<span class="cmd">./va; ./va</span>                                   # 连续运行两次
+<span class="cmd">setarch $(uname -m) -R ./va</span>                  # 关闭地址随机化（ASLR）再运行
+<span class="cmd">./va2</span>
+<span class="cmd">./va-fork</span>
+<span class="cmd">./memory-user 50 20 &amp;  pmap -x $!</span></code></pre>
+</div>
+<p><strong>① 连续运行两次 <code>va</code></strong>（示例输出，你的机器上数字会不同）：</p>
+<pre><code>location of code : 0x579374159149
+location of heap : 0x77bec9493010
+location of stack: 0x7ffc06a9011c
+
+location of code : 0x563cf9c0e149
+location of heap : 0x7ba58d6ca010
+location of stack: 0x7ffc7147368c</code></pre>
+<p>两次地址都不一样：Linux 默认开启<strong>地址空间布局随机化（ASLR）</strong>，每次运行都把代码、堆、栈放到随机的虚拟位置，让攻击者难以猜到地址。用 <code>setarch -R</code> 关掉随机化，两次（甚至两个同时运行的进程）打印出来的地址就<strong>完全一样</strong>——因为它们各自拥有私有的虚拟地址空间，谁也不妨碍谁：</p>
+<pre><code>location of code : 0x555555555149
+location of heap : 0x7ffff1e61010
+location of stack: 0x7fffffffdc0c
+location of code : 0x555555555149
+location of heap : 0x7ffff1e61010
+location of stack: 0x7fffffffdc0c</code></pre>
+<p>和书上 Mac 的结果比，"堆"的位置不太一样：<code>malloc(100e6)</code> 要了 100MB，glibc 对这么大的请求不用传统堆，而是用 <code>mmap</code> 单独映射一块，所以落在高处的共享库附近。<strong>② <code>va2</code></strong> 把各区域排清楚了（关闭 ASLR 时）：</p>
+<pre><code>code  (main)        : 0x555555555169
+data  (global_init) : 0x555555558030
+bss   (global_zero) : 0x555555558038
+heap  (malloc 100)  : 0x5555555592a0     ← 小块 malloc：紧跟数据段的 brk 堆
+mmap  (malloc 100MB): 0x7ffff1e61010     ← 大块 malloc：mmap 区域
+stack (local)       : 0x7fffffffdbfc     ← 栈在最高处，向下长</code></pre>
+<p>顺序正是"代码 → 数据 → 堆（向高地址长）……巨大的空洞……栈（向低地址长）"，和图 13.3 一致，只是规模从 16KB 变成了约 128TB 的用户空间。</p>
+<p><strong>③ <code>va-fork</code>：同一个地址，两个不同的值</strong></p>
+<pre><code>[child  pid=343781] &amp;x=0x5f9cf9eac050 x=200 | h=0x5f9d17eb02a0 *h=2
+[parent pid=343780] &amp;x=0x5f9cf9eac050 x=100 | h=0x5f9d17eb02a0 *h=1</code></pre>
+<p>子进程是父进程的复制品，所以全局变量 <code>x</code> 和堆指针 <code>h</code> 的<strong>虚拟地址完全相同</strong>；但子进程把它们改成 200 和 2 之后，父进程读到的仍然是 100 和 1。如果这些地址是物理地址，这根本不可能——同一个物理位置只能存一个值。只能说明：<strong>相同的虚拟地址，在两个进程里被翻译成了不同的物理地址</strong>。</p>
+<p><strong>④ <code>memory-user</code> + <code>pmap -x</code></strong>（节选）：</p>
+<pre><code>Address           Kbytes     RSS   Dirty Mode  Mapping
+000063916528f000       4       4       4 r---- memory-user
+0000639165290000       4       4       4 r-x-- memory-user      ← 代码
+0000639165293000       4       4       4 rw--- memory-user      ← 可写数据
+00006391878a4000     132       8       8 rw---   [ anon ]       ← brk 堆
+00007cb52bb7f000   51216   51212   51212 rw---   [ anon ]       ← 50MB 数组（mmap）
+00007cb52edab000    1428    1044       0 r-x-- libc.so.6        ← 共享库代码
+00007ffc06895000     132      16      16 rw---   [ stack ]      ← 栈
+---------------- ------- ------- -------
+total kB           53764   52860   51320</code></pre>
+<p>运行 <code>./memory-user 1000 5</code> 时 <code>free -m</code> 的 used 列从 3417MB 涨到 4405MB，程序结束后回到 3403MB。</p>
+
+<h2><span class="num">7</span>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="0"><div class="q">在 C 程序里用 <code>printf("%p", &amp;x)</code> 打印出来的地址是什么？</div>
+  <div class="opts"><button>A. 虚拟地址；用户程序能看到的任何地址都是虚拟的</button><button>B. 在内核态运行时是物理地址，用户态是虚拟地址</button><button>C. 取决于变量是在栈上还是堆上</button><button>D. 物理地址，因为它是真实存在的变量</button></div>
+  <div class="explain">原书 ASIDE："Every address you see is virtual"。只有 OS 和硬件知道真实的物理位置。</div></div>
+<div class="mcq" data-answer="2"><div class="q">为什么用"把整块内存存到磁盘再装入下一个进程"来实现时分共享不可取？</div>
+  <div class="opts"><button>A. 因为这样做无法保存 PC</button><button>B. 因为磁盘不支持随机读写</button><button>C. 保存寄存器很快，但把整块内存写到磁盘非常慢，而且内存越大越慢</button><button>D. 因为磁盘放不下那么多内存镜像</button></div>
+  <div class="explain">原书："saving the entire contents of memory to disk is brutally non-performant"。所以更好的做法是让进程留在内存中，只在它们之间切换。</div></div>
+<div class="mcq" data-answer="0"><div class="q">在图 13.3 的地址空间里，堆和栈为什么放在两端？</div>
+  <div class="opts"><button>A. 两者都可能增长，放在两头相向增长，就能共享中间的空闲空间</button><button>B. 为了让代码段能增长</button><button>C. 硬件规定栈必须在最高地址</button><button>D. 为了让堆和栈访问速度不同</button></div>
+  <div class="explain">这只是一种约定（convention），目的是让两个会增长的区域都有增长余地。多线程时这种划分就不够用了。</div></div>
+<div class="mcq" data-answer="2"><div class="q">进程 A 被装载在物理地址 320KB。A 执行一条从虚拟地址 0 读数据的 load 指令，实际访问的是：</div>
+  <div class="opts"><button>A. 取决于 A 当前是否正在运行</button><button>B. 触发异常，因为地址 0 不合法</button><button>C. 物理地址 320KB</button><button>D. 物理地址 0，也就是 OS 的内存</button></div>
+  <div class="explain">原书正是这个例子：OS 与硬件必须保证这次 load 不去物理地址 0，而是去物理地址 320KB。</div></div>
+<div class="mcq" data-answer="3"><div class="q">虚拟内存的"透明（transparency）"目标指的是：</div>
+  <div class="opts"><button>A. 程序可以直接看到物理地址</button><button>B. 每个进程都能看到其他进程的地址空间</button><button>C. OS 必须公开所有进程的内存布局</button><button>D. 程序察觉不到内存被虚拟化，行为就像拥有私有的物理内存</button></div>
+  <div class="explain">原书脚注特意澄清：这里的透明是"难以察觉"，恰恰与日常说的"公开透明"相反。</div></div>
+<div class="mcq" data-answer="1"><div class="q">关于"效率（efficiency）"目标，下列哪项说法与原书一致？</div>
+  <div class="opts"><button>A. 效率可以完全靠 OS 软件实现</button><button>B. 时间和空间都要高效，而时间高效需要依赖硬件支持，比如 TLB</button><button>C. 只要求时间效率，空间开销无所谓</button><button>D. 效率比保护更重要，可以牺牲保护</button></div>
+  <div class="explain">原书：既不能让程序慢很多（时间），也不能为虚拟化的数据结构用掉太多内存（空间）；要做到时间高效必须依赖硬件特性，如 TLB。</div></div>
+<div class="mcq" data-answer="1"><div class="q">关于"保护（protection）"，哪一项最准确？</div>
+  <div class="opts"><button>A. 只需要保护 OS，不需要保护进程之间</button><button>B. 进程的 load、store、取指令都不能访问或影响其地址空间之外的任何内存，由此实现隔离</button><button>C. 保护就是加密每个进程的内存</button><button>D. 只限制 store，load 和取指令可以随意</button></div>
+  <div class="explain">原书：保护进程彼此，也保护 OS；load、store、instruction fetch 都算。保护带来隔离（isolation）。</div></div>
+<div class="mcq" data-answer="3"><div class="q">在 Linux 上把 <code>va</code> 连续运行两次，打印的地址不同；关闭 ASLR 后再运行，两个进程打印的地址完全相同。这说明：</div>
+  <div class="opts"><button>A. 关闭 ASLR 后虚拟地址就等于物理地址</button><button>B. 第二个进程覆盖了第一个进程的内存</button><button>C. 两个进程共享了同一块物理内存</button><button>D. 每个进程有独立的虚拟地址空间，相同的虚拟地址可以对应不同的物理内存</button></div>
+  <div class="explain">相同的虚拟地址互不冲突，正是因为每个进程都有私有地址空间，由 OS + 硬件分别翻译到不同的物理位置。va-fork 的实验把这一点演示得更直接。</div></div>
+
+<h2><span class="num">8</span>常见误区与小结</h2>
+<div class="warn">
+  <p><strong>误区 1："指针的值就是内存条上的位置。"</strong>不是。用户程序里的指针都是虚拟地址，真实的物理位置只有 OS 和硬件知道。</p>
+  <p><strong>误区 2："地址空间 = 程序占用的物理内存。"</strong>地址空间是一个<strong>抽象</strong>（程序眼中的内存）。它可以很大、很稀疏（如 64 位），中间大片空洞根本不占物理内存——后面的分段、分页就是为了做到这一点。</p>
+  <p><strong>误区 3："透明就是公开。"</strong>在 OS 语境里，透明意味着"让程序察觉不到"。</p>
+  <p><strong>误区 4："堆一定在代码后面、栈一定在最高处。"</strong>这是常见约定，不是铁律；多线程程序里每个线程都有自己的栈，布局会不同。</p>
+</div>
+<div class="key">
+  <p><strong>本章小结</strong></p>
+  <ul>
+    <li>早期系统没有内存抽象；多道程序和时分共享让多个进程同时驻留内存，<strong>保护</strong>随之成为关键问题。</li>
+    <li><strong>地址空间</strong>是 OS 提供给运行程序的内存抽象，包含代码、栈、堆等全部内存状态；程序使用的是<strong>虚拟地址</strong>。</li>
+    <li>VM 系统为每个程序提供<strong>大的、稀疏的、私有的</strong>地址空间幻觉；OS 在硬件大力帮助下，把每次虚拟内存引用转成物理地址。</li>
+    <li>三个目标：<strong>透明</strong>、<strong>效率</strong>（时间 + 空间，靠硬件）、<strong>保护</strong>（带来隔离）。</li>
+    <li>接下来的路线自底向上：先讲机制（第 15 章基址/界限地址转换、第 16 章分段、第 18 章起分页和 TLB），再讲策略（第 17 章空闲空间管理、第 22 章页面替换）。第 14 章先插叙一下程序员视角的内存 API：<code>malloc</code>/<code>free</code>。</li>
+  </ul>
+</div>
+
+</main>
+<script>
+(function () {
+  "use strict";
+  const { h, s, color, stepper } = OSTEP;
+  const KB = 1024, SLOT = 64 * KB, NSLOT = 8;
+
+  // ==CORE-BEGIN==
+  // 解析 "15K" / "0x3C00" / "1234"
+  function parseAddr(str) {
+    const t = String(str).trim().toLowerCase();
+    let m = t.match(/^(-?\d+(?:\.\d+)?)\s*k(b)?$/);
+    if (m) return Math.round(parseFloat(m[1]) * 1024);
+    if (/^0x[0-9a-f]+$/.test(t)) return parseInt(t, 16);
+    if (/^-?\d+$/.test(t)) return parseInt(t, 10);
+    return NaN;
+  }
+  // 进程地址空间内的区域（地址空间大小 64KB）
+  function regionOf(p, va) {
+    if (va < 0 || va >= SLOT) return "outside";
+    if (va < p.code * KB) return "code";
+    if (va < (p.code + p.heap) * KB) return "heap";
+    if (va >= SLOT - p.stack * KB) return "stack";
+    return "free";
+  }
+  // 没有保护时，物理地址 base+va 落在哪个格子里
+  function slotOwner(slots, pa) {
+    if (pa < 0 || pa >= NSLOT * SLOT) return { kind: "none" };
+    const i = Math.floor(pa / SLOT);
+    if (i === 0) return { kind: "os", slot: 0 };
+    return slots[i] ? { kind: "proc", slot: i, p: slots[i] } : { kind: "free", slot: i };
+  }
+  // ==CORE-END==
+
+  // ---------------- 模拟器 1：共享物理内存 ----------------
+  const REG_NAME = { code: "代码", heap: "堆", free: "未使用（堆与栈之间）", stack: "栈", outside: "地址空间之外" };
+  let slots, sel, running, nextId, va = 0, lastInfo = "";
+  function fresh() {
+    slots = new Array(NSLOT).fill(null);
+    slots[5] = { name: "A", ci: 0, code: 4, heap: 12, stack: 8 };
+    slots[3] = { name: "B", ci: 1, code: 2, heap: 20, stack: 4 };
+    slots[2] = { name: "C", ci: 2, code: 6, heap: 6, stack: 10 };
+    sel = 5; running = 5; nextId = 3;
+  }
+  fresh();
+  const $ = (id) => document.getElementById(id);
+  const fmtKB = (n) => (n % KB === 0 ? n / KB + "KB" : (n / KB).toFixed(2).replace(/\.?0+$/, "") + "KB");
+
+  function translateSteps() { return 4; }
+  function info() {
+    const p = slots[sel];
+    if (!p) return null;
+    const base = sel * SLOT, pa = base + va;
+    return { p, base, pa, reg: regionOf(p, va), owner: slotOwner(slots, pa) };
+  }
+
+  function drawShare(step) {
+    const W = 640, H = 400, top = 30, colH = 352;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "虚拟视图与物理内存" });
+    const defs = s("defs", {}, s("marker", { id: "m13s", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto" }, s("path", { d: "M0,0 L10,5 L0,10 z", style: "fill:var(--accent)" })));
+    svg.append(defs);
+    // 物理内存列
+    const px = 430, pw = 150, sh = colH / NSLOT;
+    svg.append(s("text", { x: px + pw / 2, y: 18, "text-anchor": "middle", "font-size": 13, style: "font-weight:600", text: "物理内存 0–512KB" }));
+    for (let i = 0; i < NSLOT; i++) {
+      const y = top + i * sh;
+      svg.append(s("text", { x: px - 6, y: y + 4, "text-anchor": "end", "font-size": 10.5, class: "t-muted mono", text: i * 64 + "KB" }));
+      if (i === 0) {
+        svg.append(s("rect", { x: px, y, width: pw, height: sh, rx: 2, style: "fill:var(--c8)" }));
+        svg.append(s("text", { x: px + pw / 2, y: y + sh / 2 + 4, "text-anchor": "middle", "font-size": 12, style: "fill:#fff;font-weight:600", text: "Operating System" }));
+      } else if (slots[i]) {
+        const p = slots[i];
+        // 格子内画出代码/堆/空闲/栈的真实布局
+        const scale = sh / SLOT;
+        const parts = [["code", 0, p.code], ["heap", p.code, p.heap], ["stack", 64 - p.stack, p.stack]];
+        svg.append(s("rect", { x: px, y, width: pw, height: sh, rx: 2, style: `fill:${color(p.ci)};opacity:.25;stroke:${color(p.ci)}` }));
+        for (const [k, a, n] of parts) svg.append(s("rect", { x: px, y: y + a * KB * scale, width: pw, height: n * KB * scale, style: `fill:${color(p.ci)};opacity:${k === "code" ? 1 : k === "heap" ? .8 : .65}` }));
+        svg.append(s("text", { x: px + pw / 2, y: y + sh / 2 + 4, "text-anchor": "middle", "font-size": 12.5, style: "font-weight:700", text: "进程 " + p.name + (i === running ? " ▶" : "") }));
+        if (i === sel) svg.append(s("rect", { x: px - 2, y: y - 1, width: pw + 4, height: sh + 2, rx: 3, style: "fill:none;stroke:var(--accent);stroke-width:2.5" }));
+      } else {
+        svg.append(s("rect", { x: px, y, width: pw, height: sh, rx: 2, class: "box" }));
+        svg.append(s("text", { x: px + pw / 2, y: y + sh / 2 + 4, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", text: "(free)" }));
+      }
+    }
+    svg.append(s("text", { x: px - 6, y: top + colH + 4, "text-anchor": "end", "font-size": 10.5, class: "t-muted mono", text: "512KB" }));
+
+    // 虚拟视图
+    const p = slots[sel];
+    const vx = 70, vw = 130;
+    if (!p) {
+      svg.append(s("text", { x: 150, y: 200, "text-anchor": "middle", class: "t-muted", "font-size": 13, text: "（请选择一个进程）" }));
+      $("sh-svg").replaceChildren(svg); return;
+    }
+    const vtop = top, vH = colH, sc = vH / SLOT;
+    svg.append(s("text", { x: vx + vw / 2, y: 18, "text-anchor": "middle", "font-size": 13, style: "font-weight:600", text: `进程 ${p.name} 的虚拟地址空间` }));
+    const regs = [["code", 0, p.code, "代码"], ["heap", p.code, p.heap, "堆 ↓"], ["free", p.code + p.heap, 64 - p.code - p.heap - p.stack, "(free)"], ["stack", 64 - p.stack, p.stack, "栈 ↑"]];
+    const I = info();
+    for (const [k, a, n, lab] of regs) {
+      const y = vtop + a * KB * sc, hh = n * KB * sc;
+      const hl = step >= 1 && I.reg === k;
+      svg.append(s("rect", { x: vx, y, width: vw, height: hh, rx: 2, style: k === "free" ? `fill:var(--surface-2);stroke:var(--border);stroke-dasharray:4 3` : `fill:${color(p.ci)};opacity:${k === "code" ? 1 : k === "heap" ? .8 : .65}` }));
+      if (hl) svg.append(s("rect", { x: vx - 2, y: y - 1, width: vw + 4, height: hh + 2, style: "fill:none;stroke:var(--warn);stroke-width:2.5" }));
+      if (hh > 14) svg.append(s("text", { x: vx + vw / 2, y: y + hh / 2 + 4, "text-anchor": "middle", "font-size": 12, style: k === "free" ? "" : "fill:#fff;font-weight:600", class: k === "free" ? "t-muted" : null, text: lab }));
+    }
+    for (const kb of [0, 16, 32, 48, 64]) svg.append(s("text", { x: vx - 6, y: vtop + kb * KB * sc + 4, "text-anchor": "end", "font-size": 10.5, class: "t-muted mono", text: kb + "KB" }));
+    // 映射梯形
+    const pb = top + sel * sh;
+    svg.append(s("path", { d: `M${vx + vw} ${vtop} L${px} ${pb} L${px} ${pb + sh} L${vx + vw} ${vtop + vH} Z`, style: `fill:${color(p.ci)};opacity:.08;stroke:${color(p.ci)};stroke-dasharray:3 3` }));
+    // 地址标记
+    if (step >= 0 && I) {
+      const inRange = va >= 0 && va < SLOT;
+      const vy = vtop + Math.max(0, Math.min(SLOT, va)) * sc;
+      svg.append(s("line", { x1: vx - 12, x2: vx + vw + 6, y1: vy, y2: vy, style: "stroke:var(--warn);stroke-width:2.5" }));
+      svg.append(s("text", { x: vx + vw + 8, y: vy < 45 ? vy + 14 : vy - 4, "font-size": 11, class: "mono", text: "VA " + fmtKB(va) + (inRange ? "" : "（越界）") }));
+      if (step >= 2) {
+        const pa = I.pa, py = top + Math.min(NSLOT * SLOT, Math.max(0, pa)) / SLOT * sh;
+        const bad = !inRange;
+        svg.append(s("path", { d: `M${vx + vw + 6} ${vy} C ${(vx + vw + px) / 2} ${vy}, ${(vx + vw + px) / 2} ${py}, ${px - 4} ${py}`, style: `fill:none;stroke:${bad ? "var(--bad)" : "var(--accent)"};stroke-width:2`, "marker-end": "url(#m13s)" }));
+        svg.append(s("line", { x1: px, x2: px + pw, y1: py, y2: py, style: `stroke:${bad ? "var(--bad)" : "var(--warn)"};stroke-width:3` }));
+        svg.append(s("text", { x: px + pw + 6, y: py + 4, "font-size": 11, class: "mono", style: bad ? "fill:var(--bad)" : "", text: "PA " + fmtKB(pa) }));
+        if (bad && I.owner.slot != null) svg.append(s("rect", { x: px - 3, y: top + I.owner.slot * sh - 2, width: pw + 6, height: sh + 4, rx: 3, style: "fill:none;stroke:var(--bad);stroke-width:2.5;stroke-dasharray:5 3" }));
+      }
+    }
+    $("sh-svg").replaceChildren(svg);
+  }
+
+  function narrateShare(step) {
+    const I = info();
+    if (!I) return "请先在上方选择一个进程。";
+    const nm = "进程 " + I.p.name;
+    if (step === 0) return `<b>第 1 步：</b>${nm} 发出一次内存访问，虚拟地址 <code>${va}</code>（${fmtKB(va)}）。在 ${nm} 看来，它的内存从 0 开始、共 64KB，完全属于自己。`;
+    if (step === 1) return I.reg === "outside"
+      ? `<b>第 2 步：</b>这个虚拟地址 <b>不在</b> ${nm} 的 64KB 地址空间里（有效范围 0 ~ 65535）。`
+      : `<b>第 2 步：</b>该地址落在 ${nm} 地址空间的 <b>${REG_NAME[I.reg]}</b> 区域。${I.reg === "free" ? "（这一段目前没被使用，但在我们这个简单模型里整个 64KB 都连续放在物理内存中。）" : ""}`;
+    if (step === 2) return `<b>第 3 步：</b>OS 把 ${nm} 装载在物理地址 <b>${fmtKB(I.base)}</b>。硬件（在 OS 事先设置下）把虚拟地址加上这个起点：${fmtKB(I.base)} + ${fmtKB(va)} = <b>${fmtKB(I.pa)}</b>（${I.pa}）。`;
+    const o = I.owner;
+    if (I.reg !== "outside") return `<b>第 4 步：</b>访问物理地址 ${I.pa}，落在 ${nm} 自己的那一格里，一切正常。${nm} 对这次"翻译"毫无察觉——这就是<b>透明</b>。`;
+    const who = o.kind === "os" ? "<b>操作系统</b>的内存" : o.kind === "proc" ? `<b>进程 ${o.p.name}</b> 的内存` : o.kind === "free" ? "一块空闲内存" : "物理内存之外";
+    return `<b>第 4 步（危险！）：</b>如果硬件只加起点、不做检查，这次访问会落到 ${who}（物理 ${fmtKB(I.pa)}）。若是写操作，${o.kind === "proc" || o.kind === "os" ? "别人的数据就被破坏了" : "也是在乱写不属于自己的内存"}。这就是需要<b>保护</b>的原因——第 15 章的界限寄存器会在这里触发异常。`;
+  }
+
+  const shStep = stepper($("sh-step"), { steps: 4, render(i) { drawShare(i); $("sh-narrate").innerHTML = narrateShare(i); paintStats(); } });
+
+  function paintProcs() {
+    const box = $("sh-procs"); box.replaceChildren();
+    for (let i = 1; i < NSLOT; i++) if (slots[i]) {
+      const p = slots[i];
+      const b = h("button", { class: i === sel ? "sel" : "", onclick: () => { sel = i; paintProcs(); shStep.reset(); } },
+        h("span", { class: "swatch", style: { background: color(p.ci) } }), "进程 " + p.name);
+      box.append(b);
+    }
+  }
+  function paintStats() {
+    const n = slots.filter(Boolean).length;
+    $("sh-s1").textContent = n;
+    $("sh-s2").textContent = slots[running] ? "进程 " + slots[running].name : "空闲";
+    $("sh-s3").textContent = slots[sel] ? fmtKB(sel * SLOT) : "–";
+    $("sh-s4").textContent = Math.round((n + 1) / NSLOT * 100) + "%";
+  }
+  function readVA() { const v = parseAddr($("sh-va").value); if (Number.isNaN(v)) { $("sh-narrate").textContent = "无法解析这个地址，请输入如 1234、15K、0x3C00。"; return false; } va = v; return true; }
+  $("sh-go").onclick = () => { if (readVA()) shStep.reset(); };
+  $("sh-va").addEventListener("keydown", (e) => { if (e.key === "Enter") $("sh-go").click(); });
+  $("sh-new").onclick = () => {
+    const i = slots.findIndex((x, k) => k > 0 && !x);
+    if (i < 0) { $("sh-narrate").innerHTML = "物理内存已经没有空闲的 64KB 格子了，新进程无法装入。（后面几章会看到更灵活的办法。）"; return; }
+    const r = OSTEP.rng(nextId * 7919);
+    slots[i] = { name: OSTEP.letter(nextId), ci: nextId % 8, code: r.int(2, 6), heap: r.int(4, 20), stack: r.int(2, 10) };
+    nextId++; sel = i; paintProcs(); shStep.reset();
+    $("sh-narrate").innerHTML += `<br>OS 在空闲表里找到第 ${i} 格（物理 ${i * 64}KB），把新进程 ${slots[i].name} 装了进去。`;
+  };
+  $("sh-kill").onclick = () => {
+    if (!slots[sel]) return;
+    const nm = slots[sel].name; slots[sel] = null;
+    if (running === sel) running = slots.findIndex((x, k) => k > 0 && x);
+    sel = slots.findIndex((x, k) => k > 0 && x);
+    paintProcs(); shStep.reset();
+    $("sh-narrate").innerHTML = `进程 ${nm} 结束，OS 回收它的整块内存，那一格重新变成 (free)。`;
+  };
+  $("sh-run").onclick = () => { if (slots[sel]) { running = sel; shStep.refresh(); $("sh-narrate").innerHTML = `上下文切换：OS 保存上一个进程的寄存器，恢复进程 ${slots[sel].name} 的寄存器。<b>内存里的内容一个字节也不用搬</b>——所有进程都常驻内存。`; } };
+  $("sh-book").onclick = () => { fresh(); sel = 5; $("sh-va").value = "0"; va = 0; paintProcs(); shStep.go(3); };
+  $("sh-oob").onclick = () => { fresh(); sel = 2; $("sh-va").value = "70K"; va = 70 * KB; paintProcs(); shStep.go(3); };
+  $("sh-reset").onclick = () => { fresh(); $("sh-va").value = "0"; va = 0; paintProcs(); shStep.reset(); };
+  paintProcs();
+
+  // ---------------- 模拟器 2：时分共享的代价 ----------------
+  const TS_SWITCHES = 9;
+  function tsSegments(k) {
+    const mode = $("ts-mode").value;
+    const mem = Math.max(1, +$("ts-mem").value || 448), bw = Math.max(1, +$("ts-bw").value || 1000), q = Math.max(1, +$("ts-q").value || 10);
+    const sw = mode === "swap" ? (2 * mem) / bw : 0.01;     // 常驻：只换寄存器，约 10μs（示意）
+    const segs = []; let t = 0, over = 0, work = 0;
+    for (let i = 0; i <= k; i++) {
+      segs.push({ who: i % 3, start: t, end: t + q }); t += q; work += q;
+      if (i < k) { segs.push({ who: -1, start: t, end: t + sw, label: sw >= 2 ? "切换" : "" }); t += sw; over += sw; }
+    }
+    return { segs, t, over, work, sw, mode, mem, bw, q };
+  }
+  const tsStep = stepper($("ts-step"), { steps: TS_SWITCHES, autoplayMs: 700, render(k) {
+    const r = tsSegments(k);
+    OSTEP.gantt($("ts-gantt"), r.segs, { unit: r.t > 200 ? 50 : 10, names: ["A", "B", "C"] });
+    $("ts-s1").textContent = r.t.toFixed(1);
+    $("ts-s2").textContent = r.over.toFixed(2);
+    $("ts-s3").textContent = (r.work / r.t * 100).toFixed(1) + "%";
+    const cur = "ABC"[k % 3];
+    $("ts-narrate").innerHTML = r.mode === "swap"
+      ? `第 ${k + 1} 个时间片：进程 ${cur} 运行 ${r.q}ms。之前的每次切换都要把旧进程的 ${r.mem}KB 写到磁盘、再把新进程的 ${r.mem}KB 读回来，单次约 <b>${r.sw.toFixed(2)}ms</b>（灰色块）。内存越大，灰色块越长。`
+      : `第 ${k + 1} 个时间片：进程 ${cur} 运行 ${r.q}ms。三个进程都常驻内存，切换只需保存/恢复寄存器（约 0.01ms，图上几乎看不见）。代价：OS 必须保证它们互不侵犯——<b>保护</b>。`;
+  } });
+  ["ts-mode", "ts-mem", "ts-bw", "ts-q"].forEach((id) => $(id).addEventListener("input", () => tsStep.refresh()));
+})();
+</script>
+</body></html>

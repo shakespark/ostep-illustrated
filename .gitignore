@@ -1,0 +1,13 @@
+# 原书 PDF 与提取文本：版权归原作者，不公开（从 https://pages.cs.wisc.edu/~remzi/OSTEP/ 获取）
+/source/
+
+# 实验编译产物没有扩展名，labs/ 下只收带扩展名的源文件和 Makefile
+/labs/**/*
+!/labs/**/
+!/labs/**/*.*
+!/labs/**/Makefile
+*.o
+*.out
+
+node_modules/
+__pycache__/

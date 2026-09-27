@@ -1,0 +1,797 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 14 章 · 插叙：内存 API</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+  .errgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .errcard { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: 12px 14px; }
+  .errcard h4 { margin: 0 0 4px; font-size: 15px; }
+  .errcard .sym { font-size: 13px; color: var(--muted); }
+  .prog { font: 13px/1.7 var(--mono); background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 0; margin: 0 0 10px; overflow-x: auto; }
+  .prog div { padding: 0 12px; white-space: pre; }
+  .prog div.cur { background: color-mix(in srgb, var(--warn) 25%, transparent); }
+  .prog div.done { color: var(--muted); }
+  .prog .ln { display: inline-block; width: 2em; color: var(--faint); user-select: none; }
+  .ev { margin: 4px 0; }
+  .ev .tool { display: block; font-size: 13px; color: var(--muted); font-family: var(--mono); margin-top: 2px; }
+  .ev.err b.tag { color: var(--bad); } .ev.ok b.tag { color: var(--ok); } .ev.warn b.tag { color: var(--warn); } .ev.crash b.tag { color: var(--bad); }
+  .hs-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin-bottom: 12px; }
+  @media (max-width: 720px) { .hs-row { grid-template-columns: 1fr; } }
+  #hs-src { min-height: 190px; font-size: 13px; }
+  .demo { overflow-x: auto; }
+</style>
+</head>
+<body data-chapter="14">
+<main>
+
+<h2><span class="num">1</span>一句话 + 关键问题</h2>
+<div class="crux">
+  <p><strong>如何分配和管理内存？</strong>在 UNIX/C 程序里，理解怎样分配和管理内存是写出健壮、可靠软件的关键。常用的接口有哪些？哪些错误必须避免？</p>
+  <p class="small muted">原文：In UNIX/C programs, understanding how to allocate and manage memory is critical in building robust and reliable software. What interfaces are commonly used? What mistakes should be avoided?</p>
+</div>
+<p>第 13 章从 OS 的角度定义了地址空间；这一章换到<strong>程序员的角度</strong>：在自己的地址空间里，怎样用 <code>malloc()</code> / <code>free()</code> 申请和归还内存，以及最常见的七种错误。原书说这一章"短而尖锐"。</p>
+<p>它承上启下：你会看到 <code>malloc</code> 必须自己记住每块的大小（第 17 章会揭晓它把大小藏在<strong>头块（header）</strong>里），也会看到 <code>malloc</code> 不是系统调用，而是建立在 <code>brk</code>/<code>sbrk</code>/<code>mmap</code> 之上的库。</p>
+
+<h2><span class="num">2</span>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>栈内存（stack memory）</h4><p>由编译器隐式分配和回收，也叫自动内存（automatic memory）。函数返回，局部变量就没了。</p></div>
+  <div class="card"><h4>堆内存（heap memory）</h4><p>由程序员显式 <code>malloc</code>/<code>free</code>，生命周期由你决定。责任重大，也是大量 bug 的源头。</p></div>
+  <div class="card"><h4>malloc(size)</h4><p>传入字节数，成功返回指向新空间的指针（<code>void *</code>），失败返回 NULL。用 <code>sizeof</code> 算大小。</p></div>
+  <div class="card"><h4>free(ptr)</h4><p>只传 malloc 返回的指针，不传大小——大小由分配库自己记录。</p></div>
+  <div class="card"><h4>七种常见错误</h4><p>忘记分配、分配不足、忘记初始化、忘记释放、用完之前释放（悬挂指针）、重复释放、free 错误指针。</p></div>
+  <div class="card"><h4>能编译 ≠ 能运行 ≠ 正确</h4><p>这些错误大多"一声不吭"地通过编译，甚至运行正常。要靠 valgrind、AddressSanitizer 等工具抓出来。</p></div>
+  <div class="card"><h4>brk / sbrk / mmap</h4><p>malloc 是库函数，不是系统调用；它通过 brk/sbrk 移动堆顶（break），或用 mmap 向 OS 要匿名内存。</p></div>
+  <div class="card"><h4>calloc / realloc</h4><p>calloc 分配并清零；realloc 分配更大的新区域、拷贝旧数据、返回新指针。</p></div>
+</div>
+
+<h2><span class="num">3</span>图解：两种内存与 malloc/free</h2>
+
+<h3>3.1 栈 vs. 堆</h3>
+<p>运行 C 程序时有两种内存。<strong>栈内存</strong>的分配和释放由编译器替你完成：</p>
+<pre><code>void func() {
+    int x;          // 在栈上声明一个整数
+    ...
+}                   // 返回时编译器自动回收 x</code></pre>
+<p>调用 <code>func()</code> 时编译器在栈上腾出空间，返回时收回。所以<strong>想让信息活得比这次调用更久，就不能放在栈上</strong>。这种对长寿内存的需求引出了<strong>堆内存</strong>，分配和释放完全由你显式负责：</p>
+<pre><code>void func() {
+    int *x = (int *) malloc(sizeof(int));
+    ...
+}</code></pre>
+<p>注意这一行里<strong>栈分配和堆分配同时发生</strong>：编译器看到 <code>int *x</code> 就在栈上给指针留位置；程序调用 <code>malloc()</code> 在堆上申请一个整数的空间，返回它的地址（失败则返回 NULL），这个地址再存到栈上的 <code>x</code> 里。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 230" width="640" role="img" aria-label="栈上的指针指向堆上的整数">
+  <defs><marker id="m14a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker></defs>
+  <text x="130" y="20" text-anchor="middle" font-size="13.5" style="font-weight:600">栈（stack）· 编译器自动管理</text>
+  <rect x="40" y="32" width="180" height="150" rx="8" class="box"/>
+  <text x="130" y="52" text-anchor="middle" font-size="12" class="t-muted">func() 的栈帧</text>
+  <rect x="60" y="64" width="140" height="40" rx="4" class="box-strong"/>
+  <text x="72" y="89" font-size="13" class="mono">int *x</text>
+  <text x="190" y="89" font-size="12" class="mono" text-anchor="end" style="fill:var(--accent)">0x5a…2a0</text>
+  <rect x="60" y="116" width="140" height="40" rx="4" class="box-strong"/>
+  <text x="72" y="141" font-size="13" class="mono">int y</text>
+  <text x="190" y="141" font-size="13" class="mono" text-anchor="end">3</text>
+  <text x="130" y="200" text-anchor="middle" font-size="11.5" class="t-muted">函数返回 → 整个栈帧自动消失</text>
+  <text x="480" y="20" text-anchor="middle" font-size="13.5" style="font-weight:600">堆（heap）· 程序员显式管理</text>
+  <rect x="360" y="32" width="240" height="150" rx="8" class="box"/>
+  <rect x="380" y="70" width="80" height="40" rx="4" class="accent-soft"/>
+  <text x="420" y="95" text-anchor="middle" font-size="13" class="mono">int</text>
+  <text x="420" y="128" text-anchor="middle" font-size="11" class="t-muted">malloc(sizeof(int))</text>
+  <rect x="480" y="70" width="100" height="40" rx="4" class="box-strong" style="stroke-dasharray:4 3"/>
+  <text x="530" y="95" text-anchor="middle" font-size="11.5" class="t-muted">其他数据…</text>
+  <path d="M200 84 C 280 84, 300 90, 376 90" style="fill:none;stroke:var(--accent);stroke-width:2" marker-end="url(#m14a)"/>
+  <text x="480" y="200" text-anchor="middle" font-size="11.5" class="t-muted">直到 free(x) 之前一直存在，与函数返回无关</text>
+</svg>
+<figcaption><code>int *x = malloc(sizeof(int))</code>：指针 x 本身在栈上，它指向的整数在堆上</figcaption>
+</figure>
+
+<h3>3.2 malloc()：告诉它你要几个字节</h3>
+<pre><code>#include &lt;stdlib.h&gt;
+void *malloc(size_t size);</code></pre>
+<p>包含 <code>stdlib.h</code> 其实不是必需的（malloc 的代码就在所有 C 程序默认链接的 C 库里），它只是让编译器检查你调用得对不对。参数 <code>size_t size</code> 就是需要的字节数。手写数字（如 10）被认为是糟糕的风格，应该用 <code>sizeof</code>：</p>
+<pre><code>double *d = (double *) malloc(sizeof(double));   // sizeof(double) 在编译期就是 8</code></pre>
+<p><code>sizeof()</code> 是<strong>编译期运算符</strong>，不是函数调用。但对变量用 <code>sizeof</code> 要小心：</p>
+<figure class="fig">
+<svg viewBox="0 0 640 190" width="640" role="img" aria-label="sizeof 对指针和数组的不同结果">
+  <text x="160" y="20" text-anchor="middle" font-size="13" class="mono">int *x = malloc(10 * sizeof(int));</text>
+  <rect x="30" y="36" width="70" height="34" rx="4" class="box-strong"/><text x="65" y="58" text-anchor="middle" font-size="12" class="mono">x</text>
+  <g>
+    <rect x="130" y="36" width="170" height="34" rx="4" class="accent-soft"/>
+    <text x="215" y="58" text-anchor="middle" font-size="12">40 字节（10 个 int）</text>
+  </g>
+  <path d="M100 53 L126 53" class="arrow"/>
+  <text x="160" y="100" text-anchor="middle" font-size="13" class="mono">sizeof(x) → 8</text>
+  <text x="160" y="120" text-anchor="middle" font-size="12" style="fill:var(--bad)">只是"指针有多大"（64 位机上 8，32 位上 4）</text>
+  <text x="160" y="140" text-anchor="middle" font-size="12" class="t-muted">不是你动态分配了多少</text>
+  <line x1="330" y1="14" x2="330" y2="170" style="stroke:var(--border)"/>
+  <text x="490" y="20" text-anchor="middle" font-size="13" class="mono">int x[10];</text>
+  <rect x="400" y="36" width="180" height="34" rx="4" class="ok-soft"/>
+  <text x="490" y="58" text-anchor="middle" font-size="12">40 字节的数组</text>
+  <text x="490" y="100" text-anchor="middle" font-size="13" class="mono">sizeof(x) → 40</text>
+  <text x="490" y="120" text-anchor="middle" font-size="12" style="fill:var(--ok)">静态信息足够，编译器知道是 40 字节</text>
+  <text x="320" y="180" text-anchor="middle" font-size="12">字符串：用 <tspan class="mono">malloc(strlen(s) + 1)</tspan>，"+1" 是给结尾的 '\0'；这里用 sizeof 会出问题</text>
+</svg>
+<figcaption><code>sizeof</code> 对指针和数组给出不同答案；字符串长度要用 <code>strlen(s) + 1</code></figcaption>
+</figure>
+<p>malloc 返回 <code>void *</code>——C 里就是这样把一个地址交还给你，由你决定怎么用。书里的 <code>(double *)</code> 这种<strong>强制类型转换（cast）</strong>对正确性毫无作用，只是告诉编译器和读代码的人"我知道我在做什么"。</p>
+<div class="tip"><p><strong>拿不准就试一试（When in doubt, try it out）。</strong>读 man 手册有用，但它在实践中怎么表现才重要。作者自己也是写代码验证了关于 <code>sizeof</code> 的说法。</p></div>
+
+<h3>3.3 free()：只给指针，不给大小</h3>
+<pre><code>int *x = malloc(10 * sizeof(int));
+...
+free(x);</code></pre>
+<p>分配是容易的部分；<strong>何时、如何、甚至是否要释放</strong>才是难点。<code>free()</code> 只接受一个参数：之前 <code>malloc()</code> 返回的指针。你会注意到用户<strong>并没有传入大小</strong>——这意味着内存分配库必须自己记住每块有多大。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 170" width="640" role="img" aria-label="malloc 和 free 的生命周期">
+  <defs><marker id="m14b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <rect x="20" y="50" width="130" height="50" rx="8" class="box"/>
+  <text x="85" y="72" text-anchor="middle" font-size="12.5">空闲空间</text><text x="85" y="90" text-anchor="middle" font-size="11" class="t-muted">由分配库管理</text>
+  <path d="M152 66 L240 66" class="arrow" marker-end="url(#m14b)"/>
+  <text x="196" y="58" text-anchor="middle" font-size="11.5" class="mono">malloc(40)</text>
+  <rect x="245" y="40" width="30" height="70" rx="3" class="warn-soft"/>
+  <text x="260" y="128" text-anchor="middle" font-size="10.5" class="t-muted">头块</text>
+  <rect x="275" y="40" width="120" height="70" rx="3" class="accent-soft"/>
+  <text x="335" y="70" text-anchor="middle" font-size="12.5">40 字节</text><text x="335" y="88" text-anchor="middle" font-size="11" class="t-muted">归你使用</text>
+  <text x="275" y="30" font-size="11" class="mono" style="fill:var(--accent)">↓ 返回的指针 x</text>
+  <path d="M398 90 L500 90" class="arrow" marker-end="url(#m14b)"/>
+  <text x="449" y="82" text-anchor="middle" font-size="11.5" class="mono">free(x)</text>
+  <rect x="505" y="50" width="115" height="50" rx="8" class="box"/>
+  <text x="562" y="72" text-anchor="middle" font-size="12.5">回到空闲空间</text><text x="562" y="90" text-anchor="middle" font-size="11" class="t-muted">可以再分配</text>
+  <text x="320" y="158" text-anchor="middle" font-size="12">库需要自己记住"这块有多大"——通常存在返回指针前面的头块里（第 17 章细讲）</text>
+</svg>
+<figcaption>malloc 返回的指针是 free 唯一需要的信息；大小由分配库自己记录</figcaption>
+</figure>
+
+<h3>3.4 七种常见错误（每种一张图）</h3>
+<p>下面这些错误原书作者在本科 OS 课上"一遍又一遍"地见到。<strong>它们全部能编译通过、跑起来也可能毫无动静</strong>——编译通过是写出正确 C 程序的必要条件，但远远不够。正因为内存管理太容易出错，许多新语言提供了<strong>自动内存管理</strong>：你 <code>new</code> 对象，但从不需要释放，由<strong>垃圾回收器（garbage collector）</strong>找出不再被引用的内存替你释放。</p>
+<p class="small muted">下面每张图都是用第 4 节的"堆操作沙盒"跑出来的出错那一刻：上方是栈上的变量，下方是堆（每格代表一个单元），红框是出事的位置。</p>
+
+<h4>① 忘记分配内存（forgetting to allocate memory）</h4>
+<pre><code>char *src = "hello";
+char *dst;              // oops! unallocated
+strcpy(dst, src);       // segfault and die</code></pre>
+<figure class="fig"><div class="demo" data-demo="forget"></div><figcaption><code>dst</code> 从没被赋值，里面是垃圾；strcpy 往一个随机地址写 → 段错误（segmentation fault）</figcaption></figure>
+<p>段错误（segmentation fault）是"你在内存上干了蠢事，我很生气"的花哨说法（第 16 章会解释这个名字的来历）。正确写法是 <code>char *dst = (char *) malloc(strlen(src) + 1);</code>，或者直接用 <code>strdup()</code>。</p>
+
+<h4>② 分配不足（not allocating enough memory）= 缓冲区溢出（buffer overflow）</h4>
+<pre><code>char *src = "hello";
+char *dst = (char *) malloc(strlen(src));   // too small!  少了 '\0' 那 1 个字节
+strcpy(dst, src);</code></pre>
+<figure class="fig"><div class="demo" data-demo="small"></div><figcaption>"hello" 需要 6 字节，只分配了 5；第 6 个字节 '\0' 写进了紧挨着的另一块（q[0] 从 9 被改成 0）</figcaption></figure>
+<p>奇怪的是，这种程序<strong>常常看起来运行正确</strong>：多写的 1 字节有时无害（覆盖了一个没人再用的变量），有时 malloc 本来就多给了一点空间；但有时它极其有害，<strong>许多安全漏洞正源于此</strong>；还有时程序直接崩溃。教训：跑对过一次，不代表它是对的。</p>
+<div class="aside" data-title="TIP · 能编译、能运行 ≠ 正确（It compiled or it ran ≠ It is correct）">
+  <p>程序编译通过、甚至运行多次都正确，并不意味着它正确。等某天环境变了它就崩了，学生常喊"可是它之前是好的！"然后怪编译器、OS、硬件，甚至教授。问题通常就在你以为的地方——你的代码里。</p>
+</div>
+
+<h4>③ 忘记初始化分配的内存（forgetting to initialize allocated memory）</h4>
+<figure class="fig"><div class="demo" data-demo="uninit"></div><figcaption>malloc 给你的内存里是什么都有可能；读一个从未写过的位置 = 未初始化读（uninitialized read）</figcaption></figure>
+<p>运气好读到 0 之类让程序照常工作的值，运气不好就是随机而有害的东西。<code>calloc()</code> 在返回前会把内存清零，可以防止"以为内存是 0"这类错误。</p>
+
+<h4>④ 忘记释放内存（forgetting to free memory）= 内存泄漏（memory leak）</h4>
+<figure class="fig"><div class="demo" data-demo="leak"></div><figcaption>p 被改指向新块，旧块再也没有指针指向它：泄漏</figcaption></figure>
+<p>在长期运行的程序或系统（比如 OS 本身）里这是大问题：内存慢慢漏光，只能重启。注意<strong>垃圾回收语言也救不了你</strong>：只要你还持有某块内存的引用，GC 就永远不会释放它。</p>
+<div class="aside" data-title="ASIDE · 为什么进程退出后内存不会泄漏">
+  <p>系统里有<strong>两级内存管理</strong>：第一级由 OS 负责，进程运行时把内存交给它，进程退出（或被杀）时全部收回；第二级在每个进程内部，比如堆里的 <code>malloc()</code>/<code>free()</code>。即使你没 free（堆里泄漏了），进程结束时 OS 会回收它的全部页——代码、栈，以及这里关心的堆。所以对短命程序，泄漏通常不会造成实际问题（虽然是坏风格）；但对永不退出的 Web 服务器、数据库，以及 OS 内核自己，泄漏终将导致崩溃。</p>
+</div>
+<figure class="fig">
+<svg viewBox="0 0 640 170" width="640" role="img" aria-label="两级内存管理">
+  <rect x="20" y="20" width="600" height="130" rx="10" class="box"/>
+  <text x="36" y="42" font-size="13" style="font-weight:600">第一级：操作系统</text>
+  <text x="36" y="60" font-size="11.5" class="t-muted">进程运行时分配内存（代码、栈、堆的页），进程退出时全部收回</text>
+  <rect x="50" y="74" width="250" height="62" rx="8" class="accent-soft"/>
+  <text x="62" y="94" font-size="12.5" style="font-weight:600">进程 A 的地址空间</text>
+  <rect x="62" y="102" width="40" height="24" rx="3" style="fill:var(--c4)"/><text x="82" y="118" text-anchor="middle" font-size="10.5" style="fill:#fff">代码</text>
+  <rect x="106" y="102" width="130" height="24" rx="3" class="box-strong"/><text x="171" y="118" text-anchor="middle" font-size="10.5">堆：第二级（malloc/free）</text>
+  <rect x="240" y="102" width="48" height="24" rx="3" style="fill:var(--c2)"/><text x="264" y="118" text-anchor="middle" font-size="10.5" style="fill:#fff">栈</text>
+  <text x="330" y="100" font-size="12">进程 A 退出 →</text>
+  <text x="330" y="120" font-size="12">OS 收回整个地址空间，堆里忘了 free 的也一并收回</text>
+</svg>
+<figcaption>两级内存管理：malloc/free 管进程内部的堆；OS 管进程整体</figcaption>
+</figure>
+
+<h4>⑤ 用完之前就释放（freeing memory before you are done with it）= 悬挂指针（dangling pointer）</h4>
+<figure class="fig"><div class="demo" data-demo="dangling"></div><figcaption>free(p) 后 p 仍然拿着旧地址；这块内存又被 malloc 给了 q，通过 p 读到的是 q 写的 42</figcaption></figure>
+<p>后续使用可能让程序崩溃，也可能覆盖有效内存——比如你 free 之后又 malloc 了别的东西，分配器恰好回收利用了这块被错误释放的内存。</p>
+
+<h4>⑥ 重复释放（freeing memory repeatedly）= double free</h4>
+<figure class="fig"><div class="demo" data-demo="double"></div><figcaption>同一块 free 两次：结果未定义，分配器内部结构可能被搞乱，常见结局是崩溃</figcaption></figure>
+
+<h4>⑦ 错误地调用 free（calling free() incorrectly）= invalid free</h4>
+<figure class="fig"><div class="demo" data-demo="badfree"></div><figcaption>free 只接受 malloc 返回的那个指针；传入块中间的地址，分配器会在错误的位置找头块</figcaption></figure>
+<div class="errgrid">
+  <div class="errcard"><h4>忘记分配</h4><div class="sym">未初始化指针 → 通常段错误</div></div>
+  <div class="errcard"><h4>分配不足</h4><div class="sym">缓冲区溢出 → 可能"正常"，可能静默破坏，可能崩溃，可能被攻击</div></div>
+  <div class="errcard"><h4>忘记初始化</h4><div class="sym">未初始化读 → 读到不可预知的值</div></div>
+  <div class="errcard"><h4>忘记释放</h4><div class="sym">内存泄漏 → 长期运行的程序最终耗尽内存</div></div>
+  <div class="errcard"><h4>用完之前释放</h4><div class="sym">悬挂指针 → 崩溃或覆盖别人的数据</div></div>
+  <div class="errcard"><h4>重复释放</h4><div class="sym">double free → 未定义，分配器混乱，常崩溃</div></div>
+  <div class="errcard"><h4>free 错误指针</h4><div class="sym">invalid free → 危险，务必避免</div></div>
+</div>
+<p>内存错误如此常见，于是有了一整套工具生态：<strong>purify</strong> 和 <strong>valgrind</strong> 都能帮你定位内存问题的源头；本机实验用的是 gcc 自带的 <strong>AddressSanitizer</strong>（<code>-fsanitize=address</code>）。用惯了之后，你会奇怪以前没有它们是怎么活下来的。</p>
+
+<h3>3.5 底层 OS 支持：brk、sbrk、mmap</h3>
+<p>你可能注意到了：讲 malloc/free 时一直没提系统调用。原因很简单：<strong>它们不是系统调用，而是库调用</strong>。malloc 库在你的虚拟地址空间里管理空间，而它本身建立在几个向 OS 要内存/还内存的系统调用之上：</p>
+<figure class="fig">
+<svg viewBox="0 0 640 250" width="640" role="img" aria-label="brk 移动堆顶，mmap 映射匿名区域">
+  <defs><marker id="m14c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="140" y="18" text-anchor="middle" font-size="13" style="font-weight:600">进程的虚拟地址空间（低 → 高）</text>
+  <rect x="40" y="30" width="200" height="26" rx="3" style="fill:var(--c4)"/><text x="140" y="48" text-anchor="middle" font-size="12" style="fill:#fff">代码 + 数据</text>
+  <rect x="40" y="56" width="200" height="50" rx="3" style="fill:var(--c3)"/><text x="140" y="85" text-anchor="middle" font-size="12" style="fill:#fff">堆（malloc 在这里切块）</text>
+  <rect x="40" y="106" width="200" height="22" rx="3" style="fill:var(--c3);opacity:.35;stroke:var(--c3);stroke-dasharray:4 3"/>
+  <text x="140" y="121" text-anchor="middle" font-size="11">sbrk(+n) 后多出来的部分</text>
+  <line x1="30" y1="128" x2="250" y2="128" style="stroke:var(--bad);stroke-width:2"/>
+  <text x="256" y="132" font-size="11.5" style="fill:var(--bad)">program break（堆的末尾）</text>
+  <rect x="40" y="136" width="200" height="40" rx="3" class="box" style="stroke-dasharray:4 3"/><text x="140" y="160" text-anchor="middle" font-size="11" class="t-muted">未使用</text>
+  <rect x="40" y="176" width="200" height="26" rx="3" style="fill:var(--c6)"/><text x="140" y="194" text-anchor="middle" font-size="11.5" style="fill:#fff">mmap 匿名区域</text>
+  <rect x="40" y="208" width="200" height="26" rx="3" style="fill:var(--c2)"/><text x="140" y="226" text-anchor="middle" font-size="12" style="fill:#fff">栈</text>
+  <text x="330" y="60" font-size="12.5"><tspan class="mono">brk(addr)</tspan>：把 break 设到新地址，堆随之变大或变小</text>
+  <text x="330" y="82" font-size="12.5"><tspan class="mono">sbrk(incr)</tspan>：传入增量，作用类似</text>
+  <text x="330" y="112" font-size="12.5"><tspan class="mono">mmap()</tspan>：创建一块匿名内存区域（与文件无关，</text>
+  <text x="330" y="130" font-size="12.5">关联到交换空间），也能当堆来管理</text>
+  <text x="330" y="170" font-size="12.5" style="fill:var(--bad)">不要自己直接调用 brk / sbrk！</text>
+  <text x="330" y="190" font-size="12" class="t-muted">它们是给内存分配库用的；乱调很可能把事情搞砸。</text>
+  <text x="330" y="208" font-size="12" class="t-muted">坚持使用 malloc() 和 free()。</text>
+</svg>
+<figcaption>malloc 库建立在 brk/sbrk（移动堆顶）和 mmap（匿名映射）之上。glibc 对大请求（默认 ≥128KB）直接用 mmap——第 13 章实验里 <code>malloc(100e6)</code> 落在高地址就是这个原因</figcaption>
+</figure>
+
+<h3>3.6 其他调用：calloc 和 realloc</h3>
+<ul>
+  <li><code>calloc()</code>：分配内存并在返回前清零，避免"以为内存是零"却忘了初始化的错误。</li>
+  <li><code>realloc()</code>：已经分配了一块（比如数组），需要更多空间时用：它分配一块更大的新区域、把旧内容拷过去、返回<strong>新</strong>指针。旧指针随之失效——继续用它就是悬挂指针。</li>
+</ul>
+
+<h2><span class="num">4</span>模拟器：堆操作沙盒</h2>
+<section class="sim" id="sim-heap">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>malloc / free / 读写：一步一步看堆的变化</h3>
+    <div class="desc">选一个预设程序（或自己改代码），单步执行。上方是栈上的变量及它们指向哪里，下方是堆的每个格子。出现七类错误时会用红框标出位置，并告诉你真实程序会怎样、valgrind/ASan 会怎么说。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>预设程序 <select id="hs-preset"></select></label>
+    </div>
+    <details class="reveal" style="margin:0 0 10px"><summary>✎ 编辑代码 / 自己写程序</summary><div>
+      <textarea id="hs-src" spellcheck="false"></textarea>
+      <div class="controls" style="margin-top:8px"><button id="hs-load" class="primary">运行这段代码</button>
+      <span class="muted small">支持：<code>int *p = malloc(n)</code> <code>calloc(n)</code> <code>free(p)</code> <code>p[i] = v</code> <code>*p = v</code> <code>int x = p[i]</code> <code>print(p[i])</code> <code>strcpy(p, "..")</code> <code>q = p + k</code> <code>p = NULL</code> <code>char *d;</code> <code>char *s = "..."</code>；<code>//</code> 注释</span></div>
+    </div></details>
+    <div id="hs-step"></div>
+    <div class="hs-row">
+      <div class="prog" id="hs-prog"></div>
+      <div class="narrate" id="hs-narrate" style="margin-top:0"></div>
+    </div>
+    <div class="stage"><div id="hs-svg"></div></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="hs-s1">0</div><div class="l">仍在使用的块</div></div>
+      <div class="stat"><div class="v" id="hs-s2">0</div><div class="l">已 free 的块</div></div>
+      <div class="stat"><div class="v" id="hs-s3">0</div><div class="l">泄漏的字节</div></div>
+      <div class="stat"><div class="v" id="hs-s4">0</div><div class="l">检测到的错误</div></div>
+    </div>
+    <p class="small muted" style="margin-top:10px">简化说明：堆共 32 格、从地址 1000 开始、首次适配（first fit），每格代表一个元素（<code>sizeof(int)</code> 按 1 计），不画头块。真实的 malloc 会有头块和对齐，但出错的道理一样。</p>
+  </div>
+</section>
+
+<h2><span class="num">5</span>先预测，再验证</h2>
+<div class="exercise"><div class="q">在沙盒里选"分配不足"。执行到 <code>print(q[0])</code> 之前，先预测会打印什么？q 自己从没被越界访问过。</div>
+<details class="reveal"><summary>看答案</summary><div>打印 <code>'\0'</code>（也就是 0），而不是之前写入的 9。<code>dst</code> 只分配了 5 格，strcpy 写 6 个字节，最后的 '\0' 落在紧挨着的 q[0] 上。q 的主人什么都没做错，数据却被别人悄悄改了——这类 bug 最难查，因为出错的地方和症状出现的地方离得很远。</div></details></div>
+<div class="exercise"><div class="q">选"悬挂指针"。<code>int x = p[0]</code> 这一步，x 会得到 1（p 当初写的值）还是别的？</div>
+<details class="reveal"><summary>看答案</summary><div>得到 <strong>42</strong>。free(p) 后分配器把同一块地址又给了 q，q[0] = 42 覆盖了原值。在本机实验 <code>dangling.c</code> 里也是这样：<code>data=0x5b597e93a2a0 other=0x5b597e93a2a0 data[5]=12345</code>，两次 malloc 拿到了同一个地址。</div></details></div>
+<div class="exercise"><div class="q">（原书作业 5）<code>int *data = malloc(100 * sizeof(int)); data[100] = 0;</code> 直接运行会怎样？用工具运行呢？程序正确吗？</div>
+<details class="reveal"><summary>看答案</summary><div>直接运行通常<strong>什么事都没有</strong>（本机输出 <code>wrote data[100], program still running</code>，退出码 0），因为 malloc 的块后面往往还有点余量。用 ASan 运行立刻报 <code>heap-buffer-overflow … 0 bytes after 400-byte region</code>。程序显然不正确。沙盒里的"数组越界"预设演示了同样的事。</div></details></div>
+<div class="exercise"><div class="q">（原书作业 4）只 malloc 不 free 的程序，运行时会出什么问题？gdb 能帮你发现吗？valgrind（<code>--leak-check=yes</code>）或 ASan 呢？</div>
+<details class="reveal"><summary>看答案</summary><div>运行时什么问题也没有（进程退出时 OS 回收全部内存）。gdb 也看不出问题——程序没有崩溃。只有 valgrind（<code>definitely lost</code>）或 LeakSanitizer 能报告：本机 <code>leak-asan</code> 输出 <code>Direct leak of 3072 byte(s) in 3 object(s)</code>。沙盒里"忘记释放"预设在 p 被改写的那一刻就标记了泄漏。</div></details></div>
+<div class="exercise"><div class="q">在沙盒里自己写：<code>int *p = malloc(4);</code> <code>free(p);</code> <code>p = NULL;</code> <code>free(p);</code>。第二个 free 会报 double free 吗？</div>
+<details class="reveal"><summary>看答案</summary><div>不会。<code>free(NULL)</code> 是合法的空操作。这就是"free 之后立刻把指针置为 NULL"这个好习惯的价值：它把悬挂指针和重复释放都变成了无害（或立即可见的 NULL 解引用）。</div></details></div>
+
+<h2><span class="num">6</span>动手实验：用工具抓出内存错误</h2>
+<div class="lab">
+  <p>实验目录 <code>labs/14-memory-api/</code>：9 个小程序，每个对应一类错误（含原书作业 1、4、5、6、7）。Makefile 为每个程序编译两份：普通版 <code>xxx</code> 和 AddressSanitizer 版 <code>xxx-asan</code>。本机没有安装 valgrind，所以用 gcc 自带的 <code>-fsanitize=address</code>（包含 LeakSanitizer）；如果你装了 valgrind，也可以运行 <code>valgrind --leak-check=yes ./xxx</code>。</p>
+<pre><code><span class="cmd">cd labs/14-memory-api &amp;&amp; make</span>
+<span class="cmd">./overflow ; echo "exit=$?"</span>        # 普通版：看起来没事
+<span class="cmd">./overflow-asan</span>                     # ASan 版：当场抓住
+<span class="cmd">make run</span>                            # 依次运行全部 18 个版本</code></pre>
+</div>
+<p>下表是本机（gcc 14，WSL2）的真实结果。<strong>示例输出，你的机器上地址会不同</strong>：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>程序</th><th>错误类型</th><th>普通运行</th><th>ASan 版</th><th>gcc -Wall 编译期</th></tr></thead>
+<tbody>
+<tr><td><code>null</code></td><td>解引用 NULL</td><td>段错误，退出码 139</td><td>SEGV on unknown address 0x000000000000</td><td>无警告</td></tr>
+<tr><td><code>forget_alloc</code></td><td>忘记分配</td><td>段错误，退出码 139</td><td>SEGV（WRITE memory access）</td><td>‘dst’ is used uninitialized</td></tr>
+<tr><td><code>too_small</code></td><td>分配不足</td><td><strong>正常打印 dst = hello</strong>，退出码 0</td><td>heap-buffer-overflow，WRITE of size 6</td><td>无警告</td></tr>
+<tr><td><code>overflow</code></td><td>data[100] 越界</td><td><strong>正常</strong>，退出码 0</td><td>heap-buffer-overflow，0 bytes after 400-byte region</td><td>无警告</td></tr>
+<tr><td><code>uninit</code></td><td>未初始化读</td><td>读到旧数据：<code>a = -26023441 5 0 0 7 7 7 7</code></td><td><strong>不报错</strong>（ASan 把新内存填成 0xbe）</td><td>may be used uninitialized</td></tr>
+<tr><td><code>leak</code></td><td>忘记释放</td><td><strong>正常</strong>，退出码 0</td><td>LeakSanitizer：Direct leak of 3072 byte(s)</td><td>无警告</td></tr>
+<tr><td><code>dangling</code></td><td>悬挂指针</td><td><strong>正常</strong>，读到了别人写的 12345</td><td>heap-use-after-free</td><td>pointer ‘data’ used after ‘free’</td></tr>
+<tr><td><code>double_free</code></td><td>重复释放</td><td>glibc：<code>free(): double free detected in tcache 2</code>，退出码 134</td><td>attempting double-free</td><td>pointer ‘x’ used after ‘free’</td></tr>
+<tr><td><code>bad_free</code></td><td>free 错误指针</td><td>glibc：<code>free(): invalid pointer</code>，退出码 134</td><td>attempting free on address which was not malloc()-ed</td><td>‘free’ called on pointer with nonzero offset 200</td></tr>
+</tbody></table></div>
+<p>几段关键输出。<strong>分配不足</strong>（<code>too_small.c</code>）：普通版一切正常，ASan 版：</p>
+<pre><code>$ ./too_small
+dst = hello
+$ ./too_small-asan
+==345305==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000015 ...
+WRITE of size 6 at 0x502000000015 thread T0
+    #0 0x74982fea2680 in strcpy ../../../../src/libsanitizer/asan/asan_interceptors.cpp:563
+    #1 0x5ad467a921f6 in main too_small.c:8
+0x502000000015 is located 0 bytes after 5-byte region [0x502000000010,0x502000000015)
+allocated by thread T0 here:
+    #1 0x5ad467a921df in main too_small.c:7</code></pre>
+<p>ASan 精确地告诉你：第 8 行的 strcpy 往一个 5 字节的块写了 6 字节，块是第 7 行分配的。<strong>悬挂指针</strong>（<code>dangling.c</code>）：</p>
+<pre><code>$ ./dangling
+data=0x5b597e93a2a0 other=0x5b597e93a2a0 data[5]=12345
+$ ./dangling-asan
+==345319==ERROR: AddressSanitizer: heap-use-after-free on address 0x514000000054 ...
+READ of size 4 at 0x514000000054 thread T0
+    #0 0x563a582c02d0 in main dangling.c:10
+0x514000000054 is located 20 bytes inside of 400-byte region [0x514000000040,0x5140000001d0)
+freed by thread T0 here:
+    #1 0x563a582c023e in main dangling.c:7
+previously allocated by thread T0 here:
+    #1 0x563a582c01ca in main dangling.c:5</code></pre>
+<p>普通版里 <code>data</code> 和 <code>other</code> 是<strong>同一个地址</strong>：free 掉的内存马上被下一次 malloc 回收，通过旧指针读到了新主人写的 12345。<strong>内存泄漏</strong>（<code>leak.c</code>）：</p>
+<pre><code>$ ./leak-asan
+exiting without free
+
+=================================================================
+==345315==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 3072 byte(s) in 3 object(s) allocated from:
+    #0 0x7b83eb8f4c57 in malloc ../../../../src/libsanitizer/asan/asan_malloc_linux.cpp:69
+    #1 0x6149649971b3 in main leak.c:7
+
+SUMMARY: AddressSanitizer: 3072 byte(s) leaked in 3 allocation(s).</code></pre>
+<p><strong>重复释放</strong>：glibc 自己就有检查，不用工具也会中止：</p>
+<pre><code>$ ./double_free
+freed once, freeing again...
+free(): double free detected in tcache 2
+Aborted                    (退出码 134 = 128 + SIGABRT)</code></pre>
+<div class="tip"><p>观察要点：(1) "不带工具运行正常"的有 4 个（too_small、overflow、leak、dangling），这正是原书反复强调的"能跑 ≠ 正确"；(2) ASan 抓不到未初始化读，valgrind 的 memcheck 可以；(3) 现代 gcc 的 <code>-Wall</code> 已经能在编译期发现一部分（未初始化指针、use-after-free、free 非堆地址），所以<strong>永远打开 -Wall，并认真看警告</strong>。</p></div>
+
+<h2><span class="num">7</span>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="0"><div class="q"><code>int *x = malloc(10 * sizeof(int)); printf("%zu", sizeof(x));</code> 在 64 位机器上打印什么？</div>
+  <div class="opts"><button>A. 8</button><button>B. 10</button><button>C. 取决于 malloc 实际分配了多少</button><button>D. 40</button></div>
+  <div class="explain">sizeof(x) 问的是"指向 int 的指针有多大"，不是你动态分配了多少。只有 <code>int x[10]</code> 这种静态数组，sizeof 才会给出 40。</div></div>
+<div class="mcq" data-answer="3"><div class="q">为什么 <code>free()</code> 不需要传入大小？</div>
+  <div class="opts"><button>A. 因为 free 会扫描内存直到遇到 0</button><button>B. 因为 OS 会告诉 free 块的大小</button><button>C. 因为所有块大小都一样</button><button>D. 因为分配库自己记录了每块的大小</button></div>
+  <div class="explain">原书：大小不由用户传入，必须由内存分配库自己追踪。第 17 章会看到它通常藏在返回指针之前的头块里。</div></div>
+<div class="mcq" data-answer="3"><div class="q"><code>char *dst = malloc(strlen(src)); strcpy(dst, src);</code> 最准确的描述是：</div>
+  <div class="opts"><button>A. 完全正确，strlen 已经包含了结尾的 '\0'</button><button>B. 编译器会报错，无法编译</button><button>C. 一定会立刻段错误</button><button>D. 分配不足（缓冲区溢出）；程序可能看起来正常，也可能静默破坏数据或崩溃</button></div>
+  <div class="explain">strlen 不含 '\0'，应该是 strlen(src)+1。原书强调这类程序"often run seemingly correctly"，本机实验也证实普通运行毫无异常。</div></div>
+<div class="mcq" data-answer="1"><div class="q">关于短命程序不调用 free，下列哪项符合原书观点？</div>
+  <div class="opts"><button>A. 完全没有任何问题，是推荐做法</button><button>B. 进程退出时 OS 会回收全部内存，所以不会真的丢失；但这是坏习惯，对长期运行的程序是大问题</button><button>C. OS 不会回收堆，只回收代码和栈</button><button>D. 会永久丢失物理内存，直到重启</button></div>
+  <div class="explain">两级内存管理：OS 在进程退出时收回全部页（包括堆）。但作者建议养成好习惯，free 每一个显式分配的字节。</div></div>
+<div class="mcq" data-answer="2"><div class="q">关于垃圾回收（GC）语言，哪项正确？</div>
+  <div class="opts"><button>A. GC 语言仍然需要手动调用 free</button><button>B. GC 会释放所有长时间没被访问的对象</button><button>C. 如果你仍然持有某块内存的引用，GC 永远不会释放它，所以泄漏仍可能发生</button><button>D. GC 语言里不可能发生内存泄漏</button></div>
+  <div class="explain">原书："if you still have a reference to some chunk of memory, no garbage collector will ever free it"。</div></div>
+<div class="mcq" data-answer="2"><div class="q"><code>malloc()</code> 和 <code>free()</code> 是什么？</div>
+  <div class="opts"><button>A. 系统调用，每次调用都陷入内核</button><button>B. 硬件指令</button><button>C. 库调用；malloc 库在进程的虚拟地址空间内管理空间，自身基于 brk/sbrk/mmap 等系统调用</button><button>D. 编译器内建运算符，和 sizeof 一样在编译期完成</button></div>
+  <div class="explain">原书 14.5：它们不是系统调用，而是库调用。</div></div>
+<div class="mcq" data-answer="0"><div class="q">free(p) 之后又通过 p 读数据，最可能发生什么？</div>
+  <div class="opts"><button>A. 可能读到别人的新数据、可能崩溃，行为不可预测；这叫悬挂指针</button><button>B. 编译器会阻止这样写</button><button>C. 一定段错误</button><button>D. 一定读到 0</button></div>
+  <div class="explain">free 后内存可能被重新分配，旧指针读到的是新主人的数据（本机实验：12345）。gcc 14 的 -Wall 有时能在编译期警告 use-after-free，但不是所有情况都能发现。</div></div>
+<div class="mcq" data-answer="1"><div class="q">下面哪个调用是合法且无害的？</div>
+  <div class="opts"><button>A. 对同一个指针 free 两次</button><button>B. free(NULL)</button><button>C. free 一个指向字符串常量 "hello" 的指针</button><button>D. free(p + 50)，p 是 malloc 返回的</button></div>
+  <div class="explain">C 标准规定 free(NULL) 什么也不做。A 是 double free，C 和 D 都是 invalid free。</div></div>
+
+<h2><span class="num">8</span>常见误区与小结</h2>
+<div class="warn">
+  <p><strong>误区 1："程序跑了好几次都对，所以没 bug。"</strong>分配不足、越界、泄漏、悬挂指针在普通运行时经常毫无症状。要用 valgrind / ASan 验证。</p>
+  <p><strong>误区 2："malloc 的内存是 0。"</strong>不保证。刚从 OS 拿来的新页通常是 0，但复用的块里是旧数据（本机 uninit 实验读到了 7 7 7 7）。需要 0 就用 calloc。</p>
+  <p><strong>误区 3："free 之后指针就变成 NULL 了。"</strong>不会。指针里仍是旧地址，需要自己写 <code>p = NULL</code>。</p>
+  <p><strong>误区 4："(int *) 这种强制转换让 malloc 更安全。"</strong>cast 对正确性没有作用，只是告诉读者"我知道我在做什么"。</p>
+  <p><strong>误区 5："sizeof(指针) 能告诉我分配了多少。"</strong>它只给出指针本身的大小。</p>
+</div>
+<div class="key">
+  <p><strong>本章小结</strong></p>
+  <ul>
+    <li>两种内存：<strong>栈</strong>（编译器自动管理，随函数返回消失）和<strong>堆</strong>（程序员用 malloc/free 显式管理）。</li>
+    <li><code>malloc(size)</code> 用 <code>sizeof</code> 计算字节数，字符串用 <code>strlen(s)+1</code>；<code>free(ptr)</code> 只接受 malloc 返回的指针，大小由库记录。</li>
+    <li>七种常见错误：忘记分配、分配不足、忘记初始化、忘记释放、过早释放（悬挂指针）、重复释放、free 错误指针。它们都能通过编译，许多还能"正常运行"。</li>
+    <li>malloc/free 是<strong>库调用</strong>，建立在 <code>brk</code>/<code>sbrk</code>/<code>mmap</code> 之上；不要直接调用 brk/sbrk。还有 <code>calloc</code>（清零）和 <code>realloc</code>（扩容并拷贝）。</li>
+    <li>下一步：第 15 章回到 OS 视角，看硬件怎样把虚拟地址翻译成物理地址（基址 + 界限）；第 17 章揭开 malloc 内部：空闲链表、头块、分割与合并。</li>
+  </ul>
+</div>
+
+</main>
+<script>
+(function () {
+  "use strict";
+  const { h, s, color, stepper } = OSTEP;
+  // ==CORE-BEGIN==
+  // 堆操作沙盒：解释执行一小段"类 C"语句，记录每一步的内存状态和检测到的错误。
+  // 简化：堆是 HEAP_N 个字节格子，首次适配、不画头块；指针记住它指向的是哪一块。
+  function runHeapProgram(src, HEAP_N, BASE) {
+    HEAP_N = HEAP_N || 32; BASE = BASE || 1000;
+    const cells = Array.from({ length: HEAP_N }, () => ({ v: undefined, blk: -1 }));
+    const blocks = [];              // {id, start, size, freed, leaked}
+    const vars = {};                // name -> {kind:'ptr'|'int', addr, blk, state:'garbage'|'null'|'ok', v}
+    const order = [];
+    const steps = [];
+    let crashed = null;
+    const snap = () => JSON.parse(JSON.stringify({ cells, blocks, vars, order }));
+    const lines = src.split("\n");
+    const stmts = [];
+    lines.forEach((raw, ln) => {
+      const t = raw.replace(/\/\/.*$/, "").trim().replace(/;\s*$/, "").trim();
+      if (t && !/^(int\s+main|\{|\}|return\b|#include)/.test(t)) stmts.push({ t, ln });
+    });
+    const evalInt = (e) => {
+      e = e.trim();
+      const m = e.match(/^strlen\("([^"]*)"\)\s*([+-]\s*\d+)?$/);
+      if (m) return m[1].length + (m[2] ? Number(m[2].replace(/\s/g, "")) : 0);
+      const sz = e.replace(/sizeof\(\s*int\s*\)/g, "1").replace(/sizeof\(\s*char\s*\)/g, "1");
+      if (!/^[\d+\-*() ]+$/.test(sz)) throw new Error("看不懂的表达式：" + e);
+      return Function('"use strict";return (' + sz + ")")();
+    };
+    const parseVal = (e) => {
+      e = e.trim();
+      let m = e.match(/^'(\\0|.)'$/);
+      if (m) return m[1] === "\\0" ? "\\0" : m[1];
+      if (/^-?\d+$/.test(e)) return Number(e);
+      if (vars[e] && vars[e].kind === "int") return vars[e].v;
+      throw new Error("看不懂的值：" + e);
+    };
+    const blockAt = (addr) => { const i = addr - BASE; return i >= 0 && i < HEAP_N ? cells[i].blk : -1; };
+    const declare = (name, kind) => { if (!vars[name]) order.push(name); vars[name] = { kind, state: kind === "ptr" ? "garbage" : "uninit" }; };
+    function alloc(n, zero) {
+      if (n <= 0) return -1;
+      for (let s = 0; s + n <= HEAP_N; s++) {
+        let ok = true;
+        for (let k = s; k < s + n; k++) if (cells[k].blk >= 0 && !blocks[cells[k].blk].freed) { ok = false; break; }
+        if (ok) {
+          const id = blocks.length;
+          blocks.push({ id, start: BASE + s, size: n, freed: false, leaked: false });
+          for (let k = s; k < s + n; k++) { cells[k].blk = id; if (zero) cells[k].v = 0; else if (cells[k].v === undefined) cells[k].v = undefined; }
+          return id;
+        }
+      }
+      return -1;
+    }
+    // 检查是否有活着的块再也没有指针指向它 → 泄漏
+    function leakCheck(ev) {
+      for (const b of blocks) {
+        if (b.freed || b.leaked) continue;
+        const reach = order.some((n) => vars[n].kind === "ptr" && vars[n].state === "ok" && vars[n].blk === b.id);
+        if (!reach) {
+          b.leaked = true;
+          ev.push({ kind: "err", type: "leak", cells: range(b), msg: `块 #${b.id}（${b.size} 字节，地址 ${b.start}）再也没有任何指针指向它：<b>内存泄漏（memory leak）</b>。程序已无法 free 它。`, tool: `valgrind：${b.size} bytes in 1 blocks are definitely lost；ASan/LeakSanitizer：Direct leak of ${b.size} byte(s)` });
+        }
+      }
+    }
+    const range = (b) => Array.from({ length: b.size }, (_, k) => b.start + k);
+    function deref(name, idx, isWrite, ev) {
+      const p = vars[name];
+      if (!p || p.kind !== "ptr") throw new Error(name + " 不是指针变量");
+      if (p.state === "garbage") { ev.push({ kind: "err", type: "unalloc", fatal: true, cells: [], msg: `<b>${name}</b> 从未被赋值（未初始化），里面是栈上的垃圾值。通过它${isWrite ? "写" : "读"}内存 = 访问一个随机地址：<b>忘记分配内存</b>。`, tool: "真实程序：大概率段错误（Segmentation fault）崩溃；gcc -Wall 会警告 ‘is used uninitialized’" }); return null; }
+      if (p.state === "null") { ev.push({ kind: "err", type: "null", fatal: true, cells: [], msg: `<b>${name}</b> 是 NULL。解引用 NULL 访问的是虚拟地址 0 附近，那里没有映射。`, tool: "真实程序：Segmentation fault；ASan：SEGV on unknown address 0x000000000000" }); return null; }
+      if (p.state === "static") {
+        if (isWrite) { ev.push({ kind: "err", type: "rodata", fatal: true, cells: [], msg: `<b>${name}</b> 指向只读的字符串常量，往里写会触发保护异常。`, tool: "真实程序：Segmentation fault" }); return null; }
+        return { str: (p.str + "\0")[idx] };
+      }
+      const addr = p.addr + idx;
+      const b = blocks[p.blk];
+      const i = addr - BASE;
+      if (b.freed) {
+        const now = i >= 0 && i < HEAP_N ? cells[i].blk : -1;
+        const reused = now >= 0 && now !== b.id && !blocks[now].freed;
+        ev.push({ kind: "err", type: "dangling", cells: [addr], msg: `块 #${b.id} 已经被 free 了，<b>${name}</b> 却还拿着它的地址：<b>悬挂指针（dangling pointer）</b>。${reused ? `更糟的是这块内存已被重新分配成块 #${now}，你正在${isWrite ? "改写" : "读取"}别人的数据！` : ""}`, tool: "ASan：heap-use-after-free；valgrind：Invalid " + (isWrite ? "write" : "read") + " … inside a block … free'd" });
+      } else if (addr < b.start || addr >= b.start + b.size) {
+        const victim = i >= 0 && i < HEAP_N ? cells[i].blk : -1;
+        const vs = victim >= 0 && !blocks[victim].freed ? `，那是<b>块 #${victim}</b> 的数据，被悄悄${isWrite ? "覆盖" : "读出"}了` : (i < 0 || i >= HEAP_N ? "，已经超出整个堆" : "，那里暂时是空闲空间，所以程序多半\"看起来正常\"");
+        ev.push({ kind: "err", type: "overflow", cells: [addr], msg: `块 #${b.id} 只有 ${b.size} 字节（合法下标 0..${b.size - 1}），${name}[${addr - b.start}] <b>越界${isWrite ? "写" : "读"}</b>（buffer overflow）${vs}。`, tool: `ASan：heap-buffer-overflow … located 0 bytes after ${b.size}-byte region；valgrind：Invalid ${isWrite ? "write" : "read"}` });
+        if (i < 0 || i >= HEAP_N) return null;
+      }
+      return i;
+    }
+    for (let si = 0; si < stmts.length && !crashed; si++) {
+      const { t, ln } = stmts[si];
+      const ev = [];
+      let m;
+      try {
+        if ((m = t.match(/^(?:int|char|double)\s*\*\s*(\w+)$/))) {
+          declare(m[1], "ptr");
+          ev.push({ kind: "info", msg: `在栈上声明指针 <b>${m[1]}</b>，但没有初始化：它的值是栈上残留的垃圾。` });
+        } else if ((m = t.match(/^(?:(int|char|double)\s*(\*)?\s*)?(\w+)\s*=\s*(.+)$/)) && !t.match(/^\w+\s*\[/) && !t.startsWith("*")) {
+          const typ = m[1], star = m[2], name = m[3], rhs = m[4].trim();
+          let mm;
+          if ((mm = rhs.match(/^(?:\(\s*\w+\s*\*\s*\)\s*)?(malloc|calloc)\((.+)\)$/))) {
+            if (!vars[name] || vars[name].kind !== "ptr") declare(name, "ptr");
+            const old = { ...vars[name] };
+            let n;
+            if (mm[1] === "calloc") { const a = mm[2].split(","); n = evalInt(a[0]) * (a[1] ? evalInt(a[1]) : 1); } else n = evalInt(mm[2]);
+            const id = alloc(n, mm[1] === "calloc");
+            if (id < 0) { vars[name].state = "null"; ev.push({ kind: "warn", msg: `${mm[1]}(${n}) 失败：堆里找不到连续 ${n} 字节，返回 NULL。` }); }
+            else {
+              Object.assign(vars[name], { state: "ok", addr: blocks[id].start, blk: id });
+              ev.push({ kind: "ok", cells: range(blocks[id]), msg: `${mm[1]}(${n}) 在堆上找到 ${n} 字节（块 #${id}，地址 ${blocks[id].start}），把地址存进栈上的 <b>${name}</b>。${mm[1] === "calloc" ? "calloc 会把内容清零。" : "注意：内容未初始化（显示为 ?）。"}` });
+            }
+            if (old.state === "ok") leakCheck(ev);
+          } else if ((mm = rhs.match(/^"([^"]*)"$/))) {
+            if (!vars[name] || vars[name].kind !== "ptr") declare(name, "ptr");
+            Object.assign(vars[name], { state: "static", str: mm[1] });
+            delete vars[name].addr;
+            ev.push({ kind: "info", msg: `<b>${name}</b> 指向字符串常量 "${mm[1]}"（在只读数据段，不在堆上）。` });
+            leakCheck(ev);
+          } else if (rhs === "NULL" || rhs === "0" && star) {
+            if (!vars[name]) declare(name, "ptr");
+            vars[name].state = "null"; delete vars[name].addr;
+            ev.push({ kind: "info", msg: `<b>${name}</b> = NULL。` });
+            leakCheck(ev);
+          } else if ((mm = rhs.match(/^(\w+)\s*\[(.+)\]$/)) || (mm = rhs.match(/^\*\s*(\w+)$/))) {
+            if (!vars[name]) declare(name, "int");
+            const idx = mm[2] !== undefined ? evalInt(mm[2]) : 0;
+            const i = deref(mm[1], idx, false, ev);
+            if (ev.some((e) => e.fatal)) { crashed = ev.find((e) => e.fatal).type; }
+            else if (i != null && typeof i === "object") { vars[name].state = "ok"; vars[name].v = i.str === undefined ? "?" : i.str; ev.push({ kind: "ok", msg: `读取字符串常量的一个字符：${fmtV(vars[name].v)}。` }); }
+            else if (i != null) {
+              const v = cells[i].v;
+              vars[name].state = v === undefined ? "uninit" : "ok"; vars[name].v = v;
+              if (v === undefined) ev.push({ kind: "err", type: "uninit", cells: [BASE + i], msg: `读取 ${mm[1]}[${idx}]，但这个字节<b>从来没被写过</b>：<b>忘记初始化</b>（uninitialized read）。${name} 得到的是一个不可预知的值。`, tool: "valgrind：Conditional jump or move depends on uninitialised value(s)（ASan 不检测这一类，MSan 可以）" });
+              else if (!ev.length) ev.push({ kind: "ok", cells: [BASE + i], msg: `读取 ${mm[1]}[${idx}] = ${fmtV(v)}，存入 <b>${name}</b>。` });
+              else ev.push({ kind: "info", msg: `（读到的值是 ${fmtV(v)}）` });
+            }
+          } else if ((mm = rhs.match(/^(\w+)\s*(?:([+-])\s*(\d+))?$/)) && vars[mm[1]] && vars[mm[1]].kind === "ptr") {
+            const src = vars[mm[1]];
+            if (!vars[name] || vars[name].kind !== "ptr") declare(name, "ptr");
+            const off = mm[3] ? (mm[2] === "-" ? -1 : 1) * Number(mm[3]) : 0;
+            Object.assign(vars[name], { state: src.state, addr: src.addr != null ? src.addr + off : undefined, blk: src.blk });
+            ev.push({ kind: "info", msg: `<b>${name}</b> = ${mm[1]}${off ? (off > 0 ? " + " + off : " - " + -off) : ""}：两个指针${off ? "指向同一块内存的不同位置" : "指向同一块内存（别名）"}。` });
+            leakCheck(ev);
+          } else if (typ && !star) {
+            declare(name, "int"); vars[name].state = "ok"; vars[name].v = parseVal(rhs);
+            ev.push({ kind: "info", msg: `栈上的整数 <b>${name}</b> = ${vars[name].v}。` });
+          } else throw new Error("看不懂这一行");
+        } else if ((m = t.match(/^(\w+)\s*\[(.+)\]\s*=\s*(.+)$/)) || (m = t.match(/^\*\s*(\w+)\s*=\s*(.+)$/))) {
+          const name = m[1], idx = m.length === 4 ? evalInt(m[2]) : 0, val = parseVal(m.length === 4 ? m[3] : m[2]);
+          const i = deref(name, idx, true, ev);
+          if (ev.some((e) => e.fatal)) crashed = ev.find((e) => e.fatal).type;
+          else if (i != null) {
+            const victim = cells[i].blk;
+            cells[i].v = val;
+            if (!ev.length) ev.push({ kind: "ok", cells: [BASE + i], msg: `写入 ${name}[${idx}] = ${fmtV(val)}（地址 ${BASE + i}）。` });
+            else if (victim >= 0 && victim !== vars[name].blk) cells[i].corrupt = true;
+          }
+        } else if ((m = t.match(/^strcpy\((\w+)\s*,\s*"([^"]*)"\)$/))) {
+          const name = m[1], str = m[2] + "\0";
+          let wrote = 0;
+          for (let k = 0; k < str.length; k++) {
+            const sub = [];
+            const i = deref(name, k, true, sub);
+            if (sub.length) {
+              if (!ev.some((e) => e.type === sub[0].type)) ev.push(...sub.map((e) => ({ ...e, msg: `strcpy 一共要写 ${str.length} 字节（"${m[2]}" 加上结尾的 '\\0'）。` + e.msg })));
+              else if (sub[0].cells) ev.find((e) => e.type === sub[0].type).cells.push(...sub[0].cells);
+            }
+            if (sub.some((e) => e.fatal)) { crashed = sub[0].type; break; }
+            if (i == null) continue;
+            const victim = cells[i].blk;
+            cells[i].v = str[k] === "\0" ? "\\0" : str[k];
+            if (sub.length && victim >= 0 && victim !== vars[name].blk) cells[i].corrupt = true;
+            wrote++;
+          }
+          if (!ev.length) ev.push({ kind: "ok", cells: Array.from({ length: str.length }, (_, k) => vars[name].addr + k), msg: `strcpy 写入 "${m[2]}" 共 ${str.length} 字节（含结尾 '\\0'），刚好放得下。` });
+        } else if ((m = t.match(/^free\((.+)\)$/))) {
+          const arg = m[1].trim();
+          let mm = arg.match(/^(\w+)\s*(?:([+-])\s*(\d+))?$/);
+          if (arg === "NULL") ev.push({ kind: "ok", msg: "free(NULL) 什么也不做，这是合法的。" });
+          else if (!mm || !vars[mm[1]] || vars[mm[1]].kind !== "ptr") throw new Error("free 的参数必须是指针变量");
+          else {
+            const p = vars[mm[1]], off = mm[3] ? (mm[2] === "-" ? -1 : 1) * Number(mm[3]) : 0;
+            if (p.state === "null" && !off) ev.push({ kind: "ok", msg: "free(NULL) 什么也不做，这是合法的。" });
+            else if (p.state !== "ok") { ev.push({ kind: "err", type: "badfree", fatal: true, cells: [], msg: `把一个${p.state === "garbage" ? "未初始化的" : p.state === "static" ? "指向字符串常量（不是 malloc 得到）的" : "无效的"}指针交给 free：<b>free 错误指针</b>。`, tool: "glibc：free(): invalid pointer，然后 abort" }); crashed = "badfree"; }
+            else {
+              const addr = p.addr + off, b = blocks[p.blk];
+              if (b.freed && addr === b.start) {
+                ev.push({ kind: "err", type: "double", fatal: true, cells: range(b), msg: `块 #${b.id} 已经释放过了，又 free 一次：<b>重复释放（double free）</b>。分配器的空闲链表会被搞乱，结果未定义。`, tool: "glibc：free(): double free detected in tcache 2 → Aborted；ASan：attempting double-free" });
+                crashed = "double";
+              } else if (addr !== b.start) {
+                ev.push({ kind: "err", type: "badfree", fatal: true, cells: [addr], msg: `地址 ${addr} 不是 malloc 返回的起始地址（块 #${b.id} 从 ${b.start} 开始）：<b>free 错误指针</b>（invalid free）。分配器会把 ${addr} 前面的字节当成头块去读"大小"，读到的是垃圾。`, tool: "glibc：free(): invalid pointer → Aborted；ASan：attempting free on address which was not malloc()-ed" });
+                crashed = "badfree";
+              } else if (b.freed) {
+                ev.push({ kind: "err", type: "double", fatal: true, cells: range(b), msg: "重复释放。", tool: "" }); crashed = "double";
+              } else {
+                b.freed = true;
+                for (let k = b.start - BASE; k < b.start - BASE + b.size; k++) cells[k].blk = b.id;
+                ev.push({ kind: "ok", cells: range(b), msg: `free(${mm[1]})：块 #${b.id} 的 ${b.size} 字节还给分配器（它自己记得大小，不用你告诉它）。注意 <b>${mm[1]}</b> 里仍然存着旧地址——现在它是一个悬挂指针，最好紧接着写 ${mm[1]} = NULL。` });
+              }
+            }
+          }
+        } else if ((m = t.match(/^print\s*\(?\s*(\w+)\s*\[(.+)\]\s*\)?$/)) || (m = t.match(/^print\s*\(?\s*\*\s*(\w+)\s*\)?$/))) {
+          const idx = m[2] !== undefined ? evalInt(m[2]) : 0;
+          const i = deref(m[1], idx, false, ev);
+          if (ev.some((e) => e.fatal)) crashed = ev.find((e) => e.fatal).type;
+          else if (i != null && typeof i === "object") ev.push({ kind: "ok", msg: `打印 → ${fmtV(i.str)}` });
+          else if (i != null) {
+            const v = cells[i].v;
+            if (v === undefined) ev.push({ kind: "err", type: "uninit", cells: [BASE + i], msg: `打印 ${m[1]}[${idx}]，但这个字节<b>从来没被写过</b>：<b>未初始化读</b>，输出不可预知。`, tool: "valgrind：Conditional jump or move depends on uninitialised value(s)" });
+            else if (!ev.length) ev.push({ kind: "ok", cells: [BASE + i], msg: `打印 ${m[1]}[${idx}] → <b>${fmtV(v)}</b>${cells[i].corrupt ? "（这个值已经被别的指针越界改写过！）" : ""}` });
+            else ev.push({ kind: "info", msg: `（打印出 ${fmtV(v)}）` });
+          }
+        } else throw new Error("看不懂这一行");
+      } catch (e) {
+        return { error: `第 ${ln + 1} 行：${e.message}（${t}）`, steps };
+      }
+      if (crashed) ev.push({ kind: "crash", msg: crashed === "double" || crashed === "badfree" ? "程序被 glibc 中止（Aborted, core dumped）。后面的语句不会执行。" : "程序收到 SIGSEGV：Segmentation fault。后面的语句不会执行。" });
+      steps.push({ ln, t, ev, state: snap() });
+    }
+    // 程序结束：还活着的块
+    const ev = [];
+    if (!crashed) {
+      leakCheck(ev);
+      const live = blocks.filter((b) => !b.freed && !b.leaked);
+      if (live.length) ev.push({ kind: "warn", type: "reachable", cells: live.flatMap(range), msg: `程序结束时还有 ${live.length} 块内存没有 free（仍有指针指向，valgrind 称为 still reachable）。进程退出时 OS 会回收整个地址空间，所以不会真的"丢"，但长期运行的程序这样做就会泄漏。` });
+      const leakedBytes = blocks.filter((b) => b.leaked).reduce((a, b) => a + b.size, 0);
+      if (leakedBytes && !ev.some((e) => e.type === "leak")) ev.push({ kind: "warn", type: "leaked", cells: blocks.filter((b) => b.leaked).flatMap(range), msg: `程序结束。之前泄漏的 ${leakedBytes} 字节始终没能释放（valgrind 在这时报告 definitely lost）；进程退出后 OS 会把它们连同整个地址空间一起收回。` });
+      const nerr = steps.reduce((a, x) => a + x.ev.filter((e) => e.kind === "err").length, 0);
+      if (!ev.length) ev.push(nerr
+        ? { kind: "warn", msg: `程序"正常"结束（退出码 0），内存也都 free 了——但前面发生了 ${nerr} 个内存错误。真实程序里它们往往毫无征兆，只有 valgrind / ASan 这类工具才能发现。` }
+        : { kind: "ok", msg: "程序正常结束，所有 malloc 的内存都已 free。干净！" });
+      steps.push({ ln: -1, t: "（程序结束）", ev, state: snap() });
+    }
+    return { steps };
+  }
+  function fmtV(v) { return v === undefined ? "?" : typeof v === "string" ? (v === "\\0" ? "'\\0'" : `'${v}'`) : String(v); }
+  // ==CORE-END==
+
+  const PRESETS = {
+    ok: ["正确用法：malloc → 写 → 读 → free", `int *p = malloc(4);      // 申请 4 个单元
+p[0] = 7;
+p[1] = 8;
+int x = p[1];            // 读回来
+free(p);                 // 用完释放
+p = NULL;                // 好习惯：防止悬挂`],
+    forget: ["① 忘记分配", `char *src = "hello";
+char *dst;               // oops! unallocated
+strcpy(dst, "hello");    // segfault and die`],
+    small: ["② 分配不足（缓冲区溢出）", `char *dst = malloc(strlen("hello"));   // too small! 需要 +1
+int *q = malloc(4);      // 紧挨着的另一块
+q[0] = 9;
+strcpy(dst, "hello");    // 写 6 字节
+print(q[0]);             // q[0] 还是 9 吗？
+free(dst);
+free(q);`],
+    uninit: ["③ 忘记初始化", `int *p = malloc(4);
+p[0] = 1;
+int x = p[2];            // p[2] 从没写过
+free(p);`],
+    leak: ["④ 忘记释放（内存泄漏）", `int *p = malloc(4);
+p[0] = 1;
+p = malloc(4);           // 旧块再也找不到了
+p[0] = 2;
+free(p);`],
+    dangling: ["⑤ 用完之前释放（悬挂指针）", `int *p = malloc(4);
+p[0] = 1;
+free(p);                 // 释放了，但 p 还留着地址
+int *q = malloc(4);      // 分配器回收利用同一块
+q[0] = 42;
+int x = p[0];            // 通过旧指针读
+free(q);`],
+    double: ["⑥ 重复释放（double free）", `int *p = malloc(4);
+p[0] = 1;
+free(p);
+free(p);                 // 又 free 一次`],
+    badfree: ["⑦ free 错误指针", `int *p = malloc(8);
+int *q = p + 4;          // 指向块的中间
+free(q);                 // 不是 malloc 返回的指针`],
+    over: ["作业 5：数组越界 data[N]", `int *data = malloc(4);   // 合法下标 0..3
+data[3] = 5;
+data[4] = 0;             // 越界 1 个
+free(data);`],
+    reach: ["退出时未释放（still reachable）", `int *p = malloc(6);
+strcpy(p, "hello");
+print(p[0]);
+// 忘了 free(p)，直接结束`],
+  };
+  const $ = (id) => document.getElementById(id);
+  const HEAP_N = 32, BASE = 1000, PER = 16;
+
+  // 画出某一步的内存状态（沙盒和正文插图共用）
+  function drawState(host, st, evs) {
+    const cw = 38, ch = 34, x0 = 56, hy0 = 150;
+    const names = st.order;
+    const W = x0 + PER * cw + 20, H = hy0 + 2 * (ch + 30) + 16;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "栈与堆的状态" });
+    const mk = (id, c) => s("marker", { id, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto" }, s("path", { d: "M0,0 L10,5 L0,10 z", style: `fill:${c}` }));
+    const uid = "m" + Math.random().toString(36).slice(2, 8);
+    svg.append(s("defs", {}, mk(uid + "a", "var(--accent)"), mk(uid + "b", "var(--bad)")));
+    svg.append(s("text", { x: 8, y: 16, "font-size": 12.5, style: "font-weight:600", text: "栈（变量）" }));
+    svg.append(s("text", { x: 8, y: H - 4, "font-size": 12.5, style: "font-weight:600", text: "↑ 堆（地址 1000 起，每格一个单元；虚线灰格 = 已 free，红格 = 泄漏，黄格 = 被越界改写）" }));
+    const hot = new Map();
+    for (const e of evs || []) for (const a of e.cells || []) hot.set(a, e.kind === "err" ? "bad" : e.kind === "warn" ? "warn" : "ok");
+    const cellXY = (addr) => { const i = addr - BASE; return [x0 + (i % PER) * cw, hy0 + Math.floor(i / PER) * (ch + 30)]; };
+    // 堆格子
+    for (let i = 0; i < HEAP_N; i++) {
+      const c = st.cells[i], [x, y] = cellXY(BASE + i);
+      if (i % PER === 0) svg.append(s("text", { x: x0 - 6, y: y + ch / 2 + 4, "text-anchor": "end", "font-size": 10.5, class: "t-muted mono", text: BASE + i }));
+      let style = "fill:var(--surface);stroke:var(--border)";
+      const b = c.blk >= 0 ? st.blocks[c.blk] : null;
+      if (b && b.leaked) style = "fill:var(--bad-soft);stroke:var(--bad)";
+      else if (b && !b.freed) style = `fill:color-mix(in srgb, ${color(b.id)} 22%, var(--surface));stroke:${color(b.id)}`;
+      else if (b && b.freed) style = "fill:var(--surface-2);stroke:var(--faint);stroke-dasharray:3 2";
+      if (c.corrupt) style = "fill:var(--warn-soft);stroke:var(--warn)";
+      svg.append(s("rect", { x: x + 1, y, width: cw - 2, height: ch, rx: 3, style }));
+      const txt = c.v === undefined ? (b && !b.freed ? "?" : "") : fmtV(c.v).replace(/^'(.*)'$/, "$1");
+      svg.append(s("text", { x: x + cw / 2, y: y + ch / 2 + 4, "text-anchor": "middle", "font-size": 12, class: "mono" + (b && b.freed || c.v === undefined ? " t-muted" : ""), text: txt }));
+      const hk = hot.get(BASE + i);
+      if (hk) svg.append(s("rect", { x: x - 1, y: y - 2, width: cw + 2, height: ch + 4, rx: 4, style: `fill:none;stroke:var(--${hk});stroke-width:2.5` }));
+    }
+    // 块标签
+    for (const b of st.blocks) {
+      const [x, y] = cellXY(b.start);
+      const lab = "#" + b.id + (b.leaked ? " 泄漏" : b.freed ? " 已free" : "");
+      svg.append(s("text", { x: x + 3, y: y + ch + 13, "font-size": 10.5, style: b.leaked ? "fill:var(--bad)" : b.freed ? "fill:var(--muted)" : `fill:${color(b.id)};font-weight:600`, text: lab }));
+    }
+    // 栈变量
+    const bw = 104, gap = 10;
+    names.forEach((n, k) => {
+      const v = st.vars[n], x = 8 + k * (bw + gap), y = 24;
+      let val = "", sty = "", tgt = null;
+      if (v.kind === "int") { val = v.state === "uninit" ? "?" : fmtV(v.v); }
+      else if (v.state === "garbage") { val = "??? 垃圾"; sty = "fill:var(--bad)"; }
+      else if (v.state === "null") val = "NULL";
+      else if (v.state === "static") val = `"${v.str}"`;
+      else { val = String(v.addr); tgt = v.addr; }
+      svg.append(s("rect", { x, y, width: bw, height: 44, rx: 5, class: "box-strong" }));
+      svg.append(s("text", { x: x + 8, y: y + 17, "font-size": 11.5, class: "t-muted mono", text: (v.kind === "ptr" ? "*" : "") + n }));
+      svg.append(s("text", { x: x + 8, y: y + 35, "font-size": 12.5, class: "mono", style: sty, text: val }));
+      if (tgt != null) {
+        const i = tgt - BASE;
+        const dang = v.blk != null && st.blocks[v.blk] && st.blocks[v.blk].freed;
+        if (i >= 0 && i < HEAP_N) {
+          const [cx, cy] = cellXY(tgt);
+          const sx = x + bw / 2, sy = y + 44;
+          const tx = cx + cw / 2, ty = cy - 2;
+          svg.append(s("path", { d: `M${sx} ${sy} C ${sx} ${sy + 40}, ${tx} ${ty - 40}, ${tx} ${ty}`, style: `fill:none;stroke:${dang ? "var(--bad)" : "var(--accent)"};stroke-width:1.6;${dang ? "stroke-dasharray:4 3" : ""}`, "marker-end": `url(#${uid}${dang ? "b" : "a"})` }));
+        }
+      }
+      if (v.state === "garbage") svg.append(s("text", { x: x + bw / 2, y: y + 62, "text-anchor": "middle", "font-size": 11, style: "fill:var(--bad)", text: "↘ 指向某个随机地址" }));
+    });
+    host.replaceChildren(svg);
+  }
+
+  // ---------- 沙盒 ----------
+  const sel = $("hs-preset");
+  for (const [k, [name]] of Object.entries(PRESETS)) sel.append(h("option", { value: k }, name));
+  let run = { steps: [] };
+  function narrate(step) {
+    if (!step) return "";
+    const icon = { ok: "✓", err: "✗", warn: "⚠", info: "·", crash: "‼" };
+    return `<div><b>执行：</b><code>${step.t.replace(/</g, "&lt;")}</code></div>` + step.ev.map((e) =>
+      `<div class="ev ${e.kind}"><b class="tag">${icon[e.kind] || "·"}</b> ${e.msg}${e.tool ? `<span class="tool">工具/真实表现：${e.tool}</span>` : ""}</div>`).join("");
+  }
+  function paintProg(cur) {
+    const lines = $("hs-src").value.split("\n");
+    const box = $("hs-prog"); box.replaceChildren();
+    lines.forEach((ln, i) => box.append(h("div", { class: i === cur ? "cur" : "" }, h("span", { class: "ln" }, i + 1), ln || " ")));
+  }
+  const hs = stepper($("hs-step"), { steps: () => Math.max(1, run.steps.length + 1), autoplayMs: 1200, render(i) {
+    if (run.error) { $("hs-narrate").innerHTML = `<b style="color:var(--bad)">解析出错：</b>${run.error}`; $("hs-svg").replaceChildren(); paintProg(-1); return; }
+    const empty = { cells: Array.from({ length: HEAP_N }, () => ({ blk: -1 })), blocks: [], vars: {}, order: [] };
+    const step = i === 0 ? null : run.steps[i - 1];
+    drawState($("hs-svg"), step ? step.state : empty, step ? step.ev : []);
+    paintProg(step ? step.ln : -1);
+    $("hs-narrate").innerHTML = step ? narrate(step) : "程序开始：栈上还没有变量，堆是空的。点 <b>下一步 ▶</b> 逐行执行。";
+    const st = step ? step.state : empty;
+    $("hs-s1").textContent = st.blocks.filter((b) => !b.freed && !b.leaked).length;
+    $("hs-s2").textContent = st.blocks.filter((b) => b.freed).length;
+    $("hs-s3").textContent = st.blocks.filter((b) => b.leaked).reduce((a, b) => a + b.size, 0);
+    $("hs-s4").textContent = run.steps.slice(0, i).reduce((a, x) => a + x.ev.filter((e) => e.kind === "err").length, 0);
+  } });
+  function load() { run = runHeapProgram($("hs-src").value, HEAP_N, BASE); hs.reset(); }
+  sel.onchange = () => { $("hs-src").value = PRESETS[sel.value][1]; load(); };
+  $("hs-load").onclick = load;
+  sel.value = "small"; $("hs-src").value = PRESETS.small[1]; load();
+
+  // ---------- 正文插图：取每个预设第一次出错的那一步 ----------
+  document.querySelectorAll(".demo[data-demo]").forEach((el) => {
+    const r = runHeapProgram(PRESETS[el.dataset.demo][1], HEAP_N, BASE);
+    let st = r.steps.find((x) => x.ev.some((e) => e.kind === "err")) || r.steps[r.steps.length - 1];
+    drawState(el, st.state, st.ev.filter((e) => e.kind === "err"));
+    const msg = st.ev.filter((e) => e.kind === "err").map((e) => e.msg.replace(/<[^>]+>/g, "")).join(" ");
+    el.append(h("div", { class: "small", style: { marginTop: "6px", textAlign: "left" } }, h("code", {}, st.t), "　", msg));
+  });
+})();
+</script>
+</body></html>

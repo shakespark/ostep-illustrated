@@ -1,0 +1,981 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 48 章 · 分布式系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+  .defs { position: absolute; width: 0; height: 0; overflow: hidden; }
+  .lane-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; color: var(--muted); margin-top: 8px; }
+  .lane-legend i { display: inline-block; width: 18px; height: 3px; vertical-align: middle; margin-right: 4px; border-radius: 2px; }
+  .state-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; margin-top: 12px; }
+  .state-grid .readout { margin-top: 0; }
+  .rpc-buf { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; }
+  .rpc-buf .field { display: inline-flex; flex-direction: column; align-items: center; }
+  .rpc-buf .field small { font-size: 11.5px; color: var(--muted); }
+  .rpc-buf .cell.f0 { border-color: var(--c8); }
+  .rpc-buf .cell.f1 { border-color: var(--c4); background: var(--surface-2); }
+  .rpc-buf .cell.f2 { border-color: var(--c1); background: var(--accent-soft); }
+  .rpc-buf .cell.f3 { border-color: var(--c3); background: var(--ok-soft); }
+  .rpc-buf .cell.f4 { border-color: var(--c2); background: var(--warn-soft); }
+  #rl-stage svg, #rpc-stage svg { max-width: none; }
+  .sim select { max-width: 100%; }
+  .bad-text { color: var(--bad); font-weight: 600; }
+  .ok-text { color: var(--ok); font-weight: 600; }
+</style>
+</head>
+<body data-chapter="48">
+<main>
+
+<svg class="defs" aria-hidden="true" focusable="false">
+  <defs>
+    <marker id="d48-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker>
+    <marker id="d48-ah-c1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--c1)"/></marker>
+    <marker id="d48-ah-c3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--c3)"/></marker>
+    <marker id="d48-ah-acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker>
+    <marker id="d48-ah-bad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--bad)"/></marker>
+  </defs>
+</svg>
+
+<h2>关键问题：部件会坏，系统不能坏</h2>
+<div class="crux">
+  <p><strong>如何在部件会出故障的前提下构建能正常工作的系统？</strong>机器、磁盘、网络、软件都会时不时出故障，我们（很可能永远）造不出"完美"的部件。怎样用并不总是正确工作的部件，拼出一个看起来很少出故障的系统？</p>
+  <p class="small muted">原文：HOW TO BUILD SYSTEMS THAT WORK WHEN COMPONENTS FAIL. How can we build a working system out of parts that don't work correctly all the time?</p>
+</div>
+<p>你打开的每个网页背后，往往是成千上万台机器在协作。分布式系统带来的新挑战里，本章关注最主要的一个：<strong>故障（failure）</strong>。有意思的是，故障既是挑战也是机会：单台机器坏了，并不意味着整个系统必须停摆——把许多机器组合起来，就能做出一个"看起来几乎不坏"的系统，尽管它的部件经常在坏。</p>
+<p>这让人想起第 38 章的 RAID：用多块会坏的盘拼出一个可靠的盘。但分布式系统的问题更复杂：除了故障，还要考虑<strong>性能</strong>（尽量少发消息、低延迟高带宽）和<strong>安全</strong>（确认对方身份、防止第三方窃听或篡改）。本章先打地基：<strong>机器之间怎么通信</strong>，以及通信层如何对付故障。接下来的第 49 章（NFS）和第 50 章（AFS）就是建立在这些通信原语之上的分布式文件系统。</p>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>丢包是常态</h4><p>比特翻转、链路断开，最根本的是路由器/主机缓冲区满了只能丢包。通信天生不可靠。</p></div>
+  <div class="card"><h4>UDP：不可靠通信层</h4><p>发出去的数据报可能丢，发送方不会被通知；只有校验和（checksum）检测部分损坏。</p></div>
+  <div class="card"><h4>确认（ack）</h4><p>接收方回一条短消息"我收到了"，发送方由此知道对方确实收到。</p></div>
+  <div class="card"><h4>超时/重传（timeout/retry）</h4><p>发送时保留副本并设定时器；定时器到期还没 ack，就再发一次。</p></div>
+  <div class="card"><h4>序列号（sequence counter）</h4><p>双方各维护一个计数器，接收方据此识别重复消息：仍然 ack，但不再交给应用。</p></div>
+  <div class="card"><h4>分布式共享内存（DSM）</h4><p>用虚拟内存把多台机器伪装成一个地址空间；故障和性能都难处理，几乎没人用。</p></div>
+  <div class="card"><h4>远程过程调用（RPC）</h4><p>让远程执行像调用本地函数：存根生成器负责封送（marshaling），运行时库负责可靠传输。</p></div>
+  <div class="card"><h4>端到端论证（end-to-end）</h4><p>某些功能（如可靠文件传输）只有最上层的应用"端点"才能真正保证。</p></div>
+</div>
+
+<h2>通信基础：丢包是常态</h2>
+<p>现代网络的核心信条是：<strong>通信从根本上就是不可靠的</strong>。无论是广域的互联网，还是局域网里的 InfiniBand 这类高速网络，包都会经常丢失、损坏，或者因为别的原因到不了目的地。原因有好几类：</p>
+<figure class="fig">
+  <svg viewBox="0 0 760 250" width="760" role="img" aria-label="丢包的三类原因">
+    <!-- panel 1 -->
+    <rect x="10" y="10" width="236" height="230" rx="10" class="box"/>
+    <text x="128" y="36" text-anchor="middle" font-weight="700" font-size="15">① 传输中比特翻转</text>
+    <text x="30" y="80" class="mono" font-size="14">发出：1011 0010</text>
+    <line x1="60" y1="92" x2="200" y2="120" class="arrow" marker-end="url(#d48-ah)"/>
+    <text x="30" y="148" class="mono" font-size="14">收到：10<tspan style="fill:var(--bad);font-weight:700">0</tspan>1 0010</text>
+    <text x="128" y="185" text-anchor="middle" font-size="13" class="t-muted">电气干扰等让某些位变了</text>
+    <text x="128" y="205" text-anchor="middle" font-size="13" class="t-muted">→ 用校验和（checksum）检测，</text>
+    <text x="128" y="223" text-anchor="middle" font-size="13" class="t-muted">检测到就当作丢弃</text>
+    <!-- panel 2 -->
+    <rect x="262" y="10" width="236" height="230" rx="10" class="box"/>
+    <text x="380" y="36" text-anchor="middle" font-weight="700" font-size="15">② 部件坏了</text>
+    <rect x="282" y="70" width="60" height="40" rx="6" class="box-strong"/><text x="312" y="95" text-anchor="middle" font-size="13">主机 A</text>
+    <rect x="418" y="70" width="60" height="40" rx="6" class="bad-soft"/><text x="448" y="95" text-anchor="middle" font-size="13">主机 B</text>
+    <line x1="342" y1="90" x2="372" y2="90" class="stroke" stroke-width="2"/>
+    <line x1="388" y1="90" x2="418" y2="90" class="stroke" stroke-width="2"/>
+    <path d="M372,80 L380,100 M388,80 L380,100" style="stroke:var(--bad);stroke-width:2.5;fill:none"/>
+    <text x="380" y="140" text-anchor="middle" font-size="13" class="t-muted">网线被意外切断、</text>
+    <text x="380" y="160" text-anchor="middle" font-size="13" class="t-muted">路由器损坏、远端主机宕机</text>
+    <text x="380" y="195" text-anchor="middle" font-size="13" class="t-muted">包发出去了，</text>
+    <text x="380" y="213" text-anchor="middle" font-size="13" class="t-muted">但没有人能收到</text>
+    <!-- panel 3 -->
+    <rect x="514" y="10" width="236" height="230" rx="10" class="warn-soft"/>
+    <text x="632" y="36" text-anchor="middle" font-weight="700" font-size="15">③ 缓冲区满（最根本）</text>
+    <text x="545" y="68" font-size="12" class="t-muted">同时涌入的包</text>
+    <rect x="530" y="76" width="14" height="14" rx="2" style="fill:var(--c1)"/><rect x="548" y="76" width="14" height="14" rx="2" style="fill:var(--c2)"/><rect x="566" y="76" width="14" height="14" rx="2" style="fill:var(--c3)"/><rect x="584" y="76" width="14" height="14" rx="2" style="fill:var(--c4)"/><rect x="602" y="76" width="14" height="14" rx="2" style="fill:var(--c5)"/>
+    <line x1="622" y1="83" x2="648" y2="104" class="arrow" marker-end="url(#d48-ah)"/>
+    <rect x="600" y="108" width="110" height="34" rx="6" class="box-strong"/>
+    <rect x="606" y="115" width="18" height="20" rx="2" style="fill:var(--c1)"/><rect x="628" y="115" width="18" height="20" rx="2" style="fill:var(--c2)"/><rect x="650" y="115" width="18" height="20" rx="2" style="fill:var(--c3)"/><rect x="672" y="115" width="18" height="20" rx="2" style="fill:var(--c4)"/>
+    <text x="655" y="158" text-anchor="middle" font-size="12" class="t-muted">路由器内存（满）</text>
+    <rect x="540" y="170" width="14" height="14" rx="2" style="fill:var(--c5)"/>
+    <path d="M536,166 L558,188 M558,166 L536,188" style="stroke:var(--bad);stroke-width:2.5"/>
+    <text x="570" y="182" font-size="13" style="fill:var(--bad)">放不下，只能丢</text>
+    <text x="632" y="212" text-anchor="middle" font-size="13" class="t-muted">即使所有部件都完好</text>
+    <text x="632" y="230" text-anchor="middle" font-size="13" class="t-muted">也会丢包（端主机同理）</text>
+  </svg>
+  <figcaption>图 48-A：丢包的三类原因。第三类说明：就算链路和机器都完美无缺，丢包也无法避免。</figcaption>
+</figure>
+<p>第三点最关键：一个包到达路由器后，必须先放进路由器的内存里才能处理。如果同一时刻涌进来太多包，内存装不下，路由器唯一能做的就是<strong>丢掉一部分</strong>。端主机也一样：你向同一台机器猛发大量消息，它的资源很快就会被压垮，于是又开始丢包。<strong>所以丢包在网络中是根本性的</strong>，问题只能是：我们怎么应对它？</p>
+
+<div class="aside" data-title="提示：用校验和保证完整性">
+  <p>发送前对消息的字节算一个校验和（checksum），和消息一起发出；接收方对收到的字节再算一次，两者一致就可以比较放心地认为数据没在路上被损坏。最简单的校验和是把字节加起来；更复杂的有 CRC、Fletcher 校验和等。评价校验和有两个维度：<strong>有效性</strong>（数据变了，校验和是否一定跟着变）和<strong>性能</strong>（算起来多贵）——两者经常互相矛盾。</p>
+</div>
+
+<h2>不可靠通信层：UDP</h2>
+<p>最简单的应对办法是：<strong>不处理</strong>。有些应用自己知道怎么处理丢包，给它们一个基本的不可靠消息层就够了——这也是后面会讲的"端到端论证"的一个例子。今天几乎所有系统都自带的 <strong>UDP/IP</strong> 协议栈就是这样的不可靠层：进程用套接字（sockets）API 创建一个通信端点，其他机器（或同一台机器）上的进程向它发送 UDP <strong>数据报（datagram）</strong>——一个有最大长度限制的消息。</p>
+<p>下面是原书 Figure 48.1 的客户端/服务端，只保留了核心部分：</p>
+<pre><code>// client code
+int main(int argc, char *argv[]) {
+    int sd = UDP_Open(20000);                     // 在本机 20000 端口建一个端点
+    struct sockaddr_in addrSnd, addrRcv;
+    int rc = UDP_FillSockAddr(&amp;addrSnd, "cs.wisc.edu", 10000);  // 目的地：主机名 + 端口
+    char message[BUFFER_SIZE];
+    sprintf(message, "hello world");
+    rc = UDP_Write(sd, &amp;addrSnd, message, BUFFER_SIZE);          // 发出去（可能丢！）
+    if (rc &gt; 0)
+        rc = UDP_Read(sd, &amp;addrRcv, message, BUFFER_SIZE);       // 等回复（可能永远等不到）
+    return 0;
+}
+
+// server code
+int main(int argc, char *argv[]) {
+    int sd = UDP_Open(10000);
+    assert(sd &gt; -1);
+    while (1) {
+        struct sockaddr_in addr;
+        char message[BUFFER_SIZE];
+        int rc = UDP_Read(sd, &amp;addr, message, BUFFER_SIZE);     // addr 里记下是谁发来的
+        if (rc &gt; 0) {
+            char reply[BUFFER_SIZE];
+            sprintf(reply, "goodbye world");
+            rc = UDP_Write(sd, &amp;addr, reply, BUFFER_SIZE);       // 按原地址回复
+        }
+    }
+    return 0;
+}</code></pre>
+<p>它们依赖的小库（Figure 48.2）只是对套接字系统调用的薄封装：</p>
+<pre><code>int UDP_Open(int port) {
+    int sd;
+    if ((sd = socket(AF_INET, SOCK_DGRAM, 0)) == -1)   // SOCK_DGRAM：数据报 = UDP
+        return -1;
+    struct sockaddr_in myaddr;
+    bzero(&amp;myaddr, sizeof(myaddr));
+    myaddr.sin_family      = AF_INET;
+    myaddr.sin_port        = htons(port);              // 端口转成网络字节序
+    myaddr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(sd, (struct sockaddr *) &amp;myaddr, sizeof(myaddr)) == -1) {
+        close(sd);
+        return -1;
+    }
+    return sd;
+}
+int UDP_FillSockAddr(struct sockaddr_in *addr, char *hostname, int port) {
+    bzero(addr, sizeof(struct sockaddr_in));
+    addr-&gt;sin_family = AF_INET;          // host byte order
+    addr-&gt;sin_port   = htons(port);      // network byte order
+    struct hostent *host_entry;
+    if ((host_entry = gethostbyname(hostname)) == NULL)   // 命名：主机名 → IP
+        return -1;
+    addr-&gt;sin_addr = *(struct in_addr *) host_entry-&gt;h_addr;
+    return 0;
+}
+int UDP_Write(int sd, struct sockaddr_in *addr, char *buffer, int n) {
+    return sendto(sd, buffer, n, 0, (struct sockaddr *) addr, sizeof(struct sockaddr_in));
+}
+int UDP_Read(int sd, struct sockaddr_in *addr, char *buffer, int n) {
+    int len = sizeof(struct sockaddr_in);
+    return recvfrom(sd, buffer, n, 0, (struct sockaddr *) addr, (socklen_t *) &amp;len);
+}</code></pre>
+<ul>
+  <li><code>socket(AF_INET, SOCK_DGRAM, 0)</code>：创建 IPv4 的数据报套接字；<code>bind</code> 把它绑到一个端口上，别人才能按"IP + 端口"找到它。</li>
+  <li><code>htons</code>：把端口号从主机字节序转换为网络字节序（大端）。字节序问题在后面的 RPC 一节还会遇到。</li>
+  <li><code>sendto</code> 返回成功只代表"交给了本机网络栈"，<strong>不代表对方收到了</strong>。</li>
+  <li>客户端的 <code>UDP_Read</code> 会一直阻塞：如果请求或回复在路上丢了，客户端就永远等下去。</li>
+</ul>
+<p>UDP 是不可靠通信层的典型：包会丢，发送方也<strong>不会被告知</strong>。但它也不是什么都不管——UDP 包含一个校验和，用来检测某些形式的包损坏。然而很多应用只想"把数据发过去"而不操心丢包，所以我们需要更多：<strong>在不可靠的网络之上构建可靠的通信</strong>。</p>
+
+<h2>可靠通信层：确认、超时/重传、序列号</h2>
+<p>设想客户端通过不可靠的连接给服务器发消息。第一个问题：<strong>发送方怎么知道接收方真的收到了？</strong>办法叫<strong>确认（acknowledgment，简称 ack）</strong>：接收方收到后回一条短消息。发送方收到 ack，就能放心对方收到了原始消息。</p>
+<p>那没收到 ack 怎么办？再加一个机制：<strong>超时（timeout）</strong>。发送方发消息时设一个定时器；如果到期时还没收到 ack，就断定消息丢了，于是<strong>重试（retry）</strong>——再发一次同样的消息。为此发送方必须<strong>保留消息的副本</strong>。这套组合被称为<strong>超时/重传（timeout/retry）</strong>。</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 780 300" width="780" role="img" aria-label="三种时序：正常、请求丢失、ack丢失">
+    <g font-size="12.5">
+      <!-- 48.3 -->
+      <text x="130" y="20" text-anchor="middle" font-weight="700" font-size="14">正常：消息 + ack（图 48.3）</text>
+      <text x="45" y="42" text-anchor="middle" font-weight="600">发送方</text><text x="215" y="42" text-anchor="middle" font-weight="600">接收方</text>
+      <line x1="45" y1="50" x2="45" y2="290" class="stroke"/><line x1="215" y1="50" x2="215" y2="290" class="stroke"/>
+      <line x1="45" y1="70" x2="213" y2="110" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d48-ah-c1)"/>
+      <text x="120" y="80" style="fill:var(--c1)">消息</text>
+      <line x1="215" y1="120" x2="47" y2="160" style="stroke:var(--c3);stroke-width:2" marker-end="url(#d48-ah-c3)"/>
+      <text x="140" y="155" style="fill:var(--c3)">ack</text>
+      <text x="222" y="115">收到；回 ack</text>
+      <text x="52" y="175">收到 ack</text>
+      <!-- 48.4 -->
+      <text x="390" y="20" text-anchor="middle" font-weight="700" font-size="14">请求丢失（图 48.4）</text>
+      <text x="305" y="42" text-anchor="middle" font-weight="600">发送方</text><text x="475" y="42" text-anchor="middle" font-weight="600">接收方</text>
+      <line x1="305" y1="50" x2="305" y2="290" class="stroke"/><line x1="475" y1="50" x2="475" y2="290" class="stroke"/>
+      <line x1="305" y1="70" x2="385" y2="89" style="stroke:var(--bad);stroke-width:2;stroke-dasharray:5 4"/>
+      <path d="M380,82 L392,96 M392,82 L380,96" style="stroke:var(--bad);stroke-width:2.5"/>
+      <text x="312" y="66" font-size="11.5" class="t-muted">留副本、设定时器</text>
+      <rect x="296" y="72" width="5" height="80" rx="2" style="fill:var(--warn)"/>
+      <text x="312" y="140" font-size="11.5" style="fill:var(--warn)">定时器到期 → 重传</text>
+      <line x1="305" y1="152" x2="473" y2="192" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d48-ah-c1)"/>
+      <line x1="475" y1="200" x2="307" y2="240" style="stroke:var(--c3);stroke-width:2" marker-end="url(#d48-ah-c3)"/>
+      <text x="400" y="235" style="fill:var(--c3)">ack</text>
+      <text x="312" y="258" font-size="11.5">收到 ack；删副本、关定时器</text>
+      <!-- 48.5 -->
+      <text x="650" y="20" text-anchor="middle" font-weight="700" font-size="14">ack 丢失（图 48.5）</text>
+      <text x="565" y="42" text-anchor="middle" font-weight="600">发送方</text><text x="735" y="42" text-anchor="middle" font-weight="600">接收方</text>
+      <line x1="565" y1="50" x2="565" y2="290" class="stroke"/><line x1="735" y1="50" x2="735" y2="290" class="stroke"/>
+      <line x1="565" y1="70" x2="733" y2="110" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d48-ah-c1)"/>
+      <line x1="735" y1="115" x2="655" y2="134" style="stroke:var(--bad);stroke-width:2;stroke-dasharray:5 4"/>
+      <path d="M648,127 L660,141 M660,127 L648,141" style="stroke:var(--bad);stroke-width:2.5"/>
+      <text x="742" y="112" font-size="11.5">收到①</text>
+      <rect x="556" y="72" width="5" height="80" rx="2" style="fill:var(--warn)"/>
+      <text x="572" y="165" font-size="11.5" style="fill:var(--warn)">超时 → 重传</text>
+      <line x1="565" y1="152" x2="733" y2="192" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d48-ah-c1)"/>
+      <text x="742" y="190" font-size="11.5" style="fill:var(--bad);font-weight:700">又收到②！</text>
+      <line x1="735" y1="200" x2="567" y2="240" style="stroke:var(--c3);stroke-width:2" marker-end="url(#d48-ah-c3)"/>
+      <text x="572" y="258" font-size="11.5">收到 ack</text>
+      <text x="650" y="285" text-anchor="middle" font-size="12" style="fill:var(--bad)">接收方收到了两次同一条消息</text>
+    </g>
+  </svg>
+  <figcaption>图 48-B：原书 Figure 48.3 / 48.4 / 48.5。从发送方看，"请求丢了"和"ack 丢了"一模一样：都是等不到 ack。</figcaption>
+</figure>
+
+<p>可惜仅有超时/重传还不够。看右边的情况：丢的不是消息而是 ack。在发送方看来情形完全一样——没收到 ack，于是超时重传；可在接收方看来，<strong>同一条消息收到了两次</strong>！有时这无所谓，但一般不行：想象你在下载文件，结果文件中间有些包被重复写了进去。所以可靠消息层通常还要保证每条消息<strong>恰好被接收一次（exactly once）</strong>。</p>
+<p>为了识别重复，发送方要给每条消息一个唯一标识，接收方要能判断是否见过它。看到重复消息时，接收方<strong>照样回 ack</strong>（否则发送方会一直重传），但<strong>关键是不把它交给应用</strong>。</p>
+<p>一种办法是每条消息带全局唯一 ID，接收方记住见过的所有 ID——但这需要无限的内存。更省的办法是<strong>序列计数器（sequence counter）</strong>：</p>
+<figure class="fig">
+  <svg viewBox="0 0 720 210" width="720" role="img" aria-label="序列计数器去重">
+    <rect x="20" y="20" width="200" height="170" rx="10" class="accent-soft"/>
+    <text x="120" y="46" text-anchor="middle" font-weight="700">发送方</text>
+    <text x="120" y="76" text-anchor="middle" class="mono" font-size="14">counter = N</text>
+    <text x="120" y="104" text-anchor="middle" font-size="13">发消息时附上当前值 N</text>
+    <text x="120" y="126" text-anchor="middle" font-size="13">发完后 counter = N+1</text>
+    <text x="120" y="160" text-anchor="middle" font-size="12" class="t-muted">（双方事先约定起始值，</text>
+    <text x="120" y="178" text-anchor="middle" font-size="12" class="t-muted">比如都从 1 开始）</text>
+    <rect x="500" y="20" width="200" height="170" rx="10" class="ok-soft"/>
+    <text x="600" y="46" text-anchor="middle" font-weight="700">接收方</text>
+    <text x="600" y="76" text-anchor="middle" class="mono" font-size="14">expected = N</text>
+    <text x="600" y="104" text-anchor="middle" font-size="13">收到 ID == expected：</text>
+    <text x="600" y="122" text-anchor="middle" font-size="13">ack + 交给应用 + expected++</text>
+    <text x="600" y="152" text-anchor="middle" font-size="13" style="fill:var(--bad)">收到 ID &lt; expected：</text>
+    <text x="600" y="170" text-anchor="middle" font-size="13" style="fill:var(--bad)">重复！只 ack，不交给应用</text>
+    <line x1="222" y1="70" x2="496" y2="70" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d48-ah-c1)"/>
+    <text x="360" y="62" text-anchor="middle" style="fill:var(--c1)" font-size="13">消息 (ID = N)</text>
+    <line x1="498" y1="120" x2="224" y2="120" style="stroke:var(--c3);stroke-width:2" marker-end="url(#d48-ah-c3)"/>
+    <text x="360" y="112" text-anchor="middle" style="fill:var(--c3)" font-size="13">ack N</text>
+    <text x="360" y="160" text-anchor="middle" font-size="12.5" class="t-muted">每端只需存一个整数，</text>
+    <text x="360" y="178" text-anchor="middle" font-size="12.5" class="t-muted">而不是"见过的所有 ID"</text>
+  </svg>
+  <figcaption>图 48-C：序列计数器。ack N 丢失后发送方重发 N，而接收方的 expected 已经是 N+1，于是识别出重复。</figcaption>
+</figure>
+
+<div class="aside" data-title="提示：小心设置超时值">
+  <p>超时太短，发送方会白白重发消息，浪费发送方 CPU 和网络资源；超时太长，发送方等太久才重发，感知到的性能下降。从单个客户端和服务器的角度看，"正确"的值是<strong>刚好足够长以检测丢包，但不再更长</strong>。</p>
+  <p>而在多个客户端访问一个服务器的场景中，服务器端的丢包可能意味着它已经过载。这时客户端可以自适应地重试：第一次超时后把超时值提高（比如翻倍）。这种<strong>指数退避（exponential back-off）</strong>最早来自 Aloha 网络并被早期以太网采用，可以避免大量重发进一步压垮资源。</p>
+</div>
+
+<p>最常用的可靠通信层是 <strong>TCP/IP</strong>（简称 TCP）。它比上面描述的复杂得多：有应对网络拥塞的机制、允许多个未完成的请求同时在途，以及上百个其他改进。下面的模拟器实现的是最简单的"停止-等待"版本：一次只有一条消息在途。</p>
+
+<section class="sim" id="sim-reliable">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>可靠通信协议：泳道图</h3>
+    <div class="desc">左边是发送方、右边是接收方，时间从上往下流。调丢包率、超时时间，开关序列号，单步观察：消息/ack 丢失 → 超时重传 → 接收方用序列号识别重复。关掉序列号，看重复消息被"执行两次"；把超时设得比往返时间还短，看会发生什么。接收方的应用是"存款 +100"，不是幂等操作。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>消息数 <input type="number" id="rl-n" min="1" max="8" value="3"></label>
+      <label>消息丢包率 <input type="range" id="rl-pd" min="0" max="80" step="5" value="30"><span id="rl-pd-v" class="mono">30%</span></label>
+      <label>ack 丢包率 <input type="range" id="rl-pa" min="0" max="80" step="5" value="30"><span id="rl-pa-v" class="mono">30%</span></label>
+      <label>超时 <input type="number" id="rl-to" min="1" max="30" value="6"></label>
+      <label>单程延迟 <input type="number" id="rl-d" min="1" max="6" value="2"></label>
+      <label>种子 <input type="number" id="rl-seed" min="1" max="9999" value="3"></label>
+      <label><input type="checkbox" id="rl-seq" checked> 使用序列号</label>
+      <label><input type="checkbox" id="rl-bo"> 指数退避（上限 64）</label>
+    </div>
+    <div class="controls">
+      <span class="muted small">原书示例：</span>
+      <button data-preset="f3">图 48.3 无丢包</button>
+      <button data-preset="f4">图 48.4 请求丢失</button>
+      <button data-preset="f5">图 48.5 ack 丢失（有序列号）</button>
+      <button data-preset="f5n">图 48.5 ack 丢失（无序列号）</button>
+      <button data-preset="short">超时太短 + 无序列号</button>
+      <button data-preset="rand">随机丢包</button>
+    </div>
+    <div id="rl-step"></div>
+    <div class="stage" id="rl-stage"></div>
+    <div class="lane-legend">
+      <span><i style="background:var(--c1)"></i>数据消息 M（#k 表示第 k 次发送）</span>
+      <span><i style="background:var(--c3)"></i>ack</span>
+      <span><i style="background:var(--bad)"></i>丢失的包</span>
+      <span><i style="background:var(--warn)"></i>发送方定时器</span>
+    </div>
+    <div class="state-grid">
+      <div class="readout" id="rl-sstate"></div>
+      <div class="readout" id="rl-rstate"></div>
+    </div>
+    <div class="narrate" id="rl-narr"></div>
+    <div class="stats" id="rl-stats"></div>
+  </div>
+</section>
+
+<h2>通信抽象（一）：分布式共享内存为什么不行</h2>
+<p>有了基本的消息层，下一个问题是：构建分布式系统时，应该给程序员什么样的<strong>通信抽象</strong>？</p>
+<p>一派研究把操作系统的抽象扩展到分布式环境。例如<strong>分布式共享内存（distributed shared memory，DSM）</strong>让不同机器上的进程共享一个巨大的虚拟地址空间，分布式计算就变得像一个多线程程序，只不过线程跑在不同的机器上。它通常借助操作系统的虚拟内存实现：</p>
+<figure class="fig">
+  <svg viewBox="0 0 740 260" width="740" role="img" aria-label="DSM 工作方式与故障">
+    <text x="370" y="20" text-anchor="middle" font-weight="700">一个"共享"的虚拟地址空间，页面散落在各台机器上</text>
+    <g font-size="12.5">
+      <rect x="20" y="40" width="210" height="150" rx="10" class="box"/>
+      <text x="125" y="62" text-anchor="middle" font-weight="600">机器 A（运行线程）</text>
+      <rect x="40" y="75" width="40" height="30" rx="4" class="ok-soft"/><text x="60" y="95" text-anchor="middle">P0</text>
+      <rect x="90" y="75" width="40" height="30" rx="4" class="ok-soft"/><text x="110" y="95" text-anchor="middle">P1</text>
+      <text x="40" y="130">访问 P0：本地，很快</text>
+      <text x="40" y="150" style="fill:var(--warn)">访问 P2：缺页（page fault）</text>
+      <text x="40" y="170" style="fill:var(--warn)">→ 发消息去别的机器取页</text>
+      <rect x="265" y="40" width="210" height="150" rx="10" class="box"/>
+      <text x="370" y="62" text-anchor="middle" font-weight="600">机器 B</text>
+      <rect x="285" y="75" width="40" height="30" rx="4" class="accent-soft"/><text x="305" y="95" text-anchor="middle">P2</text>
+      <rect x="335" y="75" width="40" height="30" rx="4" class="accent-soft"/><text x="355" y="95" text-anchor="middle">P3</text>
+      <text x="285" y="135">缺页处理程序取回 P2，</text>
+      <text x="285" y="153">装入 A 的页表，继续执行</text>
+      <rect x="510" y="40" width="210" height="150" rx="10" class="bad-soft"/>
+      <text x="615" y="62" text-anchor="middle" font-weight="600" style="fill:var(--bad)">机器 C（宕机！）</text>
+      <rect x="530" y="75" width="40" height="30" rx="4" class="bad-soft"/><text x="550" y="95" text-anchor="middle">P4</text>
+      <rect x="580" y="75" width="40" height="30" rx="4" class="bad-soft"/><text x="600" y="95" text-anchor="middle">P5</text>
+      <path d="M525,70 L630,112 M630,70 L525,112" style="stroke:var(--bad);stroke-width:2"/>
+      <text x="530" y="135">P4、P5 突然"消失"</text>
+      <text x="530" y="153">链表的 next 指针可能</text>
+      <text x="530" y="171">正指向这里……</text>
+      <path d="M200,145 C260,210 280,210 300,108" class="arrow" marker-end="url(#d48-ah)"/>
+      <text x="40" y="225" font-size="13">问题 1 · 故障：数据结构散布在整个地址空间，一台机器坏了，地址空间就出现"窟窿"。</text>
+      <text x="40" y="247" font-size="13">问题 2 · 性能：有的内存访问是纳秒级，有的要跨网络取页；程序员只好小心安排计算、尽量不通信。</text>
+    </g>
+  </svg>
+  <figcaption>图 48-D：DSM 借助虚拟内存把远程页面伪装成本地内存。</figcaption>
+</figure>
+<p>访问一页时有两种情况：最好的情况，页面就在本机，很快；否则就触发缺页，缺页处理程序向另一台机器发消息取回该页，装进请求进程的页表，然后继续执行。</p>
+<p>这种方法今天没什么人用，原因有二。<strong>最大的问题是故障处理</strong>：某台机器坏了，它上面的页怎么办？如果分布式计算的数据结构散布在整个地址空间里，部分数据结构会突然不可用——想象一个链表，某个 next 指针指向了已经消失的那部分地址空间。<strong>其次是性能</strong>：写代码时我们通常假设访存很便宜，而在 DSM 中有些访问很便宜、有些却要缺页并从远程取回。程序员不得不非常小心地组织计算，让几乎不发生通信——这就违背了这种抽象的初衷。尽管相关研究很多，实际影响很小：今天没人用 DSM 构建可靠的分布式系统。</p>
+
+<h2>通信抽象（二）：远程过程调用（RPC）</h2>
+<p>操作系统的抽象不适合构建分布式系统，而<strong>编程语言（PL）的抽象</strong>更合理。最主流的是<strong>远程过程调用（remote procedure call，RPC）</strong>。它的目标很简单：让在远程机器上执行代码像调用本地函数一样简单直接。客户端发起一次过程调用，一段时间后得到结果；服务器只需定义好要导出的例程，其余"魔法"都由 RPC 系统处理。RPC 系统一般有两部分：<strong>存根生成器（stub generator，也叫协议编译器 protocol compiler）</strong>和<strong>运行时库（run-time library）</strong>。</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 780 250" width="780" role="img" aria-label="RPC 结构">
+    <g font-size="13">
+      <rect x="20" y="30" width="330" height="200" rx="12" class="box"/>
+      <text x="185" y="52" text-anchor="middle" font-weight="700">客户端机器</text>
+      <rect x="40" y="65" width="290" height="36" rx="7" class="box-strong"/><text x="185" y="88" text-anchor="middle">客户端代码：<tspan class="mono">r = func2(7, 300);</tspan></text>
+      <rect x="40" y="115" width="290" height="36" rx="7" class="accent-soft"/><text x="185" y="138" text-anchor="middle">客户端存根：封送参数 / 解封结果</text>
+      <rect x="40" y="165" width="290" height="36" rx="7" class="warn-soft"/><text x="185" y="188" text-anchor="middle">RPC 运行时：超时/重传、ack、命名</text>
+      <rect x="430" y="30" width="330" height="200" rx="12" class="box"/>
+      <text x="595" y="52" text-anchor="middle" font-weight="700">服务器机器</text>
+      <rect x="450" y="65" width="290" height="36" rx="7" class="box-strong"/><text x="595" y="88" text-anchor="middle">真正的函数：<tspan class="mono">int func2(a, b)</tspan></text>
+      <rect x="450" y="115" width="290" height="36" rx="7" class="accent-soft"/><text x="595" y="138" text-anchor="middle">服务端存根：解封参数 / 封送结果</text>
+      <rect x="450" y="165" width="290" height="36" rx="7" class="warn-soft"/><text x="595" y="188" text-anchor="middle">RPC 运行时：去重、线程池分派</text>
+      <line x1="330" y1="178" x2="448" y2="178" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d48-ah-c1)"/>
+      <text x="390" y="170" text-anchor="middle" font-size="12" style="fill:var(--c1)">请求</text>
+      <line x1="450" y1="194" x2="332" y2="194" style="stroke:var(--c3);stroke-width:2" marker-end="url(#d48-ah-c3)"/>
+      <text x="390" y="212" text-anchor="middle" font-size="12" style="fill:var(--c3)">回复</text>
+      <line x1="120" y1="101" x2="120" y2="113" class="arrow" marker-end="url(#d48-ah)"/><line x1="120" y1="151" x2="120" y2="163" class="arrow" marker-end="url(#d48-ah)"/>
+      <line x1="250" y1="163" x2="250" y2="153" class="arrow" marker-end="url(#d48-ah)"/><line x1="250" y1="113" x2="250" y2="103" class="arrow" marker-end="url(#d48-ah)"/>
+      <line x1="530" y1="163" x2="530" y2="153" class="arrow" marker-end="url(#d48-ah)"/><line x1="530" y1="113" x2="530" y2="103" class="arrow" marker-end="url(#d48-ah)"/>
+      <line x1="660" y1="101" x2="660" y2="113" class="arrow" marker-end="url(#d48-ah)"/><line x1="660" y1="151" x2="660" y2="163" class="arrow" marker-end="url(#d48-ah)"/>
+      <text x="390" y="245" text-anchor="middle" font-size="12" class="t-muted">两边的存根都由存根生成器根据接口定义自动生成</text>
+    </g>
+  </svg>
+  <figcaption>图 48-E：RPC 的组成。蓝色两层是存根生成器生成的代码，黄色两层是运行时库。</figcaption>
+</figure>
+
+<h3>存根生成器</h3>
+<p>存根生成器的工作是<strong>把"把函数参数和结果打包成消息"这件痛苦的事自动化</strong>。好处有很多：从设计上避免手写这类代码时的低级错误；编译器还可能优化这些代码、提升性能。它的输入就是服务器想导出的一组调用，概念上可以简单到这样：</p>
+<pre><code>interface {
+    int func1(int arg1);
+    int func2(int arg1, int arg2);
+};</code></pre>
+<p>生成器据此为客户端生成<strong>客户端存根（client stub）</strong>，其中包含接口中的每个函数；客户端程序链接这个存根并调用它来发起 RPC。在客户端看来就是调用了 <code>func1(x)</code>，而存根里的 <code>func1()</code> 内部会：</p>
+<ol>
+  <li><strong>创建消息缓冲区</strong>——通常就是一段连续的字节数组。</li>
+  <li><strong>把所需信息打包进缓冲区</strong>：要调用的函数的标识符，以及函数需要的全部参数（例如 func1 的一个整数）。把这些信息放进一个连续缓冲区的过程叫<strong>参数封送（marshaling）</strong>或消息<strong>序列化（serialization）</strong>。</li>
+  <li><strong>把消息发给目标 RPC 服务器</strong>：通信细节由运行时库处理。</li>
+  <li><strong>等待回复</strong>：函数调用通常是同步的，所以要等它完成。</li>
+  <li><strong>解包返回码和其他结果</strong>：即<strong>解封（unmarshaling）</strong>或反序列化；复杂的函数可能返回列表等复杂结果。</li>
+  <li><strong>返回给调用者</strong>。</li>
+</ol>
+<p>服务器端也会生成代码：<strong>解封消息</strong>（取出函数标识符和参数）→ <strong>调用真正的函数</strong>（终于！）→ <strong>打包结果</strong>到回复缓冲区 → <strong>发送回复</strong>。</p>
+<p>存根编译器还要考虑几个重要问题：</p>
+<ul>
+  <li><strong>复杂参数</strong>：比如 <code>write(fd, buf, size)</code> 传的是一个指针。RPC 包拿到指针必须知道该如何解释、该发送哪些字节——通常靠众所周知的类型（例如 RPC 编译器认识的 <code>buffer_t</code>，按给定大小传递一块数据），或给数据结构加注解，让编译器知道要序列化哪些字节。指针本身的值（地址）传到另一台机器上毫无意义。</li>
+  <li><strong>服务器的并发组织</strong>：最简单的服务器在一个循环里逐个处理请求，但一个 RPC 阻塞（比如等 I/O）时服务器资源就被浪费了。常见的组织方式是<strong>线程池（thread pool）</strong>：启动时创建有限个工作线程，主线程收到消息就分派给某个工作线程，自己继续接收其他请求。这提高了利用率，代价是编程复杂度——RPC 处理函数可能要用锁等同步原语（回想第 26–31 章）。</li>
+</ul>
+
+<h3>运行时库</h3>
+<p>运行时库承担了 RPC 系统的大部分重活，大多数性能和可靠性问题都在这里处理。</p>
+<p><strong>命名（naming）</strong>：客户端怎么找到远程服务？最简单的做法建立在现有命名系统之上，例如互联网协议提供的主机名和端口号：客户端必须知道运行 RPC 服务的机器的主机名或 IP 地址，以及服务使用的端口号（端口号用来区分一台机器上同时进行的多个通信活动）。协议栈负责把包从任意机器路由到这个地址。</p>
+<p><strong>传输协议选哪个</strong>：直觉上应该用可靠的 TCP——请求要可靠送达，回复也要可靠收到。然而在可靠层之上构建 RPC 会导致<strong>严重的性能浪费</strong>：</p>
+<figure class="fig">
+  <svg viewBox="0 0 700 250" width="700" role="img" aria-label="RPC over TCP 与 UDP 消息数对比">
+    <g font-size="12.5">
+      <text x="170" y="20" text-anchor="middle" font-weight="700">RPC 建在 TCP 上：4 条消息</text>
+      <text x="80" y="42" text-anchor="middle" font-weight="600">客户端</text><text x="260" y="42" text-anchor="middle" font-weight="600">服务器</text>
+      <line x1="80" y1="50" x2="80" y2="240" class="stroke"/><line x1="260" y1="50" x2="260" y2="240" class="stroke"/>
+      <line x1="80" y1="60" x2="258" y2="90" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d48-ah-c1)"/><text x="150" y="68" style="fill:var(--c1)">① 请求</text>
+      <line x1="260" y1="98" x2="82" y2="128" style="stroke:var(--c3);stroke-width:2;stroke-dasharray:4 3" marker-end="url(#d48-ah-c3)"/><text x="130" y="128" style="fill:var(--c3)">② ack（额外）</text>
+      <line x1="260" y1="150" x2="82" y2="180" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d48-ah-c1)"/><text x="150" y="160" style="fill:var(--c1)">③ 回复</text>
+      <line x1="80" y1="188" x2="258" y2="218" style="stroke:var(--c3);stroke-width:2;stroke-dasharray:4 3" marker-end="url(#d48-ah-c3)"/><text x="130" y="220" style="fill:var(--c3)">④ ack（额外）</text>
+      <text x="530" y="20" text-anchor="middle" font-weight="700">RPC 建在 UDP 上：2 条消息</text>
+      <text x="440" y="42" text-anchor="middle" font-weight="600">客户端</text><text x="620" y="42" text-anchor="middle" font-weight="600">服务器</text>
+      <line x1="440" y1="50" x2="440" y2="240" class="stroke"/><line x1="620" y1="50" x2="620" y2="240" class="stroke"/>
+      <line x1="440" y1="60" x2="618" y2="90" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d48-ah-c1)"/><text x="480" y="68" style="fill:var(--c1)">① 请求</text>
+      <line x1="620" y1="150" x2="442" y2="180" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d48-ah-c1)"/><text x="510" y="160" style="fill:var(--c1)">② 回复</text>
+      <text x="630" y="110" font-size="11.5" class="t-muted">回复本身</text>
+      <text x="630" y="126" font-size="11.5" class="t-muted">就说明请求已收到</text>
+      <text x="450" y="205" font-size="11.5" class="t-muted">RPC 层自己做超时/重传</text>
+      <text x="450" y="221" font-size="11.5" class="t-muted">+ 序列号去重</text>
+    </g>
+  </svg>
+  <figcaption>图 48-F：请求/响应协议建在可靠层之上，会多出两条"额外"的 ack。</figcaption>
+</figure>
+<p>可靠层靠 ack + 超时/重传工作：客户端发出 RPC 请求，服务器回一个 ack 让调用方知道请求已收到；服务器发回复时，客户端也要 ack。于是一个请求/响应协议就多发了两条"额外"消息。因此<strong>许多 RPC 包建在不可靠的 UDP 之上</strong>，这让 RPC 层更高效，但可靠性的责任就落到了 RPC 系统自己身上：它像前面描述的那样使用超时/重传和确认；再借助某种形式的序列号，通信层可以保证每个 RPC <strong>恰好执行一次（exactly once，没有故障时）</strong>，或者<strong>至多执行一次（at most once，出现故障时）</strong>。</p>
+<p><strong>其他问题</strong>：</p>
+<ul>
+  <li><strong>长时间运行的调用</strong>：按超时机制，一个执行很久的远程调用在客户端看来像是失败了，会触发重试。解决办法之一是：回复不能立即产生时，服务器先发一个显式的 ack，让客户端知道请求已收到；之后客户端可以定期询问服务器是否还在处理，只要服务器一直说"是"，客户端就继续等。</li>
+  <li><strong>大参数</strong>：参数大到一个包放不下时，需要发送方<strong>分片（fragmentation）</strong>、接收方<strong>重组（reassembly）</strong>。有些底层协议提供这个功能；没有的话，RPC 运行时就要自己实现。</li>
+  <li><strong>字节序（byte ordering）</strong>：有的机器是大端（big endian，从最高有效字节到最低有效字节存储，像我们写阿拉伯数字的顺序），有的是小端（little endian）。RPC 包通常在消息格式中规定一种明确的字节序，例如 Sun RPC 的 <strong>XDR（eXternal Data Representation）</strong>层。收发双方的字节序与 XDR 相同时直接收发；否则每项数据都要转换，带来少量性能开销。</li>
+  <li><strong>是否暴露异步</strong>：典型 RPC 是<strong>同步</strong>的——调用后必须等它返回。有些 RPC 包支持<strong>异步 RPC</strong>：发出请求后立即返回，客户端可以去做别的事（包括发其他 RPC），之后再调用 RPC 层等待未完成的调用结束，取回返回值。</li>
+</ul>
+
+<figure class="fig">
+  <svg viewBox="0 0 640 170" width="640" role="img" aria-label="大端与小端">
+    <g font-size="13">
+      <text x="20" y="24" font-weight="700">整数 0x12345678 在内存中的 4 个字节（地址从低到高）</text>
+      <text x="20" y="64">大端（XDR、网络字节序）</text>
+      <g class="mono">
+        <rect x="220" y="44" width="56" height="30" rx="4" class="accent-soft"/><text x="248" y="64" text-anchor="middle">12</text>
+        <rect x="280" y="44" width="56" height="30" rx="4" class="accent-soft"/><text x="308" y="64" text-anchor="middle">34</text>
+        <rect x="340" y="44" width="56" height="30" rx="4" class="accent-soft"/><text x="368" y="64" text-anchor="middle">56</text>
+        <rect x="400" y="44" width="56" height="30" rx="4" class="accent-soft"/><text x="428" y="64" text-anchor="middle">78</text>
+      </g>
+      <text x="20" y="114">小端（x86 主机）</text>
+      <g class="mono">
+        <rect x="220" y="94" width="56" height="30" rx="4" class="warn-soft"/><text x="248" y="114" text-anchor="middle">78</text>
+        <rect x="280" y="94" width="56" height="30" rx="4" class="warn-soft"/><text x="308" y="114" text-anchor="middle">56</text>
+        <rect x="340" y="94" width="56" height="30" rx="4" class="warn-soft"/><text x="368" y="114" text-anchor="middle">34</text>
+        <rect x="400" y="94" width="56" height="30" rx="4" class="warn-soft"/><text x="428" y="114" text-anchor="middle">12</text>
+      </g>
+      <text x="470" y="64" font-size="12" class="t-muted">高位在前</text>
+      <text x="470" y="114" font-size="12" class="t-muted">低位在前</text>
+      <text x="20" y="155" font-size="12.5" class="t-muted">小端机器发送前要逐项转换成大端（htonl），收到后再转回来（ntohl）。</text>
+    </g>
+  </svg>
+  <figcaption>图 48-G：字节序。两种都是合法的存储方式，问题只在于不同机器之间怎样交流。</figcaption>
+</figure>
+
+<section class="sim" id="sim-rpc">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>一次 RPC 的完整旅程</h3>
+    <div class="desc">选一个函数和参数，单步跟踪：客户端存根封送参数（看消息缓冲区里的每个字节）→ 运行时发送 → 网络 → 服务端存根解封 → 执行 → 结果原路返回。打开"回复丢失"，看运行时如何用超时重传 + 请求编号（xid）去重，保证函数不被执行两次。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>调用 <select id="rpc-fn"><option value="2">func2(arg1, arg2)</option><option value="1">func1(arg1)</option></select></label>
+      <label>arg1 <input type="number" id="rpc-a1" value="7"></label>
+      <label>arg2 <input type="number" id="rpc-a2" value="300"></label>
+      <label><input type="checkbox" id="rpc-le" checked> 客户端是小端机器</label>
+      <label><input type="checkbox" id="rpc-lose"> 第一次回复在网络中丢失</label>
+      <label><input type="checkbox" id="rpc-dedup" checked> 服务端按 xid 去重</label>
+    </div>
+    <div id="rpc-step"></div>
+    <div class="stage" id="rpc-stage"></div>
+    <div class="rpc-buf" id="rpc-buf"></div>
+    <div class="narrate" id="rpc-narr"></div>
+    <div class="stats" id="rpc-stats"></div>
+  </div>
+</section>
+<p class="small muted">模拟器中服务器的实现（示例）：<code>int func1(int arg1) { return arg1 * arg1; }</code>、<code>int func2(int arg1, int arg2) { return arg1 + arg2; }</code>。消息格式（示意，类似 Sun RPC）：请求 = [xid][过程编号][参数…]，回复 = [xid][状态][返回值]，每项 4 字节、大端。</p>
+
+<h2>端到端论证</h2>
+<p>本章多次提到一个设计原则：<strong>端到端论证（end-to-end argument）</strong>。它认为，系统中最高的一层——通常是位于"端点"的应用——才是分层系统中某些功能<strong>唯一能真正实现</strong>的地方。Saltzer 等人在其经典论文中用"两台机器之间可靠地传输文件"作为例子：</p>
+<figure class="fig">
+  <svg viewBox="0 0 760 220" width="760" role="img" aria-label="端到端论证：文件传输的出错点">
+    <g font-size="12.5">
+      <rect x="20" y="40" width="150" height="120" rx="10" class="box"/>
+      <text x="95" y="62" text-anchor="middle" font-weight="700">机器 A</text>
+      <rect x="40" y="75" width="110" height="28" rx="5" class="box-strong"/><text x="95" y="94" text-anchor="middle">磁盘上的文件</text>
+      <rect x="40" y="115" width="110" height="28" rx="5" class="bad-soft"/><text x="95" y="134" text-anchor="middle">发送方内存</text>
+      <rect x="220" y="95" width="320" height="50" rx="10" class="ok-soft"/>
+      <text x="380" y="116" text-anchor="middle" font-weight="600">可靠通信协议（ack、超时/重传、序列号）</text>
+      <text x="380" y="135" text-anchor="middle" font-size="12" class="t-muted">保证：发出的每个字节都按序到达</text>
+      <rect x="590" y="40" width="150" height="120" rx="10" class="box"/>
+      <text x="665" y="62" text-anchor="middle" font-weight="700">机器 B</text>
+      <rect x="610" y="75" width="110" height="28" rx="5" class="box-strong"/><text x="665" y="94" text-anchor="middle">接收方内存</text>
+      <rect x="610" y="115" width="110" height="28" rx="5" class="bad-soft"/><text x="665" y="134" text-anchor="middle">写入磁盘</text>
+      <line x1="170" y1="120" x2="218" y2="120" class="arrow" marker-end="url(#d48-ah)"/>
+      <line x1="540" y1="120" x2="588" y2="100" class="arrow" marker-end="url(#d48-ah)"/>
+      <text x="95" y="180" text-anchor="middle" style="fill:var(--bad)">发送前字节在内存中损坏</text>
+      <text x="665" y="180" text-anchor="middle" style="fill:var(--bad)">写盘时出错</text>
+      <text x="380" y="30" text-anchor="middle" font-weight="700">网络层"可靠"≠ 文件传输可靠</text>
+      <path d="M95,196 C95,214 665,214 665,196" style="stroke:var(--accent);stroke-width:2;fill:none;stroke-dasharray:6 4"/>
+      <text x="380" y="200" text-anchor="middle" style="fill:var(--accent)" font-weight="600">端到端检查：传完后读回 B 盘上的文件算校验和，与 A 的比对</text>
+    </g>
+  </svg>
+  <figcaption>图 48-H：可靠的底层协议管不到它两端之外发生的错误。</figcaption>
+</figure>
+<p>如果只在底层加可靠性——比如用可靠的通信协议来实现可靠的文件传输——并不能构成真正可靠的文件传输：字节可能在通信开始之前就在发送方内存中损坏，或者接收方写盘时出了问题。字节虽然在网络上可靠送达，文件传输最终仍不可靠。要实现可靠的文件传输，必须加入<strong>端到端</strong>的检查，例如传输完成后读回接收方磁盘上的文件、计算校验和，与发送方文件的校验和比较。</p>
+<p>推论是：<strong>在底层提供额外功能有时确实能提升性能</strong>、优化系统，所以不必一概排斥底层机制，而应结合它在整个系统中的最终用途，仔细权衡它的价值。TCP 的存在就是这种权衡的结果：它不能替代端到端检查，但让大部分应用少操心。</p>
+
+<h2>先预测再验证</h2>
+<div class="exercise"><div class="q">在可靠通信模拟器中点"图 48.5 ack 丢失（无序列号）"。预测：接收方的余额最终是多少？发送方一共发送了几次数据消息？然后单步验证。</div>
+  <details class="reveal"><summary>看答案</summary><div>发送 2 次（第一次 ack 丢失，超时后重传），接收方把两次都当成新消息执行，余额是 200 而不是 100。统计栏里"重复执行"为 1。勾上"使用序列号"再跑一次：重传的消息 seq=1，而接收方 expected 已经是 2，于是被识别为重复，只回 ack、不执行，余额正确为 100。</div></details></div>
+<div class="exercise"><div class="q">点"超时太短 + 无序列号"（超时 3，往返时间 = 2×单程延迟 = 4）。预测：M2 最终有没有被接收方执行？为什么发送方却认为 M2 已经成功？</div>
+  <details class="reveal"><summary>看答案</summary><div>M2 在网络中丢了，接收方从未执行它；可发送方在 t=7 收到了一个 ack——那其实是接收方对 <strong>M1 重传副本</strong>的确认。因为没有序列号，发送方无法区分这个 ack 属于谁，于是"张冠李戴"地认为 M2 成功了。结果：M1 执行两次，M2 一次都没执行。勾上序列号后，迟到的 ACK 1 会被识别为过期而忽略，发送方继续等待并重传 M2。这说明序列号不仅接收方要用，发送方匹配 ack 时也要用。</div></details></div>
+<div class="exercise"><div class="q">使用序列号，单程延迟 2，把超时从 6 逐步调到 3、2、1（保持丢包率 0）。预测：发送次数如何变化？最终余额会错吗？</div>
+  <details class="reveal"><summary>看答案</summary><div>往返时间是 4。超时 ≥ 4 时每条消息只发 1 次；超时小于往返时间时，ack 还在路上定时器就到期了，发送方不必要地重传，发送次数明显增加（超时越短越多）。但因为有序列号，重复都被接收方丢弃，余额始终正确——超时太短浪费的是网络和 CPU，而不是正确性。这正是"小心设置超时值"提示所说的。</div></details></div>
+<div class="exercise"><div class="q">点"随机丢包"后，把消息丢包率调到 60%、ack 丢包率 0%，超时 4，种子 3，分别在勾选和不勾选"指数退避"时跑到最后一步。预测：哪种情况结束得更晚？哪种发送次数更少？</div>
+  <details class="reveal"><summary>看答案</summary><div>发送次数<strong>完全相同</strong>（都是 11 次）：同一种子下，每个包丢不丢是一样的。但不退避时 t=44 就结束了，退避时要到 t=212——每次超时后定时器翻倍（4→8→16→…），连续丢包时等待越来越长。在单客户端场景下它看起来"更慢"；它的价值在多客户端场景：如果丢包是服务器过载造成的，大家都退避就能减少重发，给服务器喘息的机会。把丢包率调到 80% 再试，还会看到退避版本在时间上限内都没能完成。</div></details></div>
+<div class="exercise"><div class="q">在 RPC 模拟器中勾选"第一次回复在网络中丢失"，再取消"服务端按 xid 去重"。预测：服务器上的真实函数被执行几次？如果这个函数是"从账户转出 100 元"，会怎样？</div>
+  <details class="reveal"><summary>看答案</summary><div>客户端运行时超时后用<strong>同一个 xid</strong> 重发请求。开启去重时，服务器发现这个 xid 已处理过，直接重发缓存的回复，函数只执行 1 次（至多一次语义）。关闭去重时函数被执行 2 次：对 func1/func2 这种纯计算无所谓，但"转账"这种非幂等操作就会转出 200 元。第 49 章 NFS 会用另一种思路解决这个问题：把操作设计成幂等的。</div></details></div>
+
+<h2>动手实验</h2>
+<div class="lab">
+  <p><strong>① 原书的 UDP 客户端/服务端</strong>（Figure 48.1 + 48.2）。<code>make run</code> 会在后台启动 <code>./server 1</code>（处理一条消息后退出），然后运行客户端：</p>
+  <pre><code><span class="cmd">cd labs/48-distributed &amp;&amp; make &amp;&amp; make run</span></code></pre>
+  <p class="small muted">示例输出（本机 WSL2 上的真实运行结果，你的机器上端口、时间等细节可能不同）：</p>
+  <pre><code>./server 1 &amp; sleep 0.3; ./client localhost; wait
+server: listening on UDP port 10000
+client: sending "hello world" to localhost:10000
+server: got "hello world" (1000 bytes) from 127.0.0.1:20000
+server: replied (1000 bytes)
+client: got reply "goodbye world" (1000 bytes) from 127.0.0.1:10000</code></pre>
+  <p>注意服务端通过 <code>recvfrom</code> 得知客户端地址是 <code>127.0.0.1:20000</code>，并按这个地址回复。每条消息都是 <code>BUFFER_SIZE</code> = 1000 字节，因为代码直接发送整个缓冲区。</p>
+  <p><strong>② 在 UDP 上实现可靠通信</strong>：<code>reliable.c</code> fork 出接收方进程，发送方在发送前按概率人为丢包，用 <code>poll</code> 睡眠等待 ack 或超时（不空转）。接收方每收到一条存款消息执行 <code>balance += 100</code>。</p>
+  <pre><code><span class="cmd">./reliable -p 0.3 -m 5 -s 1        # 带序列号</span>
+<span class="cmd">./reliable -p 0.3 -m 5 -s 1 -n     # 不带序列号</span></code></pre>
+  <p class="small muted">示例输出（真实运行；时间戳在你的机器上会不同，丢包序列由种子决定）：</p>
+  <pre><code>loss=0.30 timeout=100ms msgs=5 seed=1 seq=on
+    0.48 ms  sender:   send msg #1 (seq=1, try 1)
+    0.84 ms  receiver: got seq=1 -&gt; deliver, balance=100
+    0.94 ms  receiver: send ACK seq=1
+    0.95 ms  sender:   got ACK seq=1 -&gt; msg #1 done, delete copy, timer off
+    0.97 ms  sender:   send msg #2 (seq=2, try 1)
+    0.98 ms  receiver: got seq=2 -&gt; deliver, balance=200
+    0.98 ms  receiver: send ACK seq=2  ... LOST in network
+  101.10 ms  sender:   TIMEOUT for msg #2 -&gt; retry
+  101.16 ms  sender:   send msg #2 (seq=2, try 2)
+  101.19 ms  receiver: got seq=2 but expected=3 -&gt; DUPLICATE, discard (still ack)
+  101.19 ms  receiver: send ACK seq=2  ... LOST in network
+  200.28 ms  sender:   TIMEOUT for msg #2 -&gt; retry
+  200.34 ms  sender:   send msg #2 (seq=2, try 3)
+  200.36 ms  receiver: got seq=2 but expected=3 -&gt; DUPLICATE, discard (still ack)
+  200.39 ms  receiver: send ACK seq=2
+  200.39 ms  sender:   got ACK seq=2 -&gt; msg #2 done, delete copy, timer off
+  200.40 ms  sender:   send msg #3 (seq=3, try 1)  ... LOST in network
+  300.52 ms  sender:   TIMEOUT for msg #3 -&gt; retry
+  ...（省略 msg #3~#5）
+---- sender summary: 5 messages, 9 transmissions (4 retries), seq numbers ON
+---- receiver summary: delivered=5, duplicates discarded=2, acks sent=7
+---- final balance = 500 (expected 500) OK</code></pre>
+  <p>同样的种子加 <code>-n</code>（不用序列号）时，丢包位置完全一样，但结尾变成：</p>
+  <pre><code>---- sender summary: 5 messages, 9 transmissions (4 retries), seq numbers OFF
+---- receiver summary: delivered=7, duplicates discarded=0, acks sent=7
+---- final balance = 700 (expected 500) &lt;-- WRONG! duplicate executed</code></pre>
+  <p>msg #2 的 ack 连丢两次，接收方把两次重传都当新消息执行，余额多了 200。可以试试不同的 <code>-p</code>、<code>-t</code>、<code>-s</code>，对照上面的模拟器理解每一行日志。详见 <code>labs/48-distributed/README.md</code>。</p>
+</div>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="2"><div class="q">即使所有链路、路由器和主机都完好无损，为什么网络仍然会丢包？</div>
+  <div class="opts"><button>A. 因为 UDP 的校验和会随机丢弃包</button><button>B. 因为光速有限，包会"过期"</button><button>C. 因为路由器或端主机的缓冲内存有限，同时到达的包太多时只能丢弃一部分</button><button>D. 因为 TCP 会主动丢包以控制拥塞</button></div>
+  <div class="explain">原书指出更根本的丢包原因是缓冲不足：包必须先放进路由器内存才能处理，太多包同时到达时，唯一的选择就是丢包。端主机被大量消息淹没时也一样。</div></div>
+<div class="mcq" data-answer="0"><div class="q">发送方超时后没有收到 ack，它能确定什么？</div>
+  <div class="opts"><button>A. 什么都不能确定：可能消息丢了，也可能 ack 丢了（或者只是还在路上）</button><button>B. 接收方一定宕机了</button><button>C. ack 一定丢了，接收方已经收到</button><button>D. 消息一定丢了，接收方没收到</button></div>
+  <div class="explain">从发送方角度看，"请求丢失"和"回复丢失"完全一样（图 48.4 vs 48.5）；超时设太短时 ack 甚至可能只是还没到。正因为无法区分，重传就可能造成重复，需要序列号去重。</div></div>
+<div class="mcq" data-answer="1"><div class="q">接收方用序列计数器发现一条重复消息（ID &lt; expected）后，正确的做法是？</div>
+  <div class="opts"><button>A. 把 expected 减一，重新接收</button><button>B. 回 ack，但不交给应用</button><button>C. 丢弃它，也不回 ack，节省带宽</button><button>D. 交给应用，并回 ack</button></div>
+  <div class="explain">必须回 ack：发送方重传正是因为没收到 ack，如果不回，它会一直重传。但不能交给应用，否则就违反了"恰好一次"语义。</div></div>
+<div class="mcq" data-answer="3"><div class="q">为什么序列计数器比"为每条消息生成唯一 ID、接收方记住所有见过的 ID"更好？</div>
+  <div class="opts"><button>A. 唯一 ID 无法防止重复</button><button>B. 序列号可以让多条消息同时在途，唯一 ID 不行</button><button>C. 序列号能检测比特翻转</button><button>D. 每一端只需保存一个计数器，而记住所有 ID 需要无限增长的内存</button></div>
+  <div class="explain">原书：跟踪所有见过的 ID "需要无界内存，代价高得难以承受"；序列计数器只需要双方各维护一个值，接收方把它当作下一条消息的期望 ID。</div></div>
+<div class="mcq" data-answer="0"><div class="q">分布式共享内存（DSM）没有流行起来，原书给出的<strong>最大</strong>问题是什么？</div>
+  <div class="opts"><button>A. 故障处理：一台机器坏了，地址空间的一部分就消失了，散布其中的数据结构（如链表）会断掉</button><button>B. 地址空间不够大</button><button>C. 无法实现缺页处理</button><button>D. 需要特殊硬件</button></div>
+  <div class="explain">原书说 "The largest problem for DSM is how it handles failure"。性能（有的访存要跨网络）是另一个问题。</div></div>
+<div class="mcq" data-answer="3"><div class="q">为什么很多 RPC 包选择建在 UDP 而不是 TCP 之上？</div>
+  <div class="opts"><button>A. TCP 不支持大消息</button><button>B. UDP 自动处理字节序</button><button>C. UDP 比 TCP 更可靠</button><button>D. 请求/响应建在可靠层之上会多出两条额外的 ack；RPC 层自己做超时重传更高效，回复本身就能充当确认</button></div>
+  <div class="explain">原书：building a request/response protocol on top of a reliable communication layer, two "extra" messages are sent. 代价是 RPC 层要自己承担可靠性：超时/重传、ack、序列号。</div></div>
+<div class="mcq" data-answer="2"><div class="q">关于封送（marshaling），下列说法正确的是？</div>
+  <div class="opts"><button>A. 它是服务器端调用真实函数的步骤</button><button>B. 它负责选择 TCP 还是 UDP</button><button>C. 它把函数标识符和所有参数放进一个连续的消息缓冲区，也叫序列化</button><button>D. 指针参数可以直接把地址值封送过去，服务器按地址访问即可</button></div>
+  <div class="explain">封送/序列化是客户端存根（以及服务端存根打包结果时）做的事。指针的地址值在另一台机器上没有意义，需要借助 buffer_t 这样的已知类型或注解，把指针指向的数据本身序列化。</div></div>
+<div class="mcq" data-answer="1"><div class="q">按照端到端论证，要实现可靠的文件传输，下列哪种做法才是必需的？</div>
+  <div class="opts"><button>A. 让磁盘使用 RAID</button><button>B. 传输完成后，在接收端读回文件计算校验和，与发送端比较</button><button>C. 在每个路由器上加校验</button><button>D. 使用 TCP 而不是 UDP</button></div>
+  <div class="explain">底层机制（TCP、链路校验、RAID）都管不到发送方内存损坏、写盘出错等端点上的问题；只有端到端检查能真正保证。不过底层机制仍可能在性能上有帮助。</div></div>
+
+<h2>常见误区与小结</h2>
+<div class="warn">
+  <ul>
+    <li><strong>"<code>sendto</code> 返回成功 = 对方收到了"</strong>：错。它只表示交给了本机协议栈；UDP 丢包时发送方不会得到任何通知。</li>
+    <li><strong>"有了超时重传就是可靠通信"</strong>：还不够。ack 丢失会导致重复，必须配合序列号，才能做到恰好一次交付。</li>
+    <li><strong>"收到重复消息就直接丢掉"</strong>：一定要回 ack，否则发送方会无休止地重传。</li>
+    <li><strong>"超时越短越好，反应快"</strong>：超时比往返时间还短时会产生大量不必要的重传；在多客户端场景下还可能加剧服务器过载，所以需要指数退避。</li>
+    <li><strong>"用了 TCP 就不需要应用层检查"</strong>：端到端论证告诉我们，网络层可靠不等于应用层面的正确。</li>
+    <li><strong>"RPC 和本地调用完全一样"</strong>：RPC 可能超时、重试、部分失败，参数不能直接传指针，还有字节序和性能差异。</li>
+  </ul>
+</div>
+<div class="key">
+  <p><strong>本章小结</strong></p>
+  <ul>
+    <li>分布式系统的核心问题是<strong>如何处理故障</strong>：只有一台台式机时故障很少见；在有几千台机器的数据中心里，故障无时无刻不在发生。</li>
+    <li>通信是分布式系统的核心，而网络本质上不可靠。UDP 提供不可靠的数据报（外加校验和）；可靠通信靠 <strong>ack + 超时/重传 + 序列号</strong>，TCP 是其最常用的成熟实现。</li>
+    <li>分布式共享内存试图沿用操作系统抽象，但在故障处理和性能上都不好用；<strong>RPC</strong> 这种编程语言抽象成为主流：存根生成器负责封送/解封，运行时库负责命名、可靠传输（常建在 UDP 上）、大参数分片、字节序、异步调用等。</li>
+    <li>端到端论证：某些功能只有端点才能真正保证，底层机制的价值要放在整个系统中权衡。</li>
+    <li>要真正理解 RPC，最好亲自用一用：Sun RPC（存根编译器 <code>rpcgen</code>）比较老，Google 的 gRPC 和 Apache Thrift 是现代的同类系统。</li>
+    <li><strong>接下来</strong>：第 49 章的 NFS 就是一个构建在 RPC 之上的分布式文件系统，它把"重试"与"幂等"结合，让服务器崩溃恢复变得简单；第 50 章的 AFS 则用"回调"换取可扩展性。</li>
+  </ul>
+</div>
+
+</main>
+<script>
+/*CORE-BEGIN*/
+// ===== 可靠通信协议：离散事件模拟（停止-等待） =====
+// cfg: {n, pData, pAck, timeout, delay, useSeq, backoff, rng, script, maxTime}
+// script：按包发送顺序（数据和 ack 混合）给出是否丢失的布尔数组；用完后不再丢包。为 null 时按概率随机丢包。
+function simReliable(cfg) {
+  const n = cfg.n, D = cfg.delay, maxTime = cfg.maxTime || 600;
+  const packets = [], steps = [], q = [];
+  let ord = 0, scriptIdx = 0;
+  const push = (e) => { e.ord = ord++; q.push(e); };
+  const pop = () => { q.sort((a, b) => a.t - b.t || a.pri - b.pri || a.ord - b.ord); return q.shift(); };
+  const lose = (kind) => {
+    if (cfg.script) return !!cfg.script[scriptIdx++];
+    return cfg.rng() < (kind === "data" ? cfg.pData : cfg.pAck);
+  };
+  const S = { cur: 1, attempt: 0, to: cfg.timeout, timerAt: null, lastSend: null, timerId: 0, done: false };
+  const R = { expected: 1, balance: 0, log: [] };
+  const exec = new Array(n + 1).fill(0);
+  const st = { dataSent: 0, retrans: 0, acksSent: 0, delivered: 0, dupDiscarded: 0, dupExecuted: 0, staleIgnored: 0, lostPk: 0, misAck: 0 };
+  const snap = () => ({ S: { ...S }, R: { expected: R.expected, balance: R.balance, log: R.log.slice() }, st: { ...st }, exec: exec.slice() });
+  const log = (t, who, text, extra) => steps.push(Object.assign({ t, who, text, snap: snap() }, extra || {}));
+
+  function sendData(t) {
+    S.attempt++;
+    const seq = cfg.useSeq ? S.cur : null;
+    const lost = lose("data");
+    const p = { id: packets.length, kind: "data", msg: S.cur, seq, attempt: S.attempt, t0: t, t1: t + D, lost, step: steps.length, arriveStep: null };
+    packets.push(p);
+    st.dataSent++;
+    if (S.attempt > 1) st.retrans++;
+    if (lost) st.lostPk++; else push({ t: t + D, pri: 0, type: "rdata", p });
+    S.timerAt = t + S.to; S.lastSend = t; S.timerId++;
+    push({ t: S.timerAt, pri: 1, type: "timeout", id: S.timerId });
+    const name = `M${S.cur}` + (seq != null ? `（seq=${seq}）` : "（无序列号）");
+    log(t, "S", `发送方发送 ${name}，这是第 ${S.attempt} 次发送；保留副本，定时器设为 t=${S.timerAt}` +
+      (lost ? "。这个包将在网络中丢失——发送方不会得到任何通知。" : `，预计 t=${t + D} 到达。`), { pk: p.id, note: null });
+  }
+
+  sendData(0);
+  let guard = 0;
+  while (q.length && guard++ < 2000) {
+    const e = pop();
+    if (e.t > maxTime) { log(maxTime, "-", `达到时间上限 t=${maxTime}，模拟停止（丢包率太高时可能永远完不成）。`, { end: true }); break; }
+    if (e.type === "timeout") {
+      if (S.done || e.id !== S.timerId) continue;       // 已取消的定时器
+      const old = S.to;
+      if (cfg.backoff) S.to = Math.min(S.to * 2, 64);   // 指数退避，上限 64
+      log(e.t, "S", `t=${e.t}：M${S.cur} 的定时器到期，仍未收到 ack，断定消息丢失 → 重传` + (cfg.backoff ? `（指数退避：超时 ${old} → ${S.to}）` : "") + "。",
+        { note: { side: "S", text: "超时！", cls: "warn" } });
+      sendData(e.t);
+    } else if (e.type === "rdata") {
+      const p = e.p;
+      p.arriveStep = steps.length;
+      let text, note;
+      if (!cfg.useSeq || p.seq === R.expected) {
+        exec[p.msg]++;
+        st.delivered++;
+        R.balance += 100;
+        R.log.push(`M${p.msg}`);
+        if (cfg.useSeq) R.expected++;
+        if (exec[p.msg] > 1) {
+          st.dupExecuted++;
+          text = `t=${e.t}：接收方收到 M${p.msg}（第 ${p.attempt} 次发送的副本）。没有序列号，它无法知道这是重复消息，又交给应用执行了一次：余额 = ${R.balance}（错误！）`;
+          note = { side: "R", text: `重复执行 M${p.msg}!`, cls: "bad" };
+        } else {
+          text = `t=${e.t}：接收方收到 M${p.msg}` + (cfg.useSeq ? `，seq=${p.seq} 等于期望值，交给应用（余额 = ${R.balance}），expected → ${R.expected}` : `，交给应用（余额 = ${R.balance}）`);
+          note = { side: "R", text: `交付 M${p.msg}`, cls: "ok" };
+        }
+      } else {
+        st.dupDiscarded++;
+        text = `t=${e.t}：接收方收到 seq=${p.seq}，但期望的是 ${R.expected}：这是重复消息！照样回 ack，但不交给应用（余额仍为 ${R.balance}）`;
+        note = { side: "R", text: `重复，丢弃`, cls: "muted" };
+      }
+      const lost = lose("ack");
+      const a = { id: packets.length, kind: "ack", msg: p.msg, seq: p.seq, t0: e.t, t1: e.t + D, lost, step: steps.length, arriveStep: null };
+      packets.push(a);
+      st.acksSent++;
+      if (lost) st.lostPk++; else push({ t: e.t + D, pri: 0, type: "rack", a });
+      text += `；回复 ${cfg.useSeq ? "ACK " + p.seq : "ACK"}` + (lost ? "——这个 ack 将在网络中丢失。" : "。");
+      log(e.t, "R", text, { pk: a.id, note });
+    } else if (e.type === "rack") {
+      const a = e.a;
+      a.arriveStep = steps.length;
+      if (S.done) {
+        st.staleIgnored++;
+        log(e.t, "S", `t=${e.t}：发送方收到迟到的 ${cfg.useSeq ? "ACK " + a.seq : "ACK"}，所有消息都已完成，忽略。`, { note: { side: "S", text: "迟到 ack，忽略", cls: "muted" } });
+      } else if (cfg.useSeq && a.seq !== S.cur) {
+        st.staleIgnored++;
+        log(e.t, "S", `t=${e.t}：发送方收到 ACK ${a.seq}，但正在等的是 ACK ${S.cur}：过期的 ack，忽略，继续等待。`, { note: { side: "S", text: `过期 ACK ${a.seq}`, cls: "muted" } });
+      } else {
+        let text = `t=${e.t}：发送方收到 ${cfg.useSeq ? "ACK " + a.seq : "ACK"}，认定 M${S.cur} 已送达：删除副本，关闭定时器。`;
+        let note = { side: "S", text: `M${S.cur} 完成`, cls: "ok" };
+        if (!cfg.useSeq && a.msg !== S.cur) {
+          st.misAck++;
+          text += `<br><b>但真相是</b>：这个 ack 其实是接收方对 M${a.msg} 的确认！没有序列号，发送方把它错当成 M${S.cur} 的 ack（张冠李戴）。`;
+          note = { side: "S", text: `误认 ack!`, cls: "bad" };
+        }
+        S.timerId++; S.timerAt = null; S.cur++; S.attempt = 0; S.to = cfg.timeout;
+        if (S.cur > n) { S.done = true; text += ` 全部 ${n} 条消息都已确认。`; }
+        log(e.t, "S", text, { note });
+        if (!S.done) sendData(e.t);
+      }
+    }
+  }
+  const lostMsgs = [];
+  for (let m = 1; m <= n; m++) if (exec[m] === 0) lostMsgs.push(m);
+  const endT = Math.max(...packets.map((p) => p.t1), ...steps.map((s) => s.t));
+  let summary;
+  if (!S.done) summary = `发送方未能完成全部消息。`;
+  else if (st.dupExecuted === 0 && lostMsgs.length === 0) summary = `结束：${n} 条消息各被执行恰好一次，余额 ${R.balance}（正确）。共发送数据 ${st.dataSent} 次（重传 ${st.retrans} 次），ack ${st.acksSent} 次。`;
+  else {
+    const per = [];
+    for (let m = 1; m <= n; m++) per.push(`M${m}×${exec[m]}`);
+    summary = `结束：发送方以为全部成功，但接收方` + (st.dupExecuted ? `重复执行了 ${st.dupExecuted} 次` : "") + (st.dupExecuted && lostMsgs.length ? "，并且" : "") + (lostMsgs.length ? `从未执行 ${lostMsgs.map((m) => "M" + m).join("、")}` : "") +
+      `。各消息实际执行次数：${per.join("、")}。` + (R.balance === n * 100 ? `余额碰巧是 ${R.balance}，但那是重复执行"凑"出来的，并不正确。` : `余额 ${R.balance}（应为 ${n * 100}）。`);
+  }
+  log(endT, "-", summary, { end: true });
+  return { packets, steps, st, exec, lostMsgs, balance: R.balance, done: S.done, endT };
+}
+
+// ===== RPC：封送与消息旅程 =====
+function be32(v) { v = v >>> 0; return [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]; }
+function rpcServerFn(fn, args) { return fn === 1 ? (args[0] * args[0]) | 0 : (args[0] + args[1]) | 0; }
+// 位置：0 客户端代码 1 客户端存根 2 客户端运行时 3 网络 4 服务端运行时 5 服务端存根 6 服务端函数
+function buildRpc(cfg) {
+  const fn = cfg.fn, args = fn === 1 ? [cfg.a1] : [cfg.a1, cfg.a2];
+  const xid = 0x2a;
+  const call = `func${fn}(${args.join(", ")})`;
+  const req = [{ name: "xid", v: xid, f: 0 }, { name: "过程号", v: fn, f: 1 }].concat(args.map((a, i) => ({ name: `arg${i + 1}`, v: a, f: 2 })));
+  const result = rpcServerFn(fn, args);
+  const rep = [{ name: "xid", v: xid, f: 0 }, { name: "状态", v: 0, f: 4 }, { name: "返回值", v: result, f: 3 }];
+  const S = [];
+  let execs = 0, msgs = 0;
+  const add = (pos, text, buf, extra) => S.push(Object.assign({ pos, text, buf, execs, msgs }, extra || {}));
+  add(0, `客户端程序执行 <code>r = ${call};</code>——对它来说这就是一次普通的函数调用，实际调用的是链接进来的<strong>客户端存根</strong>里的 func${fn}()。`, null);
+  add(1, `客户端存根创建一个<strong>消息缓冲区</strong>：一段连续的字节数组。`, [], {});
+  const host = cfg.littleEndian;
+  add(1, `<strong>封送（marshaling）</strong>：依次写入请求编号 xid、要调用的过程号 ${fn}，以及参数 ${args.join("、")}。` +
+    (host ? `客户端是小端机器，内存里 arg1=${args[0]} 的字节是 ${le32hex(args[0])}；消息格式规定用大端（类似 XDR），所以逐项转换成 ${be32hex(args[0])} 再写入。` : `客户端本身就是大端机器，与消息格式一致，直接写入，无需转换。`), req, { showHost: host ? args[0] : null });
+  add(2, `运行时库通过 UDP 把 ${req.length * 4} 字节的请求发往服务器（<strong>命名</strong>：事先知道服务器的主机名/IP 和端口），保留副本并设置定时器。`, req);
+  msgs++;
+  add(3, `请求在网络中传输……`, req, { dir: 1 });
+  let seen = false;
+  add(4, `服务器运行时收到请求，检查 xid=${xid}：没见过，是新请求 → 分派给线程池中的一个工作线程。`, req);
+  add(5, `服务端存根<strong>解封（unmarshaling）</strong>：从消息中取出过程号 ${fn} 和参数 ${args.join("、")}（服务器若是小端机器，这里再把大端转换回来）。`, req);
+  execs++;
+  add(6, `终于！调用真正的函数 <code>${call}</code>，得到 ${result}。（服务器实际执行次数 = ${execs}）`, null);
+  add(5, `服务端存根把返回值<strong>封送</strong>进回复缓冲区：xid、状态码 0（成功）、返回值 ${result}。`, rep);
+  add(4, `运行时发送回复` + (cfg.dedup ? `，并记住"xid=${xid} → 这个回复"，以便识别重复请求。` : `。`) + ` 回复本身就证明请求已被收到，不需要额外的 ack。`, rep);
+  msgs++;
+  seen = true;
+  if (cfg.loseReply) {
+    add(3, `回复在网络中<strong>丢失</strong>了！客户端不会得到任何通知。`, rep, { dir: -1, lost: true });
+    add(2, `客户端运行时的定时器到期，仍没有回复。它无法知道是请求丢了还是回复丢了，只能用<strong>同一个 xid</strong> 重发请求副本。`, req, { timeout: true });
+    msgs++;
+    add(3, `重发的请求在网络中传输……`, req, { dir: 1 });
+    if (cfg.dedup && seen) {
+      add(4, `服务器运行时发现 xid=${xid} 已经处理过：<strong>不再执行函数</strong>，直接重发缓存的回复（至多一次语义）。`, rep);
+    } else {
+      add(4, `服务器运行时没有去重，把它当作新请求分派下去。`, req);
+      add(5, `服务端存根再次解封参数。`, req);
+      execs++;
+      add(6, `真正的函数<strong>又执行了一次</strong>：<code>${call}</code> = ${result}（执行次数 = ${execs}）。如果这是"转账"之类的非幂等操作，结果就错了！`, null, { bad: true });
+      add(5, `再次封送回复。`, rep);
+      add(4, `发送回复。`, rep);
+    }
+    msgs++;
+  }
+  add(3, `回复在网络中传输……`, rep, { dir: -1 });
+  add(2, `客户端运行时收到 xid=${xid} 的回复，与未完成的请求匹配，取消定时器。`, rep);
+  add(1, `客户端存根<strong>解封</strong>回复：检查状态码，取出返回值 ${result}（小端机器要把大端字节转回来）。`, rep);
+  add(0, `存根返回，<code>r = ${result}</code>。调用者完全感觉不到中间发生了什么——除了它花的时间比本地调用长得多。`, null, { done: true });
+  return { steps: S, result, execs, msgs };
+}
+function be32hex(v) { return be32(v).map((b) => b.toString(16).padStart(2, "0")).join(" "); }
+function le32hex(v) { return be32(v).reverse().map((b) => b.toString(16).padStart(2, "0")).join(" "); }
+/*CORE-END*/
+
+(function () {
+  const { h, s } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+
+  // ---------------- 可靠通信模拟器 ----------------
+  const presets = {
+    f3: { n: 1, script: [], useSeq: true, timeout: 6, delay: 2, backoff: false },
+    f4: { n: 1, script: [true], useSeq: true, timeout: 6, delay: 2, backoff: false },
+    f5: { n: 1, script: [false, true], useSeq: true, timeout: 6, delay: 2, backoff: false },
+    f5n: { n: 1, script: [false, true], useSeq: false, timeout: 6, delay: 2, backoff: false },
+    short: { n: 2, script: [false, false, false, true], useSeq: false, timeout: 3, delay: 2, backoff: false },
+  };
+  let script = null, res = null;
+  const stepHost = $("rl-step");
+  const stepper = OSTEP.stepper(stepHost, { steps: () => (res ? res.steps.length : 1), render: renderRl, autoplayMs: 1000 });
+
+  function readCfg() {
+    const n = Math.max(1, Math.min(8, +$("rl-n").value || 1));
+    return {
+      n, pData: +$("rl-pd").value / 100, pAck: +$("rl-pa").value / 100,
+      timeout: Math.max(1, +$("rl-to").value || 1), delay: Math.max(1, +$("rl-d").value || 1),
+      useSeq: $("rl-seq").checked, backoff: $("rl-bo").checked,
+      rng: OSTEP.rng(+$("rl-seed").value || 1), script, maxTime: 600,
+    };
+  }
+  function run() {
+    $("rl-pd-v").textContent = $("rl-pd").value + "%";
+    $("rl-pa-v").textContent = $("rl-pa").value + "%";
+    res = simReliable(readCfg());
+    stepper.reset();
+  }
+  ["rl-n", "rl-pd", "rl-pa", "rl-to", "rl-d", "rl-seed"].forEach((id) => $(id).addEventListener("input", () => { script = null; run(); }));
+  ["rl-seq", "rl-bo"].forEach((id) => $(id).addEventListener("change", run));
+  document.querySelectorAll("#sim-reliable [data-preset]").forEach((b) => b.addEventListener("click", () => {
+    const k = b.dataset.preset;
+    if (k === "rand") { script = null; $("rl-n").value = 3; $("rl-pd").value = 30; $("rl-pa").value = 30; $("rl-to").value = 6; $("rl-d").value = 2; $("rl-seq").checked = true; $("rl-bo").checked = false; run(); return; }
+    const p = presets[k];
+    $("rl-n").value = p.n; $("rl-to").value = p.timeout; $("rl-d").value = p.delay;
+    $("rl-seq").checked = p.useSeq; $("rl-bo").checked = p.backoff;
+    script = p.script.slice();
+    run();
+  }));
+
+  function renderRl(i) {
+    const stp = res.steps[i], sn = stp.snap;
+    const top = 40, xS = 170, xR = 470, W = 640;
+    const endT = res.endT + 2;
+    const yPer = Math.max(7, Math.min(24, 560 / endT));
+    const H = top + endT * yPer + 20;
+    const Y = (t) => top + t * yPer;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "发送方与接收方的泳道时序图" });
+    svg.append(s("text", { x: xS, y: 18, "text-anchor": "middle", "font-weight": 700, text: "发送方" }));
+    svg.append(s("text", { x: xR, y: 18, "text-anchor": "middle", "font-weight": 700, text: "接收方" }));
+    svg.append(s("line", { x1: xS, y1: top - 10, x2: xS, y2: H - 8, class: "stroke", "stroke-width": 1.5 }));
+    svg.append(s("line", { x1: xR, y1: top - 10, x2: xR, y2: H - 8, class: "stroke", "stroke-width": 1.5 }));
+    // 时间刻度
+    const tick = endT > 60 ? 10 : endT > 24 ? 5 : 2;
+    for (let t = 0; t <= endT; t += tick) {
+      svg.append(s("text", { x: 22, y: Y(t) + 4, "font-size": 11, class: "t-muted mono", text: "t=" + t }));
+      svg.append(s("line", { x1: xS - 5, x2: xS, y1: Y(t), y2: Y(t), class: "stroke" }));
+    }
+    // 当前时刻
+    svg.append(s("line", { x1: 60, x2: W - 10, y1: Y(stp.t), y2: Y(stp.t), style: "stroke:var(--accent);stroke-dasharray:3 4;opacity:.7" }));
+    // 当前定时器
+    if (sn.S.timerAt != null && !sn.S.done) {
+      svg.append(s("rect", { x: xS - 12, y: Y(sn.S.lastSend), width: 5, height: Math.max(2, (sn.S.timerAt - sn.S.lastSend) * yPer), rx: 2, style: "fill:var(--warn);opacity:.85" }));
+      svg.append(s("text", { x: xS - 16, y: Y(sn.S.timerAt) + 4, "text-anchor": "end", "font-size": 11, style: "fill:var(--warn)", text: "定时器 t=" + sn.S.timerAt }));
+    }
+    // 包
+    for (const p of res.packets) {
+      if (p.step > i) continue;
+      const fromX = p.kind === "data" ? xS : xR, toX = p.kind === "data" ? xR : xS;
+      const y0 = Y(p.t0), y1 = Y(p.t1);
+      const cur = p.step === i || p.arriveStep === i;
+      const col = p.lost ? "var(--bad)" : p.kind === "data" ? "var(--c1)" : "var(--c3)";
+      const label = p.kind === "data" ? `M${p.msg}#${p.attempt}` + (p.seq != null ? ` s=${p.seq}` : "") : (p.seq != null ? `ACK ${p.seq}` : "ACK");
+      if (p.lost) {
+        const mx = fromX + (toX - fromX) * 0.55, my = y0 + (y1 - y0) * 0.55;
+        svg.append(s("line", { x1: fromX, y1: y0, x2: mx, y2: my, style: `stroke:${col};stroke-width:${cur ? 3 : 2};stroke-dasharray:5 4` }));
+        svg.append(s("path", { d: `M${mx - 6},${my - 6} L${mx + 6},${my + 6} M${mx + 6},${my - 6} L${mx - 6},${my + 6}`, style: "stroke:var(--bad);stroke-width:2.5" }));
+        svg.append(s("text", { x: fromX + (mx - fromX) * 0.45, y: y0 + (my - y0) * 0.45 + 15, "text-anchor": "middle", "font-size": 11.5, style: "fill:var(--bad)", text: label + " 丢失" }));
+      } else {
+        const arrived = p.arriveStep != null && p.arriveStep <= i;
+        const mk = p.kind === "data" ? "url(#d48-ah-c1)" : "url(#d48-ah-c3)";
+        const tx = toX + (fromX < toX ? -2 : 2);
+        svg.append(s("line", { x1: fromX, y1: y0, x2: tx, y2: y1, "marker-end": mk, style: `stroke:${col};stroke-width:${cur ? 3 : 2};${arrived ? "" : "stroke-dasharray:3 3;opacity:.55"}` }));
+        const lx = fromX + (toX - fromX) * 0.5, ly = y0 + (y1 - y0) * 0.5;
+        svg.append(s("text", { x: lx, y: ly - 5, "text-anchor": "middle", "font-size": 11.5, style: `fill:${col};font-weight:${cur ? 700 : 400}`, text: label }));
+      }
+    }
+    // 旁注
+    const used = {};
+    res.steps.forEach((st, k) => {
+      if (k > i || !st.note) return;
+      const side = st.note.side, key = side + Math.round(Y(st.t));
+      const off = (used[key] = (used[key] || 0) + 1) - 1;
+      const colr = st.note.cls === "bad" ? "var(--bad)" : st.note.cls === "ok" ? "var(--ok)" : st.note.cls === "warn" ? "var(--warn)" : "var(--muted)";
+      const x = side === "S" ? xS - 20 : xR + 10;
+      svg.append(s("text", { x, y: Y(st.t) + 4 + off * 13, "text-anchor": side === "S" ? "end" : "start", "font-size": 11.5, style: `fill:${colr};font-weight:${k === i ? 700 : 500}`, text: st.note.text }));
+    });
+    $("rl-stage").replaceChildren(svg);
+
+    const S = sn.S, R = sn.R;
+    $("rl-sstate").textContent = `发送方\n当前消息：${S.done ? "全部完成" : "M" + S.cur + "（第 " + S.attempt + " 次发送）"}\n保留的副本：${S.done ? "无" : "M" + S.cur}\n定时器：${S.timerAt == null || S.done ? "关闭" : "t=" + S.timerAt + " 到期（超时值 " + S.to + "）"}`;
+    $("rl-rstate").textContent = `接收方\n${$("rl-seq").checked ? "期望序号 expected = " + R.expected : "（没有序列号，无法识别重复）"}\n交给应用的消息：${R.log.join(" ") || "（无）"}\n余额 balance = ${R.balance}`;
+    $("rl-narr").innerHTML = stp.text;
+    const st = sn.st;
+    const stat = (v, l, cls) => h("div", { class: "stat" }, h("div", { class: "v " + (cls || "") }, v), h("div", { class: "l" }, l));
+    $("rl-stats").replaceChildren(
+      stat(st.dataSent, "数据发送次数"), stat(st.retrans, "其中重传"), stat(st.acksSent, "ack 发送次数"), stat(st.lostPk, "丢失的包"),
+      stat(st.delivered, "交给应用次数"), stat(st.dupDiscarded, "识别并丢弃的重复"),
+      stat(st.dupExecuted, "重复执行（错误）", st.dupExecuted ? "bad-text" : ""),
+      stat(st.misAck, "误认的 ack（错误）", st.misAck ? "bad-text" : ""));
+  }
+  run();
+
+  // ---------------- RPC 模拟器 ----------------
+  let rpc = null;
+  const rStep = OSTEP.stepper($("rpc-step"), { steps: () => (rpc ? rpc.steps.length : 1), render: renderRpc, autoplayMs: 1300 });
+  function rpcRun() {
+    const fn = +$("rpc-fn").value;
+    $("rpc-a2").disabled = fn === 1;
+    rpc = buildRpc({ fn, a1: (+$("rpc-a1").value) | 0, a2: (+$("rpc-a2").value) | 0, littleEndian: $("rpc-le").checked, loseReply: $("rpc-lose").checked, dedup: $("rpc-dedup").checked });
+    rStep.reset();
+  }
+  ["rpc-fn", "rpc-a1", "rpc-a2", "rpc-le", "rpc-lose", "rpc-dedup"].forEach((id) => $(id).addEventListener("input", rpcRun));
+  const boxes = [
+    { x: 10, y: 20, t: "客户端代码" }, { x: 10, y: 80, t: "客户端存根" }, { x: 10, y: 140, t: "客户端 RPC 运行时" },
+    { x: 280, y: 140, t: "网络" },
+    { x: 550, y: 140, t: "服务端 RPC 运行时" }, { x: 550, y: 80, t: "服务端存根" }, { x: 550, y: 20, t: "func" },
+  ];
+  function renderRpc(i) {
+    const st = rpc.steps[i];
+    const W = 740, H = 200;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "RPC 各层" });
+    svg.append(s("rect", { x: 2, y: 8, width: 196, height: 186, rx: 10, style: "fill:none;stroke:var(--border);stroke-dasharray:4 4" }));
+    svg.append(s("rect", { x: 542, y: 8, width: 196, height: 186, rx: 10, style: "fill:none;stroke:var(--border);stroke-dasharray:4 4" }));
+    // 固定连线（先画，压在方框下面）
+    [[1, 0], [2, 1], [4, 5], [5, 6]].forEach(([a, b]) => {
+      const A = boxes[a], B = boxes[b];
+      svg.append(s("line", { x1: A.x + 90, y1: A.y, x2: B.x + 90, y2: B.y + 40, style: "stroke:var(--border);stroke-width:1.5" }));
+    });
+    svg.append(s("line", { x1: 190, y1: 160, x2: 280, y2: 160, style: "stroke:var(--border);stroke-width:1.5" }));
+    svg.append(s("line", { x1: 460, y1: 160, x2: 550, y2: 160, style: "stroke:var(--border);stroke-width:1.5" }));
+    boxes.forEach((b, k) => {
+      const on = k === st.pos;
+      const w = 180, hh = 40;
+      const cls = on ? (st.lost || st.bad ? "bad-soft" : "accent-soft") : "box";
+      svg.append(s("rect", { x: b.x, y: b.y, width: k === 3 ? w : w, height: hh, rx: 8, class: cls, "stroke-width": on ? 2.5 : 1 }));
+      const label = k === 6 ? `真正的 func${+$("rpc-fn").value}()` : b.t;
+      svg.append(s("text", { x: b.x + w / 2, y: b.y + 25, "text-anchor": "middle", "font-size": 13.5, "font-weight": on ? 700 : 400, text: label }));
+    });
+    if (st.pos === 3) {
+      const req = st.dir === 1;
+      const y = req ? 125 : 195;
+      svg.append(s("line", { x1: req ? 190 : 550, y1: y, x2: req ? (st.lost ? 370 : 548) : (st.lost ? 370 : 192), y2: y, "marker-end": st.lost ? null : req ? "url(#d48-ah-c1)" : "url(#d48-ah-c3)", style: `stroke:${st.lost ? "var(--bad)" : req ? "var(--c1)" : "var(--c3)"};stroke-width:2.5;${st.lost ? "stroke-dasharray:5 4" : ""}` }));
+      if (st.lost) svg.append(s("path", { d: "M364,189 L376,201 M376,189 L364,201", style: "stroke:var(--bad);stroke-width:2.5" }));
+      svg.append(s("text", { x: 370, y: req ? 118 : 188, "text-anchor": "middle", "font-size": 12, style: `fill:${st.lost ? "var(--bad)" : req ? "var(--c1)" : "var(--c3)"}`, text: req ? "请求 →" : st.lost ? "← 回复（丢失）" : "← 回复" }));
+    }
+    if (st.timeout) svg.append(s("text", { x: 100, y: 196, "text-anchor": "middle", "font-size": 12, style: "fill:var(--warn);font-weight:700", text: "⏰ 超时，重发" }));
+    $("rpc-stage").replaceChildren(svg);
+
+    const bufHost = $("rpc-buf");
+    bufHost.replaceChildren();
+    if (st.buf) {
+      if (!st.buf.length) bufHost.append(h("span", { class: "muted small" }, "消息缓冲区：（空）"));
+      else {
+        bufHost.append(h("span", { class: "muted small", style: { alignSelf: "center" } }, "消息缓冲区（大端，" + st.buf.length * 4 + " 字节）："));
+        st.buf.forEach((f) => bufHost.append(h("div", { class: "field" },
+          h("div", {}, be32(f.v).map((b) => h("span", { class: "cell f" + f.f }, b.toString(16).padStart(2, "0")))),
+          h("small", {}, `${f.name} = ${f.v}`))));
+      }
+      if (st.showHost != null) bufHost.append(h("div", { class: "readout", style: { flexBasis: "100%" } },
+        `arg1 = ${st.showHost} 在小端主机内存中：${le32hex(st.showHost)}\n                转换为网络/XDR 大端：${be32hex(st.showHost)}`));
+    }
+    $("rpc-narr").innerHTML = st.text;
+    const stat = (v, l, cls) => h("div", { class: "stat" }, h("div", { class: "v " + (cls || "") }, v), h("div", { class: "l" }, l));
+    $("rpc-stats").replaceChildren(stat(st.msgs, "已发送的网络消息"), stat(st.execs, "服务器函数执行次数", st.execs > 1 ? "bad-text" : ""), stat(st.done ? rpc.result : "…", "调用结果 r"));
+  }
+  rpcRun();
+})();
+</script>
+</body></html>

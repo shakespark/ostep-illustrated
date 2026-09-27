@@ -1,0 +1,878 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 26 章 · 并发：介绍</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+  .codebox { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; font: 12.5px/1.6 var(--mono); padding: 6px 0; overflow-x: auto; }
+  .codebox .ln { display: block; padding: 0 10px 0 4px; white-space: pre; border-left: 3px solid transparent; }
+  .codebox .ln .no { color: var(--faint); display: inline-block; width: 3.2em; user-select: none; }
+  .codebox .ln.next { background: var(--accent-soft); border-left-color: var(--accent); }
+  .codebox .ln.done { background: var(--warn-soft); border-left-color: var(--warn); }
+  .codebox .ln .mk { float: right; font-family: var(--font); font-size: 11.5px; color: var(--muted); margin-left: 10px; }
+  .race-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+  .tcard { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); overflow: hidden; }
+  .tcard.cur { box-shadow: 0 0 0 2px var(--accent); }
+  .tcard .th { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--border); font-weight: 650; font-size: 14px; gap: 6px; flex-wrap: wrap; }
+  .tcard .th .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: middle; }
+  .tcard .codebox { border: 0; border-radius: 0; }
+  .tcard .regs { display: flex; gap: 8px; padding: 6px 10px; font-size: 13px; flex-wrap: wrap; align-items: center; border-top: 1px solid var(--border); }
+  .reg { font: 600 14px var(--mono); border: 1px solid var(--border); border-radius: 6px; padding: 1px 8px; background: var(--surface-2); }
+  .reg small { font: 11.5px var(--font); color: var(--muted); margin-right: 4px; font-weight: 400; }
+  .st { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-2); font-weight: 500; }
+  .st.run { border-color: var(--ok); background: var(--ok-soft); }
+  .st.ready { border-color: var(--warn); background: var(--warn-soft); }
+  .memrow { display: flex; flex-wrap: wrap; gap: 10px; align-items: stretch; margin-bottom: 10px; }
+  .membox { border: 2px solid var(--border); border-radius: 8px; padding: 6px 14px; background: var(--surface); min-width: 170px; transition: background .25s, border-color .25s; }
+  .membox .k { font-size: 12px; color: var(--muted); display: block; }
+  .membox .v { font: 700 24px var(--mono); }
+  .membox.write { border-color: var(--ok); background: var(--ok-soft); }
+  .membox.stale { border-color: var(--bad); background: var(--bad-soft); }
+  .cpubox { border: 1px dashed var(--border); border-radius: 8px; padding: 6px 14px; font-size: 13.5px; display: flex; flex-direction: column; justify-content: center; }
+  table.trace { font: 12.5px/1.45 var(--mono); }
+  table.trace th { font-family: var(--font); }
+  table.trace td { padding: 3px 10px; white-space: nowrap; }
+  table.trace tr.os td { color: var(--muted); background: var(--surface-2); font-style: italic; }
+  table.trace tr.cur td { background: var(--accent-soft); }
+  table.trace tr.stale td { color: var(--bad); font-weight: 700; }
+  table.trace td.n { text-align: right; }
+  .manual-btns button { font-weight: 600; }
+  .ordtab td { font-size: 13.5px; padding: 3px 10px; }
+  .ordtab tr.cur td { background: var(--accent-soft); }
+  .ordtab td.blk { color: var(--bad); }
+  .outbox { font: 13px/1.6 var(--mono); background: var(--code-bg); border: 1px dashed var(--border); border-radius: 8px; padding: 8px 12px; white-space: pre; min-height: 3em; }
+  .terms { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin: 16px 0; }
+  .term { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: 14px 16px; border-top: 4px solid var(--accent); }
+  .term h4 { margin: 0 0 4px; font-size: 16px; }
+  .term .en { font-size: 12.5px; color: var(--muted); letter-spacing: .03em; }
+  .term p { margin: 6px 0 0; font-size: 14.5px; }
+  .term .eg { font-size: 13.5px; color: var(--muted); border-top: 1px dashed var(--border); padding-top: 6px; margin-top: 8px; }
+  .term.t1 { border-top-color: var(--c1); } .term.t2 { border-top-color: var(--c2); } .term.t3 { border-top-color: var(--c3); } .term.t4 { border-top-color: var(--c4); }
+</style>
+</head>
+<body data-chapter="26">
+<main>
+
+<h2 id="crux">本章要解决什么</h2>
+<div class="crux">
+  <p><strong>如何支持同步？</strong>为了构建有用的同步原语，我们需要硬件提供什么支持？需要操作系统提供什么支持？怎样正确、高效地构建这些原语？程序又该怎样使用它们来得到期望的结果？</p>
+  <p class="small muted">CRUX: How to support synchronization. What support do we need from the hardware in order to build useful synchronization primitives? What support do we need from the OS? How can we build these primitives correctly and efficiently? How can programs use them to get the desired results?</p>
+</div>
+<p>前两部分里，操作系统做了两件大事：把一个物理 CPU 虚拟成多个 CPU（进程），把物理内存虚拟成每个进程私有的大地址空间。这一章引入<strong>单个进程内部</strong>的新抽象——<strong>线程（thread）</strong>：一个程序不再只有一个执行点（一个 PC），而是有多个执行点，它们<strong>共享同一个地址空间</strong>。</p>
+<p>共享带来了方便，也带来了全书"并发"部分的核心麻烦：两个线程同时更新一个变量，结果可能是错的，而且每次运行都不一样。本章用一个只有一行的 <code>counter = counter + 1</code> 把问题彻底拆开，给出四个关键术语，并引出后面几章要造的工具：锁（第 28 章）、条件变量（第 30 章）、信号量（第 31 章）。</p>
+
+<h2 id="concepts">核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>线程（thread）</h4><p>进程里的一个独立执行流：有自己的 PC 和寄存器，但与同进程的其他线程共享地址空间（代码、全局变量、堆）。</p></div>
+  <div class="card"><h4>线程控制块（TCB）</h4><p>类似进程的 PCB。线程切换时把寄存器保存到 TCB；但<strong>不用切换页表</strong>，因为地址空间没变。</p></div>
+  <div class="card"><h4>每线程一个栈</h4><p>局部变量、参数、返回地址放在各自的栈上，称为线程本地存储（thread-local storage）。</p></div>
+  <div class="card"><h4>为什么用线程</h4><p>① 并行（parallelism）：多个 CPU 一起干活；② 避免 I/O 阻塞：一个线程等 I/O，另一个继续计算。</p></div>
+  <div class="card"><h4>不受控的调度</h4><p>调度程序可以在<strong>任意两条指令之间</strong>切换线程。一条 C 语句往往是好几条指令，中途被打断就可能出错。</p></div>
+  <div class="card"><h4>竞态条件（race condition）</h4><p>结果取决于线程执行的时序。<code>counter</code> 从 50 加两次，可能只得到 51。</p></div>
+  <div class="card"><h4>原子性（atomicity）</h4><p>"要么全做，要么全不做"，中间状态对外不可见。我们希望一段指令像一条指令那样原子地执行。</p></div>
+  <div class="card"><h4>同步原语（synchronization primitive）</h4><p>用少量硬件指令 + 操作系统支持构造出来的通用工具（锁、条件变量……），用来让临界区原子地执行。</p></div>
+</div>
+
+<h2 id="thread">线程是什么：多个 PC，一个地址空间</h2>
+<p>单线程进程只有一个执行点。多线程程序有多个执行点，每个都在取指、执行。可以把每个线程想成一个"小进程"，区别只有一个：<strong>它们共享同一个地址空间，因此可以访问相同的数据</strong>。</p>
+<p>线程的状态和进程很像：有程序计数器（PC）、有一组私有寄存器。两个线程在同一个 CPU 上轮流运行时，也要做<strong>上下文切换（context switch）</strong>：保存 T1 的寄存器到它的 TCB，恢复 T2 的寄存器。与进程切换相比有一个大区别：<strong>地址空间不变，不需要切换页表</strong>（也就不用清 TLB 之类的连带开销）。</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>状态</th><th>每个线程私有</th><th>同一进程的线程共享</th></tr></thead>
+  <tbody>
+    <tr><td>程序计数器 PC、通用寄存器（如 <code>%eax</code>）</td><td>✔ 保存在各自的 TCB</td><td></td></tr>
+    <tr><td>栈（局部变量、参数、返回地址）</td><td>✔ 每个线程一个栈</td><td></td></tr>
+    <tr><td>代码段</td><td></td><td>✔</td></tr>
+    <tr><td>全局变量 / 静态变量（如 <code>counter</code>）</td><td></td><td>✔ ← 竞态条件的来源</td></tr>
+    <tr><td>堆（<code>malloc</code> 出来的数据）</td><td></td><td>✔</td></tr>
+    <tr><td>页表（地址空间本身）、打开的文件</td><td></td><td>✔</td></tr>
+  </tbody>
+</table></div>
+
+<p>另一个大区别在于<strong>栈</strong>。经典单线程地址空间里只有一个栈，放在地址空间底部，和堆相向增长。多线程进程里，每个线程独立调用各种函数，所以<strong>每个线程都要有自己的栈</strong>（图 26.1 右）：</p>
+
+<figure class="fig">
+<svg viewBox="0 0 660 360" width="660" role="img" aria-label="单线程与多线程地址空间">
+  <g font-size="13">
+    <text x="165" y="18" text-anchor="middle" font-weight="600">单线程地址空间</text>
+    <text x="495" y="18" text-anchor="middle" font-weight="600">双线程地址空间</text>
+    <!-- left -->
+    <rect x="95" y="30" width="140" height="36" class="box" />
+    <text x="165" y="53" text-anchor="middle">程序代码</text>
+    <rect x="95" y="66" width="140" height="36" class="ok-soft" />
+    <text x="165" y="89" text-anchor="middle">堆 Heap</text>
+    <rect x="95" y="102" width="140" height="196" class="box" style="fill:var(--surface)" stroke-dasharray="4 3"/>
+    <text x="165" y="205" text-anchor="middle" class="t-muted">(空闲)</text>
+    <rect x="95" y="298" width="140" height="36" style="fill:var(--c1);stroke:var(--c1)" />
+    <text x="165" y="321" text-anchor="middle" style="fill:#fff;font-weight:600">栈 Stack</text>
+    <path d="M165 108 v24" class="arrow" marker-end="url(#ar26)"/>
+    <text x="172" y="128" font-size="11" class="t-muted">堆向下长</text>
+    <path d="M165 292 v-24" class="arrow" marker-end="url(#ar26)"/>
+    <text x="172" y="278" font-size="11" class="t-muted">栈向上长</text>
+    <g class="t-muted mono" font-size="11" text-anchor="end">
+      <text x="88" y="34">0KB</text><text x="88" y="70">1KB</text><text x="88" y="106">2KB</text><text x="88" y="302">15KB</text><text x="88" y="338">16KB</text>
+    </g>
+    <!-- right -->
+    <rect x="425" y="30" width="140" height="36" class="box" />
+    <text x="495" y="53" text-anchor="middle">程序代码</text>
+    <rect x="425" y="66" width="140" height="36" class="ok-soft" />
+    <text x="495" y="89" text-anchor="middle">堆 Heap</text>
+    <rect x="425" y="102" width="140" height="90" class="box" style="fill:var(--surface)" stroke-dasharray="4 3"/>
+    <text x="495" y="152" text-anchor="middle" class="t-muted">(空闲)</text>
+    <rect x="425" y="192" width="140" height="36" style="fill:var(--c2);stroke:var(--c2)" />
+    <text x="495" y="215" text-anchor="middle" style="fill:#fff;font-weight:600">栈 (2)</text>
+    <rect x="425" y="228" width="140" height="70" class="box" style="fill:var(--surface)" stroke-dasharray="4 3"/>
+    <text x="495" y="268" text-anchor="middle" class="t-muted">(空闲)</text>
+    <rect x="425" y="298" width="140" height="36" style="fill:var(--c1);stroke:var(--c1)" />
+    <text x="495" y="321" text-anchor="middle" style="fill:#fff;font-weight:600">栈 (1)</text>
+    <g class="t-muted mono" font-size="11" text-anchor="end">
+      <text x="418" y="34">0KB</text><text x="418" y="70">1KB</text><text x="418" y="106">2KB</text><text x="418" y="302">15KB</text><text x="418" y="338">16KB</text>
+    </g>
+    <text x="575" y="214" font-size="11.5">线程 2 的栈</text>
+    <text x="575" y="320" font-size="11.5">线程 1 的栈</text>
+    <text x="330" y="352" text-anchor="middle" font-size="12" class="t-muted">多个栈打破了"堆和栈相向生长、中间整片空闲"的整齐布局</text>
+  </g>
+  <defs><marker id="ar26" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+</svg>
+<figcaption>图 26.1 单线程与多线程地址空间：代码、堆是共享的；每个线程有自己的栈（线程本地存储）。</figcaption>
+</figure>
+<p>多个栈让原本"堆向下、栈向上、中间都是空闲"的漂亮布局不复存在。好在栈通常不需要很大（大量递归的程序除外），所以这通常不是问题。</p>
+
+<h2 id="why">为什么要用线程</h2>
+<p>原书给出两个主要理由：</p>
+<ol>
+  <li><strong>并行（parallelism）</strong>：比如把两个大数组相加。单 CPU 上只能一个元素一个元素地做；有多个 CPU 时，每个 CPU 负责一部分就能大大加速。把单线程程序改造成能在多 CPU 上干活的程序叫<strong>并行化（parallelization）</strong>，每个 CPU 一个线程是最自然的做法。</li>
+  <li><strong>避免因为慢速 I/O 阻塞程序</strong>：一个线程在等网络、磁盘或缺页时，调度程序可以切到同一程序的其他线程继续计算或发出更多 I/O。这就像多道程序（multiprogramming）让进程之间重叠 I/O 与计算一样，只不过发生在一个程序内部。Web 服务器、数据库大量使用这种方式。</li>
+</ol>
+<figure class="fig">
+<svg viewBox="0 0 700 250" width="700" role="img" aria-label="并行与I/O重叠">
+  <g font-size="12.5">
+    <text x="10" y="18" font-weight="600">① 并行：数组 16 个元素分给 4 个 CPU</text>
+    <g id="arr26"></g>
+    <text x="10" y="120" font-weight="600">② I/O 重叠：同样的工作，单线程 vs 双线程</text>
+    <text x="10" y="152" class="t-muted">单线程</text>
+    <rect x="80" y="138" width="120" height="22" rx="3" style="fill:var(--c1)"/><text x="140" y="153" text-anchor="middle" style="fill:#fff">计算</text>
+    <rect x="200" y="138" width="160" height="22" rx="3" class="box" stroke-dasharray="4 3"/><text x="280" y="153" text-anchor="middle" class="t-muted">等待 I/O（CPU 空闲）</text>
+    <rect x="360" y="138" width="120" height="22" rx="3" style="fill:var(--c1)"/><text x="420" y="153" text-anchor="middle" style="fill:#fff">计算</text>
+    <text x="10" y="192" class="t-muted">线程 1</text>
+    <rect x="80" y="178" width="120" height="22" rx="3" style="fill:var(--c1)"/><text x="140" y="193" text-anchor="middle" style="fill:#fff">计算</text>
+    <rect x="200" y="178" width="160" height="22" rx="3" class="box" stroke-dasharray="4 3"/><text x="280" y="193" text-anchor="middle" class="t-muted">阻塞在 I/O</text>
+    <text x="10" y="222" class="t-muted">线程 2</text>
+    <rect x="200" y="208" width="120" height="22" rx="3" style="fill:var(--c2)"/><text x="260" y="223" text-anchor="middle" style="fill:#fff">计算</text>
+    <text x="490" y="153" class="t-muted">总时间 = 400</text>
+    <text x="370" y="223" style="fill:var(--ok)">线程 2 在 I/O 期间用上了 CPU</text>
+  </g>
+</svg>
+<figcaption>线程让程序同时利用多个 CPU（上），或把 I/O 等待和计算重叠起来（下）。</figcaption>
+</figure>
+<p>这两件事用多个<strong>进程</strong>也能做。但线程共享地址空间，共享数据非常方便，所以写这类程序时线程更自然；而逻辑上彼此独立、几乎不需要共享内存数据结构的任务，用进程更稳妥。</p>
+
+<h2 id="create">线程创建：谁先跑？说不准</h2>
+<p>下面是原书的 <code>t0.c</code>（图 26.2）：主线程创建两个线程 T1、T2，分别打印 "A" 和 "B"，然后用 <code>pthread_join()</code> 依次等它们结束。</p>
+<pre><code>void *mythread(void *arg) {
+    printf("%s\n", (char *) arg);
+    return NULL;
+}
+
+int main(int argc, char *argv[]) {
+    pthread_t p1, p2;
+    printf("main: begin\n");
+    Pthread_create(&amp;p1, NULL, mythread, "A");
+    Pthread_create(&amp;p2, NULL, mythread, "B");
+    // join waits for the threads to finish
+    Pthread_join(p1, NULL);
+    Pthread_join(p2, NULL);
+    printf("main: end\n");
+    return 0;
+}</code></pre>
+<p>创建线程有点像函数调用，但系统<strong>不是</strong>先执行完被调函数再返回，而是为它创建一个新的执行流，它和调用者<strong>独立</strong>运行：可能在 <code>pthread_create</code> 返回之前就跑，也可能很久以后才跑；先创建的线程也不一定先运行。到底谁先跑，由操作系统调度程序决定。下面这个小模拟器可以重放原书图 26.3、26.4、26.5 三种执行顺序，也可以随机生成别的合法顺序。</p>
+
+<section class="sim" id="sim-order">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>t0.c 的执行顺序</h3>
+    <div class="desc">每一行是某个线程执行的一个动作，时间向下增长（和原书的三栏执行图一样）。观察：A、B 的打印顺序会变，但 "main: begin" 永远第一、"main: end" 永远最后——为什么？</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <button data-preset="0">原书图 26.3</button>
+      <button data-preset="1">原书图 26.4</button>
+      <button data-preset="2">原书图 26.5</button>
+      <span class="sep"></span>
+      <label>种子 <input type="number" id="ord-seed" value="7" min="0" max="99999"></label>
+      <button id="ord-rand">随机调度</button>
+    </div>
+    <div id="ord-step"></div>
+    <div class="stage"><div class="table-wrap" style="margin:0"><table class="ordtab" id="ord-table"></table></div></div>
+    <div class="narrate" id="ord-narr"></div>
+    <div class="outbox" id="ord-out"></div>
+  </div>
+</section>
+
+<h2 id="shared">更糟的情况：共享数据</h2>
+<p>上面的例子线程之间没有共享数据。现在看原书的 <code>t1.c</code>（图 26.6）：两个线程都对全局变量 <code>counter</code> 加 1，各加 1000 万次，期望结果是 20,000,000。</p>
+<pre><code>static volatile int counter = 0;
+
+void *mythread(void *arg) {
+    printf("%s: begin\n", (char *) arg);
+    int i;
+    for (i = 0; i &lt; 1e7; i++) {
+        counter = counter + 1;      // ← 两个线程都在改同一个全局变量
+    }
+    printf("%s: done\n", (char *) arg);
+    return NULL;
+}
+// main() 创建线程 "A"、"B"，join 两次后打印 counter</code></pre>
+<p>书中有时得到 20000000，但更多时候得到 19345221、19221041……<strong>每次都错，而且每次错得不一样</strong>。不是教授骗了你"计算机是确定性的"，而是这段代码里存在竞态条件。下面是本机（16 个逻辑 CPU）真实运行的结果，错得比原书还多：</p>
+<pre><code>$ ./t1
+main: begin (counter = 0)
+A: begin
+B: begin
+A: done
+B: done
+main: done with both (counter = 10642433, expected 20000000)
+$ make race        # 连续 5 次
+main: done with both (counter = 10519561, expected 20000000)
+main: done with both (counter = 10339241, expected 20000000)
+main: done with both (counter = 10488674, expected 20000000)
+main: done with both (counter = 10378985, expected 20000000)
+main: done with both (counter = 10404946, expected 20000000)</code></pre>
+<p class="small muted">示例输出，你的机器上数字会不同。</p>
+
+<h2 id="heart">问题的核心：不受控的调度</h2>
+<p>要理解为什么会错，得看编译器为 <code>counter = counter + 1</code> 生成了什么。原书用 <code>objdump -d</code> 反汇编（<strong>学会用工具</strong>是原书反复强调的技巧），假设 <code>counter</code> 在地址 <code>0x8049a1c</code>：</p>
+<pre><code>mov 0x8049a1c, %eax    ; ① 读：把内存里的 counter 装进寄存器 eax
+add $0x1, %eax         ; ② 改：eax = eax + 1
+mov %eax, 0x8049a1c    ; ③ 写：把 eax 存回内存</code></pre>
+<p>一行 C 代码是<strong>三条</strong>指令。调度程序可以在任意两条指令之间通过定时器中断切换线程。关键在于：<strong>每个线程运行时都有自己私有的寄存器</strong>（上下文切换时保存/恢复），但 <code>counter</code> 在共享内存里。</p>
+<p>原书的故事：<code>counter</code> 初值 50。T1 执行了 ① ②，它的 <code>eax=51</code>；此时定时器中断，OS 把 T1 的 PC 和寄存器存进 TCB。T2 被调度，完整执行 ①②③：读到的仍是 50，写回 51。再切回 T1，它恢复 <code>eax=51</code>，执行 ③——把 51 <strong>又</strong>写了一遍。代码执行了两次，<code>counter</code> 却只从 50 变成 51，而正确结果应是 52。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 680 400" width="680" role="img" aria-label="丢失更新的时序图">
+  <defs><marker id="ar26b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <g font-size="12.5">
+    <rect x="40" y="10" width="150" height="30" rx="6" style="fill:var(--c1)"/><text x="115" y="30" text-anchor="middle" style="fill:#fff;font-weight:600">线程 1（eax 私有）</text>
+    <rect x="265" y="10" width="150" height="30" rx="6" class="box-strong"/><text x="340" y="30" text-anchor="middle" font-weight="600">共享内存 counter</text>
+    <rect x="490" y="10" width="150" height="30" rx="6" style="fill:var(--c2)"/><text x="565" y="30" text-anchor="middle" style="fill:#fff;font-weight:600">线程 2（eax 私有）</text>
+    <line x1="115" y1="40" x2="115" y2="390" class="stroke" stroke-dasharray="3 4" style="stroke:var(--c1)"/>
+    <line x1="340" y1="40" x2="340" y2="390" class="stroke" stroke-dasharray="3 4"/>
+    <line x1="565" y1="40" x2="565" y2="390" class="stroke" stroke-dasharray="3 4" style="stroke:var(--c2)"/>
+    <!-- values on memory lane -->
+    <g class="mono">
+      <rect x="315" y="55" width="50" height="22" rx="4" class="box"/><text x="340" y="71" text-anchor="middle">50</text>
+      <rect x="315" y="265" width="50" height="22" rx="4" class="ok-soft"/><text x="340" y="281" text-anchor="middle">51</text>
+      <rect x="315" y="350" width="50" height="22" rx="4" class="bad-soft"/><text x="340" y="366" text-anchor="middle">51</text>
+    </g>
+    <!-- T1 load -->
+    <path d="M315 70 L125 88" class="arrow" marker-end="url(#ar26b)"/>
+    <text x="10" y="95" class="mono">① mov → eax=50</text>
+    <text x="10" y="120" class="mono">② add → eax=51</text>
+    <rect x="30" y="135" width="620" height="24" rx="4" class="warn-soft"/>
+    <text x="340" y="152" text-anchor="middle">定时器中断：保存 T1（PC=108, eax=51）到 TCB，恢复 T2</text>
+    <path d="M365 70 L555 180" class="arrow" marker-end="url(#ar26b)"/>
+    <text x="500" y="200" class="mono">① mov → eax=50</text>
+    <text x="500" y="225" class="mono">② add → eax=51</text>
+    <text x="500" y="250" class="mono">③ mov → 写 51</text>
+    <path d="M555 256 L368 274" class="arrow" marker-end="url(#ar26b)"/>
+    <rect x="30" y="300" width="620" height="24" rx="4" class="warn-soft"/>
+    <text x="340" y="317" text-anchor="middle">中断：保存 T2，恢复 T1（eax 仍是它自己早先算出的 51）</text>
+    <text x="10" y="352" class="mono">③ mov → 写 51</text>
+    <path d="M125 350 L312 360" class="arrow" marker-end="url(#ar26b)"/>
+    <text x="380" y="366" style="fill:var(--bad);font-weight:600">T2 的那次 +1 被覆盖，丢失！</text>
+  </g>
+</svg>
+<figcaption>丢失更新（lost update）：两个线程都基于"旧值 50"计算，后写的覆盖了先写的。</figcaption>
+</figure>
+
+<p>原书把代码放在地址 100 处（x86 指令变长：<code>mov</code> 占 5 字节，<code>add</code> 占 3 字节，所以三条指令分别在 100、105、108），并给出了精确的执行轨迹（图 26.7）。表中 PC、eax 是<strong>当前正在运行的线程</strong>在该指令执行<strong>之后</strong>的值：</p>
+<div class="table-wrap"><table class="trace">
+  <thead><tr><th>OS</th><th>Thread 1</th><th>Thread 2</th><th class="num">PC</th><th class="num">eax</th><th class="num">counter</th></tr></thead>
+  <tbody>
+    <tr><td></td><td>before critical section</td><td></td><td class="n">100</td><td class="n">0</td><td class="n">50</td></tr>
+    <tr><td></td><td>mov 8049a1c,%eax</td><td></td><td class="n">105</td><td class="n">50</td><td class="n">50</td></tr>
+    <tr><td></td><td>add $0x1,%eax</td><td></td><td class="n">108</td><td class="n">51</td><td class="n">50</td></tr>
+    <tr class="os"><td>interrupt<br>save T1<br>restore T2</td><td></td><td></td><td class="n">100</td><td class="n">0</td><td class="n">50</td></tr>
+    <tr><td></td><td></td><td>mov 8049a1c,%eax</td><td class="n">105</td><td class="n">50</td><td class="n">50</td></tr>
+    <tr><td></td><td></td><td>add $0x1,%eax</td><td class="n">108</td><td class="n">51</td><td class="n">50</td></tr>
+    <tr><td></td><td></td><td>mov %eax,8049a1c</td><td class="n">113</td><td class="n">51</td><td class="n">51</td></tr>
+    <tr class="os"><td>interrupt<br>save T2<br>restore T1</td><td></td><td></td><td class="n">108</td><td class="n">51</td><td class="n">51</td></tr>
+    <tr class="stale"><td></td><td>mov %eax,8049a1c</td><td></td><td class="n">113</td><td class="n">51</td><td class="n">51</td></tr>
+  </tbody>
+</table></div>
+<p>这就是<strong>竞态条件（race condition）</strong>，更具体地说是<strong>数据竞争（data race）</strong>：结果取决于代码执行的时机。运气不好（在不合时宜的时刻发生上下文切换）就会得到错误结果，而且每次可能不同——我们称这种结果是<strong>不确定的（indeterminate）</strong>。可能导致竞态条件的这段代码叫<strong>临界区（critical section）</strong>：访问共享变量（或更一般地，共享资源）的一段代码，它<strong>不能被多个线程同时执行</strong>。我们真正想要的是<strong>互斥（mutual exclusion）</strong>：一个线程在临界区内执行时，其他线程被阻止进入。</p>
+<p>下面的模拟器仿照官方作业里的 <code>x86.py</code>：你来扮演调度程序，决定每一条指令由哪个线程执行。</p>
+
+<section class="sim" id="sim-race">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>线程交错执行器（仿 x86.py）</h3>
+    <div class="desc">每个线程执行若干次 <code>counter = counter + 1</code> 编译出的三条指令。<strong>手动</strong>模式下点按钮选择下一条指令由谁执行；也可以用固定时间片（x86.py 的 <code>-i</code>）或随机时间片（<code>-i -r</code>）。观察每个线程私有的 PC、eax 与共享的 counter，找出"丢失更新"发生的那一刻；再勾选"原子执行"对比。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>调度方式 <select id="rc-mode">
+        <option value="manual">手动（你来选）</option>
+        <option value="interval">固定时间片 -i</option>
+        <option value="random">随机时间片 -i -r</option>
+      </select></label>
+      <label>线程数 <select id="rc-threads"><option>2</option><option>3</option></select></label>
+      <label>每线程循环次数 <input type="number" id="rc-loops" value="1" min="1" max="5"></label>
+      <label>counter 初值 <input type="number" id="rc-init" value="50" min="0" max="9999"></label>
+      <label>时间片 i <input type="number" id="rc-int" value="3" min="1" max="12"></label>
+      <label>种子 <input type="number" id="rc-seed" value="0" min="0" max="99999"></label>
+      <label><input type="checkbox" id="rc-atomic"> 原子执行（三条指令不可打断）</label>
+    </div>
+    <div class="controls">
+      <button class="primary" id="rc-book">载入原书图 26.7</button>
+      <button id="rc-min">载入"最小结果"交错</button>
+      <span class="sep"></span>
+      <span class="manual-btns" id="rc-mbtns"></span>
+      <button id="rc-undo">撤销</button>
+      <button id="rc-clear">清空</button>
+    </div>
+    <div id="rc-step"></div>
+    <div class="stage">
+      <div class="memrow">
+        <div class="membox" id="rc-mem"><span class="k">共享内存 0x8049a1c（counter）</span><span class="v">50</span></div>
+        <div class="cpubox" id="rc-cpu"></div>
+      </div>
+      <div class="race-grid" id="rc-threads-view"></div>
+    </div>
+    <div class="narrate" id="rc-narr"></div>
+    <div class="stats" id="rc-stats"></div>
+    <details class="reveal" open><summary>执行轨迹（原书图 26.7 的格式，逐步展开）</summary>
+      <div style="border:0;padding:0"><div class="table-wrap"><table class="trace" id="rc-trace"></table></div></div>
+    </details>
+  </div>
+</section>
+
+<div class="tip"><p>模拟器里的 PC 只模拟三条指令：<code>100 mov</code>、<code>105 add</code>、<code>108 mov</code>，执行完是 113。循环次数大于 1 时，省略了循环控制指令（<code>sub/test/jgt</code>），写回之后直接回到 100 开始下一次。<strong>先想清楚：中断发生在哪两条指令之间才会出错？</strong>答案：只要一个线程"读"了 counter 之后、"写"回之前，别的线程写了 counter，这个线程的写回就会覆盖别人的更新。</p></div>
+
+<h2 id="atomic">原子性的愿望</h2>
+<p>解决这个问题的一种办法是：让硬件提供一条更强大的指令，一步完成我们要做的事，这样就不可能在中间被打断。例如一条"超级指令"：</p>
+<pre><code>memory-add 0x8049a1c, $0x1</code></pre>
+<p>硬件保证它<strong>原子地（atomically）</strong>执行：中断发生时，这条指令要么还没执行，要么已经执行完，<strong>不存在中间状态</strong>。"原子"在这里的意思是"作为一个整体"，也常理解为"全有或全无"（all or none）。我们希望的正是把那三条指令原子地执行。</p>
+<div class="aside" data-title="原书提示：使用原子操作（USE ATOMIC OPERATIONS）">
+  <p>原子操作是构建计算机系统最强大的底层技术之一，从体系结构、并发代码，到文件系统（日志、写时复制）、数据库（把一组动作打包成一个<strong>事务 transaction</strong>）、分布式系统都在用。本部分里，我们用同步原语把一小段指令序列变成原子执行的块。</p>
+</div>
+<p>但一般情况下不会有这样的单条指令。想象你在写一棵并发 B 树——难道要让硬件提供一条"原子地更新 B 树"的指令吗？显然不现实。于是真正的路线是：<strong>向硬件要少量有用的指令</strong>，再加上<strong>操作系统的一些帮助</strong>，在此之上构建一套通用的<strong>同步原语（synchronization primitives）</strong>，让多线程代码以同步、受控的方式访问临界区。这就是本部分要研究的问题（本页开头的 CRUX）。原书的原话：这是个美妙而困难的问题，应该让你的脑袋疼一点；如果不疼，说明你还没懂。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 640 170" width="640" role="img" aria-label="原子执行对比">
+  <g font-size="12.5">
+    <text x="10" y="20" font-weight="600">非原子：中断可以落在任意两条指令之间</text>
+    <g class="mono" font-size="12">
+      <rect x="20" y="30" width="120" height="26" rx="4" style="fill:var(--c1)"/><text x="80" y="47" text-anchor="middle" style="fill:#fff">mov (读)</text>
+      <rect x="150" y="30" width="120" height="26" rx="4" style="fill:var(--c1)"/><text x="210" y="47" text-anchor="middle" style="fill:#fff">add</text>
+      <rect x="280" y="30" width="120" height="26" rx="4" style="fill:var(--c1)"/><text x="340" y="47" text-anchor="middle" style="fill:#fff">mov (写)</text>
+    </g>
+    <g style="fill:var(--bad)" font-size="18" font-weight="700"><text x="140" y="74">↑</text><text x="270" y="74">↑</text></g>
+    <text x="420" y="47" class="t-muted">↑ 处被打断 → 可能丢失更新</text>
+    <text x="10" y="112" font-weight="600">原子：三条指令像一条指令一样不可分割</text>
+    <rect x="20" y="122" width="380" height="26" rx="4" style="fill:var(--c3)"/>
+    <text x="210" y="139" text-anchor="middle" class="mono" style="fill:#fff">memory-add 0x8049a1c, $0x1（或：lock; 读-改-写; unlock）</text>
+    <text x="420" y="139" class="t-muted">中断只能在块的前后</text>
+  </g>
+</svg>
+<figcaption>原子性 = 中间状态对其他线程不可见。在模拟器里勾选"原子执行"，时间片到期的中断会被推迟到块结束。</figcaption>
+</figure>
+
+<h2 id="wait">另一个问题：等待另一个线程</h2>
+<p>到目前为止，线程之间只有一种交互：访问共享变量，需要让临界区原子执行。实际上还有另一种常见交互：<strong>一个线程必须等另一个线程完成某件事后才能继续</strong>。例如进程发起磁盘 I/O 后被置为睡眠，I/O 完成时需要把它唤醒。所以后面几章不仅要构建支持原子性的同步原语，还要构建支持这种<strong>睡眠/唤醒</strong>交互的机制——这就是第 30 章的<strong>条件变量（condition variables）</strong>。</p>
+<p>顺带一提：<code>t0.c</code> 里的 <code>pthread_join()</code> 正是"等另一个线程结束"的一个特例。</p>
+
+<h2 id="terms">四个关键术语（Dijkstra）</h2>
+<p>原书专门用一个旁注列出这四个术语，它们大多由 Edsger Dijkstra 提出（他因为这些工作获得了图灵奖，1968 年的论文 "Cooperating Sequential Processes" 至今值得一读）。</p>
+<div class="terms">
+  <div class="term t1"><h4>临界区</h4><div class="en">CRITICAL SECTION</div>
+    <p>访问共享资源（通常是一个变量或数据结构）的一段代码。</p>
+    <div class="eg">例：<code>counter = counter + 1</code> 编译出的三条指令，从"读"到"写"整段。</div></div>
+  <div class="term t2"><h4>竞态条件</h4><div class="en">RACE CONDITION（DATA RACE）</div>
+    <p>多个执行线程大致同时进入临界区，都试图更新共享数据，导致出乎意料（可能不希望的）结果。</p>
+    <div class="eg">例：图 26.7 中 50 加两次得到 51。</div></div>
+  <div class="term t3"><h4>不确定性</h4><div class="en">INDETERMINATE</div>
+    <p>程序含有一个或多个竞态条件，输出随每次运行而变，取决于哪些线程在何时运行。</p>
+    <div class="eg">例：t1.c 每次输出的 counter 都不同。</div></div>
+  <div class="term t4"><h4>互斥</h4><div class="en">MUTUAL EXCLUSION</div>
+    <p>用互斥原语保证同一时刻只有一个线程进入临界区，从而避免竞争，得到确定的输出。</p>
+    <div class="eg">例：<code>t1_lock.c</code> 用锁包住 <code>counter++</code>，结果永远正确。</div></div>
+</div>
+
+<h2 id="os">为什么在操作系统课里学并发？</h2>
+<p>一个词：<strong>历史</strong>。操作系统是<strong>第一个并发程序</strong>，许多技术最初就是为 OS 内部发明的；后来有了多线程进程，应用程序员也必须考虑这些问题。</p>
+<p>原书的例子：两个进程都调用 <code>write()</code> 向同一个文件末尾追加数据。为此内核要分配一个新块、在文件的 inode 里记录块的位置、修改文件大小……因为中断可能随时发生，更新这些共享结构（分配位图、inode）的代码都是临界区。从引入中断的第一天起，OS 设计者就得操心内核如何更新内部结构。页表、进程列表、文件系统结构——几乎每个内核数据结构都必须用合适的同步原语小心访问。</p>
+<figure class="fig">
+<svg viewBox="0 0 620 170" width="620" role="img" aria-label="内核中的临界区">
+  <g font-size="12.5">
+    <rect x="20" y="20" width="130" height="34" rx="6" style="fill:var(--c1)"/><text x="85" y="42" text-anchor="middle" style="fill:#fff">进程 A: write()</text>
+    <rect x="20" y="110" width="130" height="34" rx="6" style="fill:var(--c2)"/><text x="85" y="132" text-anchor="middle" style="fill:#fff">进程 B: write()</text>
+    <rect x="230" y="10" width="370" height="150" rx="10" class="box"/>
+    <text x="415" y="30" text-anchor="middle" font-weight="600">内核（共享的数据结构）</text>
+    <rect x="250" y="45" width="160" height="40" rx="6" class="warn-soft"/><text x="330" y="70" text-anchor="middle">空闲块位图 bitmap</text>
+    <rect x="425" y="45" width="160" height="40" rx="6" class="warn-soft"/><text x="505" y="70" text-anchor="middle">文件的 inode（大小、块指针）</text>
+    <text x="415" y="115" text-anchor="middle" class="t-muted">分配新块 → 记录块位置 → 更新文件大小</text>
+    <text x="415" y="140" text-anchor="middle" style="fill:var(--bad)">这些更新都是临界区：中断随时可能到来</text>
+    <path d="M150 37 L245 60" class="arrow"/><path d="M150 127 L245 75" class="arrow"/>
+  </g>
+</svg>
+<figcaption>并发问题最早出现在内核中：两个进程同时追加写同一个文件。</figcaption>
+</figure>
+
+<h2 id="exercises">先预测，再验证</h2>
+<div class="exercise"><div class="q">（改编自 Homework 第 7 题）模拟器选"固定时间片 -i"、2 个线程、每线程循环 1 次、counter 初值 0。<strong>先预测</strong> i = 1、2、3、4 时最终 counter 分别是多少，哪些 i 能得到正确结果 2？</div>
+<details class="reveal"><summary>看答案</summary><div>
+  <p>i=1：T1 读(0) → T2 读(0) → T1 加 → T2 加 → T1 写 1 → T2 写 1，结果 <strong>1</strong>。</p>
+  <p>i=2：T1 读、加 → T2 读(0)、加 → T1 写 1 → T2 写 1，结果 <strong>1</strong>。</p>
+  <p>i≥3：每个线程在一个时间片内完整执行三条指令，中断恰好落在临界区之外，结果 <strong>2</strong>。关键不在于中断频繁与否，而在于<strong>中断是否落在读与写之间</strong>。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（改编自 Homework 第 7、8 题）把每线程循环次数改为 3（相当于 <code>-a bx=3</code>），期望结果是 6。预测 i = 1…6 中哪些能得到 6？哪个 i 的结果最出乎意料？</div>
+<details class="reveal"><summary>看答案</summary><div>
+  <p>用模拟器实测（初值 0）：i=1 → <strong>3</strong>，i=2 → <strong>3</strong>，i=3 → <strong>6</strong>，i=4 → <strong>4</strong>，i=5 → <strong>4</strong>，i=6 → <strong>6</strong>。</p>
+  <p>只有 i 是 3 的倍数时，每次切换都恰好落在一次完整的"读-加-写"之后，结果才正确。i=4、5 的时间片比 i=3 更长，结果却错了：中断落在了某次读和写之间。<strong>更长的时间片不等于更安全</strong>，要看中断落在哪里。（真实的 x86.py 程序还有循环控制指令，具体数字会不同，但结论相同。）</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（改编自 Homework 第 6 题）临界区到底是哪几条指令？中断发生在什么位置是"安全"的？</div>
+<details class="reveal"><summary>看答案</summary><div>
+  <p>临界区是从 <code>mov 0x8049a1c,%eax</code>（读）到 <code>mov %eax,0x8049a1c</code>（写）的整段三条指令。中断落在一次完整的读-加-写<strong>之前或之后</strong>是安全的；落在读之后、写之前（PC=105 或 108 时），只要别的线程在此期间写了 counter，就会丢失更新。在模拟器里注意执行轨迹中标红的写回行。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">2 个线程，每线程循环 k 次（k ≥ 2），初值 0。正确结果是 2k。<strong>最坏情况下</strong>最终 counter 能小到多少？先猜，再点"载入'最小结果'交错"验证（它按 k=2 构造）。</div>
+<details class="reveal"><summary>看答案</summary><div>
+  <p>答案是 <strong>2</strong>，与 k 无关！构造方法：T1 读到 0 后被打断；T2 连续做完 k−1 次（counter=k−1）；T1 写回 1（抹掉 T2 的全部成果）；T2 读到 1 后被打断；T1 做完剩下 k−1 次（counter=k）；T2 写回 2。一次恶意的交错就能抹掉几乎所有工作——这也解释了为什么 <code>t1.c</code> 在单 CPU 上偶尔会一下子丢掉几百万。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">勾选"原子执行"，然后随便换调度方式、时间片、种子、线程数。最终 counter 还会出错吗？"推迟的中断"统计说明了什么？</div>
+<details class="reveal"><summary>看答案</summary><div>
+  <p>永远正确（= 初值 + 线程数 × 循环次数）。原子执行时，若时间片在块中间到期，中断被推迟到块结束，所以任何线程都不可能在另一个线程的"读"和"写"之间写 counter。现实中硬件不会替你推迟中断，我们要用<strong>锁</strong>在软件层面达到同样的效果（第 28 章）。</p>
+</div></details></div>
+
+<h2 id="lab">动手实验：亲眼看到竞态条件</h2>
+<div class="lab">
+  <p>在 <code>labs/26-concurrency/</code> 下有原书的 <code>t0.c</code>、<code>t1.c</code> 和加锁修正版 <code>t1_lock.c</code>：</p>
+  <pre><code><span class="cmd">cd labs/26-concurrency &amp;&amp; make</span>
+<span class="cmd">./t1                # 期望 20000000</span>
+<span class="cmd">make race           # 连续跑 5 次</span>
+<span class="cmd">make single         # taskset -c 0：所有线程钉在一个 CPU 上</span>
+<span class="cmd">make disasm         # objdump 看 counter = counter + 1 的三条指令</span>
+<span class="cmd">./t1_lock           # 加锁版</span></code></pre>
+  <p><strong>反汇编</strong>（本机 x86-64，<code>-O0</code>）与原书几乎一模一样——读、加、写三条指令：</p>
+  <pre><code>    11a9:	mov    0x2e91(%rip),%eax        # 4040 &lt;__TMC_END__&gt;
+    11af:	add    $0x1,%eax
+    11b2:	mov    %eax,0x2e88(%rip)        # 4040 &lt;__TMC_END__&gt;
+    11b8:	addl   $0x1,-0x4(%rbp)
+    11bc:	mov    0x2e76(%rip),%eax        # 4038 &lt;loops&gt;
+    11c2:	cmp    %eax,-0x4(%rbp)
+    11c5:	jl     11a9 &lt;mythread+0x30&gt;</code></pre>
+  <p class="small muted">地址 0x4040 就是 <code>counter</code>（objdump 恰好用了同地址的另一个符号名 <code>__TMC_END__</code> 来标注）。后面四条是 <code>i++</code> 和循环判断，也就是模拟器里省略的循环控制指令。</p>
+  <p><strong>单 CPU</strong>（<code>make single</code>）与<strong>次数很少</strong>时的真实输出：</p>
+  <pre><code>$ make single
+main: done with both (counter = 12809893, expected 20000000)
+main: done with both (counter = 20000000, expected 20000000)
+main: done with both (counter = 16589243, expected 20000000)
+main: done with both (counter = 13496073, expected 20000000)
+main: done with both (counter = 20000000, expected 20000000)
+$ ./t1 1000
+main: begin (counter = 0)
+A: begin
+A: done
+B: begin
+B: done
+main: done with both (counter = 2000, expected 2000)
+$ ./t1_lock
+main: done with both (counter = 20000000, expected 20000000)   # 约 0.35 s，比无锁版（约 0.02 s）慢得多</code></pre>
+  <p class="small muted">示例输出，你的机器上数字会不同（本机 AMD Ryzen 7 8745H，16 个逻辑 CPU，WSL2，gcc 14.2）。</p>
+  <p><strong>怎么解读：</strong></p>
+  <ul>
+    <li><strong>多核上</strong>两个线程真正同时运行，几乎每次读-改-写都可能撞车，所以丢了将近一半（约 1050 万）。</li>
+    <li><strong>单 CPU 上</strong>只有定时器中断恰好落在读和写之间才出错，所以有时完全正确；可一旦出错，被打断的线程恢复后把<strong>很旧的值 + 1</strong> 写回，抹掉另一个线程整整一个时间片的累加——所以一错就是几百万（正是上面"最小结果"练习的现实版本）。</li>
+    <li><code>./t1 1000</code> "碰巧正确"：线程 A 在 B 启动前就跑完了，根本没有重叠。竞态条件并不是每次都出现，这正是它难以调试的原因。</li>
+    <li>加锁后永远正确，但慢了一个数量级：互斥换来了正确性，也带来了开销（第 28、29 章的主题）。</li>
+  </ul>
+</div>
+
+<h2 id="quiz">自测题</h2>
+<p class="quiz-score"></p>
+
+<div class="mcq" data-answer="3"><div class="q">1. 同一进程中的两个线程，下列哪项是<strong>每个线程私有</strong>的？</div>
+  <div class="opts"><button>A. 全局变量 counter</button><button>B. 页表</button><button>C. 堆上 malloc 的数据</button><button>D. 栈和寄存器（含 PC）</button></div>
+  <div class="explain">线程共享地址空间（代码、全局变量、堆、页表），但每个线程有自己的 PC、寄存器（保存在 TCB）和栈。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">2. 同一进程内的线程切换，和进程切换相比最主要的区别是？</div>
+  <div class="opts"><button>A. 不会发生定时器中断</button><button>B. 不需要保存寄存器</button><button>C. 不需要切换页表（地址空间不变）</button><button>D. 不需要进入内核</button></div>
+  <div class="explain">线程切换同样要保存/恢复寄存器（到 TCB），但地址空间相同，不用切换正在使用的页表。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">3. <code>counter = counter + 1</code> 为什么会产生竞态条件？</div>
+  <div class="opts"><button>A. 因为它编译成读、加、写三条指令，调度程序可能在中间切换线程</button><button>B. 因为 counter 被声明为 volatile</button><button>C. 因为 eax 寄存器被两个线程共享</button><button>D. 因为 add 指令本身不是原子的</button></div>
+  <div class="explain">每个线程运行时都有自己私有的寄存器，问题在于"读-改-写"是三条指令，中间可以被打断，另一个线程可能在此期间写 counter。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">4. 在原书图 26.7 的轨迹中，counter 从 50 开始，两个线程各执行一次 +1，最终是多少？丢了几次更新？</div>
+  <div class="opts"><button>A. 不确定，取决于 CPU 数</button><button>B. 51，丢 1 次</button><button>C. 50，丢 2 次</button><button>D. 52，丢 0 次</button></div>
+  <div class="explain">T1 读到 50，被打断；T2 完整执行写入 51；T1 恢复后把自己算出的 51 再写一遍。最终 51，丢失 1 次更新。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">5. 下列关于临界区（critical section）的说法，哪个最准确？</div>
+  <div class="opts"><button>A. 临界区是访问共享资源、不能被多个线程同时执行的一段代码</button><button>B. 临界区是操作系统内核中的代码</button><button>C. 临界区是执行时间最长的代码</button><button>D. 临界区是会导致死锁的代码</button></div>
+  <div class="explain">原书定义：访问共享变量（或共享资源）的一段代码，必须不能被多个线程并发执行。它可以在用户程序里，也可以在内核里。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">6. 在<strong>只有一个 CPU</strong> 的机器上运行 t1.c，会出现竞态条件吗？</div>
+  <div class="opts"><button>A. 会，定时器中断可能落在读和写之间</button><button>B. 不会，因为 counter 是 volatile</button><button>C. 不会，单 CPU 上线程不会同时运行</button><button>D. 只有开了 -O2 才会</button></div>
+  <div class="explain">原书强调"even on a single processor"也会出错：并发（交错执行）就足够，不需要真正的并行。实验里 <code>make single</code> 也会出错。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">7. 为什么不让硬件为每种需求都提供一条原子指令（比如"原子更新 B 树"）？</div>
+  <div class="opts"><button>A. 因为硬件无法实现任何原子指令</button><button>B. 因为原子指令不能被中断，会让系统挂起</button><button>C. 因为原子指令只能在内核态使用</button><button>D. 不现实；更好的办法是用少量硬件原语 + OS 支持构造通用的同步原语</button></div>
+  <div class="explain">原书："would we really want the hardware to support an atomic update of B-tree instruction? Probably not." 我们只向硬件要几条有用的指令，再在其上构建锁、条件变量等。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">8. 除了"原子地访问共享变量"，本章提到线程之间还有哪种常见交互，将由条件变量解决？</div>
+  <div class="opts"><button>A. 线程之间复制页表</button><button>B. 一个线程等待另一个线程完成某个动作（睡眠/唤醒）</button><button>C. 两个线程共享同一个栈</button><button>D. 线程迁移到另一个 CPU</button></div>
+  <div class="explain">例如进程等磁盘 I/O 完成时被睡眠、完成后被唤醒。第 30 章的条件变量就是为这种交互设计的。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">9. 在 t0.c 中，"main: end" 为什么一定在 A 和 B 之后打印？</div>
+  <div class="opts"><button>A. 因为先创建的线程一定先运行</button><button>B. 因为线程创建后会立刻运行完</button><button>C. 因为 main 在打印前调用了两次 pthread_join，等待两个线程结束</button><button>D. 因为 printf 是原子的</button></div>
+  <div class="explain">join 会等待指定线程结束（若它已结束则立即返回）。A 和 B 之间的顺序不确定，但它们都在 main: end 之前。</div></div>
+
+<h2 id="pitfalls">常见误区</h2>
+<div class="warn">
+  <ul>
+    <li><strong>"一行 C 代码就是一步"</strong>：不是。<code>counter++</code> 通常是读、改、写三条指令，任何两条之间都可能切换。</li>
+    <li><strong>"单核机器上没有并发问题"</strong>：有。只要有抢占式调度，交错执行就足以引发竞态条件。</li>
+    <li><strong>"先创建的线程先运行"</strong>：没有任何保证，谁先运行由调度程序决定（图 26.5 中 B 就先于 A）。</li>
+    <li><strong>"寄存器是共享的，所以会出错"</strong>：恰恰相反，寄存器由上下文切换虚拟化，每个线程私有。出错是因为<strong>内存</strong>中的 counter 是共享的，而线程基于过时的私有副本写回。</li>
+    <li><strong>"跑了几次都对，所以代码没问题"</strong>：竞态条件依赖时序，可能很少出现（比如 <code>./t1 1000</code> 碰巧正确）。正确性要靠推理，而不是靠测试运气。</li>
+    <li><strong>"<code>volatile</code> 能保证原子性"</strong>：<code>volatile</code> 只让编译器每次都真的去读写内存，并不让读-改-写成为一个原子操作。</li>
+  </ul>
+</div>
+
+<h2 id="summary">本章小结</h2>
+<ul>
+  <li>线程 = 进程内的独立执行流：私有 PC、寄存器、栈；共享代码、全局数据、堆和页表。线程切换要保存 TCB，但不切换地址空间。</li>
+  <li>用线程的两个理由：并行加速、以及在 I/O 阻塞时让程序的其他部分继续推进。</li>
+  <li>线程执行顺序由调度程序决定，不可预测；共享数据时，这种不可预测性会导致<strong>竞态条件</strong>和<strong>不确定</strong>的结果。</li>
+  <li>根源是<strong>不受控的调度</strong> + 非原子的多指令<strong>临界区</strong>。我们需要<strong>互斥</strong>，让临界区像一条原子指令那样执行。</li>
+  <li>路线图：第 27 章先认识 pthread API；第 28 章用硬件原语（test-and-set 等）和 OS 支持构建<strong>锁</strong>；第 29 章把锁用进数据结构；第 30 章用<strong>条件变量</strong>解决"等待另一个线程"；第 31 章的<strong>信号量</strong>把两者统一起来。</li>
+</ul>
+
+</main>
+
+<script>
+/* ===== 引擎（纯函数，不碰 DOM，可以单独用 node 测试） ===== */
+// mulberry32，与 OSTEP.rng 相同的算法
+function mkRng(seed) {
+  let a = (seed >>> 0) || 1;
+  const f = () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  f.int = (lo, hi) => lo + Math.floor(f() * (hi - lo + 1));
+  return f;
+}
+
+// ---- t0.c 执行顺序 ----
+const ORDER = (() => {
+  const MAIN = ["starts running", 'prints "main: begin"', "creates Thread 1", "creates Thread 2", "J1", "J2", 'prints "main: end"'];
+  const TH = ["runs", "prints", "returns"];
+  function simulate(sched) {
+    const st = { m: 0, blockedOn: 0, created: [false, false], pc: [0, 0], done: [false, false] };
+    const rows = [], out = [];
+    const runnable = (w) => w === "M" ? st.m < MAIN.length && !(st.blockedOn && !st.done[st.blockedOn - 1])
+                                      : st.created[w - 1] && !st.done[w - 1];
+    for (const pick of sched) {
+      const w = pick === "M" ? "M" : Number(pick);
+      if (!runnable(w)) continue;
+      if (w === "M") {
+        if (st.blockedOn && st.done[st.blockedOn - 1]) st.blockedOn = 0;
+        const ev = MAIN[st.m++];
+        let text = ev, blk = false;
+        if (ev === "J1" || ev === "J2") {
+          const k = ev === "J1" ? 1 : 2;
+          if (st.done[k - 1]) text = `waits for T${k} → returns immediately; T${k} is done`;
+          else { text = `waits for T${k}（阻塞）`; st.blockedOn = k; blk = true; }
+        }
+        if (ev === "creates Thread 1") st.created[0] = true;
+        if (ev === "creates Thread 2") st.created[1] = true;
+        if (ev === 'prints "main: begin"') out.push("main: begin");
+        if (ev === 'prints "main: end"') out.push("main: end");
+        rows.push({ who: 0, text, blk, out: out.slice() });
+      } else {
+        const k = w - 1, ev = TH[st.pc[k]++];
+        let text = ev;
+        if (ev === "prints") { text = `prints "${k ? "B" : "A"}"`; out.push(k ? "B" : "A"); }
+        if (ev === "returns") st.done[k] = true;
+        rows.push({ who: w, text, blk: false, out: out.slice() });
+      }
+    }
+    return { rows, out, complete: st.m === MAIN.length };
+  }
+  const PRESETS = [
+    "MMMMM111M222M".split(""),                // 图 26.3
+    "MMM111M222MMM".split(""),                // 图 26.4
+    "MMMMM222111MM".split(""),                // 图 26.5
+  ];
+  function randomSched(seed) {
+    const rng = mkRng(seed), sched = [];
+    let cur = "M";
+    for (let guard = 0; guard < 200; guard++) {
+      const trial = simulate(sched);
+      if (trial.complete) break;
+      const cand = ["M", "1", "2"].filter((w) => simulate(sched.concat([w])).rows.length > trial.rows.length);
+      if (!cand.length) break;
+      const w = cand.includes(cur) && rng() < 0.55 ? cur : cand[Math.floor(rng() * cand.length)];
+      sched.push(w); cur = w;
+    }
+    return sched;
+  }
+  return { simulate, PRESETS, randomSched };
+})();
+
+// ---- 线程交错执行器（仿 x86.py） ----
+const RACE = (() => {
+  const CODE = [
+    { pc: 100, asm: "mov 0x8049a1c, %eax", book: "mov 8049a1c,%eax" },
+    { pc: 105, asm: "add $0x1, %eax",      book: "add $0x1,%eax" },
+    { pc: 108, asm: "mov %eax, 0x8049a1c", book: "mov %eax,8049a1c" },
+  ];
+  const END = 113;
+  const idxOf = (pc) => (pc === 100 ? 0 : pc === 105 ? 1 : pc === 108 ? 2 : -1);
+  const TN = (k) => "T" + (k + 1);
+
+  // cfg: {threads, loops, init, mode:'manual'|'interval'|'random', interval, seed, atomic, manual:[tid...]}
+  function simulate(cfg) {
+    const n = cfg.threads, loops = cfg.loops;
+    const T = Array.from({ length: n }, () => ({ pc: 100, eax: 0, left: loops, done: false, loadVer: -1, iter: 1 }));
+    let mem = cfg.init, ver = 0, cur = 0, used = 0, switches = 0, deferred = 0, mi = 0, staleStores = 0;
+    const rng = mkRng(cfg.seed || 0);
+    const sliceLen = () => (cfg.mode === "random" ? rng.int(1, Math.max(1, cfg.interval)) : Math.max(1, cfg.interval));
+    let len = sliceLen();
+    const snap = () => T.map((t) => ({ pc: t.pc, eax: t.eax, left: t.left, done: t.done, iter: t.iter }));
+    const rows = [{ kind: "start", tid: 0, pc: 100, eax: 0, mem, cur: 0, th: snap(),
+      note: `开始：${n} 个线程都停在 PC=100（临界区之前），各自的 eax=0；共享内存中 counter=${mem}。${TN(0)} 先上 CPU。` }];
+    const nextAlive = (from) => { for (let d = 1; d <= n; d++) { const k = (from + d) % n; if (!T[k].done) return k; } return -1; };
+    let pendingNote = "";
+    for (let guard = 0; guard < 2000; guard++) {
+      if (T.every((t) => t.done)) break;
+      const mid = !T[cur].done && T[cur].pc !== 100;
+      let next, reason = "";
+      if (cfg.atomic && mid) {
+        next = cur;
+        if (cfg.mode !== "manual" && used >= len) { if (!pendingNote) deferred++; pendingNote = "时间片已到，但当前处于原子块中间，中断被推迟到块结束。"; }
+      } else if (cfg.mode === "manual") {
+        while (mi < cfg.manual.length && (cfg.manual[mi] >= n || T[cfg.manual[mi]].done)) mi++;
+        if (mi >= cfg.manual.length) break;
+        next = cfg.manual[mi++];
+        reason = T[cur].done ? "halt" : "interrupt";
+      } else {
+        if (T[cur].done) { next = nextAlive(cur); reason = "halt"; }
+        else if (used >= len) { next = nextAlive(cur); reason = "interrupt"; if (next === cur) { used = 0; len = sliceLen(); } }
+        else next = cur;
+      }
+      if (next !== cur) {
+        switches++;
+        const t = T[next];
+        rows.push({ kind: "switch", from: cur, tid: next, reason, pc: t.pc, eax: t.eax, mem, cur: next, th: snap(),
+          note: (reason === "halt" ? `${TN(cur)} 已经执行完毕（halt），切换到 ${TN(next)}。` : `中断！OS 把 ${TN(cur)} 的 PC 和寄存器保存到它的 TCB，再从 ${TN(next)} 的 TCB 恢复：PC=${t.pc}，eax=${t.eax}。`)
+            + (t.pc !== 100 && !T[next].done ? ` 注意：${TN(next)} 是在临界区中间被打断的，它的 eax 可能已经过时。` : "") });
+        cur = next; used = 0; len = sliceLen();
+      }
+      // 执行一条指令
+      const t = T[cur], ix = idxOf(t.pc), ins = CODE[ix];
+      let stale = false, note = "";
+      if (ix === 0) { t.eax = mem; t.loadVer = ver;
+        note = `${TN(cur)} 执行 mov：从内存读出 counter=${mem} 放进自己的 eax。从现在起直到写回，这个值只是一份<strong>私有副本</strong>。`; }
+      else if (ix === 1) { t.eax += 1;
+        note = `${TN(cur)} 执行 add：自己的 eax 变成 ${t.eax}。内存里的 counter 仍然是 ${mem}。`; }
+      else {
+        stale = ver !== t.loadVer;
+        const before = mem;
+        mem = t.eax; ver++;
+        if (stale) staleStores++;
+        note = stale
+          ? `⚠ ${TN(cur)} 执行 mov 写回 ${t.eax}，但它读 counter 之后，别的线程已经写过 counter（当时是 ${before}）。这次写回<strong>覆盖了别人的更新</strong>——丢失更新！`
+          : `${TN(cur)} 执行 mov：把 eax=${t.eax} 写回内存，counter 变为 ${mem}。这次读-改-写期间没人插手，结果正确。`;
+      }
+      t.pc = ix === 2 ? END : CODE[ix + 1].pc;
+      if (t.pc === END) { t.left--; if (t.left > 0) { t.pc = 100; t.iter++; } else t.done = true; }
+      used++;
+      if (pendingNote && t.pc === 100) { note += " " + pendingNote.replace("被推迟到块结束。", "现在块结束，推迟的中断可以发生了。"); pendingNote = ""; }
+      else if (pendingNote) note += " （" + pendingNote + "）";
+      rows.push({ kind: "ins", tid: cur, ix, asm: ins.asm, book: ins.book, pc: t.done ? END : (ix === 2 ? END : t.pc), eax: t.eax, mem, stale, cur, th: snap(), note });
+    }
+    const expected = cfg.init + n * loops;
+    const finished = T.every((t) => t.done);
+    return { rows, final: mem, expected, lost: finished ? expected - mem : null, switches, deferred, staleStores, finished, waitingFor: finished ? null : cur };
+  }
+  // 原书图 26.7：T1 执行 mov、add；中断；T2 执行三条；中断；T1 执行写回
+  const BOOK = [0, 0, 1, 1, 1, 0];
+  // k=2 时构造最小结果 2：T1 读；T2 完整 1 次；T1 加、写；T2 读；T1 完整 1 次；T2 加、写
+  const MIN2 = [0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1];
+  return { simulate, CODE, END, BOOK, MIN2 };
+})();
+</script>
+
+<script>
+/* ===== 界面 ===== */
+(function () {
+  const { h } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+
+  // ---------- 并行示意图的小方块 ----------
+  (function drawArr() {
+    const g = document.getElementById("arr26");
+    if (!g) return;
+    for (let i = 0; i < 16; i++) {
+      const cpu = Math.floor(i / 4), x = 20 + i * 40;
+      g.append(OSTEP.s("rect", { x, y: 30, width: 36, height: 30, rx: 4, style: `fill:${OSTEP.color(cpu)}` }));
+      g.append(OSTEP.s("text", { x: x + 18, y: 50, "text-anchor": "middle", "font-size": 11.5, style: "fill:#fff", text: "a" + i }));
+    }
+    for (let c = 0; c < 4; c++) g.append(OSTEP.s("text", { x: 20 + c * 160 + 78, y: 82, "text-anchor": "middle", "font-size": 12, text: `CPU ${c} 的线程` }));
+  })();
+
+  // ---------- t0.c 执行顺序 ----------
+  (function () {
+    let sched = ORDER.PRESETS[0], res = ORDER.simulate(sched);
+    const table = $("ord-table"), narr = $("ord-narr"), outEl = $("ord-out");
+    const names = ["main", "Thread 1", "Thread 2"];
+    const explain = (r, i) => {
+      if (r.blk) return `main 调用 pthread_join 时，被等待的线程还没结束，于是 main 阻塞，调度程序去运行别的线程。`;
+      if (/returns immediately/.test(r.text)) return `被等待的线程早已结束，所以 pthread_join 立即返回。`;
+      if (/creates/.test(r.text)) return `pthread_create 创建了新线程。新线程可能马上运行，也可能先进入就绪状态，要看调度程序。`;
+      if (r.who && r.text === "runs") return `${names[r.who]} 第一次被调度上 CPU。`;
+      if (/prints "[AB]"/.test(r.text)) return `${names[r.who]} 打印 ${r.text.slice(8, 9)}。`;
+      if (r.text === "returns") return `${names[r.who]} 从 mythread() 返回，线程结束。`;
+      return i === 0 ? "主线程开始运行。" : `main ${r.text}。`;
+    };
+    const step = OSTEP.stepper($("ord-step"), {
+      steps: () => res.rows.length,
+      autoplayMs: 800,
+      render(i) {
+        const head = h("tr", {}, names.map((n, k) => h("th", { style: { color: `var(--c${k === 0 ? 8 : k})` } }, n)));
+        const body = res.rows.slice(0, i + 1).map((r, k) => h("tr", { class: k === i ? "cur" : "" },
+          [0, 1, 2].map((c) => h("td", { class: c === r.who && r.blk ? "blk" : "" }, c === r.who ? r.text : ""))));
+        table.replaceChildren(h("thead", {}, head), h("tbody", {}, body));
+        narr.innerHTML = explain(res.rows[i], i);
+        outEl.textContent = "屏幕输出：\n" + res.rows[i].out.join("\n");
+      },
+    });
+    document.querySelectorAll("#sim-order [data-preset]").forEach((b) => (b.onclick = () => {
+      sched = ORDER.PRESETS[Number(b.dataset.preset)]; res = ORDER.simulate(sched); step.reset();
+    }));
+    $("ord-rand").onclick = () => {
+      const seed = Number($("ord-seed").value) || 0;
+      sched = ORDER.randomSched(seed); res = ORDER.simulate(sched); step.reset();
+      $("ord-seed").value = seed + 1;
+    };
+  })();
+
+  // ---------- 交错执行器 ----------
+  (function () {
+    let manual = RACE.BOOK.slice();
+    let res;
+    const cfg = () => ({
+      threads: Number($("rc-threads").value),
+      loops: Math.max(1, Math.min(5, Number($("rc-loops").value) || 1)),
+      init: Math.max(0, Number($("rc-init").value) || 0),
+      mode: $("rc-mode").value,
+      interval: Math.max(1, Math.min(12, Number($("rc-int").value) || 1)),
+      seed: Number($("rc-seed").value) || 0,
+      atomic: $("rc-atomic").checked,
+      manual,
+    });
+    const tcol = (k) => `var(--c${k + 1})`;
+    function recompute(toEnd) {
+      res = RACE.simulate(cfg());
+      renderButtons();
+      if (toEnd) step.go(res.rows.length - 1); else step.reset();
+    }
+    function renderButtons() {
+      const c = cfg(), box = $("rc-mbtns");
+      box.replaceChildren();
+      const isManual = c.mode === "manual";
+      $("rc-undo").disabled = !isManual || manual.length === 0;
+      $("rc-clear").disabled = !isManual;
+      if (!isManual) { box.append(h("span", { class: "muted small" }, "（手动模式下这里会出现 T1/T2 按钮）")); return; }
+      const last = res.rows[res.rows.length - 1];
+      for (let k = 0; k < c.threads; k++) {
+        const th = last.th[k];
+        box.append(h("button", {
+          style: { borderColor: tcol(k) }, disabled: th.done || res.finished,
+          onclick: () => { manual = manual.concat([k]); recompute(true); },
+        }, `▶ T${k + 1} 执行一条`));
+        box.append(" ");
+      }
+    }
+    function codebox(th, k, row) {
+      const lines = RACE.CODE.map((ins, j) => {
+        const isNext = !th.done && th.pc === ins.pc;
+        const justDone = row.kind === "ins" && row.tid === k && row.ix === j;
+        return h("span", { class: "ln" + (justDone ? " done" : isNext ? " next" : "") },
+          h("span", { class: "no" }, ins.pc), ins.asm,
+          justDone ? h("span", { class: "mk" }, "刚执行") : isNext ? h("span", { class: "mk" }, "▶ 下一条") : null);
+      });
+      lines.push(h("span", { class: "ln" + (th.done ? " next" : "") }, h("span", { class: "no" }, RACE.END), h("span", { class: "muted" }, "（临界区之后）"), th.done ? h("span", { class: "mk" }, "完成") : null));
+      return h("div", { class: "codebox" }, lines);
+    }
+    const step = OSTEP.stepper($("rc-step"), {
+      steps: () => res.rows.length,
+      autoplayMs: 1000,
+      render(i) {
+        const c = cfg(), row = res.rows[i];
+        // 内存
+        const mem = $("rc-mem");
+        mem.className = "membox" + (row.kind === "ins" && row.ix === 2 ? (row.stale ? " stale" : " write") : "");
+        mem.querySelector(".v").textContent = row.mem;
+        $("rc-cpu").replaceChildren(h("span", { class: "muted small" }, "CPU 上正在运行"),
+          h("b", { style: { color: tcol(row.cur), fontSize: "18px" } }, `T${row.cur + 1}`),
+          h("span", { class: "muted small" }, row.kind === "switch" ? "刚发生上下文切换" : ""));
+        // 线程卡片
+        $("rc-threads-view").replaceChildren(...row.th.map((th, k) => {
+          const running = row.cur === k && !th.done;
+          return h("div", { class: "tcard" + (row.cur === k ? " cur" : "") },
+            h("div", { class: "th" }, h("span", {}, h("span", { class: "dot", style: { background: tcol(k) } }), `线程 T${k + 1}`),
+              h("span", { class: "st " + (th.done ? "" : running ? "run" : "ready") }, th.done ? "已完成" : running ? "运行中" : "就绪（在 TCB 中）")),
+            codebox(th, k, row),
+            h("div", { class: "regs" },
+              h("span", { class: "reg" }, h("small", {}, "PC"), th.done ? RACE.END : th.pc),
+              h("span", { class: "reg" }, h("small", {}, "eax"), th.eax),
+              c.loops > 1 ? h("span", { class: "muted small" }, th.done ? `完成 ${c.loops} 次` : `第 ${th.iter} / ${c.loops} 次`) : null,
+              !running && !th.done ? h("span", { class: "muted small" }, "寄存器保存在 TCB") : null));
+        }));
+        // 解说
+        let note = row.note;
+        if (i === res.rows.length - 1) {
+          if (res.finished) note += ` <br><strong>全部完成：</strong>counter = ${res.final}，期望 ${res.expected}` + (res.lost ? `，丢失了 ${res.lost} 次更新。` : "，结果正确。");
+          else if (c.mode === "manual") note += ` <br><strong>轮到你了：</strong>点上方的 ▶ 按钮，选择下一条指令由哪个线程执行。`;
+        }
+        $("rc-narr").innerHTML = note;
+        // 统计
+        const S = (v, l) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+        const lost = res.finished ? res.lost : "—";
+        $("rc-stats").replaceChildren(
+          S(row.mem, "当前 counter"), S(res.expected, "期望最终值"),
+          S(res.finished ? res.final : "进行中", "最终 counter"),
+          h("div", { class: "stat", style: { background: res.finished && res.lost ? "var(--bad-soft)" : "" } }, h("div", { class: "v" }, lost), h("div", { class: "l" }, "丢失的更新")),
+          S(res.switches, "上下文切换次数"),
+          c.atomic ? S(res.deferred, "被推迟的中断") : null);
+        // 轨迹表
+        const n = c.threads;
+        const head = h("tr", {}, h("th", {}, "OS"), Array.from({ length: n }, (_, k) => h("th", { style: { color: tcol(k) } }, `Thread ${k + 1}`)),
+          h("th", { class: "num" }, "PC"), h("th", { class: "num" }, "eax"), h("th", { class: "num" }, "counter"));
+        const body = res.rows.slice(0, i + 1).map((r, j) => {
+          const cls = [r.kind === "switch" ? "os" : "", j === i ? "cur" : "", r.stale ? "stale" : ""].join(" ");
+          const osText = r.kind === "switch" ? (r.reason === "halt" ? `halt; switch to T${r.tid + 1}` : `interrupt · save T${r.from + 1} · restore T${r.tid + 1}`) : "";
+          return h("tr", { class: cls }, h("td", {}, osText),
+            Array.from({ length: n }, (_, k) => h("td", {}, r.kind === "start" && k === 0 ? "before critical section" : r.kind === "ins" && r.tid === k ? r.book + (r.stale ? "  ← 丢失更新" : "") : "")),
+            h("td", { class: "n" }, r.pc), h("td", { class: "n" }, r.eax), h("td", { class: "n" }, r.mem));
+        });
+        $("rc-trace").replaceChildren(h("thead", {}, head), h("tbody", {}, body));
+      },
+    });
+    ["rc-mode", "rc-threads", "rc-loops", "rc-init", "rc-int", "rc-seed", "rc-atomic"].forEach((id) =>
+      $(id).addEventListener("change", () => recompute($("rc-mode").value === "manual")));
+    $("rc-book").onclick = () => {
+      $("rc-mode").value = "manual"; $("rc-threads").value = "2"; $("rc-loops").value = 1; $("rc-init").value = 50; $("rc-atomic").checked = false;
+      manual = RACE.BOOK.slice(); recompute(false);
+    };
+    $("rc-min").onclick = () => {
+      $("rc-mode").value = "manual"; $("rc-threads").value = "2"; $("rc-loops").value = 2; $("rc-init").value = 0; $("rc-atomic").checked = false;
+      manual = RACE.MIN2.slice(); recompute(false);
+    };
+    $("rc-undo").onclick = () => { manual = manual.slice(0, -1); recompute(true); };
+    $("rc-clear").onclick = () => { manual = []; recompute(true); };
+    res = RACE.simulate(cfg());
+    renderButtons();
+  })();
+})();
+</script>
+</body></html>

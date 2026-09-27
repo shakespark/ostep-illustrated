@@ -1,0 +1,1304 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 40 章 · 文件系统实现</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+/* 仅本页样式 */
+.blk-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; color: var(--muted); margin: 8px 0 0; justify-content: center; }
+.blk-legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 4px; }
+.seg-btns { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.seg-btns button.on { border-color: var(--accent); background: var(--accent-soft); }
+.fsgrid { display: grid; grid-template-columns: 110px 1fr; gap: 6px 10px; align-items: center; font-size: 13px; min-width: 560px; }
+.fsgrid .rl { color: var(--muted); text-align: right; font-size: 12.5px; line-height: 1.3; }
+.fsgrid .row { display: flex; flex-wrap: nowrap; gap: 4px; }
+.fscell { flex: 1 1 0; min-width: 0; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); padding: 3px 4px; font: 11.5px/1.35 var(--mono); text-align: center; min-height: 30px; display: flex; flex-direction: column; justify-content: center; transition: background .25s, border-color .25s; word-break: break-all; }
+.fscell .idx { font-size: 10px; color: var(--faint); }
+.fscell.bit1 { background: var(--accent-soft); border-color: var(--accent); }
+.fscell.used { background: var(--surface-2); }
+.fscell.chg { border-color: var(--warn); background: var(--warn-soft); box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 35%, transparent); }
+.fscell.freed { border-style: dashed; border-color: var(--bad); background: var(--bad-soft); }
+.opline { font: 14px var(--mono); padding: 8px 10px; border-radius: 8px; background: var(--code-bg); margin-bottom: 10px; overflow-x: auto; white-space: nowrap; }
+.opline.fail { background: var(--bad-soft); }
+.opline .hidden-op { color: var(--muted); font-family: var(--font); }
+.tl { border-collapse: collapse; font-size: 12.5px; min-width: 640px; }
+.tl th, .tl td { border: 1px solid var(--border); padding: 3px 6px; text-align: center; white-space: nowrap; }
+.tl th { font-weight: 600; font-size: 11.5px; line-height: 1.25; }
+.tl th small { display: block; font-weight: 400; color: var(--faint); }
+.tl td.grp { text-align: left; font-family: var(--mono); color: var(--muted); background: var(--surface-2); }
+.tl td.r { color: var(--accent); font-weight: 600; }
+.tl td.w { color: var(--bad); font-weight: 600; }
+.tl td.hit, .tl td.buf { color: var(--muted); font-weight: 400; font-style: italic; }
+.tl tr.cur td:not(.grp) { background: var(--warn-soft); }
+.tl tr.cur td.r, .tl tr.cur td.w { outline: 2px solid var(--warn); outline-offset: -2px; }
+.tl tr.future td:not(.grp) { color: transparent; }
+.tl tr.future td.grp { color: var(--faint); }
+.minimap { display: grid; grid-template-columns: repeat(16, 1fr); gap: 2px; max-width: 520px; margin: 12px auto 0; }
+.minimap div { height: 20px; border-radius: 3px; font: 9.5px/20px var(--mono); text-align: center; color: var(--muted); background: var(--surface-2); border: 1px solid var(--border); }
+.minimap div.S { background: color-mix(in srgb, var(--c4) 30%, var(--surface)); }
+.minimap div.B { background: color-mix(in srgb, var(--c5) 30%, var(--surface)); }
+.minimap div.I { background: color-mix(in srgb, var(--c1) 25%, var(--surface)); }
+.minimap div.hot { outline: 2px solid var(--warn); background: var(--warn); color: #fff; font-weight: 700; }
+.dirtab td, .dirtab th { font-family: var(--mono); font-size: 13px; padding: 5px 10px; }
+.dirtab tr.freeent td { color: var(--faint); text-decoration: line-through; }
+.dirtab tr.newent td { background: var(--ok-soft); }
+.formula { font: 13.5px/1.9 var(--mono); background: var(--code-bg); border-radius: 8px; padding: 10px 12px; margin-top: 12px; overflow-x: auto; white-space: pre; }
+.formula b { color: var(--accent); }
+.tree-note { font-size: 13.5px; color: var(--muted); }
+</style>
+</head>
+<body data-chapter="40">
+<main>
+
+<h2 id="why">本章要解决什么</h2>
+<div class="crux">
+<p><strong>如何实现一个简单的文件系统？</strong>磁盘上需要哪些结构？它们要记录什么？系统调用又是怎样访问它们的？</p>
+<p class="muted small">How can we build a simple file system? What structures are needed on the disk? What do they need to track? How are they accessed?</p>
+</div>
+<p>上一章我们站在用户这一边，学会了 <code>open</code>/<code>read</code>/<code>write</code>/<code>link</code>/<code>unlink</code> 这些接口。这一章翻到接口的另一面：用一个极简的文件系统 <strong>vsfs（Very Simple File System）</strong>，看看"文件""目录""inode 号"在磁盘上到底是什么样子，一次 <code>open("/foo/bar")</code> 会引发多少次磁盘读写。</p>
+<p>文件系统是<strong>纯软件</strong>：和 CPU、内存虚拟化不同，这里不需要新的硬件支持。正因为自由度大，才有了从 AFS 到 ZFS 的各种设计。vsfs 是一个简化版的 UNIX 文件系统，后面几章（FFS、日志、LFS）都是在它的基础上改进"性能"或"崩溃一致性"。所以这一章是整个持久化部分的地基——请把本页的两个模拟器都亲手玩一遍。</p>
+
+<h2 id="cards">核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>两个角度：数据结构 + 访问方法</h4><p>磁盘上放了什么结构？每个系统调用读写了哪些结构？两个问题都答得上来，就有了文件系统的心智模型。</p></div>
+  <div class="card"><h4>超级块（superblock）</h4><p>记录整个文件系统的参数：多少 inode、多少数据块、inode 表从哪开始、魔数。挂载时第一个读它。</p></div>
+  <div class="card"><h4>位图（bitmap）</h4><p>inode 位图 + 数据位图，每一位表示对应的 inode / 数据块是空闲（0）还是已用（1）。</p></div>
+  <div class="card"><h4>inode 与 i-number</h4><p>inode 存文件的元数据和数据块位置；i-number 就是它在 inode 表里的下标，可以直接算出它在哪个扇区。</p></div>
+  <div class="card"><h4>多级索引（multi-level index）</h4><p>少量直接指针照顾小文件，间接 / 双重间接 / 三重间接指针让文件可以长到 GB、TB 级。</p></div>
+  <div class="card"><h4>目录 = 特殊的文件</h4><p>目录的数据块里存一串 (名字, inode 号) 记录：inum | reclen | strlen | name。</p></div>
+  <div class="card"><h4>访问路径（access path）</h4><p>打开文件要从根目录逐级读 inode 和目录数据；I/O 次数与路径长度成正比。创建文件还要改位图和目录。</p></div>
+  <div class="card"><h4>缓存与写缓冲</h4><p>页缓存让重复的读几乎不碰磁盘；写缓冲把多次写合并、推迟，换来性能，代价是崩溃时可能丢数据。</p></div>
+</div>
+
+<h2 id="think">思考文件系统的方式</h2>
+<p>原书建议从两个方面理解任何一个文件系统：</p>
+<ol>
+<li><strong>数据结构（data structures）</strong>：磁盘上用什么结构组织数据和元数据？vsfs 用最简单的"块数组"；更复杂的文件系统（如 SGI XFS）用 B 树之类的树形结构。</li>
+<li><strong>访问方法（access methods）</strong>：进程调用 <code>open()</code>、<code>read()</code>、<code>write()</code> 时，文件系统要读哪些结构、写哪些结构？效率如何？</li>
+</ol>
+<div class="aside" data-title="旁注 · 心智模型">
+<p>学文件系统，真正要建立的是<strong>心智模型（mental model）</strong>：磁盘上有哪些结构保存数据与元数据？进程打开一个文件时发生了什么？一次读、一次写各访问了哪些结构？能回答这些，你就理解了它；只会背某个文件系统的代码细节反而是次要的。本章后面的两个模拟器正是分别针对"数据结构"和"访问方法"设计的。</p>
+</div>
+
+<h2 id="layout">整体组织：64 个块的 vsfs</h2>
+<p>先把磁盘分区切成大小相同的<strong>块（block）</strong>，vsfs 选常用的 4KB。假设分区非常小，只有 64 个块（编号 0–63）。接下来一步步决定这些块里放什么——点下面的按钮，跟着原书的推理顺序把布局"搭"出来；点任意一个块可以查看它的用途。</p>
+<figure class="fig" id="fig-layout">
+  <div class="controls" style="justify-content:center">
+    <span class="seg-btns" id="layout-btns">
+      <button data-stage="0">① 数据区</button><button data-stage="1">② + inode 表</button><button data-stage="2">③ + 两个位图</button><button data-stage="3" class="on">④ + 超级块</button>
+    </span>
+  </div>
+  <div id="layout-svg"></div>
+  <div class="blk-legend">
+    <span><i style="background:var(--c4)"></i>S 超级块</span><span><i style="background:var(--c5)"></i>i inode 位图</span><span><i style="background:var(--c6)"></i>d 数据位图</span><span><i style="background:var(--c1)"></i>I inode 表</span><span><i style="background:var(--ok-soft);border:1px solid var(--ok)"></i>D 数据区</span>
+  </div>
+  <div class="readout" id="layout-info">点击一个块查看说明。</div>
+  <figcaption>vsfs 的磁盘布局（对应原书 40.2 节的一系列图）：块 0 超级块，块 1 inode 位图，块 2 数据位图，块 3–7 inode 表，块 8–63 数据区</figcaption>
+</figure>
+<p>推理顺序是这样的：</p>
+<ul>
+<li><strong>数据区（data region）</strong>：文件系统里绝大部分空间应该留给用户数据。先预留最后 56 块（8–63）。</li>
+<li><strong>inode 表（inode table）</strong>：每个文件的元数据放在一个 <strong>inode</strong> 里。inode 通常只有 128 或 256 字节；按 256 字节算，一个 4KB 块能放 16 个 inode。拿 5 块（3–7）做 inode 表，就有 5 × 16 = <strong>80 个 inode</strong>——这也就是这个文件系统最多能容纳的文件数（在更大的磁盘上可以分配更大的 inode 表）。</li>
+<li><strong>分配结构（allocation structures）</strong>：要知道哪些 inode、哪些数据块是空闲的。vsfs 用两个<strong>位图</strong>：inode 位图（块 1）和数据位图（块 2）。一整块 4KB 的位图可以追踪 32K 个对象，对 80 个 inode 和 56 个数据块来说大材小用，但图简单。</li>
+<li><strong>超级块（superblock）</strong>：剩下的块 0 放超级块，记录"有 80 个 inode、56 个数据块、inode 表从块 3 开始"之类的全局信息，外加一个标识文件系统类型的<strong>魔数</strong>。挂载（mount）时操作系统先读超级块，初始化各种参数，再把这个卷接到目录树上。</li>
+</ul>
+
+<figure class="fig">
+<svg viewBox="0 0 640 190" width="640" role="img" aria-label="位图与 inode 的对应关系">
+  <text x="10" y="18" font-size="13" font-weight="600">inode 位图（块 1）的前 16 位 ↔ inode 表中的前 16 个 inode</text>
+  <text x="10" y="56" font-size="12" class="t-muted">位图</text>
+  <text x="10" y="146" font-size="12" class="t-muted">inode</text>
+  <g id="bm-bits" font-size="13"></g>
+  <text x="10" y="180" font-size="12" class="t-muted">1 = 已分配（inode 里有内容），0 = 空闲。创建文件时扫描位图找第一个 0，把它置 1 再写回磁盘。</text>
+</svg>
+<figcaption>位图：第 k 位描述第 k 个对象。inode 位图对应 inode 表，数据位图对应数据区</figcaption>
+</figure>
+
+<h2 id="inode">inode：文件的"档案卡"</h2>
+<p><strong>inode</strong> 是 index node（索引节点）的缩写：最早的 UNIX 把这些节点存成数组，用编号去<em>索引</em>它。每个 inode 由一个数字隐式标识，叫 <strong>i-number</strong>，也就是上一章说的文件的<strong>低级名字（low-level name）</strong>。在 vsfs 这种简单的文件系统里，给定 i-number，就能<strong>直接算出</strong>它在磁盘上的位置：</p>
+<pre><code>blk    = (inumber * sizeof(inode_t)) / blockSize;              // 第几个 inode 块
+sector = ((blk * blockSize) + inodeStartAddr) / sectorSize;   // 该块的起始扇区</code></pre>
+<p>原书的例子：inode 表从 12KB 开始（超级块 0KB、inode 位图 4KB、数据位图 8KB），每个 inode 256 字节。要读 <strong>inode 32</strong>：表内偏移 32 × 256 = 8192，加上起始地址 12KB 得到 <strong>20KB</strong>；磁盘不能按字节寻址，只能按 512 字节的扇区读，所以发出读扇区 20 × 1024 / 512 = <strong>40</strong> 的请求，把包含 inode 32 的整块（iblock 2，也就是块 5）读进来。自己换几个数试试：</p>
+
+<section class="sim" id="sim-inode">
+  <div class="sim-head"><span class="tag">计算器</span><h3>inode 定位：给定 i-number，算出块号与扇区号</h3>
+    <div class="desc">改 inode 号、inode 大小或 inode 表起始地址，观察它落在哪个 inode 块、哪个扇区。红框是目标 inode，蓝色是需要整块读入的那个块。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>inode 号 <input type="number" id="il-inum" value="32" min="0"></label>
+      <label>inode 大小 <select id="il-isz"><option value="128">128 B</option><option value="256" selected>256 B</option></select></label>
+      <label>块大小 <select id="il-bsz"><option value="1024">1 KB</option><option value="2048">2 KB</option><option value="4096" selected>4 KB</option></select></label>
+      <label>inode 表起始 <input type="number" id="il-start" value="12" min="0" step="4"> KB</label>
+      <label>扇区 <select id="il-ssz"><option value="512" selected>512 B</option><option value="4096">4096 B</option></select></label>
+      <button id="il-book">载入原书示例（inode 32）</button>
+    </div>
+    <div class="stage" id="il-stage"></div>
+    <div class="formula" id="il-formula"></div>
+    <div class="stats" id="il-stats"></div>
+  </div>
+</section>
+
+<p>inode 里存着关于文件的几乎一切：类型（普通文件、目录……）、大小、分配了多少块、权限与属主、各种时间，以及<strong>数据块在哪里</strong>。这些统称为<strong>元数据（metadata）</strong>——文件系统里凡不是纯用户数据的信息都叫元数据。下面是简化的 ext2 inode（原书 Figure 40.1）：</p>
+<div class="table-wrap"><table>
+<thead><tr><th class="num">字节</th><th>字段</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td class="num">2</td><td><code>mode</code></td><td>能否读 / 写 / 执行</td></tr>
+<tr><td class="num">2</td><td><code>uid</code></td><td>属主是谁</td></tr>
+<tr><td class="num">4</td><td><code>size</code></td><td>文件有多少字节</td></tr>
+<tr><td class="num">4</td><td><code>time</code></td><td>最后访问时间</td></tr>
+<tr><td class="num">4</td><td><code>ctime</code></td><td>inode 最后被修改的时间</td></tr>
+<tr><td class="num">4</td><td><code>mtime</code></td><td>文件内容最后修改时间</td></tr>
+<tr><td class="num">4</td><td><code>dtime</code></td><td>inode 被删除的时间</td></tr>
+<tr><td class="num">2</td><td><code>gid</code></td><td>属组</td></tr>
+<tr><td class="num">2</td><td><code>links_count</code></td><td>有多少个硬链接指向它（上一章的引用计数）</td></tr>
+<tr><td class="num">4</td><td><code>blocks</code></td><td>分配了多少块</td></tr>
+<tr><td class="num">4</td><td><code>flags</code></td><td>ext2 如何使用这个 inode</td></tr>
+<tr><td class="num">4</td><td><code>osd1</code></td><td>与操作系统相关的字段</td></tr>
+<tr><td class="num">60</td><td><code>block</code></td><td><strong>15 个磁盘指针</strong>（下一节的重点）</td></tr>
+<tr><td class="num">4</td><td><code>generation</code></td><td>文件版本（NFS 用）</td></tr>
+<tr><td class="num">4</td><td><code>file_acl</code></td><td>超越 mode 位的新权限模型</td></tr>
+<tr><td class="num">4</td><td><code>dir_acl</code></td><td>即访问控制列表（ACL）</td></tr>
+</tbody></table></div>
+<p class="small muted">注意：inode 里<strong>没有文件名</strong>。名字存在目录里（见后文）；ext2 甚至把文件类型也记在目录项里。这正是硬链接能成立的原因——多个名字可以指向同一个 inode。</p>
+
+<h2 id="mli">多级索引：inode 怎样指向数据块</h2>
+<p>inode 设计里最重要的决定之一：怎样记录数据块的位置。最简单的办法是放若干个<strong>直接指针（direct pointer）</strong>，每个指针是一个磁盘块地址。但这样文件最大只能是"块大小 × 直接指针数"——12 个直接指针 × 4KB = 48KB，显然不够。</p>
+<p>于是引入<strong>间接指针（indirect pointer）</strong>：它不指向用户数据，而是指向一个装满指针的块。4KB 的块、4 字节的地址，一个间接块能装 1024 个指针，文件可以长到 (12 + 1024) × 4KB = <strong>4144KB</strong>。还不够？再加<strong>双重间接指针（double indirect pointer）</strong>：它指向一个"装满间接块指针"的块，又多出 1024 × 1024 ≈ 100 万个块，文件可以超过 <strong>4GB</strong>：(12 + 1024 + 1024²) × 4KB。再往上是<strong>三重间接指针</strong>。这棵"一边倒"的不平衡树就叫<strong>多级索引（multi-level index）</strong>。</p>
+
+<section class="sim" id="sim-mli">
+  <div class="sim-head"><span class="tag">计算器</span><h3>多级索引：最大文件大小 + 第 k 块走哪条路</h3>
+    <div class="desc">改块大小、指针大小、直接指针个数和间接层数，看最大文件大小怎样变化；输入文件的第 k 个块，看文件系统要沿哪条指针链找到它、额外要读几个索引块。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>块大小 <select id="mli-bs"><option value="1024">1 KB</option><option value="2048">2 KB</option><option value="4096" selected>4 KB</option><option value="8192">8 KB</option></select></label>
+      <label>指针 <select id="mli-ps"><option value="4" selected>4 B</option><option value="8">8 B</option></select></label>
+      <label>直接指针 <input type="number" id="mli-nd" value="12" min="0" max="64"></label>
+      <label>间接层数 <select id="mli-lv"><option value="0">0（只有直接指针）</option><option value="1">1（+ 间接）</option><option value="2" selected>2（+ 双重间接）</option><option value="3">3（+ 三重间接）</option></select></label>
+      <label>查找文件第 k 块 <input type="number" id="mli-k" value="12" min="0" style="width:8em"></label>
+    </div>
+    <div class="controls">
+      <button id="mli-b1">原书：12 直接 + 1 间接</button>
+      <button id="mli-b2">原书：+ 双重间接（≈4GB）</button>
+      <button id="mli-b3">原书思考题：+ 三重间接</button>
+    </div>
+    <div class="stage" id="mli-stage"></div>
+    <div class="formula" id="mli-formula"></div>
+    <div class="narrate" id="mli-narr"></div>
+  </div>
+</section>
+
+<p>为什么要用这么不平衡的树？因为几十年的测量一再发现同样的"事实"（原书 Figure 40.2，来自 Agrawal 等人的研究）：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>规律</th><th>具体数字</th></tr></thead>
+<tbody>
+<tr><td>大多数文件很小</td><td>最常见的大小约 2KB</td></tr>
+<tr><td>平均文件大小在增长</td><td>平均接近 200KB</td></tr>
+<tr><td>大部分字节存在大文件里</td><td>少数大文件占了大部分空间</td></tr>
+<tr><td>文件系统里文件很多</td><td>平均约 10 万个</td></tr>
+<tr><td>文件系统大约半满</td><td>即使磁盘变大，也保持 ~50% 使用率</td></tr>
+<tr><td>目录通常很小</td><td>多数目录项很少，大多 ≤ 20 项</td></tr>
+</tbody></table></div>
+<p>既然大多数文件很小，就为小文件优化：12 个直接指针让 inode 直接覆盖 48KB，读小文件不需要任何额外的索引块；只有大文件才付出读间接块的代价。ext2、ext3、NetApp WAFL 和原始 UNIX 文件系统都采用多级索引。</p>
+
+<div class="aside" data-title="提示 · 考虑基于 extent 的方法">
+<p>另一种做法是用 <strong>extent（区段）</strong>：一个磁盘指针 + 一个长度（以块计）。不需要为每个块存一个指针，一个 extent 就能描述一大段连续的块。只允许一个 extent 太受限（很难总找到足够大的连续空闲空间），所以基于 extent 的文件系统通常允许多个 extent。</p>
+<p>比较：指针方式最灵活，但每个文件的元数据很多（尤其是大文件）；extent 方式不那么灵活但更紧凑，在空闲空间充足、文件能连续存放时效果很好。SGI XFS 和 Linux ext4 用 extent——本章实验里的 <code>fiemap</code> 程序会让你亲眼看到 ext4 文件的 extent。extent 之于指针，就像虚拟内存里的<strong>分段</strong>之于<strong>分页</strong>。</p>
+</div>
+
+<div class="aside" data-title="旁注 · 基于链表的方法与 FAT">
+<p>更简单的设计：inode 里只放一个指针指向文件第一块，每个数据块末尾再放指向下一块的指针——链表。问题是读文件最后一块、或者随机访问，都要把前面的块挨个读一遍。</p>
+<p>改进：把"下一块"指针从数据块里拿出来，集中成一张<strong>内存中的表</strong>，按数据块地址 D 索引，表项是 D 的下一块（或文件结束 / 空闲标记）。这样随机访问只需先在内存里沿表走，再直接去磁盘读目标块。这张表就是 <strong>文件分配表（FAT）</strong>，也就是经典 Windows FAT 文件系统的核心。FAT 没有 inode，目录项里直接存元数据和第一块的地址——所以 FAT 上<strong>无法创建硬链接</strong>。</p>
+<svg viewBox="0 0 600 130" width="600" role="img" aria-label="FAT 表示意" style="display:block;margin:6px auto;max-width:100%">
+  <text x="10" y="18" font-size="12" font-weight="600">目录项：foo → 首块 4</text>
+  <text x="10" y="44" font-size="12" class="t-muted">FAT（内存中）：</text>
+  <g font-family="var(--mono)" font-size="12">
+    <g transform="translate(110,28)">
+      <rect x="0" y="0" width="48" height="24" class="box"/><text x="24" y="16" text-anchor="middle">2:EOF</text>
+      <rect x="52" y="0" width="48" height="24" class="box"/><text x="76" y="16" text-anchor="middle">3:free</text>
+      <rect x="104" y="0" width="48" height="24" class="accent-soft"/><text x="128" y="16" text-anchor="middle">4:7</text>
+      <rect x="156" y="0" width="48" height="24" class="box"/><text x="180" y="16" text-anchor="middle">5:free</text>
+      <rect x="208" y="0" width="48" height="24" class="box"/><text x="232" y="16" text-anchor="middle">6:2</text>
+      <rect x="260" y="0" width="48" height="24" class="accent-soft"/><text x="284" y="16" text-anchor="middle">7:9</text>
+      <rect x="312" y="0" width="48" height="24" class="box"/><text x="336" y="16" text-anchor="middle">8:free</text>
+      <rect x="364" y="0" width="48" height="24" class="accent-soft"/><text x="388" y="16" text-anchor="middle">9:EOF</text>
+    </g>
+  </g>
+  <text x="10" y="92" font-size="12">foo 的块链：4 → 7 → 9 → EOF。</text>
+  <text x="10" y="114" font-size="12">要读 foo 的第 3 块：先在内存里查 FAT[4]=7、FAT[7]=9，再直接读磁盘块 9。</text>
+</svg>
+</div>
+
+<h2 id="dir">目录的存储</h2>
+<p>在 vsfs 里（很多文件系统也一样），目录的组织非常简单：它的数据块里就是一串 <strong>(名字, inode 号)</strong>。名字可变长，所以每项还带长度。原书的例子：目录 <code>dir</code>（inode 5）里有 <code>foo</code>、<code>bar</code>、<code>foobar_is_a_pretty_longname</code> 三个文件，inode 号分别为 12、13、24。</p>
+<ul>
+<li><strong>inum</strong>：inode 号；<strong>reclen</strong>：这条记录占的总字节数（名字加上可能剩余的空间）；<strong>strlen</strong>：名字的实际长度（含结尾的 <code>\0</code>，所以 <code>foo</code> 是 4）；<strong>name</strong>：名字本身。</li>
+<li>每个目录都有两项特殊记录：<code>.</code> 指向自己，<code>..</code> 指向父目录（这里是根，inode 2）。</li>
+<li>删除文件（<code>unlink()</code>）会在目录中间留下空洞，可以用保留的 inode 号（如 0）标记为空闲。这也是需要 <strong>reclen</strong> 的原因：新建的名字可以复用一条更大的旧记录，记录里就留有多余空间。</li>
+</ul>
+
+<section class="sim" id="sim-dir">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>目录数据块：删除留下空洞，新名字复用旧记录</h3>
+    <div class="desc">先点某行的"删除"，再创建一个名字：新项会复用第一个"足够大"的空闲记录（reclen 不变）；找不到才追加到末尾。观察偏移量与 reclen。本模拟器用 reclen = 8 字节头 + 名字按 4 字节对齐，与原书示例的数字一致。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>新名字 <input type="text" id="dir-name" value="baz" style="width:12em"></label>
+      <button class="primary" id="dir-add">创建</button>
+      <button id="dir-reset">重置为原书示例</button>
+    </div>
+    <div class="stage"><div class="table-wrap" style="margin:0"><table class="dirtab" id="dir-table"></table></div></div>
+    <div class="narrate" id="dir-narr"></div>
+  </div>
+</section>
+
+<p>目录存在哪里？文件系统通常把目录当作<strong>一种特殊的文件</strong>：它也有一个 inode（类型字段标为"目录"），inode 指向若干数据块（也可以有间接块），这些数据块就放在普通的数据区里。所以磁盘布局<strong>不需要任何改变</strong>。线性列表也不是唯一选择：XFS 把目录存成 B 树，创建文件时检查"名字是否已存在"就不必扫描整个列表。</p>
+
+<h2 id="free">空闲空间管理</h2>
+<p>文件系统必须知道哪些 inode 和数据块是空闲的，分配新文件 / 新目录时才有地方放。vsfs 用两个位图：</p>
+<ul>
+<li><strong>创建文件</strong>：在 inode 位图里找一个空闲 inode 分配给它，把那一位标成 1，并（最终）把位图写回磁盘。</li>
+<li><strong>分配数据块</strong>：同理，在数据位图里找空位。</li>
+<li><strong>预分配（pre-allocation）策略</strong>：ext2/ext3 给新文件分配数据块时，会找一串连续的空闲块（比如 8 块）一起分配，保证文件至少有一部分在磁盘上是连续的，提高后续顺序读写的性能。</li>
+</ul>
+<div class="aside" data-title="旁注 · 空闲空间管理的其他办法">
+<p>位图只是一种办法。一些早期文件系统用<strong>空闲链表（free list）</strong>：超级块里一个指针指向第一个空闲块，那个块里存着下一个空闲块的指针，依此类推；要用块时取表头并更新链表。现代文件系统用更复杂的结构，例如 XFS 用某种 B 树紧凑地表示哪些区段空闲。和所有数据结构一样，这是时间与空间的取舍。</p>
+</div>
+
+<h2 id="vsfs-sim">模拟器：仿 vsfs.py 观察磁盘状态的变化</h2>
+<p>下面的模拟器复现了原书作业工具 <code>vsfs.py</code> 的模型：一个只有 8 个 inode、8 个数据块的小文件系统，开始时只有根目录（inode 0，数据块 0）。每执行一个操作，就能看到 inode 位图、inode 表、数据位图、数据块发生了什么变化（黄框 = 本步改动，红色虚线 = 本步释放）。显示格式与 vsfs.py 相同：</p>
+<ul class="small">
+<li>inode：<code>[d a:0 r:2]</code> 表示目录（d）、数据块地址 0、引用计数 2；<code>[f a:-1 r:1]</code> 是还没有数据块的空文件；<code>[]</code> 是空闲 inode。</li>
+<li>数据块：目录块显示目录项 <code>[(.,0) (..,0) (g,1)]</code>；文件块显示一个字母，代表它的内容；<code>[]</code> 是空闲块。</li>
+<li>和 vsfs.py 一样，每个文件最多只有 1 个数据块；分配策略是"找编号最小的空闲项"。</li>
+</ul>
+
+<section class="sim" id="sim-vsfs">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>vsfs：mkdir / creat / write / link / unlink 如何改变磁盘</h3>
+    <div class="desc">在文本框里写操作序列（每行一个），或随机生成；单步执行，看每一步改了哪几个位图位、哪几个 inode、哪几个数据块。勾选"隐藏操作"就变成 vsfs.py 的默认玩法：只看状态变化，猜是什么操作。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>inode 数 <input type="number" id="vs-ni" value="8" min="2" max="16"></label>
+      <label>数据块数 <input type="number" id="vs-nd" value="8" min="2" max="16"></label>
+      <span class="sep"></span>
+      <label>种子 <input type="number" id="vs-seed" value="17"></label>
+      <label>操作数 <input type="number" id="vs-n" value="10" min="1" max="40"></label>
+      <button id="vs-rand">随机生成</button>
+    </div>
+    <textarea id="vs-ops" rows="7" spellcheck="false" aria-label="操作序列（每行一个：mkdir /路径、creat /路径、write /路径、link /旧 /新、unlink /路径）"></textarea>
+    <p class="small muted" style="margin:4px 0 0">语法：<code>mkdir /g</code>、<code>creat /g/h</code>、<code>write /g/h</code>（追加一个块）、<code>link /g/h /u</code>、<code>unlink /u</code>；也接受 vsfs.py 的输出格式，如 <code>mkdir("/g");</code>。</p>
+    <div class="controls" style="margin-top:8px">
+      <button class="primary" id="vs-load">载入这个序列</button>
+      <button id="vs-p1">示例：创建、写、链接、删除</button>
+      <button id="vs-p2">作业 3：只有 2 个数据块</button>
+      <button id="vs-p3">作业 4：只有 3 个 inode</button>
+      <label><input type="checkbox" id="vs-hide"> 隐藏操作（猜猜发生了什么）</label>
+    </div>
+    <div id="vs-step"></div>
+    <div class="stage">
+      <div class="opline" id="vs-opline"></div>
+      <div class="fsgrid" id="vs-grid"></div>
+    </div>
+    <div class="narrate" id="vs-narr"></div>
+    <div class="stats" id="vs-stats"></div>
+    <details class="reveal"><summary>vsfs.py 格式的文本输出 &amp; 目录树</summary><div class="readout" id="vs-dump"></div></details>
+  </div>
+</section>
+
+<div class="tip">
+<p>玩的时候盯住三件事：① <strong>creat</strong> 只动 inode 位图、inode 和父目录，不分配数据块（空文件没有数据）；② <strong>link</strong> 两个位图都不动，只在目录里多一项、引用计数 +1；③ <strong>unlink</strong> 只有在引用计数降到 0 时才真正释放 inode 和数据块。再观察一下 mkdir：父目录的引用计数为什么也会 +1？</p>
+</div>
+
+<h2 id="access">访问路径：读和写一个文件时发生了什么</h2>
+<p>知道了磁盘上有什么，接下来追踪系统调用的<strong>访问路径（access path）</strong>。假设文件系统已经挂载，超级块已在内存中，其他一切（inode、目录）都还在磁盘上。</p>
+<h3>读文件 /foo/bar</h3>
+<p>执行 <code>open("/foo/bar", O_RDONLY)</code> 时，文件系统先要找到 bar 的 inode，但它手里只有路径名，所以必须<strong>遍历路径（traverse the pathname）</strong>：</p>
+<ol>
+<li>一切遍历从根目录开始。根的 inode 号必须是"众所周知"的（根没有父目录可查），大多数 UNIX 文件系统里是 <strong>2</strong>。读入包含 inode 2 的块（第一个 inode 块）。</li>
+<li>从根 inode 里的指针找到根目录的数据块，读进来，在里面找 <code>foo</code> 这一项，得到 foo 的 inode 号（比如 44）。</li>
+<li>递归：读 foo 的 inode，再读 foo 的目录数据，找到 <code>bar</code> 的 inode 号。</li>
+<li>最后把 bar 的 inode 读进内存，做权限检查，在进程的打开文件表里分配一个文件描述符返回给用户。</li>
+</ol>
+<p>之后每次 <code>read()</code>：查 inode 找到下一块的地址 → 读数据块 → 更新 inode 的最后访问时间（一次写），并更新内存中打开文件表里的偏移。<code>close()</code> 只需释放文件描述符，<strong>不产生磁盘 I/O</strong>。</p>
+<div class="aside" data-title="旁注 · 读文件不访问分配结构">
+<p>很多同学以为读文件时也要查位图。<strong>不会！</strong>位图这类分配结构只在需要分配时才访问。inode、目录、间接块已经包含了完成读请求所需的全部信息——inode 已经指向这个块了，没必要再去确认它"是否已分配"。</p>
+</div>
+<h3>创建并写文件 /foo/bar</h3>
+<p>写文件可能需要<strong>分配</strong>新块（除非是覆盖写），于是每次写不仅要写数据，还要决定用哪个块，并更新相应结构。一次分配型写入逻辑上产生 <strong>5 次 I/O</strong>：读数据位图、写数据位图、读 inode、写 inode（记录新块地址）、写数据块本身。</p>
+<p>创建文件更贵：要分配 inode，还要在目录里分配空间。读 inode 位图、写 inode 位图、写新 inode（初始化）、写目录数据（名字 → inode 号）、读写目录 inode（更新大小和时间）……再加上路径遍历，原书例子里一次 create 就是 <strong>10 次 I/O</strong>。如果目录需要变大，还得再分配数据块（数据位图 + 新目录块）。</p>
+<p>下面的模拟器逐行复现原书 Figure 40.3（读）和 Figure 40.4（创建 + 三次写）的时间线表格，时间向下增长。你还可以改变路径深度、调用次数，或者打开"页缓存"看看 I/O 数量怎样骤减。</p>
+
+<section class="sim" id="sim-path">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>I/O 时间线：open / read / create / write 各读写了哪些块</h3>
+    <div class="desc">每一行是一次磁盘 I/O（或缓存命中 / 被缓冲的写）。单步执行，看当前这一次访问的是哪个结构、在磁盘布局里的哪个块、为什么需要它。底部统计总 I/O 数。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>操作 <select id="ap-mode"><option value="read">打开并读文件</option><option value="create">创建并写文件</option></select></label>
+      <label>路径 <select id="ap-depth"><option value="1">/foo/bar</option><option value="2">/foo/x/bar</option><option value="3">/foo/x/y/bar</option></select></label>
+      <label>read()/write() 次数 <select id="ap-n"><option>1</option><option>2</option><option selected>3</option></select></label>
+      <label>缓存 <select id="ap-cache"><option value="none">无缓存（原书图）</option><option value="cold">有页缓存 · 冷启动</option><option value="warm">有页缓存 · 路径已缓存</option></select></label>
+    </div>
+    <div class="controls">
+      <button id="ap-b1">载入原书 Figure 40.3（读）</button>
+      <button id="ap-b2">载入原书 Figure 40.4（创建）</button>
+    </div>
+    <div id="ap-step"></div>
+    <div class="stage">
+      <div class="table-wrap" style="margin:0"><table class="tl" id="ap-table"></table></div>
+      <div class="minimap" id="ap-map" aria-label="64 块磁盘布局"></div>
+      <p class="small muted" style="text-align:center;margin:6px 0 0">上图是 64 块的 vsfs 布局（紫 = 超级块，黄 = 位图，蓝 = inode 表）。本模拟器假设：根 = inode 2（块 3），foo = inode 44（块 5），x = 20（块 4），y = 52（块 6），bar = 67（块 7）；目录数据依次在块 8–11，bar 的数据从块 12 开始。</p>
+    </div>
+    <div class="narrate" id="ap-narr"></div>
+    <div class="stats" id="ap-stats"></div>
+  </div>
+</section>
+
+<p>两个结论值得记住：</p>
+<ul>
+<li><strong>open 产生的 I/O 与路径长度成正比</strong>：路径上每多一层目录，就要多读它的 inode 和（至少一块）数据。目录很大时，可能要读很多数据块才找到目标项。</li>
+<li><strong>写比读更糟，创建更糟</strong>：读文件，每块 3 次 I/O；写新文件，每块 5 次 I/O；创建 10 次 I/O——而且这些 I/O 散布在磁盘各处（位图、inode 表、数据区），全是寻道。</li>
+</ul>
+<p class="small muted">原书脚注里的"小谜题"：创建 bar 时为什么要先<strong>读</strong>它还没初始化的 inode？因为 inode 很小（256B），而磁盘按块（4KB）读写，同一块里还有别的 inode。要更新其中一个，只能先读整块、改其中一部分、再写回——读-改-写（read-modify-write）。</p>
+
+<div class="crux">
+<p><strong>如何降低文件系统的 I/O 成本？</strong>即便是打开、读、写文件这样最简单的操作，也会引发大量分散在磁盘上的 I/O。文件系统能做些什么？</p>
+<p class="muted small">How to reduce file system I/O costs? Even the simplest of operations like opening, reading, or writing a file incurs a huge number of I/O operations, scattered over the disk.</p>
+</div>
+
+<h2 id="cache">缓存与缓冲</h2>
+<p>答案是利用内存（DRAM）<strong>缓存</strong>重要的块。没有缓存，打开 <code>/1/2/3/.../100/file.txt</code> 这样的长路径要做好几百次读。</p>
+<h3>从静态划分到统一页缓存</h3>
+<p>早期文件系统在启动时分配一块固定大小的缓存（大约占内存的 10%），用 LRU 之类的策略决定保留哪些块。问题是这种<strong>静态划分（static partitioning）</strong>很浪费：文件系统暂时用不着 10% 的内存时，这些页也不能挪作他用。现代操作系统采用<strong>动态划分（dynamic partitioning）</strong>：把虚拟内存页和文件系统页合并成<strong>统一页缓存（unified page cache）</strong>，谁需要更多内存就多给谁。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 170" width="640" role="img" aria-label="静态划分与动态划分">
+  <text x="10" y="20" font-size="13" font-weight="600">静态划分：启动时切死</text>
+  <rect x="10" y="30" width="540" height="34" rx="5" class="box"/>
+  <rect x="10" y="30" width="486" height="34" rx="5" style="fill:color-mix(in srgb, var(--c1) 28%, var(--surface));stroke:var(--c1)"/>
+  <text x="250" y="52" text-anchor="middle" font-size="12">虚拟内存页（90%）——内存紧张时也不能用右边</text>
+  <rect x="496" y="30" width="54" height="34" rx="5" style="fill:color-mix(in srgb, var(--c3) 30%, var(--surface));stroke:var(--c3)"/>
+  <text x="523" y="52" text-anchor="middle" font-size="11">FS 10%</text>
+  <text x="560" y="52" font-size="11" class="t-muted">空闲也浪费</text>
+  <text x="10" y="100" font-size="13" font-weight="600">动态划分：统一页缓存</text>
+  <rect x="10" y="110" width="540" height="34" rx="5" class="box"/>
+  <rect x="10" y="110" width="250" height="34" rx="5" style="fill:color-mix(in srgb, var(--c1) 28%, var(--surface));stroke:var(--c1)"/>
+  <rect x="260" y="110" width="290" height="34" rx="5" style="fill:color-mix(in srgb, var(--c3) 30%, var(--surface));stroke:var(--c3)"/>
+  <text x="135" y="132" text-anchor="middle" font-size="12">进程的匿名页</text>
+  <text x="405" y="132" text-anchor="middle" font-size="12">文件页（页缓存）</text>
+  <path d="M 230 160 L 290 160" class="arrow" marker-start="url(#ah40)" marker-end="url(#ah40)"/>
+  <text x="300" y="164" font-size="11" class="t-muted">边界随需求移动</text>
+  <defs><marker id="ah40" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+</svg>
+<figcaption>静态划分 vs 动态划分（统一页缓存）</figcaption>
+</figure>
+<div class="aside" data-title="提示 · 理解静态划分与动态划分">
+<p>分配资源给多个使用者时，静态划分保证每个人都有一份，性能更可预测、实现更简单；动态划分利用率更高（空闲资源可以被需要的人用），但更复杂，而且当你闲置的资源被别人占了、而你突然需要时，收回可能要花很久。没有绝对的最好，要看具体问题。</p>
+</div>
+<p>有了缓存，第一次打开文件可能产生大量 I/O 来读目录的 inode 和数据，但之后再打开同一个文件（或同一目录下的文件），基本都会命中缓存，<strong>不需要 I/O</strong>。在上面的时间线模拟器里把缓存切到"有页缓存"就能看到：读 /foo/bar 并读 3 块，从 14 次 I/O 降到 9 次（冷）甚至 1 次（热）。</p>
+
+<h3>写缓冲</h3>
+<p>写就不一样了：读 I/O 可以被足够大的缓存完全消除，但写最终必须到达磁盘才能持久。不过<strong>写缓冲（write buffering）</strong>仍有三大好处：</p>
+<ol>
+<li><strong>批处理（batch）</strong>：inode 位图在创建一个文件时被改了，片刻后又因为创建另一个文件被改——推迟写入，两次修改只需一次 I/O。</li>
+<li><strong>调度</strong>：内存里攒了一批写，就可以对它们排序、调度，提高磁盘效率。</li>
+<li><strong>避免写</strong>：应用创建一个文件又马上删掉，推迟写就能完全省掉这些 I/O。此时"懒"是一种美德。</li>
+</ol>
+<figure class="fig">
+<svg viewBox="0 0 640 190" width="640" role="img" aria-label="写缓冲时间线">
+  <defs><marker id="ah40b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <line x1="40" y1="150" x2="620" y2="150" class="arrow" marker-end="url(#ah40b)"/>
+  <text x="600" y="170" font-size="11" class="t-muted">时间</text>
+  <text x="10" y="40" font-size="12">应用</text>
+  <text x="10" y="100" font-size="12">磁盘</text>
+  <g font-size="11">
+    <rect x="60" y="26" width="92" height="22" rx="4" class="accent-soft"/><text x="106" y="41" text-anchor="middle">creat a（改位图）</text>
+    <rect x="160" y="26" width="92" height="22" rx="4" class="accent-soft"/><text x="206" y="41" text-anchor="middle">creat b（改位图）</text>
+    <rect x="260" y="26" width="92" height="22" rx="4" class="accent-soft"/><text x="306" y="41" text-anchor="middle">creat tmp</text>
+    <rect x="360" y="26" width="92" height="22" rx="4" class="accent-soft"/><text x="406" y="41" text-anchor="middle">unlink tmp</text>
+    <text x="250" y="68" text-anchor="middle" class="t-muted">全部只改内存中的缓存页（很快返回）</text>
+    <rect x="466" y="86" width="150" height="26" rx="4" class="ok-soft"/><text x="541" y="103" text-anchor="middle">一次刷盘：位图只写 1 次</text>
+    <text x="541" y="128" text-anchor="middle" class="t-muted">tmp 的创建从未落盘</text>
+    <line x1="430" y1="80" x2="430" y2="140" style="stroke:var(--bad);stroke-dasharray:4 3"/>
+    <text x="428" y="140" text-anchor="end" style="fill:var(--bad)">若此刻崩溃：a、b 都丢失</text>
+  </g>
+</svg>
+<figcaption>写缓冲的收益（合并、避免写）与代价（崩溃时丢失尚未刷盘的更新）</figcaption>
+</figure>
+<p>因此大多数现代文件系统会把写在内存里缓冲 <strong>5 到 30 秒</strong>。这又是一个权衡：系统在刷盘前崩溃，这些更新就丢了；缓冲得越久，性能越好（批处理、调度、避免写）。</p>
+<div class="aside" data-title="提示 · 理解持久性与性能的权衡">
+<p>存储系统常常让用户在<strong>持久性（durability）</strong>与<strong>性能</strong>之间选择。想要写完立即持久，就必须真的等数据落盘，写很慢但安全；能容忍丢一点数据，系统就可以先缓冲、稍后在后台写，写"看起来"很快。浏览器丢了最后几张下载的图片也许无所谓，数据库事务丢了一笔进账可就不行了。</p>
+</div>
+<p>数据库这类应用不接受这种权衡，于是它们用 <code>fsync()</code> 强制落盘、用绕过缓存的<strong>直接 I/O（direct I/O）</strong>接口，或干脆使用<strong>裸磁盘接口（raw disk）</strong>完全绕开文件系统。大多数应用接受文件系统的默认选择，但需要时总有办法让系统按你的要求做。</p>
+
+<h2 id="predict">先预测，再验证</h2>
+
+<div class="exercise"><div class="q">用 inode 定位计算器：inode 表从 12KB 开始、inode 256B、块 4KB、扇区 512B。<strong>inode 10</strong> 和 <strong>inode 79</strong> 各要读哪个扇区（所在块的起始扇区）？如果 inode 改成 128B，<strong>inode 32</strong> 又在哪？先手算再验证。</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>inode 10：偏移 2560 → blk 0 → 块起始 12KB → 扇区 <strong>24</strong>。inode 79：偏移 20224 → blk 4 → 块起始 28KB → 扇区 <strong>56</strong>（inode 本身在该块内偏移 3840 处，也就是扇区 63）。</p>
+<p>128B 时每块放 32 个 inode：inode 32 偏移 4096 → blk 1 → 块起始 16KB → 扇区 <strong>32</strong>。inode 越小，同一块里装得越多，编号相近的 inode 越可能在同一块里（一次读就能拿到多个）。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">块大小改成 <strong>1KB</strong>、指针 4B，12 个直接指针 + 1 个间接 + 1 个双重间接。最大文件多大？文件的第 300 块要额外读几个索引块？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>每块 P = 1024 / 4 = 256 个指针。最大块数 = 12 + 256 + 256² = 65804 块 × 1KB = <strong>65804KB ≈ 64.3MB</strong>。块小了，不仅每块数据少，每个间接块能装的指针也少，最大文件大小按"平方"缩水。</p>
+<p>第 300 块：300 − 12 = 288 ≥ 256，所以不在一级间接范围；288 − 256 = 32，落在双重间接里：双重间接块[0] → 间接块[32]，额外读 <strong>2</strong> 个索引块。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">在 vsfs 模拟器里输入下面的序列（8 个 inode、8 个数据块），<strong>先写出最终状态</strong>再运行验证：<br><code>mkdir /a</code>、<code>creat /a/b</code>、<code>write /a/b</code>、<code>link /a/b /c</code>、<code>unlink /a/b</code></div>
+<details class="reveal"><summary>看答案</summary><div>
+<pre><code>inode bitmap  11100000
+inodes        [d a:0 r:3] [d a:1 r:2] [f a:2 r:1] [] [] [] [] []
+data bitmap   11100000
+data          [(.,0) (..,0) (a,1) (c,2)] [(.,1) (..,0)] [a] [] [] [] [] []</code></pre>
+<p>要点：/a/b 被 unlink 后，inode 2 仍被 /c 引用（r:1），所以 inode 和数据块都没被释放；目录 /a 里只剩 . 和 ..。根的引用计数是 3（自己的 .、自己的 ..、以及 /a 里的 ..）。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（原书作业 2）用不同的随机种子多生成几组操作，只看 inode 和数据块的<strong>编号</strong>：vsfs 的分配算法偏好哪些块？删除一个文件后再创建，新文件会用到哪个 inode？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>总是分配<strong>编号最小的空闲项</strong>（从位图开头扫描第一个 0）。所以刚被释放的低编号 inode / 数据块会立刻被下一次分配复用。真实文件系统（如下一章的 FFS）会用更讲究的策略，考虑局部性：把同一目录的文件放在一起。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（原书作业 3、4）把数据块数设成 <strong>2</strong>：哪些操作会失败？哪些永远能成功？把 inode 数设成 <strong>3</strong> 呢？用两个预设按钮验证。</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>只有 2 个数据块（根目录已占 1 块）：只能再有一次 mkdir <em>或</em>一次 write 成功，之后 mkdir 和 write 都失败；creat、link、unlink 不需要数据块，只要还有 inode / 目录空间就能成功。所以文件系统里最后多是<strong>空文件</strong>和链接。</p>
+<p>只有 3 个 inode：只能再创建 2 个对象，之后 creat 和 mkdir 都失败；link、write、unlink 不需要新 inode 仍能成功。unlink 释放 inode 后又能创建新的。最终状态多是少数几个文件带着多个硬链接。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">在 I/O 时间线模拟器里选 <strong>/foo/x/y/bar</strong>、打开并读 <strong>2</strong> 块、无缓存。总共多少次 I/O？再预测：把缓存换成"冷启动"，原书 Figure 40.4（创建 + 3 次写）从 25 次 I/O 降到多少？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>open：4 个目录 × 2（inode + 数据）+ bar 的 inode = 9 次读；每次 read() 3 次 I/O，共 6 次；合计 <strong>15</strong> 次。</p>
+<p>冷缓存创建 + 3 次写：真正的读只剩 7 次（根 inode、根数据、foo inode、foo 数据、inode 位图、bar inode、数据位图，每个只读一次），写被缓冲后合并为 8 个不同的块各刷一次，合计 <strong>15</strong> 次（原来 25 次）。</p>
+</div></details></div>
+
+<h2 id="lab">动手实验</h2>
+<div class="lab">
+<p>三个小程序，把本章的概念落到真实的 Linux ext4 上。代码在 <code>labs/40-fs-impl/</code>：</p>
+<pre><code class="cmd">cd labs/40-fs-impl &amp;&amp; make &amp;&amp; ./sparse &amp;&amp; ./fiemap &amp;&amp; ./cache</code></pre>
+<ul>
+<li><code>sparse</code>：inode 里的 <code>size</code>（文件有多长）和 <code>blocks</code>（真正分配了多少块）是两回事——跳着写只分配写到的块，中间是"洞"；目录也是文件，条目多了要分配更多数据块，删掉条目后也不收缩。</li>
+<li><code>fiemap</code>：用 <code>FS_IOC_FIEMAP</code> ioctl 读出文件的"逻辑块 → 物理块"映射，亲眼看到 ext4 的 extent（起始块 + 长度）。</li>
+<li><code>cache</code>：写 128MB 带不带 <code>fsync</code>、同一文件连续读两次、用 <code>O_DIRECT</code> 绕过页缓存读，体会写缓冲和读缓存。</li>
+</ul>
+<p class="small muted">示例输出（WSL2 · ext4，你的机器上数字会不同）：</p>
+<pre><code id="lab-out">$ ./sparse
+== 1. 文件大小 vs 分配的数据块 ==
+inode=1034668   size=0           blocks=0   (=  0 KB) links=1  &lt;- 刚创建（空文件）
+inode=1034668   size=1           blocks=8   (=  4 KB) links=1  &lt;- 写入 1 字节后
+inode=1034668   size=49153       blocks=16  (=  8 KB) links=1  &lt;- 在偏移 48KB 处再写 1 字节
+inode=1034668   size=1073741825  blocks=24  (= 12 KB) links=1  &lt;- 在偏移 1GB 处再写 1 字节
+
+== 2. 目录也是文件：条目多了，目录要分配更多数据块 ==
+inode=1030428   size=4096        blocks=8   (=  4 KB) links=2  &lt;- 空目录
+inode=1030428   size=4096        blocks=8   (=  4 KB) links=2  &lt;- 目录里有 51 个文件后
+inode=1030428   size=12288       blocks=24  (= 12 KB) links=2  &lt;- 目录里有 101 个文件后
+inode=1030428   size=16384       blocks=32  (= 16 KB) links=2  &lt;- 目录里有 201 个文件后
+inode=1030428   size=36864       blocks=80  (= 40 KB) links=2  &lt;- 目录里有 401 个文件后
+inode=1030428   size=36864       blocks=80  (= 40 KB) links=2  &lt;- 删掉 400 个文件后（目录不收缩）
+
+$ ./fiemap
+fiemap-test.dat: size=4259840 字节, inode=1030428, extent 数=2
+  #   逻辑偏移(4K块) 物理位置(4K块) 长度(块) 标志
+  0   0                  127213568          256        
+  1   1024               127218688          16         LAST 
+
+$ ./cache
+== 写缓冲：write() 返回 ≠ 数据已落盘 ==
+200 次 4KB 追加写，不 fsync   :     1.02 ms（平均每次    5.1 µs）
+200 次 4KB 追加写，每次 fsync :   352.24 ms（平均每次 1761.2 µs）
+写 64 MB：write() 循环用时     89.2 ms  ← 数据只是进了页缓存（脏页）
+          随后 fsync() 用时     27.0 ms  ← 这时才等设备把脏页真正写下去
+
+== 读缓存：第二次读几乎不碰磁盘 ==
+第 1 次读（已尽量清缓存）  :     31.6 ms  ( 2023 MB/s)
+第 2 次读（命中页缓存）    :     19.2 ms  ( 3340 MB/s)
+O_DIRECT 读（绕过页缓存）  :     30.4 ms  ( 2105 MB/s)</code></pre>
+<p>怎么解读：</p>
+<ul>
+<li>空文件 <code>blocks=0</code>：creat 只分配 inode，不分配数据块（和 vsfs 模拟器一致）。写 1 字节就分配一整块 4KB（<code>blocks</code> 以 512B 为单位，8 × 512 = 4KB）。跳到 1GB 处写 1 字节，<code>size</code> 变成 1GB 多，实际只占 12KB——中间的洞不占空间，读洞会得到 0。</li>
+<li>目录从 4KB 长到 36KB：目录项多了，目录文件需要更多数据块；删光文件后大小不变（空出来的目录项只是被标记为空闲，正如前面目录模拟器里的"空洞"）。ext4 在目录超过一块时还会启用 htree 索引，所以增长不完全线性。</li>
+<li>fiemap：1MB 连续写入被记成<strong>一个</strong>长度 256 块的 extent，而不是 256 个指针；洞（逻辑块 256–1023）根本不出现在映射里。</li>
+<li>cache：不 fsync 的写只写进页缓存就返回；fsync 要等设备确认。第二次读命中页缓存更快。WSL2 的虚拟磁盘背后还有 Windows 主机的缓存，差距可能没有物理硬盘那么夸张，多跑几次看看波动。</li>
+</ul>
+</div>
+
+<h2 id="quiz">自测题</h2>
+<p class="quiz-score"></p>
+
+<div class="mcq" data-answer="3"><div class="q">1. vsfs 中，inode 表从 12KB 开始，每个 inode 256B，块 4KB。读 inode 32 需要读哪个扇区（512B）？</div>
+<div class="opts"><button>A. 64</button><button>B. 32</button><button>C. 20</button><button>D. 40</button></div>
+<div class="explain">32 × 256 = 8192 = 8KB，加上起始 12KB = 20KB；20 × 1024 / 512 = 40。C 是 KB 数不是扇区号；B 把 inode 号直接当扇区号。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">2. 进程执行 <code>open("/foo/bar", O_RDONLY)</code> 然后 <code>read()</code> 一个块（无缓存）。下面哪个结构在整个过程中<strong>完全不会</strong>被访问？</div>
+<div class="opts"><button>A. bar 的 inode</button><button>B. 数据位图</button><button>C. 根目录的数据块</button><button>D. foo 的 inode</button></div>
+<div class="explain">读文件不需要分配任何东西，所以不访问位图。inode 已经指向数据块，没必要去确认"是否已分配"。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">3. 4KB 块、4 字节指针、12 个直接指针 + 1 个间接指针，最大文件是多少？</div>
+<div class="opts"><button>A. 4144KB</button><button>B. 4GB</button><button>C. 48KB</button><button>D. 4MB</button></div>
+<div class="explain">间接块能装 4096/4 = 1024 个指针，(12 + 1024) × 4KB = 4144KB。48KB 是只有直接指针的情况；约 4GB 要再加双重间接指针。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">4. 为什么 inode 的指针树设计成"少量直接指针 + 逐级间接"这种不平衡的样子？</div>
+<div class="opts"><button>A. 为了让所有文件的访问代价相同</button><button>B. 因为磁盘只支持 12 个连续地址</button><button>C. 因为大多数文件很小，直接指针就能覆盖它们，不必付出读间接块的代价</button><button>D. 因为间接块比数据块读得更快</button></div>
+<div class="explain">测量研究一再发现"大多数文件很小"。为常见情况优化：小文件只用直接指针，零额外 I/O；只有大文件才需要走间接块。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">5. 在 vsfs 里执行 <code>link("/q", "/u")</code>，哪些结构会被修改？</div>
+<div class="opts"><button>A. 数据位图、新数据块和目录</button><button>B. 只有根目录的数据块</button><button>C. inode 位图和 q 的 inode</button><button>D. 根目录的数据块和 q 的 inode（引用计数 +1）</button></div>
+<div class="explain">硬链接不分配任何新东西：只在目录里加一项 (u, q 的 inode 号)，再把该 inode 的引用计数加 1。两个位图都不变。B 漏掉了引用计数。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">6. 原书 Figure 40.4 中，创建 /foo/bar 需要 10 次 I/O，其中有一次是<strong>读</strong> bar 的 inode——明明它还没初始化。原因是？</div>
+<div class="opts"><button>A. inode 比块小，更新块内的一个 inode 必须先读出整块再写回（读-改-写）</button><button>B. 要读出 bar 的数据块指针</button><button>C. 要检查 bar 是否已存在</button><button>D. 这是为了更新访问时间</button></div>
+<div class="explain">磁盘按块读写，一个 4KB 块里有 16 个 inode。只改其中一个，必须先读整块，改好后再写回整块，否则会覆盖邻居 inode。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">7. 关于缓存与缓冲，下列说法<strong>正确</strong>的是：</div>
+<div class="opts"><button>A. 现代系统通常把 10% 内存固定划给文件缓存</button><button>B. 写缓冲会增加写 I/O 的总次数</button><button>C. 足够大的缓存可以消除几乎所有重复读 I/O，但写最终仍然必须到达磁盘</button><button>D. 调用 write() 返回就说明数据已经持久保存</button></div>
+<div class="explain">写缓冲通过合并、避免写来<em>减少</em> I/O；现代系统用统一页缓存动态划分；write() 返回时数据可能还在内存里，要持久化得用 fsync()。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">8. 不考虑缓存，<code>open("/a/b/c/d.txt")</code> 为了找到 d.txt 的 inode，至少要读多少次磁盘（假设每个目录只有一个数据块）？</div>
+<div class="opts"><button>A. 9 次</button><button>B. 8 次</button><button>C. 5 次</button><button>D. 4 次</button></div>
+<div class="explain">要遍历 4 个目录（/、a、b、c），每个读 inode + 数据块 = 8 次，再读 d.txt 的 inode 1 次，共 9 次。I/O 数量与路径长度成正比。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">9. 目录项中的 <code>reclen</code>（记录长度）为什么可以大于名字实际需要的空间？</div>
+<div class="opts"><button>A. 因为每个名字都必须补齐到 256 字节</button><button>B. 删除文件会留下空洞，新名字可以复用一条更大的旧记录，多出来的空间就留在记录里</button><button>C. 为了让目录项按 inode 号排序</button><button>D. 为了存储文件大小</button></div>
+<div class="explain">reclen 告诉遍历者"下一条记录从哪开始"。复用旧记录时 reclen 保持不变，于是可能比 strlen 大很多——在目录模拟器里试试删掉长名字再创建短名字。</div></div>
+
+<h2 id="summary">常见误区与小结</h2>
+<div class="warn">
+<ul>
+<li><strong>"inode 里存着文件名"</strong>——没有。名字在父目录的数据块里，inode 只有元数据和块指针；所以一个 inode 可以有多个名字（硬链接）。</li>
+<li><strong>"读文件也要查位图"</strong>——不需要。位图只在分配 / 释放时访问。</li>
+<li><strong>"close() 会把数据写回磁盘"</strong>——在 vsfs 模型里 close 不产生任何磁盘 I/O；要保证落盘请用 fsync()。</li>
+<li><strong>"文件大小 = 占用的磁盘空间"</strong>——稀疏文件的洞不分配块；反过来 1 字节的文件也占一整块。</li>
+<li><strong>"unlink 就是删除"</strong>——unlink 只是删掉一个名字、引用计数减 1；计数为 0（且没有进程打开它）时才释放 inode 和数据块。</li>
+<li><strong>"inode 数量无限"</strong>——inode 表大小在 mkfs 时就定了；inode 用光后，即使还有数据块，也无法创建新文件。</li>
+</ul>
+</div>
+<div class="key">
+<p><strong>本章要点</strong></p>
+<ul>
+<li>磁盘被划分成块：超级块 + inode 位图 + 数据位图 + inode 表 + 数据区。</li>
+<li>inode 保存文件的元数据；i-number 是它在 inode 表里的下标，<code>sector = ((inum × size / B) × B + start) / 512</code> 可直接算出位置。</li>
+<li>多级索引（直接 + 间接 + 双重间接……）为"多数文件很小"优化，又能支持很大的文件；extent 是更紧凑的替代方案。</li>
+<li>目录是特殊的文件，数据是一串 (inum, reclen, strlen, name) 记录；位图管理空闲空间。</li>
+<li>访问路径：open 逐级读 inode 和目录数据；每次读 3 次 I/O、每次分配型写 5 次、创建 10 次。</li>
+<li>缓存消除重复读；写缓冲通过批处理、调度、避免写来提升性能，代价是持久性，需要时用 fsync。</li>
+</ul>
+</div>
+<p><strong>和后续章节的联系：</strong>vsfs 完全不考虑磁盘的物理特性，数据块可能被放得很散——下一章的 <strong>FFS（快速文件系统）</strong>就是要让文件系统"懂磁盘"，改进局部性。上面看到的"一次创建 10 次写、分散在各处"如果中途断电怎么办？这就是第 42 章<strong>崩溃一致性（fsck 与日志）</strong>要解决的问题。而"写都要到处寻道"的问题，第 43 章的 <strong>LFS</strong> 给出了激进的答案：把所有写都变成顺序写。</p>
+
+</main>
+<script>
+(function () {
+"use strict";
+// ===== CORE BEGIN（纯函数，无 DOM；可单独用 node 测试） =====
+// ---- inode 定位：给定 inode 号，算出所在块与扇区（原书 40.3 节公式） ----
+function inodeLoc(inum, inodeSize, blockSize, inodeStartKB, sectorSize) {
+  const start = inodeStartKB * 1024;                 // inode 表起始字节地址
+  const off = inum * inodeSize;                      // 在 inode 表内的字节偏移
+  const blk = Math.floor(off / blockSize);           // 第几个 inode 块（iblock）
+  const blockAddr = blk * blockSize + start;         // 该 inode 块的起始字节地址
+  const sector = Math.floor(blockAddr / sectorSize); // 读这个块要发的扇区号
+  const byteAddr = start + off;                      // inode 本身的精确字节地址
+  return {
+    off, blk, blockAddr, sector, byteAddr,
+    inBlock: off % blockSize,
+    exactSector: Math.floor(byteAddr / sectorSize),
+    fsBlock: Math.floor(blockAddr / blockSize),
+    perBlock: Math.floor(blockSize / inodeSize),
+  };
+}
+
+// ---- 多级索引：最大文件大小，以及"文件第 k 块走哪条指针路径" ----
+function maxFileBlocks(nDirect, P, levels) {
+  let total = nDirect, pow = 1;
+  for (let l = 1; l <= levels; l++) { pow *= P; total += pow; }
+  return total;
+}
+function locateFileBlock(k, nDirect, P, levels) {
+  if (k < 0) return null;
+  if (k < nDirect) return { level: 0, path: [k], extraReads: 0 };
+  let rest = k - nDirect, span = 1;
+  for (let l = 1; l <= levels; l++) {
+    span *= P;
+    if (rest < span) {
+      const path = [];
+      let r = rest;
+      for (let d = l - 1; d >= 0; d--) { const w = Math.pow(P, d); path.push(Math.floor(r / w)); r %= w; }
+      return { level: l, path, extraReads: l };
+    }
+    rest -= span;
+  }
+  return null; // 超出最大文件
+}
+
+// ---- 目录项：inum | reclen | strlen | name ----
+// strlen 含结尾的 '\0'（"foo" → 4）；reclen = 8 字节头(inum 4 + reclen 2 + strlen 2) + 名字按 4 字节对齐
+function recLen(name) { return 8 + Math.ceil((name.length + 1) / 4) * 4; }
+function dirInsert(entries, name, inum) {
+  const need = recLen(name);
+  const i = entries.findIndex((e) => e.inum === 0 && e.reclen >= need);
+  const out = entries.map((e) => ({ ...e }));
+  if (i >= 0) { out[i] = { inum, reclen: out[i].reclen, strlen: name.length + 1, name }; return { entries: out, idx: i, reused: true }; }
+  out.push({ inum, reclen: need, strlen: name.length + 1, name });
+  return { entries: out, idx: out.length - 1, reused: false };
+}
+function dirDelete(entries, name) {
+  const out = entries.map((e) => ({ ...e }));
+  const i = out.findIndex((e) => e.inum !== 0 && e.name === name);
+  if (i >= 0) out[i].inum = 0;
+  return { entries: out, idx: i };
+}
+
+// ---- vsfs：仿 vsfs.py 的极简文件系统 ----
+// inode: {t:'d'|'f', a:数据块号或 -1, r:引用计数}；数据块: 目录 {t:'d', e:[[name, inum]...]} 或文件 {t:'f', c:'x'}
+class VSFS {
+  constructor(ni = 8, nd = 8, dirCap = 8) {
+    this.ni = ni; this.nd = nd; this.dirCap = dirCap;
+    this.ibm = Array(ni).fill(0); this.inodes = Array(ni).fill(null);
+    this.dbm = Array(nd).fill(0); this.data = Array(nd).fill(null);
+    this.ibm[0] = 1; this.inodes[0] = { t: "d", a: 0, r: 2 };      // 根目录：inode 0，数据块 0
+    this.dbm[0] = 1; this.data[0] = { t: "d", e: [[".", 0], ["..", 0]] };
+  }
+  clone() { const c = Object.create(VSFS.prototype); Object.assign(c, JSON.parse(JSON.stringify(this))); return c; }
+  static alloc(bm) { const i = bm.indexOf(0); if (i >= 0) bm[i] = 1; return i; }  // 首个空闲（最小编号）
+  static split(path) {
+    const parts = path.split("/").filter(Boolean);
+    const name = parts.pop();
+    return { parent: "/" + parts.join("/"), name };
+  }
+  lookup(path) {
+    const parts = path.split("/").filter(Boolean);
+    let cur = 0;
+    for (const p of parts) {
+      const ino = this.inodes[cur];
+      if (!ino || ino.t !== "d") return -1;
+      const ent = this.data[ino.a].e.find((x) => x[0] === p);
+      if (!ent) return -1;
+      cur = ent[1];
+    }
+    return cur;
+  }
+  dirs() { // 所有目录的路径
+    const out = [];
+    const walk = (inum, path) => {
+      out.push(path);
+      for (const [n, c] of this.data[this.inodes[inum].a].e) if (n !== "." && n !== ".." && this.inodes[c].t === "d") walk(c, (path === "/" ? "" : path) + "/" + n);
+    };
+    walk(0, "/");
+    return out;
+  }
+  files() { // 所有普通文件的路径（同一 inode 的多个名字都会列出）
+    const out = [];
+    const walk = (inum, path) => {
+      for (const [n, c] of this.data[this.inodes[inum].a].e) {
+        if (n === "." || n === "..") continue;
+        const p = (path === "/" ? "" : path) + "/" + n;
+        if (this.inodes[c].t === "d") walk(c, p); else out.push(p);
+      }
+    };
+    walk(0, "/");
+    return out;
+  }
+  // 执行一个操作：返回 {ok, err, notes:[中文说明], touch:[{k:'ibm'|'inode'|'dbm'|'data', i}]}
+  apply(op) {
+    const notes = [], touch = [];
+    const T = (k, i) => touch.push({ k, i });
+    const fail = (err) => ({ ok: false, err, notes, touch: [] });
+    const { parent, name } = VSFS.split(op.path || "/");
+    const pin = this.lookup(parent);
+    if (op.kind === "mkdir" || op.kind === "creat") {
+      if (!name) return fail("路径无效");
+      if (pin < 0 || this.inodes[pin].t !== "d") return fail(`父目录 ${parent} 不存在`);
+      const pdata = this.data[this.inodes[pin].a];
+      if (pdata.e.some((x) => x[0] === name)) return fail(`${op.path} 已存在`);
+      if (pdata.e.length >= this.dirCap) return fail(`父目录 ${parent} 的数据块已满（本模拟器每个目录只有 1 块，最多 ${this.dirCap} 项）`);
+      const ni = VSFS.alloc(this.ibm);
+      if (ni < 0) return fail("没有空闲 inode 了（inode 位图全是 1）");
+      if (op.kind === "mkdir") {
+        const nb = VSFS.alloc(this.dbm);
+        if (nb < 0) { this.ibm[ni] = 0; return fail("没有空闲数据块了：新目录至少需要 1 块来存放 . 和 ..（已分配的 inode 被回滚）"); }
+        this.inodes[ni] = { t: "d", a: nb, r: 2 };
+        this.data[nb] = { t: "d", e: [[".", ni], ["..", pin]] };
+        pdata.e.push([name, ni]);
+        this.inodes[pin].r += 1;
+        T("ibm", ni); T("inode", ni); T("dbm", nb); T("data", nb); T("data", this.inodes[pin].a); T("inode", pin);
+        notes.push(`扫描 inode 位图，第一个空闲的是 ${ni} → 置 1；扫描数据位图，第一个空闲块是 ${nb} → 置 1。`);
+        notes.push(`初始化 inode ${ni}：类型 d、地址 ${nb}、引用计数 2（父目录里的 "${name}" + 自己的 "."）。数据块 ${nb} 写入 (.,${ni}) (..,${pin})。`);
+        notes.push(`父目录（inode ${pin}）的数据块 ${this.inodes[pin].a} 追加 (${name},${ni})；父目录引用计数 +1 变成 ${this.inodes[pin].r}，因为新目录的 ".." 指向它。`);
+      } else {
+        this.inodes[ni] = { t: "f", a: -1, r: 1 };
+        pdata.e.push([name, ni]);
+        T("ibm", ni); T("inode", ni); T("data", this.inodes[pin].a); T("inode", pin);
+        notes.push(`扫描 inode 位图，第一个空闲的是 ${ni} → 置 1。`);
+        notes.push(`初始化 inode ${ni}：类型 f、还没有数据块（a:-1）、引用计数 1。空文件不占数据块，所以数据位图不变。`);
+        notes.push(`父目录（inode ${pin}）的数据块 ${this.inodes[pin].a} 追加目录项 (${name},${ni})。`);
+      }
+      return { ok: true, notes, touch };
+    }
+    const inum = this.lookup(op.path || "");
+    if (op.kind === "write") {
+      if (inum < 0) return fail(`${op.path} 不存在`);
+      const ino = this.inodes[inum];
+      if (ino.t !== "f") return fail(`${op.path} 是目录，不能 write`);
+      if (ino.a >= 0) return fail(`文件已满：vsfs.py 的每个文件最多只有 1 个数据块（inode ${inum} 已指向块 ${ino.a}）`);
+      const nb = VSFS.alloc(this.dbm);
+      if (nb < 0) return fail("没有空闲数据块了（数据位图全是 1）");
+      ino.a = nb;
+      this.data[nb] = { t: "f", c: op.ch || "x" };
+      T("dbm", nb); T("data", nb); T("inode", inum);
+      notes.push(`追加写一个块：扫描数据位图，第一个空闲块是 ${nb} → 置 1；把内容 "${op.ch || "x"}" 写进数据块 ${nb}。`);
+      notes.push(`更新 inode ${inum} 的地址字段 a:${nb}（以及大小）。注意 inode 位图和目录都不变。`);
+      return { ok: true, notes, touch };
+    }
+    if (op.kind === "link") {
+      if (inum < 0) return fail(`${op.path} 不存在`);
+      if (this.inodes[inum].t !== "f") return fail("不能给目录建硬链接（会造成目录环）");
+      const t = VSFS.split(op.path2 || "");
+      const tp = this.lookup(t.parent);
+      if (!t.name || tp < 0 || this.inodes[tp].t !== "d") return fail(`目标父目录 ${t.parent} 不存在`);
+      const td = this.data[this.inodes[tp].a];
+      if (td.e.some((x) => x[0] === t.name)) return fail(`${op.path2} 已存在`);
+      if (td.e.length >= this.dirCap) return fail(`目录 ${t.parent} 已满`);
+      td.e.push([t.name, inum]);
+      this.inodes[inum].r += 1;
+      T("data", this.inodes[tp].a); T("inode", inum);
+      notes.push(`只在目录 ${t.parent}（数据块 ${this.inodes[tp].a}）里加一项 (${t.name},${inum})——指向同一个 inode，不复制数据。`);
+      notes.push(`inode ${inum} 的引用计数 +1 → ${this.inodes[inum].r}。两个位图都不变：没有分配任何新东西。`);
+      return { ok: true, notes, touch };
+    }
+    if (op.kind === "unlink") {
+      if (inum < 0) return fail(`${op.path} 不存在`);
+      const ino = this.inodes[inum];
+      if (ino.t !== "f") return fail("vsfs.py 的 unlink 只删除普通文件");
+      const pd = this.data[this.inodes[pin].a];
+      pd.e = pd.e.filter((x) => x[0] !== name);
+      ino.r -= 1;
+      T("data", this.inodes[pin].a); T("inode", inum);
+      notes.push(`从目录 ${parent}（数据块 ${this.inodes[pin].a}）删掉目录项 (${name},${inum})，inode ${inum} 引用计数 -1 → ${ino.r}。`);
+      if (ino.r === 0) {
+        if (ino.a >= 0) { this.dbm[ino.a] = 0; this.data[ino.a] = null; T("dbm", ino.a); T("data", ino.a); notes.push(`引用计数到 0：释放它的数据块 ${ino.a}（数据位图置 0）。`); }
+        this.ibm[inum] = 0; this.inodes[inum] = null; T("ibm", inum);
+        notes.push(`释放 inode ${inum}（inode 位图置 0）。这才是真正的"删除"。`);
+      } else {
+        notes.push(`引用计数还不是 0（还有别的名字指向它），所以 inode 和数据块都保留。`);
+      }
+      return { ok: true, notes, touch };
+    }
+    return fail("未知操作 " + op.kind);
+  }
+  dump() {
+    const ino = this.inodes.map((x) => (x ? `[${x.t} a:${x.a} r:${x.r}]` : "[]")).join(" ");
+    const dat = this.data.map((x) => (!x ? "[]" : x.t === "d" ? "[" + x.e.map((e) => `(${e[0]},${e[1]})`).join(" ") + "]" : `[${x.c}]`)).join(" ");
+    return `inode bitmap  ${this.ibm.join("")}\ninodes        ${ino}\ndata bitmap   ${this.dbm.join("")}\ndata          ${dat}`;
+  }
+}
+function opText(op) {
+  switch (op.kind) {
+    case "mkdir": return `mkdir("${op.path}");`;
+    case "creat": return `creat("${op.path}");`;
+    case "write": return `fd=open("${op.path}", O_WRONLY|O_APPEND); write(fd, buf, BLOCKSIZE); close(fd);`;
+    case "link": return `link("${op.path}", "${op.path2}");`;
+    case "unlink": return `unlink("${op.path}");`;
+  }
+  return op.kind;
+}
+function parseOps(text) {
+  const ops = [];
+  let letter = 0;
+  for (const raw of text.split(/[\n;]+/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const m = line.match(/^(mkdir|creat|write|link|unlink)\b/);
+    if (!m) { ops.push({ kind: "bad", raw: line }); continue; }
+    const paths = line.match(/\/[A-Za-z0-9_./-]*/g) || [];
+    const op = { kind: m[1], path: paths[0], path2: paths[1] };
+    if (op.kind === "write") op.ch = "abcdefghijklmnopqrstuvwxyz"[letter++ % 26];
+    ops.push(op);
+  }
+  return ops;
+}
+// 随机生成操作序列（思路同 vsfs.py：随机挑操作、随机挑目录/文件、名字是单个字母）
+function randomOps(seed, n, ni, nd, rngFactory) {
+  const r = rngFactory(seed);
+  const fs = new VSFS(ni, nd);
+  const used = new Set();
+  const newName = () => {
+    const free = "abcdefghijklmnopqrstuvwxyz".split("").filter((c) => !used.has(c));
+    const c = free.length ? r.pick(free) : r.pick("abcdefghijklmnopqrstuvwxyz".split("")) + r.int(0, 9);
+    used.add(c);
+    return c;
+  };
+  const join = (d, nm) => (d === "/" ? "" : d) + "/" + nm;
+  const ops = [];
+  let guard = 0;
+  while (ops.length < n && guard++ < n * 20) {
+    const x = r();
+    const files = fs.files();
+    let op;
+    if (x < 0.2) op = { kind: "mkdir", path: join(r.pick(fs.dirs()), newName()) };
+    else if (x < 0.5) op = { kind: "creat", path: join(r.pick(fs.dirs()), newName()) };
+    else if (x < 0.7) { if (!files.length) continue; op = { kind: "write", path: r.pick(files), ch: "abcdefghijklmnopqrstuvwxyz"[r.int(0, 25)] }; }
+    else if (x < 0.85) { if (!files.length) continue; op = { kind: "link", path: r.pick(files), path2: join(r.pick(fs.dirs()), newName()) }; }
+    else { if (!files.length) continue; op = { kind: "unlink", path: r.pick(files) }; }
+    fs.apply(op);
+    ops.push(op);
+  }
+  return ops;
+}
+// 依次执行，得到每一步的状态快照
+function runOps(ni, nd, ops) {
+  let fs = new VSFS(ni, nd);
+  const states = [{ fs: fs.clone(), op: null, res: null }];
+  for (const op of ops) {
+    fs = fs.clone();
+    const res = op.kind === "bad" ? { ok: false, err: "无法解析：" + op.raw, notes: [], touch: [] } : fs.apply(op);
+    states.push({ fs: fs.clone(), op, res });
+  }
+  return states;
+}
+
+// ---- 访问路径时间线（复刻 Figure 40.3 / 40.4） ----
+// mode: 'read' | 'create'；depth: 中间目录个数（1 → /foo/bar）；n: read()/write() 次数；cache: 'none'|'cold'|'warm'
+function accessTimeline(mode, depth, n, cache) {
+  const dirs = ["root", "foo", "x", "y"].slice(0, depth + 1);
+  const path = "/" + dirs.slice(1).concat("bar").join("/");
+  const cols = ["data bitmap", "inode bitmap", ...dirs.map((d) => d + " inode"), "bar inode", ...dirs.map((d) => d + " data"), ...Array.from({ length: n }, (_, k) => `bar data[${k}]`)];
+  const rows = [];
+  const add = (group, col, rw, why) => rows.push({ group, col, rw, why });
+  const walk = (group) => {
+    dirs.forEach((d, k) => {
+      const next = k + 1 < dirs.length ? dirs[k + 1] : "bar";
+      add(group, d + " inode", "read", `读 ${d} 的 inode${k === 0 ? "（根的 inode 号是众所周知的 2，无需查找）" : ""}，拿到它的数据块指针与权限。`);
+      add(group, d + " data", "read", `读 ${d} 的目录数据，线性查找名字 "${next}" 的目录项，得到 ${next} 的 inode 号。`);
+    });
+  };
+  const last = dirs[dirs.length - 1];
+  if (mode === "read") {
+    const g = "open(bar)";
+    walk(g);
+    add(g, "bar inode", "read", "读 bar 的 inode 进内存：检查权限、记下文件大小，然后在进程的打开文件表里分配 fd。");
+    for (let k = 0; k < n; k++) {
+      const gg = `read() #${k + 1}`;
+      add(gg, "bar inode", "read", `查 bar 的 inode，找到第 ${k} 个数据块的磁盘地址。`);
+      add(gg, `bar data[${k}]`, "read", `读数据块 bar data[${k}]，拷贝到用户缓冲区；打开文件表里的偏移 += 4KB。`);
+      add(gg, "bar inode", "write", "写回 inode：更新最后访问时间（atime）。");
+    }
+  } else {
+    const g = "create(/…/bar)";
+    walk(g);
+    add(g, "inode bitmap", "read", "读 inode 位图，找一个空闲 inode。");
+    add(g, "inode bitmap", "write", "把该位置 1 写回：标记这个 inode 已分配。");
+    add(g, last + " data", "write", `在 ${last} 的目录数据里写入新目录项 (bar, inode 号)。`);
+    add(g, "bar inode", "read", "读新 inode 所在的块——inode 只有 256B，而磁盘按 4KB 块读写，只能\"读-改-写\"整个块。");
+    add(g, "bar inode", "write", "初始化并写回 bar 的 inode（类型、权限、大小 0……）。");
+    add(g, last + " inode", "write", `更新 ${last} 的 inode（目录大小、修改时间）。`);
+    for (let k = 0; k < n; k++) {
+      const gg = `write() #${k + 1}`;
+      add(gg, "bar inode", "read", "读 bar 的 inode：第 " + k + " 块还没分配。");
+      add(gg, "data bitmap", "read", "读数据位图，找一个空闲数据块。");
+      add(gg, "data bitmap", "write", "把该位置 1 写回：标记这个数据块已分配。");
+      add(gg, `bar data[${k}]`, "write", `把用户数据写进新分配的块 bar data[${k}]。`);
+      add(gg, "bar inode", "write", "写回 inode：记录新块的地址、更新大小与修改时间。");
+    }
+  }
+  // 缓存模拟：读命中就不发 I/O；写只标脏，最后统一刷盘（同一块多次写合并成一次）
+  const out = [];
+  const cached = new Set(), dirty = [];
+  if (cache === "warm") {
+    for (const d of dirs) { cached.add(d + " inode"); cached.add(d + " data"); }
+    cached.add("bar inode");
+    if (mode === "read") for (let k = 0; k < n; k++) cached.add(`bar data[${k}]`);
+    else { cached.add("inode bitmap"); cached.add("data bitmap"); cached.delete("bar inode"); }
+  }
+  for (const r of rows) {
+    if (cache === "none") { out.push({ ...r, io: true }); continue; }
+    if (r.rw === "read") {
+      const hit = cached.has(r.col);
+      cached.add(r.col);
+      out.push({ ...r, io: !hit, hit });
+    } else {
+      cached.add(r.col);
+      if (!dirty.includes(r.col)) dirty.push(r.col);
+      out.push({ ...r, io: false, buffered: true });
+    }
+  }
+  if (cache !== "none") for (const c of dirty) out.push({ group: "稍后刷盘（5~30 秒后 / fsync）", col: c, rw: "write", io: true, flush: true, why: `把 ${c} 的脏块写到磁盘。之前对它的多次修改在内存里合并，只需这一次 I/O。` });
+  const ios = out.filter((r) => r.io);
+  return { path, cols, rows: out, total: ios.length, reads: ios.filter((r) => r.rw === "read").length, writes: ios.filter((r) => r.rw === "write").length, hits: out.filter((r) => r.hit).length, buffered: out.filter((r) => r.buffered).length };
+}
+// ===== CORE END =====
+
+
+// ===== 页面交互部分 =====
+const { h, s } = OSTEP;
+const $ = (id) => document.getElementById(id);
+const fmtN = (n) => n.toLocaleString("en-US");
+function fmtBytes(b) {
+  const u = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let i = 0, x = b;
+  while (x >= 1024 && i < u.length - 1) { x /= 1024; i++; }
+  return (Number.isInteger(x) ? x : x.toFixed(2)) + " " + u[i];
+}
+
+// ---------- 图：64 块布局 ----------
+(function layoutFig() {
+  const host = $("layout-svg"), info = $("layout-info");
+  let stage = 3;
+  const type = (b) => {
+    if (b >= 8) return "D";
+    if (stage >= 1 && b >= 3) return "I";
+    if (stage >= 2 && b === 1) return "i";
+    if (stage >= 2 && b === 2) return "d";
+    if (stage >= 3 && b === 0) return "S";
+    return "";
+  };
+  const fill = { S: "var(--c4)", i: "var(--c5)", d: "var(--c6)", I: "var(--c1)" };
+  function describe(b) {
+    const t = type(b);
+    const addr = `字节地址 ${b * 4}KB–${b * 4 + 4}KB，扇区 ${b * 8}–${b * 8 + 7}`;
+    if (t === "S") return `块 0：超级块（superblock）。记录"80 个 inode、56 个数据块、inode 表从块 3 开始"等参数和一个标识 vsfs 的魔数。挂载时第一个被读。${addr}。`;
+    if (t === "i") return `块 1：inode 位图。第 k 位 = 1 表示 inode k 已分配。4KB 可追踪 32768 个 inode，这里只用前 80 位。${addr}。`;
+    if (t === "d") return `块 2：数据位图。第 k 位对应数据区的第 k 块（即块 ${8}+k），这里只用前 56 位。${addr}。`;
+    if (t === "I") { const k = b - 3; return `块 ${b}：inode 表的第 ${k} 块（iblock ${k}），存 inode ${16 * k}–${16 * k + 15}（每个 256B，一块 16 个）。${addr}。`; }
+    if (t === "D") return `块 ${b}：数据区第 ${b - 8} 块。可以存文件内容、目录内容（目录项列表），或者间接指针块。${addr}。`;
+    return `块 ${b}：还没决定用途——继续点上面的按钮往下搭。`;
+  }
+  function draw() {
+    const cw = 18, ch = 30, gap = 8, x0 = 20;
+    const svg = s("svg", { viewBox: "0 0 640 130", width: 640, role: "img", "aria-label": "vsfs 64 块布局" });
+    for (let b = 0; b < 64; b++) {
+      const row = b >> 5, col = b & 31, grp = col >> 3;
+      const x = x0 + col * cw + grp * gap, y = 24 + row * 62;
+      const t = type(b);
+      const style = t === "D" ? "fill:var(--ok-soft);stroke:var(--ok)" : t ? `fill:${fill[t]};stroke:${fill[t]}` : "fill:var(--surface-2);stroke:var(--border)";
+      const g = s("g", { style: "cursor:pointer", onclick: () => { info.textContent = describe(b); } });
+      g.append(s("rect", { x, y, width: cw - 2, height: ch, rx: 3, style }));
+      if (t) g.append(s("text", { x: x + (cw - 2) / 2, y: y + 19, "text-anchor": "middle", "font-size": 11, style: t === "D" ? "" : "fill:#fff;font-weight:700", text: t }));
+      g.append(s("title", { text: describe(b) }));
+      svg.append(g);
+      if (col % 8 === 0 || col % 8 === 7) svg.append(s("text", { x: x + (cw - 2) / 2, y: y - 5, "text-anchor": "middle", "font-size": 10, class: "t-muted mono", text: b }));
+    }
+    host.replaceChildren(svg);
+  }
+  $("layout-btns").addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    stage = Number(b.dataset.stage);
+    [...$("layout-btns").children].forEach((x) => x.classList.toggle("on", x === b));
+    info.textContent = ["第①步：先把最后 56 块（8–63）留给用户数据。", "第②步：块 3–7 做 inode 表：5 块 × 16 个 inode = 80 个 inode。", "第③步：块 1 = inode 位图，块 2 = 数据位图，记录谁空闲谁已用。", "第④步：块 0 = 超级块。布局完成！点任意块看详情。"][stage];
+    draw();
+  });
+  draw();
+})();
+
+// ---------- 图：位图 ↔ inode ----------
+(function bitmapFig() {
+  const g = $("bm-bits");
+  const bits = [1, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+  bits.forEach((b, k) => {
+    const x = 70 + k * 35;
+    g.append(s("rect", { x, y: 36, width: 28, height: 28, rx: 4, class: b ? "accent-soft" : "box" }));
+    g.append(s("text", { x: x + 14, y: 55, "text-anchor": "middle", class: "mono", text: b }));
+    g.append(s("text", { x: x + 14, y: 30, "text-anchor": "middle", "font-size": 9.5, class: "t-muted mono", text: k }));
+    g.append(s("line", { x1: x + 14, y1: 65, x2: x + 14, y2: 124, class: "arrow", style: b ? "" : "stroke-dasharray:3 3" }));
+    g.append(s("rect", { x, y: 126, width: 28, height: 30, rx: 3, class: b ? "ok-soft" : "box" }));
+    g.append(s("text", { x: x + 14, y: 145, "text-anchor": "middle", "font-size": 10, class: "mono", text: b ? "i" + k : "空" }));
+  });
+})();
+
+// ---------- 计算器：inode 定位 ----------
+(function inodeCalc() {
+  const inp = { inum: $("il-inum"), isz: $("il-isz"), bsz: $("il-bsz"), start: $("il-start"), ssz: $("il-ssz") };
+  function render() {
+    const isz = +inp.isz.value, bsz = +inp.bsz.value, ssz = +inp.ssz.value;
+    const startKB = Math.max(0, +inp.start.value || 0);
+    const per = bsz / isz, total = per * 5;
+    let inum = Math.floor(+inp.inum.value || 0);
+    const warn = inum < 0 || inum >= total;
+    inum = Math.max(0, Math.min(total - 1, inum));
+    const L = inodeLoc(inum, isz, bsz, startKB, ssz);
+    // 近景图：5 个 inode 块
+    const cols = 4, rows = Math.ceil(per / cols), cw = 26, chh = 18, bw = cols * cw + 12, gap = 14;
+    const W = 30 + 5 * (bw + gap), H = 60 + rows * (chh + 2) + 30;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "inode 表近景" });
+    for (let k = 0; k < 5; k++) {
+      const x = 20 + k * (bw + gap), y = 30;
+      const isT = k === L.blk;
+      svg.append(s("rect", { x, y, width: bw, height: rows * (chh + 2) + 10, rx: 6, class: isT ? "accent-soft" : "box" }));
+      svg.append(s("text", { x, y: 20, "font-size": 11, class: "t-muted mono", text: `${startKB + (k * bsz) / 1024}KB` }));
+      const fsb = (startKB * 1024) / bsz + k;
+      svg.append(s("text", { x: x + bw / 2, y: y + rows * (chh + 2) + 28, "text-anchor": "middle", "font-size": 11.5, style: isT ? "font-weight:700" : "", text: `iblock ${k}` + (Number.isInteger(fsb) ? `（块 ${fsb}）` : "") }));
+      for (let j = 0; j < per; j++) {
+        const n = k * per + j, cx = x + 6 + (j % cols) * cw, cy = y + 5 + Math.floor(j / cols) * (chh + 2);
+        const me = n === inum;
+        svg.append(s("rect", { x: cx, y: cy, width: cw - 3, height: chh, rx: 3, style: me ? "fill:var(--bad-soft);stroke:var(--bad);stroke-width:2" : "fill:var(--surface);stroke:var(--border)" }));
+        svg.append(s("text", { x: cx + (cw - 3) / 2, y: cy + 13, "text-anchor": "middle", "font-size": 10, class: "mono", style: me ? "font-weight:700" : "", text: n }));
+      }
+    }
+    svg.append(s("text", { x: 20 + 5 * (bw + gap) - gap, y: 20, "text-anchor": "end", "font-size": 11, class: "t-muted mono", text: `${startKB + (5 * bsz) / 1024}KB` }));
+    $("il-stage").replaceChildren(svg);
+    $("il-formula").innerHTML =
+      (warn ? `<span style="color:var(--bad)">（inode 表只有 5 块、共 ${total} 个 inode，已把 inode 号限制到 0–${total - 1}）</span>\n` : "") +
+      `偏移   = inum × inode大小          = ${inum} × ${isz} = <b>${L.off}</b>\n` +
+      `blk    = 偏移 / 块大小              = ${L.off} / ${bsz} = <b>${L.blk}</b>   （块内第 ${L.inBlock / isz} 个 inode，块内偏移 ${L.inBlock}）\n` +
+      `块地址 = blk × 块大小 + inode表起始 = ${L.blk} × ${bsz} + ${startKB * 1024} = <b>${L.blockAddr}</b>（${L.blockAddr / 1024}KB）\n` +
+      `sector = 块地址 / 扇区大小          = ${L.blockAddr} / ${ssz} = <b>${L.sector}</b>` +
+      (bsz > ssz ? `   （一次读 ${bsz / ssz} 个扇区 = 整个块）` : "") +
+      `\n（inode 本身的字节地址 = ${L.byteAddr}，落在扇区 ${L.exactSector}）`;
+    const st = [[L.blk, "所在 inode 块（iblock）"], [Number.isInteger(L.blockAddr / bsz) ? L.fsBlock : "—", "磁盘块号"], [L.sector, "要读的起始扇区"], [per, "每块 inode 数"]];
+    $("il-stats").replaceChildren(...st.map(([v, l]) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l))));
+  }
+  Object.values(inp).forEach((el) => el.addEventListener("input", render));
+  $("il-book").onclick = () => { inp.inum.value = 32; inp.isz.value = 256; inp.bsz.value = 4096; inp.start.value = 12; inp.ssz.value = 512; render(); };
+  render();
+})();
+
+// ---------- 计算器：多级索引 ----------
+(function mliCalc() {
+  const bs = $("mli-bs"), ps = $("mli-ps"), nd = $("mli-nd"), lv = $("mli-lv"), kk = $("mli-k");
+  function render() {
+    const B = +bs.value, P = B / +ps.value, N = Math.max(0, Math.min(64, Math.floor(+nd.value || 0))), Lv = +lv.value;
+    const k = Math.max(0, Math.floor(+kk.value || 0));
+    const maxB = maxFileBlocks(N, P, Lv);
+    const terms = [String(N)];
+    for (let l = 1; l <= Lv; l++) terms.push(l === 1 ? String(P) : `${P}${["", "", "²", "³"][l]}`);
+    $("mli-formula").innerHTML =
+      `每个索引块能装的指针数 P = ${B} / ${ps.value} = <b>${P}</b>\n` +
+      `最大块数 = ${terms.join(" + ")} = <b>${fmtN(maxB)}</b> 块\n` +
+      `最大文件 = ${fmtN(maxB)} × ${B / 1024}KB = ${fmtN(maxB * (B / 1024))} KB ≈ <b>${fmtBytes(maxB * B)}</b>\n` +
+      `（只有直接指针时：${N} × ${B / 1024}KB = ${fmtBytes(N * B)}）`;
+    const loc = locateFileBlock(k, N, P, Lv);
+    const names = ["直接指针", "间接指针", "双重间接指针", "三重间接指针"];
+    const blockNames = ["", "间接块", "双重间接块", "三重间接块"];
+    // 画树
+    const W = 820;
+    const svg = s("svg", { width: W, role: "img", "aria-label": "多级索引路径" });
+    svg.append(s("defs", {}, s("marker", { id: "mliah", viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto" }, s("path", { d: "M0,0 L10,5 L0,10 z", style: "fill:var(--accent)" }))));
+    // inode
+    const ix = 10, iy = 10, iw = 170;
+    const slotsShown = Math.min(N, 12);
+    const dRows = Math.ceil(slotsShown / 6) || 0;
+    const ih = 28 + dRows * 22 + Lv * 24 + 8;
+    svg.append(s("rect", { x: ix, y: iy, width: iw, height: ih, rx: 8, class: "box-strong" }));
+    svg.append(s("text", { x: ix + 8, y: iy + 18, "font-size": 12, "font-weight": 700, text: "inode" }));
+    let from = null;
+    for (let j = 0; j < slotsShown; j++) {
+      const cx = ix + 8 + (j % 6) * 26, cy = iy + 26 + Math.floor(j / 6) * 22;
+      const on = loc && loc.level === 0 && (loc.path[0] === j || (j === slotsShown - 1 && loc.path[0] >= slotsShown));
+      svg.append(s("rect", { x: cx, y: cy, width: 23, height: 18, rx: 3, style: on ? "fill:var(--accent);stroke:var(--accent)" : "fill:var(--surface-2);stroke:var(--border)" }));
+      svg.append(s("text", { x: cx + 11.5, y: cy + 13, "text-anchor": "middle", "font-size": 9.5, class: "mono", style: on ? "fill:#fff;font-weight:700" : "", text: j === slotsShown - 1 && N > 12 ? "…" : "d" + j }));
+      if (on) from = [cx + 23, cy + 9];
+    }
+    for (let l = 1; l <= Lv; l++) {
+      const cy = iy + 26 + dRows * 22 + (l - 1) * 24;
+      const on = loc && loc.level === l;
+      svg.append(s("rect", { x: ix + 8, y: cy, width: iw - 16, height: 20, rx: 3, style: on ? "fill:var(--accent);stroke:var(--accent)" : "fill:var(--surface-2);stroke:var(--border)" }));
+      svg.append(s("text", { x: ix + 14, y: cy + 14, "font-size": 11, style: on ? "fill:#fff;font-weight:700" : "", text: names[l] }));
+      if (on) from = [ix + iw - 8, cy + 10];
+    }
+    if (loc) {
+      let x = 220;
+      const boxes = [];
+      for (let d = 0; d < loc.level; d++) boxes.push({ title: blockNames[loc.level - d], idx: loc.path[d], sub: `${P} 个指针` });
+      boxes.push({ title: "数据块", idx: null, sub: `文件第 ${fmtN(k)} 块` });
+      const bw = 130, bh = 64, by = 70;
+      let prev = from;
+      boxes.forEach((b, j) => {
+        const isData = j === boxes.length - 1;
+        svg.append(s("rect", { x, y: by, width: bw, height: bh, rx: 8, class: isData ? "ok-soft" : "accent-soft" }));
+        svg.append(s("text", { x: x + bw / 2, y: by + 20, "text-anchor": "middle", "font-size": 12, "font-weight": 700, text: b.title }));
+        svg.append(s("text", { x: x + bw / 2, y: by + 38, "text-anchor": "middle", "font-size": 11, class: "t-muted", text: b.sub }));
+        if (!isData) svg.append(s("text", { x: x + bw / 2, y: by + 55, "text-anchor": "middle", "font-size": 11.5, class: "mono", text: `取第 [${fmtN(b.idx)}] 项` }));
+        if (prev) svg.append(s("path", { d: `M ${prev[0]} ${prev[1]} C ${prev[0] + 30} ${prev[1]}, ${x - 30} ${by + bh / 2}, ${x - 2} ${by + bh / 2}`, style: "stroke:var(--accent);fill:none;stroke-width:1.6", "marker-end": "url(#mliah)" }));
+        prev = [x + bw, by + bh / 2];
+        x += bw + 30;
+      });
+      svg.append(s("text", { x: 220, y: 170, "font-size": 12, class: "t-muted", text: loc.level === 0 ? "直接指针：读 inode 后直接读数据块，不需要额外 I/O。" : `需要先读 ${loc.level} 个索引块（每个都是一次磁盘读，除非已在缓存中），再读数据块。` }));
+    } else {
+      svg.append(s("text", { x: 220, y: 100, "font-size": 13, style: "fill:var(--bad)", text: `文件第 ${fmtN(k)} 块超出了最大文件（${fmtN(maxB)} 块）` }));
+    }
+    const H = Math.max(ih + 24, 185);
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    $("mli-stage").replaceChildren(svg);
+    let msg;
+    if (!loc) msg = `第 ${fmtN(k)} 块超出范围：这种配置下文件最多 ${fmtN(maxB)} 块。试着增加间接层数。`;
+    else if (loc.level === 0) msg = `第 ${fmtN(k)} 块 < ${N}，由 inode 里的直接指针 d${k} 指向。小文件的所有块都走这条最快的路。`;
+    else {
+      const before = maxFileBlocks(N, P, loc.level - 1);
+      msg = `第 ${fmtN(k)} 块 ≥ ${fmtN(before)}（前面各级一共覆盖 ${fmtN(before)} 块），落在<strong>${names[loc.level]}</strong>覆盖的范围内。` +
+        `减去 ${fmtN(before)} 得到 ${fmtN(k - before)}，再按 ${P} 进制拆成下标 [${loc.path.map(fmtN).join("][")}]：依次读 ${loc.level} 个索引块，额外 ${loc.extraReads} 次 I/O。`;
+    }
+    $("mli-narr").innerHTML = msg;
+  }
+  [bs, ps, nd, lv, kk].forEach((el) => el.addEventListener("input", render));
+  const preset = (b, p, n, l, k) => () => { bs.value = b; ps.value = p; nd.value = n; lv.value = l; kk.value = k; render(); };
+  $("mli-b1").onclick = preset(4096, 4, 12, 1, 1035);
+  $("mli-b2").onclick = preset(4096, 4, 12, 2, 1036);
+  $("mli-b3").onclick = preset(4096, 4, 12, 3, 1049612);
+  render();
+})();
+
+// ---------- 模拟器：目录数据块 ----------
+(function dirSim() {
+  const book = () => [[5, "."], [2, ".."], [12, "foo"], [13, "bar"], [24, "foobar_is_a_pretty_longname"]].map(([inum, name]) => ({ inum, name, strlen: name.length + 1, reclen: recLen(name) }));
+  let ents = book(), mark = -1, nextInum = 30;
+  const narr = $("dir-narr");
+  function render() {
+    let off = 0;
+    const rows = ents.map((e, i) => {
+      const tr = h("tr", { class: (e.inum === 0 ? "freeent " : "") + (i === mark ? "newent" : "") },
+        h("td", { class: "num" }, off), h("td", { class: "num" }, e.inum), h("td", { class: "num" }, e.reclen), h("td", { class: "num" }, e.strlen),
+        h("td", {}, e.inum === 0 ? e.name + "（空闲）" : e.name),
+        h("td", {}, e.inum !== 0 && e.name !== "." && e.name !== ".." ? h("button", { onclick: () => del(e.name) }, "删除") : ""));
+      off += e.reclen;
+      return tr;
+    });
+    $("dir-table").replaceChildren(h("thead", {}, h("tr", {}, ...["偏移", "inum", "reclen", "strlen", "name", ""].map((t, j) => h("th", { class: j < 4 ? "num" : "" }, t)))), h("tbody", {}, rows),
+      h("tfoot", {}, h("tr", {}, h("td", { colspan: 6, class: "small muted" }, `记录总长 ${off} 字节（一个 4KB 目录块还剩 ${4096 - off} 字节）`))));
+  }
+  function del(name) {
+    const r = dirDelete(ents, name);
+    ents = r.entries; mark = r.idx;
+    narr.innerHTML = `unlink("${name}")：把这条记录的 inum 置为 0，标记为空闲。<strong>记录本身还在原位</strong>，后面各项的偏移都不变——目录里出现了一个"空洞"，reclen = ${ents[r.idx].reclen} 字节可供复用。`;
+    render();
+  }
+  $("dir-add").onclick = () => {
+    const name = $("dir-name").value.trim();
+    if (!name || name.includes("/") || name.length > 255) { narr.textContent = "名字不能为空、不能含 /，长度不超过 255。"; return; }
+    if (ents.some((e) => e.inum !== 0 && e.name === name)) { narr.textContent = `"${name}" 已存在：创建文件前必须先扫描整个目录确认名字没被用过（XFS 用 B 树就是为了加速这一步）。`; return; }
+    const need = recLen(name);
+    const r = dirInsert(ents, name, nextInum++);
+    ents = r.entries; mark = r.idx;
+    const e = ents[r.idx];
+    narr.innerHTML = r.reused
+      ? `创建 "${name}"（inode ${e.inum}）：需要 8 + ${Math.ceil((name.length + 1) / 4) * 4} = ${need} 字节，找到第 ${r.idx} 条空闲记录（reclen ${e.reclen} ≥ ${need}），<strong>复用</strong>它。reclen 保持 ${e.reclen}，其中 ${e.reclen - need} 字节是多余空间——这就是 reclen 可以大于名字所需空间的原因。`
+      : `创建 "${name}"（inode ${e.inum}）：需要 ${need} 字节，没有足够大的空闲记录，于是<strong>追加</strong>到目录末尾，reclen = 8 字节头 + 名字 ${name.length + 1} 字节补齐到 4 的倍数 = ${need}。`;
+    render();
+  };
+  $("dir-reset").onclick = () => { ents = book(); mark = -1; nextInum = 30; narr.textContent = "原书示例：目录 dir（inode 5），父目录是根（inode 2）。试试先删除 foo 再创建 baz；或删除长名字再创建短名字。"; render(); };
+  $("dir-reset").onclick();
+})();
+
+// ---------- 模拟器：vsfs ----------
+(function vsfsSim() {
+  const ta = $("vs-ops"), grid = $("vs-grid"), opline = $("vs-opline"), narr = $("vs-narr");
+  let states = [], revealed = new Set();
+  const P1 = "mkdir /g\ncreat /q\nwrite /q\nlink /q /u\nunlink /q\ncreat /g/h\nwrite /g/h\nunlink /u\ncreat /g/k";
+  const P2 = "creat /a\ncreat /b\nmkdir /c\nwrite /a\nwrite /b\nlink /a /d\nunlink /a\ncreat /e";
+  const P3 = "mkdir /a\ncreat /b\ncreat /c\nlink /b /d\nwrite /b\nunlink /b\nunlink /d\ncreat /c";
+  const toLine = (op) => [op.kind, op.path, op.path2].filter(Boolean).join(" ");
+  function load() {
+    const ni = Math.max(2, Math.min(16, +$("vs-ni").value || 8)), nd = Math.max(2, Math.min(16, +$("vs-nd").value || 8));
+    states = runOps(ni, nd, parseOps(ta.value));
+    revealed = new Set();
+    stepper.reset();
+  }
+  function tree(fs) {
+    const lines = [];
+    const walk = (inum, prefix) => {
+      const ents = fs.data[fs.inodes[inum].a].e.filter((e) => e[0] !== "." && e[0] !== "..");
+      ents.forEach(([n, c], j) => {
+        const last = j === ents.length - 1, ino = fs.inodes[c];
+        const desc = ino.t === "d" ? `${n}/  (inode ${c}, 目录块 ${ino.a}, r:${ino.r})` : `${n}  (inode ${c}, ${ino.a < 0 ? "空文件" : "数据块 " + ino.a}, r:${ino.r})`;
+        lines.push(prefix + (last ? "└─ " : "├─ ") + desc);
+        if (ino.t === "d") walk(c, prefix + (last ? "   " : "│  "));
+      });
+    };
+    lines.push("/  (inode 0, 目录块 0)");
+    walk(0, "");
+    return lines.join("\n");
+  }
+  function cell(content, idx, cls) { return h("div", { class: "fscell " + cls }, h("span", { class: "idx" }, idx), h("span", {}, content)); }
+  function render(i) {
+    const st = states[i], prev = i > 0 ? states[i - 1] : null, fs = st.fs;
+    const touched = new Set((st.res && st.res.ok ? st.res.touch : []).map((t) => t.k + t.i));
+    const cls = (k, j, used, wasUsed) => (touched.has(k + j) ? (!used && wasUsed ? "freed" : "chg") : "") + (used ? (k === "ibm" || k === "dbm" ? " bit1" : " used") : "");
+    const hidden = $("vs-hide").checked && i > 0 && !revealed.has(i);
+    // 操作行
+    opline.className = "opline" + (st.res && !st.res.ok && !hidden ? " fail" : "");
+    if (i === 0) opline.textContent = "初始状态：只有根目录（inode 0，数据块 0）";
+    else if (hidden) opline.replaceChildren(h("span", { class: "hidden-op" }, `第 ${i} 个操作已隐藏——根据下面的变化猜一猜是什么 `), h("button", { onclick: () => { revealed.add(i); render(i); } }, "显示操作"));
+    else opline.textContent = `${i}. ${opText(st.op)}` + (st.res.ok ? "" : `   ✗ 失败`);
+    // 网格
+    const pv = prev ? prev.fs : fs;
+    const rowOf = (arr) => h("div", { class: "row" }, arr);
+    grid.replaceChildren(
+      h("div", { class: "rl" }, "inode 位图"), rowOf(fs.ibm.map((b, j) => cell(b, j, cls("ibm", j, b, pv.ibm[j])))),
+      h("div", { class: "rl" }, "inode 表"), rowOf(fs.inodes.map((x, j) => cell(x ? `${x.t} a:${x.a} r:${x.r}` : "—", j, cls("inode", j, !!x, !!pv.inodes[j])))),
+      h("div", { class: "rl" }, "数据位图"), rowOf(fs.dbm.map((b, j) => cell(b, j, cls("dbm", j, b, pv.dbm[j])))),
+      h("div", { class: "rl" }, "数据块"), rowOf(fs.data.map((x, j) => cell(!x ? "—" : x.t === "d" ? x.e.map((e) => `(${e[0]},${e[1]})`).join(" ") : `「${x.c}」`, j, cls("data", j, !!x, !!pv.data[j])))));
+    // 解说
+    if (i === 0) narr.innerHTML = `文件系统刚格式化完：inode 0 是根目录（类型 d，数据块 0，引用计数 2 = 自己的 "." 和 ".."），数据块 0 里是 (.,0) (..,0)。共 ${states.length - 1} 个操作，点"下一步"。`;
+    else if (hidden) narr.innerHTML = "黄框 = 这一步改动的位置，红色虚线 = 被释放的位置。想一想：inode 位图变了吗？数据位图呢？哪个目录多了 / 少了一项？引用计数怎么变的？";
+    else if (!st.res.ok) narr.innerHTML = `<strong>操作失败：</strong>${st.res.err}。磁盘状态保持不变。`;
+    else narr.innerHTML = st.res.notes.map((n) => "• " + n).join("<br>");
+    const files = fs.inodes.filter((x) => x && x.t === "f").length, dirs = fs.inodes.filter((x) => x && x.t === "d").length;
+    $("vs-stats").replaceChildren(...[[`${fs.ibm.reduce((a, b) => a + b, 0)} / ${fs.ni}`, "已用 inode"], [`${fs.dbm.reduce((a, b) => a + b, 0)} / ${fs.nd}`, "已用数据块"], [files, "文件（inode）数"], [dirs, "目录数"], [states.slice(1, i + 1).filter((x) => !x.res.ok).length, "到目前为止失败的操作"]].map(([v, l]) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l))));
+    $("vs-dump").textContent = (i > 0 && !hidden ? opText(st.op) + "\n\n" : "") + fs.dump() + "\n\n目录树：\n" + tree(fs);
+  }
+  const stepper = OSTEP.stepper($("vs-step"), { steps: () => Math.max(1, states.length), render: (i) => states.length && render(i), autoplayMs: 1400 });
+  $("vs-load").onclick = load;
+  $("vs-hide").onchange = () => stepper.refresh();
+  const preset = (txt, ni, nd) => () => { ta.value = txt; $("vs-ni").value = ni; $("vs-nd").value = nd; load(); };
+  $("vs-p1").onclick = preset(P1, 8, 8);
+  $("vs-p2").onclick = preset(P2, 8, 2);
+  $("vs-p3").onclick = preset(P3, 3, 8);
+  $("vs-rand").onclick = () => {
+    const ni = Math.max(2, Math.min(16, +$("vs-ni").value || 8)), nd = Math.max(2, Math.min(16, +$("vs-nd").value || 8));
+    const ops = randomOps(+$("vs-seed").value || 1, Math.max(1, Math.min(40, +$("vs-n").value || 10)), ni, nd, OSTEP.rng);
+    ta.value = ops.map(toLine).join("\n");
+    load();
+  };
+  ta.value = P1;
+  states = runOps(8, 8, parseOps(P1));
+})();
+
+// ---------- 模拟器：访问路径 I/O 时间线 ----------
+(function pathSim() {
+  const mode = $("ap-mode"), depth = $("ap-depth"), nsel = $("ap-n"), cache = $("ap-cache");
+  const BLK = { "data bitmap": 2, "inode bitmap": 1, "root inode": 3, "foo inode": 5, "x inode": 4, "y inode": 6, "bar inode": 7, "root data": 8, "foo data": 9, "x data": 10, "y data": 11 };
+  const blkOf = (c) => (c in BLK ? BLK[c] : 12 + Number((c.match(/\[(\d+)\]/) || [0, 0])[1]));
+  let T = null;
+  const map = $("ap-map");
+  const mapCells = Array.from({ length: 64 }, (_, b) => h("div", { class: b === 0 ? "S" : b <= 2 ? "B" : b <= 7 ? "I" : "", title: "块 " + b }, b));
+  map.replaceChildren(...mapCells);
+  function build() { T = accessTimeline(mode.value, +depth.value, +nsel.value, cache.value); stepper.reset(); }
+  function render(i) {
+    if (!T) return;
+    const cur = i - 1;
+    const head = h("tr", {}, h("th", {}, "系统调用"), ...T.cols.map((c) => h("th", {}, c.split(" ")[0], h("br"), c.split(" ")[1], h("small", {}, "块 " + blkOf(c)))));
+    let lastG = null;
+    const body = T.rows.map((r, j) => {
+      const tr = h("tr", { class: j === cur ? "cur" : j > cur ? "future" : "" });
+      tr.append(h("td", { class: "grp" }, r.group !== lastG ? r.group : ""));
+      lastG = r.group;
+      for (const c of T.cols) {
+        if (c !== r.col) { tr.append(h("td")); continue; }
+        const txt = r.hit ? "read·命中" : r.buffered ? "write→缓存" : r.rw;
+        tr.append(h("td", { class: r.hit ? "hit" : r.buffered ? "buf" : r.rw === "read" ? "r" : "w" }, txt));
+      }
+      return tr;
+    });
+    $("ap-table").replaceChildren(h("thead", {}, head), h("tbody", {}, body));
+    mapCells.forEach((el) => el.classList.remove("hot"));
+    const done = T.rows.slice(0, i);
+    const ios = done.filter((r) => r.io);
+    if (i === 0) {
+      $("ap-narr").innerHTML = `${mode.value === "read" ? "打开并读取" : "创建并写入"} <code>${T.path}</code>，${nsel.value} 次 ${mode.value === "read" ? "read()" : "write()"}，每次 4KB。本场景一共 <strong>${T.total}</strong> 次磁盘 I/O（读 ${T.reads}、写 ${T.writes}）。时间向下增长，点"下一步"逐行展开。`;
+    } else {
+      const r = T.rows[cur];
+      if (r.io) mapCells[blkOf(r.col)].classList.add("hot");
+      const tag = r.hit ? "（缓存命中，<strong>不访问磁盘</strong>）" : r.buffered ? "（只改内存中的缓存页、标记为脏，<strong>暂不写盘</strong>）" : `（磁盘${r.rw === "read" ? "读" : "写"}块 ${blkOf(r.col)}）`;
+      $("ap-narr").innerHTML = `<code>${r.group}</code> → ${r.rw} <strong>${r.col}</strong>${tag}：${r.why}`;
+    }
+    $("ap-stats").replaceChildren(...[[ios.length, "已发生的磁盘 I/O"], [ios.filter((r) => r.rw === "read").length, "其中读"], [ios.filter((r) => r.rw === "write").length, "其中写"], [done.filter((r) => r.hit).length, "缓存命中"], [done.filter((r) => r.buffered).length, "被缓冲的写"], [T.total, "本场景总 I/O"]].map(([v, l]) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l))));
+  }
+  const stepper = OSTEP.stepper($("ap-step"), { steps: () => (T ? T.rows.length + 1 : 1), render, autoplayMs: 1100 });
+  [mode, depth, nsel, cache].forEach((el) => el.addEventListener("change", build));
+  $("ap-b1").onclick = () => { mode.value = "read"; depth.value = 1; nsel.value = 3; cache.value = "none"; build(); };
+  $("ap-b2").onclick = () => { mode.value = "create"; depth.value = 1; nsel.value = 3; cache.value = "none"; build(); };
+  T = accessTimeline("read", 1, 3, "none");
+})();
+
+})();
+</script>
+</body>
+</html>

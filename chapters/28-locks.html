@@ -1,0 +1,1013 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 28 章 · 锁</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+  .codebox { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; font: 12.5px/1.6 var(--mono); padding: 6px 0; overflow-x: auto; }
+  .codebox .ln { display: block; padding: 0 10px 0 4px; white-space: pre; border-left: 3px solid transparent; }
+  .codebox .ln .no { color: var(--faint); display: inline-block; width: 1.8em; user-select: none; }
+  .codebox .ln.next { background: var(--accent-soft); border-left-color: var(--accent); }
+  .codebox .ln.done { background: var(--warn-soft); border-left-color: var(--warn); }
+  .codebox .ln.cs { font-weight: 700; }
+  .lk-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; }
+  .tcard { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); overflow: hidden; }
+  .tcard.cur { box-shadow: 0 0 0 2px var(--accent); }
+  .tcard.incs { border-color: var(--ok); }
+  .tcard.viol { border-color: var(--bad); background: var(--bad-soft); }
+  .tcard .th { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--border); font-weight: 650; font-size: 14px; gap: 6px; flex-wrap: wrap; }
+  .tcard .th .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: middle; }
+  .tcard .codebox { border: 0; border-radius: 0; }
+  .tcard .regs { display: flex; gap: 8px; padding: 6px 10px; font-size: 13px; flex-wrap: wrap; border-top: 1px solid var(--border); }
+  .reg { font: 600 13.5px var(--mono); border: 1px solid var(--border); border-radius: 6px; padding: 1px 8px; background: var(--surface-2); }
+  .reg small { font: 11.5px var(--font); color: var(--muted); margin-right: 4px; font-weight: 400; }
+  .st { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-2); font-weight: 500; }
+  .st.cs { border-color: var(--ok); background: var(--ok-soft); }
+  .st.spin { border-color: var(--bad); background: var(--bad-soft); }
+  .shared { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
+  .shared .box { border: 2px solid var(--border); border-radius: 8px; background: var(--surface); padding: 4px 12px; min-width: 90px; transition: background .25s; }
+  .shared .box.chg { border-color: var(--warn); background: var(--warn-soft); }
+  .shared .box .k { color: var(--muted); font-size: 12px; display: block; }
+  .shared .box .v { font: 700 18px var(--mono); }
+  .acq { font: 13px var(--mono); margin-top: 8px; }
+  .acq span { display: inline-block; padding: 0 6px; margin: 1px; border-radius: 4px; color: #fff; }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px; color: var(--muted); margin-top: 8px; }
+  .legend i { display: inline-block; width: 14px; height: 12px; border-radius: 2px; vertical-align: -1px; margin-right: 4px; }
+  .cmp td, .cmp th { font-size: 13.5px; }
+  .yes { color: var(--ok); font-weight: 600; } .no { color: var(--bad); font-weight: 600; } .mid { color: var(--warn); font-weight: 600; }
+  .race-rows { font: 13px/1.6 var(--mono); }
+  .race-rows div { padding: 2px 8px; border-left: 3px solid transparent; }
+  .race-rows div.cur { background: var(--accent-soft); border-left-color: var(--accent); }
+  .race-rows div.bad { color: var(--bad); font-weight: 700; }
+  .race-rows div.fut { opacity: .35; }
+</style>
+</head>
+<body data-chapter="28">
+<main>
+
+<h2 id="crux">本章要解决什么</h2>
+<div class="crux">
+  <p><strong>如何构建一个锁？</strong>怎样构建高效的锁？高效的锁以低成本提供互斥，还可能具备其他一些性质。需要什么硬件支持？什么操作系统支持？</p>
+  <p class="small muted">THE CRUX: How to build a lock. How can we build an efficient lock? Efficient locks provide mutual exclusion at low cost, and also might attain a few other properties we discuss below. What hardware support is needed? What OS support?</p>
+</div>
+<p>第 26 章看到：我们想让一段指令原子地执行，但中断（或多个 CPU 上同时运行的线程）让这做不到。本章正面解决这个问题：程序员在临界区前后加上<strong>锁（lock）</strong>，让临界区看起来就像一条原子指令。第 27 章只讲了 <code>pthread_mutex_lock</code> 怎么<em>用</em>；这一章讲它怎么<em>造</em>：从关中断、只用 load/store 的失败尝试，到 test-and-set、compare-and-swap、LL/SC、fetch-and-add 这些<strong>硬件原语</strong>，再到借助<strong>操作系统</strong>的 yield、park/unpark 和 Linux futex，避免白白自旋。</p>
+<p>本章还有第二个关键问题（28.12 节）：<strong>如何避免自旋？</strong>怎样开发一种不会在 CPU 上无谓浪费时间自旋的锁？（CRUX: How to avoid spinning. How can we develop a lock that doesn't needlessly waste time spinning on the CPU?）</p>
+
+<h2 id="concepts">核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>锁（lock / mutex）</h4><p>一个变量，状态是<strong>可用（available/unlocked/free）</strong>或<strong>被持有（acquired/locked/held）</strong>。持有者称为锁的所有者（owner）。</p></div>
+  <div class="card"><h4>三条评价标准</h4><p><strong>正确性</strong>（能否互斥）、<strong>公平性</strong>（会不会饿死）、<strong>性能</strong>（无竞争、单 CPU 竞争、多 CPU 竞争时的开销）。</p></div>
+  <div class="card"><h4>自旋锁（spin lock）</h4><p>抢不到锁就在循环里反复检查（spin-wait），一直占着 CPU。简单，但可能浪费整个时间片。</p></div>
+  <div class="card"><h4>硬件原子指令</h4><p>test-and-set（xchg）、compare-and-swap（cmpxchg）、LL/SC、fetch-and-add：把"检查 + 修改"合成一个不可分割的操作。</p></div>
+  <div class="card"><h4>ticket 锁</h4><p>用 fetch-and-add 取号、按号入场。保证每个线程最终都能拿到锁（公平），不会饿死。</p></div>
+  <div class="card"><h4>yield / park</h4><p>抢不到锁时，与其自旋，不如让出 CPU（yield），或者排进队列睡眠（park），等持有者释放时唤醒（unpark）。</p></div>
+  <div class="card"><h4>futex 与两阶段锁</h4><p>Linux 的做法：先在用户态用原子指令试一下/自旋一会儿，拿不到再进内核睡眠。无竞争时几乎零开销。</p></div>
+  <div class="card"><h4>优先级反转</h4><p>高优先级线程自旋等待低优先级线程持有的锁，而后者得不到 CPU——系统卡死。避免自旋锁的另一个理由。</p></div>
+</div>
+
+<h2 id="idea">锁的基本思想</h2>
+<p>典型的临界区是更新共享变量：</p>
+<pre><code>lock_t mutex;            // some globally-allocated lock 'mutex'
+...
+lock(&amp;mutex);
+balance = balance + 1;   // 临界区
+unlock(&amp;mutex);</code></pre>
+<p>语义很简单：调用 <code>lock()</code> 尝试获取锁；如果没有别的线程持有，就获得锁、进入临界区。如果别的线程已持有，<code>lock()</code> <strong>不会返回</strong>，直到持有者调用 <code>unlock()</code>。释放时如果有线程在 <code>lock()</code> 里等待，其中一个会（最终）注意到或被告知锁的状态变化，获得锁并进入临界区。</p>
+<p>锁把一点<strong>调度控制权</strong>还给了程序员：线程由程序员创建、由 OS 按它的方式调度；而用锁包住一段代码，程序员就能保证这段代码里至多只有一个线程活动。</p>
+<p>POSIX 把锁叫 <strong>mutex</strong>（mutual exclusion，互斥）。注意 <code>pthread_mutex_lock(&amp;lock)</code> 传入一个锁变量：不同的数据可以用不同的锁保护。一把大锁保护所有临界区叫<strong>粗粒度（coarse-grained）</strong>加锁；不同数据结构用不同的锁叫<strong>细粒度（fine-grained）</strong>加锁，允许更多线程同时处在加锁代码中。</p>
+
+<h2 id="eval">怎样评价一个锁</h2>
+<figure class="fig">
+<svg viewBox="0 0 660 150" width="660" role="img" aria-label="评价锁的三条标准">
+  <g font-size="13">
+    <rect x="10" y="10" width="200" height="130" rx="10" class="ok-soft"/>
+    <text x="110" y="36" text-anchor="middle" font-weight="700">① 正确性</text>
+    <text x="110" y="62" text-anchor="middle" font-size="12">能否提供互斥？</text>
+    <text x="110" y="84" text-anchor="middle" font-size="12">会不会让两个线程</text>
+    <text x="110" y="102" text-anchor="middle" font-size="12">同时进入临界区？</text>
+    <rect x="230" y="10" width="200" height="130" rx="10" class="warn-soft"/>
+    <text x="330" y="36" text-anchor="middle" font-weight="700">② 公平性</text>
+    <text x="330" y="62" text-anchor="middle" font-size="12">每个竞争者锁空闲时</text>
+    <text x="330" y="84" text-anchor="middle" font-size="12">都有公平的机会吗？</text>
+    <text x="330" y="102" text-anchor="middle" font-size="12">有没有线程会饿死？</text>
+    <rect x="450" y="10" width="200" height="130" rx="10" class="accent-soft"/>
+    <text x="550" y="36" text-anchor="middle" font-weight="700">③ 性能</text>
+    <text x="550" y="62" text-anchor="middle" font-size="12">无竞争时的开销</text>
+    <text x="550" y="84" text-anchor="middle" font-size="12">单 CPU 上多线程竞争</text>
+    <text x="550" y="106" text-anchor="middle" font-size="12">多 CPU 上多线程竞争</text>
+  </g>
+</svg>
+<figcaption>原书 28.4 节：评价锁的三条标准。本章末尾有一张表把所有实现按这三条对比。</figcaption>
+</figure>
+
+<h2 id="interrupts">最早的方案：关中断</h2>
+<pre><code>void lock()   { DisableInterrupts(); }
+void unlock() { EnableInterrupts(); }</code></pre>
+<p>在<strong>单处理器</strong>上，进入临界区前关中断，临界区就不会被打断，于是像原子的一样执行。优点只有一个：<strong>简单</strong>。缺点很多：</p>
+<ol>
+  <li><strong>要信任应用程序</strong>：必须允许任意线程执行特权操作（开关中断）。贪婪的程序一开始就 <code>lock()</code> 独占 CPU；恶意或出错的程序 <code>lock()</code> 后死循环，OS 再也拿不回控制权，只能重启。</li>
+  <li><strong>多处理器上无效</strong>：别的 CPU 上的线程照样能进入临界区，关本 CPU 的中断毫无用处。</li>
+  <li><strong>长时间关中断会丢中断</strong>：比如错过磁盘读完成的中断，OS 就不知道该唤醒等待的进程。</li>
+</ol>
+<p>所以关中断只在有限场合使用：操作系统<strong>自己</strong>访问内部数据结构时，有时用屏蔽中断保证原子性——OS 总是信任自己，不存在信任问题。</p>
+
+<h2 id="flag">失败的尝试：只用 load/store</h2>
+<p>试着只用一个普通变量 <code>flag</code> 表示锁是否被持有（图 28.1）：</p>
+<pre><code>typedef struct __lock_t { int flag; } lock_t;
+
+void init(lock_t *mutex) {
+    // 0 -&gt; lock is available, 1 -&gt; held
+    mutex-&gt;flag = 0;
+}
+
+void lock(lock_t *mutex) {
+    while (mutex-&gt;flag == 1)   // TEST the flag
+        ;                      // spin-wait (do nothing)
+    mutex-&gt;flag = 1;           // now SET it!
+}
+
+void unlock(lock_t *mutex) {
+    mutex-&gt;flag = 0;
+}</code></pre>
+<p>有两个问题。<strong>正确性</strong>：<em>检查</em>（TEST）和<em>设置</em>（SET）是两步。如果 T1 读到 flag=0、正要设置时被中断，T2 也读到 0 并设置为 1 进入临界区；T1 恢复后也把 flag 设为 1——<strong>两个线程都进了临界区</strong>（图 28.2）。<strong>性能</strong>：等待者不停地检查 flag，称为<strong>自旋等待（spin-waiting）</strong>，在单处理器上尤其浪费——它等的那个线程在它自旋时根本没法运行。</p>
+<div class="aside" data-title="原书提示：把并发想成一个恶意的调度程序">
+  <p>假装你是一个恶意的调度程序，总在最不合时宜的时刻打断线程，破坏它们构建同步原语的努力。某个中断序列也许不太可能出现，但只要<strong>可能</strong>，就足以证明某个方案不行。下面的模拟器就让你当这个调度程序。</p>
+</div>
+
+<section class="sim" id="sim-flag">
+  <div class="sim-head"><span class="tag">模拟器 1</span><h3>错误的锁：只用 flag 的 load/store</h3>
+    <div class="desc">你来当（恶意的）调度程序：每点一次按钮，选中的线程执行一行代码。目标：让两个线程同时进入临界区。点"载入原书图 28.2"看书中的轨迹。</div></div>
+  <div class="sim-body" data-lock="flag"></div>
+</section>
+
+<h2 id="tas">用 test-and-set 构建能用的自旋锁</h2>
+<p>既然关中断在多处理器上无效、load/store 又不行，系统设计者开始发明<strong>加锁的硬件支持</strong>。最早的多处理器（如 1960 年代初的 Burroughs B5000）就有，今天所有系统都有，甚至单 CPU 系统也有。最简单的是 <strong>test-and-set</strong>（也叫<strong>原子交换 atomic exchange</strong>），用 C 描述它做的事：</p>
+<pre><code>int TestAndSet(int *old_ptr, int new) {
+    int old = *old_ptr;   // fetch old value at old_ptr
+    *old_ptr = new;       // store 'new' into old_ptr
+    return old;           // return the old value
+}   // 关键：这三步由硬件<strong>原子地</strong>完成</code></pre>
+<p>它返回旧值，同时把内存设为新值。在 SPARC 上叫 <code>ldstub</code>，在 x86 上就是带锁的 <code>xchg</code>。用它构建自旋锁（图 28.3）：</p>
+<pre><code>void lock(lock_t *lock) {
+    while (TestAndSet(&amp;lock-&gt;flag, 1) == 1)
+        ;   // spin-wait (do nothing)
+}
+void unlock(lock_t *lock) {
+    lock-&gt;flag = 0;
+}</code></pre>
+<p>为什么正确？两种情况：① 锁空闲（flag=0）：TestAndSet 返回 0，线程跳出循环获得锁，<strong>同时</strong>flag 被原子地设为 1。② 锁被持有（flag=1）：TestAndSet 返回 1（又把 1 写了一遍，无害），线程继续自旋，直到持有者把 flag 清 0，下一次 TestAndSet 返回 0 并原子地设成 1。<strong>检查旧值和设置新值合成了一个原子操作</strong>，所以只有一个线程能拿到锁。</p>
+<p>这种锁叫<strong>自旋锁（spin lock）</strong>。在单处理器上它需要<strong>抢占式调度</strong>（定时器中断会打断线程）；否则自旋的线程永远不会让出 CPU，持锁者永远没机会释放。</p>
+
+<div class="aside" data-title="旁注：Dekker 算法与 Peterson 算法">
+  <p>1960 年代 Dijkstra 向朋友们提出并发问题，数学家 Dekker 给出了一个<strong>只用 load 和 store</strong> 的解法（假设它们彼此原子，早期硬件确实如此）。Peterson 后来改进了它（两个线程）：</p>
+<pre><code>int flag[2];
+int turn;
+void init() {
+    flag[0] = flag[1] = 0;   // 用 flag 表示"我想持有锁"
+    turn = 0;                // 轮到谁？（线程 0 或 1）
+}
+void lock() {
+    flag[self] = 1;          // self 是调用者的线程 ID
+    turn = 1 - self;         // 谦让：让对方先
+    while ((flag[1-self] == 1) &amp;&amp; (turn == 1 - self))
+        ;                    // 对方也想要，且轮到对方 → 自旋
+}
+void unlock() {
+    flag[self] = 0;          // 撤销意愿
+}</code></pre>
+  <p><code>flag</code> 表达"我想进"，<code>turn</code> 决定"两人都想进时谁让"。两个线程都设了 flag 时，<strong>最后写 turn 的那个</strong>把机会让给了对方，所以对方能进、自己等。模拟器 2 可以选 Peterson 验证它。不过原书指出：这条研究路线后来意义不大——假设一点硬件支持要简单得多；而且这类算法在<strong>现代硬件上不能工作</strong>（宽松的内存一致性模型会重排 load/store）。</p>
+</div>
+
+<h2 id="eval-spin">评价自旋锁</h2>
+<ul>
+  <li><strong>正确性</strong>：✔ 一次只允许一个线程进入临界区。</li>
+  <li><strong>公平性</strong>：✘ 不保证。自旋的线程在竞争下可能永远拿不到锁——<strong>饿死（starvation）</strong>。</li>
+  <li><strong>性能（单 CPU）</strong>：很痛苦。持锁线程在临界区里被抢占后，调度程序可能依次运行其他 N−1 个线程，每个都尝试获取锁、<strong>自旋整整一个时间片</strong>才放弃 CPU。</li>
+  <li><strong>性能（多 CPU）</strong>：相当不错（线程数大致等于 CPU 数时）。A 在 CPU1 持锁，B 在 CPU2 自旋；临界区通常很短，锁很快就可用，B 没浪费多少周期。</li>
+</ul>
+
+<h2 id="cas">compare-and-swap</h2>
+<p>另一个硬件原语：SPARC 上叫 <strong>compare-and-swap</strong>，x86 上叫 <strong>compare-and-exchange</strong>（<code>cmpxchg</code>）（图 28.4）：</p>
+<pre><code>int CompareAndSwap(int *ptr, int expected, int new) {
+    int original = *ptr;
+    if (original == expected)
+        *ptr = new;
+    return original;
+}</code></pre>
+<p>检查 <code>*ptr</code> 是否等于 <code>expected</code>，是就更新为 <code>new</code>，否则什么也不做；无论如何都返回原值，调用者据此知道是否成功。把 TAS 锁的 <code>lock()</code> 换成下面这样即可：</p>
+<pre><code>void lock(lock_t *lock) {
+    while (CompareAndSwap(&amp;lock-&gt;flag, 0, 1) == 1)
+        ;   // spin
+}</code></pre>
+<p>CAS 比 TAS 更强大，后面讲<strong>无锁同步（lock-free synchronization）</strong>时会用到这种能力；但如果只是用它构建简单自旋锁，行为和 TAS 自旋锁完全相同。</p>
+
+<h2 id="llsc">load-linked / store-conditional</h2>
+<p>MIPS、Alpha、PowerPC、ARM 提供一对配合使用的指令（图 28.5）：</p>
+<pre><code>int LoadLinked(int *ptr) {
+    return *ptr;
+}
+int StoreConditional(int *ptr, int value) {
+    if (no update to *ptr since LL to this addr) {
+        *ptr = value;
+        return 1;   // success!
+    } else {
+        return 0;   // failed to update
+    }
+}</code></pre>
+<p><strong>load-linked</strong> 就像普通的 load；关键在 <strong>store-conditional</strong>：只有自上次 LL 以来<strong>没有别的 store 写过这个地址</strong>，它才成功（写入并返回 1），否则失败（不写，返回 0）。用它构建锁（图 28.6）：</p>
+<pre><code>void lock(lock_t *lock) {
+    while (1) {
+        while (LoadLinked(&amp;lock-&gt;flag) == 1)
+            ;   // spin until it's zero
+        if (StoreConditional(&amp;lock-&gt;flag, 1) == 1)
+            return;   // if set-to-1 was success: done
+        // otherwise: try again
+    }
+}
+void unlock(lock_t *lock) {
+    lock-&gt;flag = 0;
+}</code></pre>
+<p>失败是怎么发生的：T1 执行 LL 读到 0，正要 SC 时被中断；T2 也执行 LL 读到 0。现在两个线程都要 SC——<strong>只有一个能成功</strong>把 flag 改成 1；第二个 SC 会失败（因为另一个线程在它 LL 和 SC 之间写了 flag），只好重试。学生 David Capel 给出的更短写法（利用短路求值）：</p>
+<pre><code>void lock(lock_t *lock) {
+    while (LoadLinked(&amp;lock-&gt;flag) || !StoreConditional(&amp;lock-&gt;flag, 1))
+        ;   // spin
+}</code></pre>
+<div class="tip"><p>原书提示：<strong>代码越少越好（Lauer 定律）</strong>。"If the same people had twice as much time, they could produce as good of a system in half the code." 简洁的代码更容易理解、bug 更少。</p></div>
+
+<h2 id="ticket">fetch-and-add 与 ticket 锁</h2>
+<p><strong>fetch-and-add</strong> 原子地把一个值加 1 并返回旧值：</p>
+<pre><code>int FetchAndAdd(int *ptr) {
+    int old = *ptr;
+    *ptr = old + 1;
+    return old;
+}</code></pre>
+<p>Mellor-Crummey 和 Scott 用它构建了 <strong>ticket 锁</strong>（图 28.7）：</p>
+<pre><code>typedef struct __lock_t {
+    int ticket;
+    int turn;
+} lock_t;
+
+void lock_init(lock_t *lock) {
+    lock-&gt;ticket = 0;
+    lock-&gt;turn   = 0;
+}
+void lock(lock_t *lock) {
+    int myturn = FetchAndAdd(&amp;lock-&gt;ticket);   // 取号
+    while (lock-&gt;turn != myturn)
+        ;   // spin                             // 等叫号
+}
+void unlock(lock_t *lock) {
+    lock-&gt;turn = lock-&gt;turn + 1;                // 叫下一个号
+}</code></pre>
+<figure class="fig">
+<svg viewBox="0 0 640 170" width="640" role="img" aria-label="ticket 锁像银行叫号">
+  <g font-size="12.5">
+    <rect x="20" y="20" width="150" height="60" rx="8" class="accent-soft"/>
+    <text x="95" y="44" text-anchor="middle" font-weight="700">ticket = 3</text>
+    <text x="95" y="66" text-anchor="middle" class="t-muted">取号机：下一个号码</text>
+    <rect x="470" y="20" width="150" height="60" rx="8" class="ok-soft"/>
+    <text x="545" y="44" text-anchor="middle" font-weight="700">turn = 1</text>
+    <text x="545" y="66" text-anchor="middle" class="t-muted">叫号屏：现在轮到</text>
+    <g>
+      <rect x="200" y="110" width="70" height="40" rx="6" style="fill:var(--c1)"/><text x="235" y="135" text-anchor="middle" style="fill:#fff">T1 · 0</text>
+      <rect x="285" y="110" width="70" height="40" rx="6" style="fill:var(--c2)"/><text x="320" y="135" text-anchor="middle" style="fill:#fff">T2 · 1</text>
+      <rect x="370" y="110" width="70" height="40" rx="6" style="fill:var(--c3)"/><text x="405" y="135" text-anchor="middle" style="fill:#fff">T3 · 2</text>
+    </g>
+    <text x="235" y="166" text-anchor="middle" font-size="11.5" class="t-muted">已用完</text>
+    <text x="320" y="166" text-anchor="middle" font-size="11.5" style="fill:var(--ok)">myturn==turn → 进入</text>
+    <text x="405" y="166" text-anchor="middle" font-size="11.5" class="t-muted">自旋等待</text>
+    <path d="M170 50 C 200 80, 210 95, 225 108" class="arrow"/>
+    <path d="M470 50 C 400 70, 350 90, 330 108" class="arrow"/>
+  </g>
+</svg>
+<figcaption>ticket 锁 = 银行取号：FAA 取号，unlock 把叫号屏加 1。先取号的一定先入场。</figcaption>
+</figure>
+<p>和之前方案的重要区别：<strong>它保证所有线程都能前进</strong>。一旦线程拿到号，它一定会在未来某个时刻被叫到（前面的人用完临界区之后）。而 TAS 自旋锁没有这种保证：一个线程可能一直自旋，而别的线程反复获取、释放锁。</p>
+
+<section class="sim" id="sim-locks">
+  <div class="sim-head"><span class="tag">模拟器 2</span><h3>硬件原语构建的锁：逐行交错执行</h3>
+    <div class="desc">选择锁的实现，扮演调度程序单步执行（每步 = 一行，硬件原子指令整行原子）。观察共享变量（flag / ticket / turn）、每个线程的局部变量（myturn、LL 链接是否有效）、谁在临界区、每个线程自旋了几次，以及获得锁的先后顺序。试试"恶意调度"：它总在 T1 刚拿到锁时打断它，比较 TAS 与 ticket 锁的公平性。</div></div>
+  <div class="sim-body" data-lock="tas"></div>
+</section>
+
+<h2 id="spin-problem">自旋太多：怎么办？</h2>
+<p>硬件锁简单（几行代码）而且正确，但有时非常低效。想象单处理器上两个线程：线程 0 持锁时被中断，线程 1 尝试获取锁，发现被持有，于是开始自旋——自旋——继续自旋……直到定时器中断，线程 0 再次运行并释放锁。<strong>任何时候线程在这种情况下自旋，都浪费了整个时间片，去检查一个不会改变的值</strong>。N 个线程竞争时，可能浪费 N−1 个时间片。</p>
+<p>这就是本章第二个关键问题：<strong>如何避免自旋？</strong>单靠硬件解决不了，还需要操作系统的支持。</p>
+
+<h3>简单方法：让出 CPU（yield）</h3>
+<pre><code>void init() {
+    flag = 0;
+}
+void lock() {
+    while (TestAndSet(&amp;flag, 1) == 1)
+        yield();   // give up the CPU
+}
+void unlock() {
+    flag = 0;
+}</code></pre>
+<p>假设 OS 提供 <code>yield()</code> 系统调用：把调用者从<strong>运行</strong>态变成<strong>就绪</strong>态，让另一个线程运行——相当于线程主动把自己"取消调度"。两个线程一个 CPU 时效果很好：发现锁被持有就让出 CPU，持锁者得以运行并完成临界区。</p>
+<p>但如果有 100 个线程反复竞争：持锁者被抢占后，其余 99 个都会执行"运行一下、发现锁被持有、yield"。比自旋（浪费 99 个时间片）好，但<strong>上下文切换的开销</strong>仍然可观。更糟的是，它<strong>没有解决饿死</strong>：一个线程可能陷入无休止的 yield 循环，而别的线程反复进出临界区。</p>
+
+<h3>使用队列：休眠代替自旋</h3>
+<p>前面方法的真正问题是把太多事留给运气：调度程序决定下一个运行谁，选错了，运行的线程要么自旋、要么立刻让出。我们需要<strong>明确控制</strong>锁释放后由谁获得。为此需要一点 OS 支持和一个<strong>等待队列</strong>。原书采用 Solaris 的两个调用：<code>park()</code> 让调用线程睡眠，<code>unpark(threadID)</code> 唤醒指定线程（图 28.9）：</p>
+<pre><code>typedef struct __lock_t {
+    int flag;
+    int guard;
+    queue_t *q;
+} lock_t;
+
+void lock_init(lock_t *m) {
+    m-&gt;flag  = 0;
+    m-&gt;guard = 0;
+    queue_init(m-&gt;q);
+}
+
+void lock(lock_t *m) {
+    while (TestAndSet(&amp;m-&gt;guard, 1) == 1)
+        ;                        // acquire guard lock by spinning
+    if (m-&gt;flag == 0) {
+        m-&gt;flag = 1;             // lock is acquired
+        m-&gt;guard = 0;
+    } else {
+        queue_add(m-&gt;q, gettid());
+        m-&gt;guard = 0;
+        park();                  // 睡眠，直到被 unpark
+    }
+}
+
+void unlock(lock_t *m) {
+    while (TestAndSet(&amp;m-&gt;guard, 1) == 1)
+        ;                        // acquire guard lock by spinning
+    if (queue_empty(m-&gt;q))
+        m-&gt;flag = 0;             // let go of lock; no one wants it
+    else
+        unpark(queue_remove(m-&gt;q));   // hold lock (for next thread!)
+    m-&gt;guard = 0;
+}</code></pre>
+<p>逐点理解：</p>
+<ul>
+  <li><strong>guard 是一个"保护 flag 和队列"的自旋锁</strong>。所以这个方案并没有完全消除自旋：线程可能在获取/释放锁的过程中被中断，导致别人自旋等 guard。但自旋时间很有限——只是 lock/unlock 里的几条指令，而不是用户定义的临界区。</li>
+  <li>拿不到锁时，线程把自己加入队列、<strong>释放 guard</strong>、然后 <code>park()</code>。思考题：如果 guard 的释放放在 <code>park()</code> <em>之后</em>会怎样？提示：很糟——线程带着 guard 睡着了，其他线程（包括要来 unlock 唤醒它的持锁者）都会在 guard 上永远自旋。</li>
+  <li><strong>唤醒别的线程时 flag 不置 0</strong>。这不是错误而是必须：被唤醒的线程从 <code>park()</code> 返回时并不持有 guard，没法再去把 flag 设成 1。所以锁被<strong>直接从释放者传递给下一个获取者</strong>，flag 中间不变成 0。</li>
+  <li>用队列控制下一个获得锁的是谁，因此<strong>避免了饿死</strong>。</li>
+</ul>
+
+<h3>唤醒/等待竞争（wakeup/waiting race）与 setpark()</h3>
+<p>注意 <code>park()</code> 调用之前那一小段：线程已经决定要睡觉（因为锁被持有），但还没真正睡着。如果此时切换到持锁线程并且它释放了锁，它会 <code>unpark</code> 这个"还醒着"的线程——这次唤醒就落空了；随后该线程执行 <code>park()</code>，<strong>可能永远睡下去</strong>。Solaris 用第三个系统调用 <code>setpark()</code> 解决：线程先声明"我马上要 park 了"；若在真正 park 之前有人 unpark 了它，随后的 park 会<strong>立即返回</strong>而不是睡眠：</p>
+<pre><code>queue_add(m-&gt;q, gettid());
+setpark();          // new code
+m-&gt;guard = 0;
+park();</code></pre>
+<p>另一种办法是把 guard 传进内核，由内核原子地释放锁并把当前线程移出运行队列。下面这个小模拟器对比有无 <code>setpark()</code> 时的同一交错：</p>
+
+<section class="sim" id="sim-wake">
+  <div class="sim-head"><span class="tag">模拟器 3a</span><h3>wakeup/waiting race：一次落空的唤醒</h3>
+    <div class="desc">T1 持有锁，T2 来获取。T2 在"释放 guard"与"park()"之间被中断，T1 恰好在此时 unlock。切换有无 setpark()，看 T2 的结局。</div></div>
+  <div class="sim-body">
+    <div class="controls"><label><input type="checkbox" id="wk-setpark"> 使用 setpark()</label></div>
+    <div id="wk-step"></div>
+    <div class="stage"><div class="shared" id="wk-shared"></div><div class="race-rows" id="wk-rows"></div></div>
+    <div class="narrate" id="wk-narr"></div>
+  </div>
+</section>
+
+<p>下面的模拟器把三种等待策略放在同一个单 CPU 上比较：N 个线程循环执行"获取锁 → 临界区 → 释放 → 做其他工作"，时间片轮转调度，初始时 T1 持锁并即将在临界区中被抢占（原书讨论的最坏情形）。</p>
+
+<section class="sim" id="sim-wait">
+  <div class="sim-head"><span class="tag">模拟器 3b</span><h3>自旋 vs 让出（yield）vs 队列 + park/unpark</h3>
+    <div class="desc">单 CPU，时间单位离散。红色 = 自旋/失败尝试浪费的 CPU，黄色 = 上下文切换开销。改变线程数 N、时间片、临界区长度，比较三种策略浪费的 CPU 时间和各线程获得锁的次数（公平性）。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>策略 <select id="wt-kind"><option value="spin">自旋（TAS）</option><option value="yield">TAS + yield</option><option value="park" selected>队列 + park/unpark</option></select></label>
+      <label>线程数 N <input type="number" id="wt-n" value="4" min="2" max="8"></label>
+      <label>时间片 Q <input type="number" id="wt-q" value="10" min="2" max="30"></label>
+      <label>临界区长度 C <input type="number" id="wt-c" value="4" min="1" max="20"></label>
+      <label>临界区外工作 W <input type="number" id="wt-w" value="6" min="0" max="40"></label>
+      <label>切换开销 <input type="number" id="wt-s" value="1" min="0" max="5"></label>
+      <label>总时长 <input type="number" id="wt-h" value="150" min="40" max="400"></label>
+    </div>
+    <div id="wt-step"></div>
+    <div class="stage" id="wt-stage"></div>
+    <div class="legend"><span><i style="background:var(--c1)"></i>临界区（线程颜色）</span><span><i style="background:var(--c1);opacity:.4"></i>临界区外的工作</span><span><i style="background:var(--bad)"></i>自旋 / 失败的尝试</span><span><i style="background:var(--warn)"></i>上下文切换</span><span><i style="background:var(--surface-2);border:1px solid var(--border)"></i>睡眠（park，不占 CPU）</span></div>
+    <div class="narrate" id="wt-narr"></div>
+    <div class="stats" id="wt-stats"></div>
+    <div class="table-wrap"><table id="wt-cmp" class="cmp"></table></div>
+  </div>
+</section>
+
+<div class="aside" data-title="旁注：避免自旋的另一个理由——优先级反转（priority inversion）">
+  <p>设 T2 优先级高、T1 优先级低，调度程序只要 T2 可运行就运行 T2。T2 因 I/O 阻塞时 T1 运行，拿到一个<strong>自旋锁</strong>进入临界区。此时 T2 的 I/O 完成，立刻抢占 T1；T2 尝试获取锁，拿不到，就一直自旋——而 T1 永远得不到 CPU 去释放锁，<strong>系统挂起</strong>。（火星探路者号 Mars Pathfinder 就遇到过优先级反转；macOS 的 OSSpinLock 在不同优先级线程间也不安全。）</p>
+  <p>不用自旋锁也躲不开：三个线程 T3 &gt; T2 &gt; T1，T1 持锁，T3 抢占 T1 后等这把锁，此时 T2 开始运行——它优先级高于 T1，于是 T1 一直没机会运行，最高优先级的 T3 被中等优先级的 T2 间接卡住。解决办法：避免自旋锁；<strong>优先级继承（priority inheritance）</strong>——高优先级线程等待低优先级线程时，临时提升后者的优先级；或者最简单地，让所有线程优先级相同。</p>
+</div>
+
+<h2 id="futex">不同的 OS，不同的支持：Linux futex</h2>
+<p>Linux 提供 <strong>futex</strong>，与 Solaris 的接口类似但把更多功能放进内核：每个 futex 关联一个物理内存地址和一个<strong>内核中的等待队列</strong>。<code>futex_wait(address, expected)</code>：如果 <code>*address == expected</code> 就让调用者睡眠，否则立即返回（这个"检查-睡眠"在内核中原子完成，天然避免了唤醒/等待竞争）。<code>futex_wake(address)</code> 唤醒队列中的一个线程。nptl 库（glibc）中 <code>lowlevellock.h</code> 的代码片段（图 28.10）：</p>
+<pre><code>void mutex_lock (int *mutex) {
+    int v;
+    // Bit 31 was clear, we got the mutex (fastpath)
+    if (atomic_bit_test_set (mutex, 31) == 0)
+        return;
+    atomic_increment (mutex);
+    while (1) {
+        if (atomic_bit_test_set (mutex, 31) == 0) {
+            atomic_decrement (mutex);
+            return;
+        }
+        // Have to wait. First make sure futex value
+        // we are monitoring is negative (locked).
+        v = *mutex;
+        if (v &gt;= 0)
+            continue;
+        futex_wait (mutex, v);
+    }
+}
+
+void mutex_unlock (int *mutex) {
+    // Adding 0x80000000 to counter results in 0 if and
+    // only if there are not other interested threads
+    if (atomic_add_zero (mutex, 0x80000000))
+        return;
+    // There are other threads waiting for this mutex,
+    // wake one of them up.
+    futex_wake (mutex);
+}</code></pre>
+<figure class="fig">
+<svg viewBox="0 0 640 120" width="640" role="img" aria-label="futex 整数的位布局">
+  <g font-size="12.5">
+    <rect x="20" y="30" width="60" height="36" style="fill:var(--c2)"/><text x="50" y="53" text-anchor="middle" style="fill:#fff;font-weight:700">bit 31</text>
+    <rect x="80" y="30" width="540" height="36" class="accent-soft"/><text x="350" y="53" text-anchor="middle">bit 30 … bit 0：等待者（感兴趣的线程）个数</text>
+    <text x="50" y="90" text-anchor="middle" font-size="12">1 = 已加锁</text>
+    <text x="50" y="106" text-anchor="middle" font-size="11.5" class="t-muted">（整数为负）</text>
+    <text x="350" y="92" text-anchor="middle" font-size="12" class="t-muted">unlock 加 0x80000000：结果为 0 ⇔ 没有等待者 → 不用进内核</text>
+    <text x="20" y="20" font-weight="600">一个 int 同时编码"是否持有"和"有多少等待者"</text>
+  </g>
+</svg>
+<figcaption>futex 锁的整数：最高位表示锁是否被持有，其余位计数等待者。</figcaption>
+</figure>
+<p>这段真实代码有两点值得注意：① 用<strong>一个整数</strong>同时记录锁是否被持有（最高位）和等待者数量（其余位），所以锁被持有时这个整数是负数；② 为<strong>常见情况（无竞争）优化</strong>：只有一个线程加锁、解锁时，只做一次原子位测试并设置（加锁）和一次原子加法（解锁），<strong>完全不进内核</strong>。</p>
+
+<h2 id="twophase">两阶段锁（two-phase lock）</h2>
+<p>Linux 的做法有一种古老方法的味道，至少可追溯到 1960 年代初的 Dahm 锁，现在叫<strong>两阶段锁</strong>：它意识到自旋可能是有用的，尤其是锁<strong>即将</strong>被释放时。<strong>第一阶段</strong>先自旋一会儿，希望能拿到锁；如果没拿到，进入<strong>第二阶段</strong>：调用者睡眠，直到锁空闲时被唤醒。上面的 Linux 锁只自旋一次；推广一下，可以在循环里自旋固定时间再用 futex 睡眠。</p>
+<p>两阶段锁是又一个<strong>混合方案</strong>：把两个好主意结合起来可能得到更好的主意。但效果强烈依赖于硬件环境、线程数和工作负载。做出一个对所有情况都好的通用锁，是个真正的挑战。</p>
+
+<h2 id="compare">把所有实现放在一起比较</h2>
+<div class="table-wrap"><table class="cmp">
+  <thead><tr><th>实现</th><th>正确性（互斥）</th><th>公平性</th><th>性能：单 CPU 竞争</th><th>性能：多 CPU 竞争</th><th>需要的支持</th></tr></thead>
+  <tbody>
+    <tr><td>关中断</td><td class="mid">仅单处理器</td><td>—</td><td>快，但要信任应用、可能丢中断</td><td class="no">无效</td><td>特权指令</td></tr>
+    <tr><td>只用 load/store 的 flag</td><td class="no">✘ 可同时进入</td><td class="no">✘</td><td>自旋浪费</td><td>自旋浪费</td><td>无</td></tr>
+    <tr><td>Peterson / Dekker</td><td class="mid">✔ 仅限顺序一致的内存</td><td class="yes">✔（两线程轮流）</td><td>自旋浪费</td><td class="no">现代 CPU 宽松内存模型下失效</td><td>只要 load/store</td></tr>
+    <tr><td>TAS 自旋锁</td><td class="yes">✔</td><td class="no">✘ 可能饿死</td><td class="no">差：最多浪费 N−1 个时间片</td><td class="yes">好（线程≈CPU、临界区短）</td><td>test-and-set / xchg</td></tr>
+    <tr><td>CAS 自旋锁</td><td class="yes">✔</td><td class="no">✘</td><td class="no">同 TAS</td><td class="yes">同 TAS</td><td>compare-and-swap</td></tr>
+    <tr><td>LL/SC 自旋锁</td><td class="yes">✔</td><td class="no">✘</td><td class="no">同 TAS</td><td class="yes">同 TAS</td><td>load-linked / store-conditional</td></tr>
+    <tr><td>ticket 锁</td><td class="yes">✔</td><td class="yes">✔ 先来先服务</td><td class="no">差，且下一个持号者没在运行时会整体停滞</td><td class="mid">好，但每次交接都要把缓存行搬到指定的核</td><td>fetch-and-add</td></tr>
+    <tr><td>TAS + yield</td><td class="yes">✔</td><td class="no">✘ 可能饿死</td><td class="mid">较好：只浪费上下文切换</td><td class="mid">线程很多时切换开销大</td><td>yield()</td></tr>
+    <tr><td>队列 + park/unpark</td><td class="yes">✔（需 setpark 防唤醒竞争）</td><td class="yes">✔ 队列 FIFO</td><td class="yes">好：等待者睡眠</td><td class="yes">好（guard 只自旋几条指令）</td><td>park / unpark / setpark</td></tr>
+    <tr><td>futex / 两阶段锁（pthread_mutex）</td><td class="yes">✔</td><td class="mid">通常不保证严格公平</td><td class="yes">好</td><td class="yes">好，无竞争时不进内核</td><td>原子指令 + futex</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="exercises">先预测，再验证</h2>
+<div class="exercise"><div class="q">（改编自 Homework 第 2-4 题）模拟器 1 中，从初始状态出发，最少需要几次线程切换才能让两个线程同时进入临界区？中断应该落在哪一行之后？</div>
+<details class="reveal"><summary>看答案</summary><div>
+  <p>最少 2 次切换：T1 执行 <code>while (flag == 1)</code> 读到 0 后被打断（第 1 次切换）；T2 执行 while（也读到 0）和 <code>flag = 1</code>；再切回 T1（第 2 次切换），它执行 <code>flag = 1</code>——此刻两个线程都已通过 lock()，都会进入临界区。这正是原书图 28.2 的轨迹（点"载入原书图 28.2"）。关键点：中断落在 <strong>TEST 之后、SET 之前</strong>。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">模拟器 2 选 TAS，点"恶意调度"，数一数 T1 拿到锁 3 次期间 T2 自旋了几次、拿到过几次锁？再换成 ticket 锁，用同一个恶意调度程序，获得锁的顺序变成什么样？</div>
+<details class="reveal"><summary>看答案</summary><div>
+  <p>TAS：T1 连续拿到 3 次锁，T2 每次被调度时锁都被 T1 持有，自旋 3 次、一次也没拿到，直到 T1 全部做完——这就是<strong>不公平</strong>（换成无限循环就是饿死）。ticket：T2 在 T1 第一次持锁期间就取了号（1），T1 释放后再取号只能拿到 2，于是获得顺序变成 T1、T2、T1、T2……严格轮流。<strong>公平的代价</strong>是 T1 也得自旋等待。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">模拟器 2 选 LL/SC，点"两个线程同时 LL"。预测哪个线程的 StoreConditional 会失败，为什么？</div>
+<details class="reveal"><summary>看答案</summary><div>
+  <p>T1、T2 都 LL 读到 flag=0。T1 先 SC 成功（flag 在它 LL 之后没被写过），把 flag 写成 1。T2 的 SC <strong>失败</strong>：自它 LL 之后，flag 已被 T1 写过，于是返回 0，回到外层循环重试，这次 LL 读到 1 开始自旋。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">模拟器 3b：N=4、Q=10、C=4、W=6、切换开销 1、时长 150。先预测三种策略中哪个浪费（红色）最多？把 N 改为 8，自旋策略的浪费大约按什么规律增长？</div>
+<details class="reveal"><summary>看答案</summary><div>
+  <p>用模拟器实测（150 个时间单位）：N=4 时，自旋策略浪费 30 个自旋单位 + 14 个切换单位（29%）；yield 只浪费 3 + 16（13%）；park 浪费 12 + 23（23%），但四个线程获得锁的次数恰好都是 3 次。N=8 时自旋浪费飙升到 70 + 14（56%）：持锁者被抢占时，其余 7 个线程每人自旋一整个时间片（7 × 10 = 70），正是原书说的"N−1 个时间片"。</p>
+  <p>yield 把"浪费整个时间片"变成"浪费一次尝试和一次切换"，而且释放者常常自己又立刻抢到锁，所以浪费最少——但谁拿到锁全凭运气（N=8 时获得次数 2,2,2,2,1,1,1,1）。park 让等待者根本不被调度，并按队列顺序把锁<strong>直接交接</strong>，获得锁的次数最均匀；代价是每次交接都要切换到被唤醒的线程，释放者下次来拿锁时往往也得排队睡眠。这和实验里"不公平的 yield/mutex 吞吐量最高"是同一个道理：<strong>公平与性能常常需要取舍</strong>。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（原书思考题）图 28.9 里，如果把 <code>m-&gt;guard = 0;</code> 移到 <code>park();</code> 之后，会发生什么？</div>
+<details class="reveal"><summary>看答案</summary><div>
+  <p>线程带着 guard 睡着了。持锁者调用 <code>unlock()</code> 时要先获取 guard，只能在 guard 上<strong>永远自旋</strong>，于是永远没人 unpark 那个睡着的线程；其他来 <code>lock()</code> 的线程也都卡在 guard 上。整个锁<strong>死锁</strong>。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（改编自 Homework 第 9-10 题）模拟器 2 选 Peterson，尝试各种调度（包括恶意调度和随机调度），两个线程能同时进入临界区吗？会不会两个人都永远等下去？</div>
+<details class="reveal"><summary>看答案</summary><div>
+  <p>都不会。若两人都设了 flag，<code>turn</code> 只能等于其中一个值：最后写 turn 的线程让出，另一个能进入——所以既互斥又不会死锁。但请记住：这依赖于 load/store 按程序顺序生效；在现代 CPU 上，编译器和硬件的重排会破坏它，需要内存屏障（memory fence）。</p>
+</div></details></div>
+
+<h2 id="lab">动手实验：用 GCC 原子内建造锁</h2>
+<div class="lab">
+  <p><code>labs/28-locks/locks.c</code> 用 <code>__sync_lock_test_and_set</code>（x86 上是 <code>xchg</code>）、<code>__sync_val_compare_and_swap</code>（<code>lock cmpxchg</code>）、<code>__atomic_fetch_add</code>（<code>lock xadd</code>）实现 TAS、TTAS、CAS、ticket、TAS+yield 锁，与 <code>pthread_mutex</code> 和图 28.1 的错误 flag 锁对比：N 个线程各做 <code>loops</code> 次 <code>lock; counter++; unlock</code>，检查结果并计时（所有线程在 barrier 上集合后同时开跑）。</p>
+  <pre><code><span class="cmd">cd labs/28-locks &amp;&amp; make</span>
+<span class="cmd">make correct     # 正确性</span>
+<span class="cmd">make bench       # 1/2/4/8/16 线程</span>
+<span class="cmd">make oversub     # 线程数 = 2 × CPU 数</span>
+<span class="cmd">make single      # 所有线程钉在 CPU 0 上</span></code></pre>
+  <p><strong>正确性</strong>（4 线程 × 100 万次）：</p>
+  <pre><code>none   threads=4   counter=1070265   expected=4000000   WRONG time=0.006s
+flag   threads=4   counter=1057400   expected=4000000   WRONG time=0.011s
+tas    threads=4   counter=4000000   expected=4000000   OK    time=0.140s
+cas    threads=4   counter=4000000   expected=4000000   OK    time=0.148s
+ticket threads=4   counter=4000000   expected=4000000   OK    time=0.308s
+mutex  threads=4   counter=4000000   expected=4000000   OK    time=0.075s</code></pre>
+  <p><strong>性能</strong>（每线程 100 万次，单位：秒；<code>make bench</code> 的真实输出整理）：</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th class="num">线程数</th><th class="num">tas</th><th class="num">ttas</th><th class="num">cas</th><th class="num">ticket</th><th class="num">yield</th><th class="num">mutex</th></tr></thead>
+    <tbody>
+      <tr><td class="num">1</td><td class="num">0.002</td><td class="num">0.002</td><td class="num">0.003</td><td class="num">0.003</td><td class="num">0.003</td><td class="num">0.007</td></tr>
+      <tr><td class="num">2</td><td class="num">0.030</td><td class="num">0.032</td><td class="num">0.033</td><td class="num">0.061</td><td class="num">0.006</td><td class="num">0.039</td></tr>
+      <tr><td class="num">4</td><td class="num">0.133</td><td class="num">0.094</td><td class="num">0.162</td><td class="num">0.315</td><td class="num">0.015</td><td class="num">0.076</td></tr>
+      <tr><td class="num">8</td><td class="num">0.569</td><td class="num">0.545</td><td class="num">0.590</td><td class="num">1.082</td><td class="num">0.042</td><td class="num">0.211</td></tr>
+      <tr><td class="num">16</td><td class="num">2.399</td><td class="num">2.015</td><td class="num">3.234</td><td class="num" style="color:var(--bad)">20 s 超时（只完成 459 万 / 1600 万）</td><td class="num">0.107</td><td class="num">0.381</td></tr>
+    </tbody>
+  </table></div>
+  <pre><code>$ make oversub     # 32 线程 × 20 万次
+tas    threads=32  counter=6400000   expected=6400000   OK    time=1.517s
+ttas   threads=32  counter=6400000   expected=6400000   OK    time=1.341s
+ticket threads=32  TIMEOUT after 10.0s: only 18964 of 6400000 increments done (1896 per second)
+yield  threads=32  counter=6400000   expected=6400000   OK    time=0.030s
+mutex  threads=32  counter=6400000   expected=6400000   OK    time=0.143s
+$ make single      # taskset -c 0，4 线程 × 500 万次
+tas    threads=4   counter=20000000  expected=20000000  OK    time=0.136s
+ticket threads=4   TIMEOUT after 5.0s: only 534588 of 20000000 increments done (106918 per second)
+yield  threads=4   counter=20000000  expected=20000000  OK    time=0.093s
+mutex  threads=4   counter=20000000  expected=20000000  OK    time=0.150s</code></pre>
+  <p class="small muted">示例输出，你的机器上数字会不同（本机 AMD Ryzen 7 8745H，8 核 16 线程，WSL2，gcc 14.2 -O2）。</p>
+  <p><strong>怎么解读：</strong></p>
+  <ul>
+    <li><strong>正确性</strong>：图 28.1 的 flag 锁和不加锁一样错（丢了约 3/4）；所有基于原子指令的锁都正确。</li>
+    <li><strong>自旋锁随线程数急剧变慢</strong>：锁变量所在的缓存行在各核之间来回搬；每次 TAS/CAS 都是一次独占写。TTAS 先只读自旋（命中本地缓存），略好一些。</li>
+    <li><strong>ticket 锁最公平，也最脆弱</strong>：它严格按号交接，每次都要把锁交给<strong>指定的下一个线程</strong>。一旦那个线程没在运行（16 线程占满 16 个逻辑 CPU 再加上系统其他负载、32 线程超额订阅、单 CPU），所有人都得等它被调度回来——每次交接都付出一次调度延迟，吞吐量暴跌到每秒几千次。这正是原书"单 CPU 上自旋锁很痛苦"的极端版本：公平性与性能之间的冲突。</li>
+    <li><strong>yield 和 mutex 反而最快</strong>：它们不公平——抢不到的线程让出 CPU / 睡眠，持锁线程释放后往往自己立刻又拿到锁（缓存还是热的），一口气完成很多次。吞吐高，公平性差。</li>
+    <li><strong>无竞争时</strong>（1 线程）mutex 比 TAS 稍慢：glibc 快路径多做了一些检查，但仍只是一次原子操作、不进内核——正是 futex "为常见情况优化"的效果。</li>
+  </ul>
+</div>
+
+<h2 id="quiz">自测题</h2>
+<p class="quiz-score"></p>
+
+<div class="mcq" data-answer="1"><div class="q">1. 为什么"关中断"不能作为通用的锁实现？</div>
+  <div class="opts"><button>A. 关中断后 TLB 会被清空</button><button>B. 需要信任应用程序执行特权操作，且在多处理器上无效</button><button>C. 关中断指令执行太慢</button><button>D. 关中断会导致页表失效</button></div>
+  <div class="explain">原书列举：要信任任意程序（可能独占 CPU 或死循环）、多处理器上无效、长时间关中断会丢中断。它只在 OS 内部有限使用。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">2. 图 28.1 的 flag 锁为什么不正确？</div>
+  <div class="opts"><button>A. 因为 unlock 没有检查调用者是否持有锁</button><button>B. 因为 flag 没有初始化</button><button>C. 因为"检查 flag"和"设置 flag"是两个独立的操作，中间可能被打断</button><button>D. 因为自旋会浪费 CPU</button></div>
+  <div class="explain">两个线程都可能在对方 SET 之前完成 TEST，都读到 0，然后都 SET 为 1 进入临界区。自旋浪费是性能问题，不是正确性问题。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">3. TestAndSet(&amp;flag, 1) 返回 0 意味着什么？</div>
+  <div class="opts"><button>A. 锁已被别人持有</button><button>B. flag 的新值是 0</button><button>C. 设置失败，需要重试</button><button>D. 锁原本空闲，调用者已原子地把它设为 1，获得了锁</button></div>
+  <div class="explain">TAS 返回旧值并原子地写入新值。旧值为 0 说明锁原本空闲，而现在它已经是 1，调用者就是新的所有者。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">4. 下列哪种锁能保证每个等待的线程最终都能获得锁（不会饿死）？</div>
+  <div class="opts"><button>A. test-and-set + yield</button><button>B. test-and-set 自旋锁</button><button>C. 基于 fetch-and-add 的 ticket 锁</button><button>D. compare-and-swap 自旋锁</button></div>
+  <div class="explain">ticket 锁按取号顺序服务：一旦取到号，前面的人用完后一定轮到你。TAS、CAS、yield 都不提供这种保证。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">5. 单 CPU 上 N 个线程竞争一个 TAS 自旋锁，持锁线程在临界区中被抢占。最坏情况下浪费多少？</div>
+  <div class="opts"><button>A. 大约 N−1 个完整的时间片</button><button>B. 没有浪费，因为单 CPU 上不会自旋</button><button>C. 一次上下文切换</button><button>D. 几条指令</button></div>
+  <div class="explain">其余 N−1 个线程依次被调度，每个都自旋到时间片结束才放弃 CPU，而它们等的持锁者根本没机会运行。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">6. LL/SC 锁中，StoreConditional 什么时候会失败？</div>
+  <div class="opts"><button>A. 当有线程在自旋时</button><button>B. 当 flag 的值是 0 时</button><button>C. 永远不会失败</button><button>D. 自本线程执行 LoadLinked 之后，有其他 store 写过这个地址</button></div>
+  <div class="explain">SC 只有在 LL 之后该地址没被更新过时才成功。两个线程都 LL 到 0 时，先 SC 的成功，后 SC 的失败并重试。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">7. 图 28.9 中，unlock 在有等待者时为什么<strong>不</strong>把 flag 置 0？</div>
+  <div class="opts"><button>A. 锁被直接传给被唤醒的线程；它从 park 返回时不持有 guard，无法自己再设置 flag</button><button>B. 为了减少内存写入</button><button>C. 这是一个 bug，应该置 0</button><button>D. 因为 flag 由内核维护</button></div>
+  <div class="explain">原书："we just pass the lock directly from the thread releasing the lock to the next thread acquiring it; flag is not set to 0 in-between."</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">8. setpark() 解决的是什么问题？</div>
+  <div class="opts"><button>A. 队列满了无法加入</button><button>B. 线程决定 park 但还没睡着时被 unpark，导致之后永远睡眠（唤醒/等待竞争）</button><button>C. 优先级反转</button><button>D. guard 自旋时间太长</button></div>
+  <div class="explain">调用 setpark() 后，如果在真正 park 之前被 unpark，随后的 park 会立即返回，不会错过这次唤醒。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">9. 关于 Linux futex 锁（图 28.10），哪项正确？</div>
+  <div class="opts"><button>A. 无竞争时只做原子操作，不进内核；有竞争时才用 futex_wait/futex_wake 睡眠和唤醒</button><button>B. 它是一种纯自旋锁</button><button>C. 用两个整数分别记录锁状态和等待者数</button><button>D. 每次加锁都要进入内核</button></div>
+  <div class="explain">一个整数：最高位表示是否持有、其余位计数等待者。快路径只需一次原子位测试并设置；这也是两阶段锁的一种形式（只自旋一次）。</div></div>
+
+<h2 id="pitfalls">常见误区</h2>
+<div class="warn">
+  <ul>
+    <li><strong>"用一个普通变量当锁就行"</strong>：不行。检查与设置必须合成一个原子操作，这需要硬件原语（或 Peterson 这类在现代硬件上并不可靠的算法）。</li>
+    <li><strong>"自旋锁总是坏的"</strong>：多 CPU、线程数不超过 CPU 数、临界区很短时，自旋锁很好，甚至比睡眠更快（省掉了上下文切换）。两阶段锁正是基于这一点。</li>
+    <li><strong>"公平的锁一定更快"</strong>：相反。实验中最公平的 ticket 锁在线程数 ≥ CPU 数时性能崩溃；不公平的 mutex、yield 吞吐量最高。公平和性能常常矛盾。</li>
+    <li><strong>"yield 解决了饿死"</strong>：没有。yield 只减少了浪费，线程仍可能无限地 yield 而别人反复拿锁。需要队列才能控制下一个获得锁的是谁。</li>
+    <li><strong>"有了 park/unpark 就完全不自旋了"</strong>：guard 仍是自旋锁，只是自旋时间限于 lock/unlock 内的几条指令。</li>
+    <li><strong>"CAS 锁比 TAS 锁更好"</strong>：只用来构建简单自旋锁时两者行为相同；CAS 的强大之处在无锁数据结构。</li>
+  </ul>
+</div>
+
+<h2 id="summary">本章小结</h2>
+<ul>
+  <li>锁让临界区像单条原子指令一样执行。评价锁看三点：<strong>正确性、公平性、性能</strong>（无竞争 / 单 CPU / 多 CPU）。</li>
+  <li>关中断只适合单处理器上的 OS 内部；只用 load/store 的 flag 不正确；Peterson/Dekker 只用 load/store 能工作，但在现代宽松内存模型下失效。</li>
+  <li>硬件原语——<strong>test-and-set、compare-and-swap、LL/SC、fetch-and-add</strong>——把"检查 + 修改"合成一个原子操作，可以构建正确的自旋锁；ticket 锁进一步保证了公平。</li>
+  <li>自旋在单 CPU 或线程多于 CPU 时浪费严重。OS 支持能改善：<strong>yield</strong> 让出 CPU；<strong>队列 + park/unpark</strong>（加 setpark 防唤醒竞争）让等待者睡眠并按序交接；Linux <strong>futex</strong> 加上<strong>两阶段锁</strong>是今天真实的做法：硬件原子指令 + OS 睡眠/唤醒原语。</li>
+  <li>下一章（第 29 章）把锁用到计数器、链表、队列、哈希表中，看看<strong>锁放在哪里、放几把</strong>如何影响正确性与性能；第 30 章的条件变量处理"等待某个条件成立"。</li>
+</ul>
+
+</main>
+
+<script>
+/* ===== 引擎（纯函数，不碰 DOM，可以单独用 node 测试） ===== */
+function mkRng(seed) {
+  let a = (seed >>> 0) || 1;
+  const f = () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  f.int = (lo, hi) => lo + Math.floor(f() * (hi - lo + 1));
+  return f;
+}
+
+// ---------- 模拟器 1、2：逐行交错执行的锁 ----------
+const LOCKS = (() => {
+  const TN = (k) => "T" + (k + 1);
+  const CS = { code: "counter = counter + 1;   // 临界区", cs: true, run: (t, S, k) => { S.counter++; return { next: t.pc + 1, msg: `${TN(k)} 在临界区内执行 counter++（counter=${S.counter}）。` }; } };
+  const DEFS = {
+    flag: {
+      name: "只用 load/store 的 flag（图 28.1）", maxThreads: 3,
+      init: () => ({ flag: 0, counter: 0 }), shared: ["flag"],
+      lines: [
+        { code: "while (flag == 1)   // TEST", run: (t, S, k) => S.flag === 1 ? { spin: true, msg: `${TN(k)} 读到 flag=1，锁被持有，继续自旋。` } : { next: 1, msg: `${TN(k)} 读到 flag=0，跳出 while 循环。<strong>注意：它还没有设置 flag！</strong>` } },
+        { code: "flag = 1;           // SET", run: (t, S, k) => { S.flag = 1; return { next: 2, acquire: true, msg: `${TN(k)} 把 flag 设为 1，认为自己拿到了锁。` }; } },
+        CS,
+        { code: "flag = 0;           // unlock", unlock: true, run: (t, S, k) => { S.flag = 0; return { msg: `${TN(k)} 释放锁：flag = 0。` }; } },
+      ],
+    },
+    tas: {
+      name: "test-and-set 自旋锁（图 28.3）", maxThreads: 3,
+      init: () => ({ flag: 0, counter: 0 }), shared: ["flag"],
+      lines: [
+        { code: "while (TestAndSet(&flag, 1) == 1) ;", run: (t, S, k) => { const old = S.flag; S.flag = 1; return old === 1 ? { spin: true, msg: `${TN(k)} TestAndSet 返回旧值 1（又写了一次 1），锁被持有，自旋。` } : { next: 1, acquire: true, msg: `${TN(k)} TestAndSet 返回旧值 0，<strong>同时</strong>原子地把 flag 设为 1——获得锁。` }; } },
+        CS,
+        { code: "flag = 0;   // unlock", unlock: true, run: (t, S, k) => { S.flag = 0; return { msg: `${TN(k)} 释放锁：flag = 0。` }; } },
+      ],
+    },
+    cas: {
+      name: "compare-and-swap 自旋锁（图 28.4）", maxThreads: 3,
+      init: () => ({ flag: 0, counter: 0 }), shared: ["flag"],
+      lines: [
+        { code: "while (CompareAndSwap(&flag, 0, 1) == 1) ;", run: (t, S, k) => { const old = S.flag; if (old === 0) S.flag = 1; return old === 1 ? { spin: true, msg: `${TN(k)} CAS：flag=1 ≠ 期望的 0，不修改，返回 1，自旋。` } : { next: 1, acquire: true, msg: `${TN(k)} CAS：flag 等于期望的 0，原子地换成 1，返回 0——获得锁。` }; } },
+        CS,
+        { code: "flag = 0;   // unlock", unlock: true, run: (t, S, k) => { S.flag = 0; S.ver++; return { msg: `${TN(k)} 释放锁：flag = 0。` }; } },
+      ],
+    },
+    llsc: {
+      name: "load-linked / store-conditional（图 28.6）", maxThreads: 3,
+      init: () => ({ flag: 0, counter: 0, ver: 0 }), shared: ["flag"],
+      lines: [
+        { code: "while (LoadLinked(&flag) == 1) ;", run: (t, S, k) => { t.ll = S.ver; return S.flag === 1 ? { spin: true, msg: `${TN(k)} LoadLinked 读到 1，自旋。` } : { next: 1, msg: `${TN(k)} LoadLinked 读到 0，并"链接"这个地址（记住此刻 flag 未被改写）。` }; } },
+        { code: "if (StoreConditional(&flag, 1) == 1) return;", run: (t, S, k) => { if (t.ll === S.ver) { S.flag = 1; S.ver++; t.ll = -1; return { next: 2, acquire: true, msg: `${TN(k)} StoreConditional 成功：自它 LL 以来没人写过 flag，于是写入 1 并返回 1——获得锁。` }; } t.ll = -1; return { next: 0, fail: true, msg: `${TN(k)} StoreConditional <strong>失败</strong>：它 LL 之后别的线程写过 flag，不写入、返回 0，回到外层循环重试。` }; } },
+        CS,
+        { code: "flag = 0;   // unlock", unlock: true, run: (t, S, k) => { S.flag = 0; S.ver++; return { msg: `${TN(k)} 释放锁：flag = 0（这次 store 会让其他线程的 LL 链接失效）。` }; } },
+      ],
+    },
+    ticket: {
+      name: "ticket 锁（fetch-and-add，图 28.7）", maxThreads: 3,
+      init: () => ({ ticket: 0, turn: 0, counter: 0 }), shared: ["ticket", "turn"],
+      lines: [
+        { code: "myturn = FetchAndAdd(&ticket);", run: (t, S, k) => { t.myturn = S.ticket++; return { next: 1, msg: `${TN(k)} 取号：FetchAndAdd 返回 ${t.myturn}，ticket 变为 ${S.ticket}。` }; } },
+        { code: "while (turn != myturn) ;", run: (t, S, k) => S.turn !== t.myturn ? { spin: true, msg: `${TN(k)} 叫号屏 turn=${S.turn}，不是自己的 ${t.myturn}，自旋。` } : { next: 2, acquire: true, msg: `${TN(k)} turn=${S.turn} 等于自己的号——获得锁。` } },
+        CS,
+        { code: "turn = turn + 1;   // unlock", unlock: true, run: (t, S, k) => { S.turn++; return { msg: `${TN(k)} 释放锁：turn 加 1 变为 ${S.turn}，叫下一个号。` }; } },
+      ],
+    },
+    peterson: {
+      name: "Peterson 算法（两线程，只用 load/store）", maxThreads: 2,
+      init: () => ({ flag0: 0, flag1: 0, turn: 0, counter: 0 }), shared: ["flag0", "flag1", "turn"],
+      lines: [
+        { code: "flag[self] = 1;", run: (t, S, k) => { S["flag" + k] = 1; return { next: 1, msg: `${TN(k)} 表明意愿：flag[${k}] = 1。` }; } },
+        { code: "turn = 1 - self;", run: (t, S, k) => { S.turn = 1 - k; return { next: 2, msg: `${TN(k)} 谦让：turn = ${1 - k}（轮到对方）。` }; } },
+        { code: "while (flag[1-self] == 1 && turn == 1-self) ;", run: (t, S, k) => (S["flag" + (1 - k)] === 1 && S.turn === 1 - k) ? { spin: true, msg: `${TN(k)} 对方也想进（flag[${1 - k}]=1）且轮到对方（turn=${S.turn}），自旋。` } : { next: 3, acquire: true, msg: `${TN(k)} ${S["flag" + (1 - k)] === 1 ? `turn=${S.turn} 轮到自己` : "对方不想进"}——进入临界区。` } },
+        CS,
+        { code: "flag[self] = 0;   // unlock", unlock: true, run: (t, S, k) => { S["flag" + k] = 0; return { msg: `${TN(k)} 释放：flag[${k}] = 0。` }; } },
+      ],
+    },
+  };
+  DEFS.cas.init = () => ({ flag: 0, counter: 0, ver: 0 });
+
+  // cfg: {lock, threads, loops, mode:'manual'|'interval'|'random'|'malicious', interval, seed, manual:[tid]}
+  function simulate(cfg) {
+    const D = DEFS[cfg.lock], n = Math.min(cfg.threads, D.maxThreads), L = D.lines;
+    const csIdx = L.findIndex((l) => l.cs);
+    const S = D.init();
+    const T = Array.from({ length: n }, () => ({ pc: 0, iter: 0, done: false, spins: 0, acq: 0, myturn: null, ll: -1, streak: 0 }));
+    const rng = mkRng(cfg.seed || 0);
+    const slice = () => (cfg.mode === "random" ? rng.int(1, Math.max(1, cfg.interval)) : Math.max(1, cfg.interval));
+    const snap = () => ({ S: { ...S }, th: T.map((t) => ({ ...t })) });
+    const rows = [{ kind: "start", cur: 0, msg: `初始：${Object.keys(S).filter((k) => k !== "ver").map((k) => `${k}=${S[k]}`).join("，")}。每个线程要进出临界区 ${cfg.loops} 次。`, ...snap() }];
+    const order = [];
+    let cur = 0, used = 0, len = slice(), mi = 0, violation = null, switches = 0, malPhase = 0;
+    const alive = () => T.map((t, k) => k).filter((k) => !T[k].done);
+    const nextAlive = (from) => { for (let d = 1; d <= n; d++) { const k = (from + d) % n; if (!T[k].done) return k; } return -1; };
+    for (let guard = 0; guard < 600; guard++) {
+      if (!alive().length) break;
+      let next;
+      if (cfg.mode === "manual") {
+        while (mi < cfg.manual.length && (cfg.manual[mi] >= n || T[cfg.manual[mi]].done)) mi++;
+        if (mi >= cfg.manual.length) break;
+        next = cfg.manual[mi++];
+      } else if (cfg.mode === "malicious") {
+        // T1 一拿到锁（或连续自旋 3 次）就被打断；其他线程每次只运行 1 步
+        if (T[0].done) { next = T[cur].done || used >= 3 || cur === 0 ? nextAlive(cur) : cur; if (next !== cur) used = 0; }
+        else if (cur === 0) next = malPhase ? nextAlive(0) : 0;
+        else next = 0;
+        if (next === -1) break;
+      } else {
+        if (T[cur].done) next = nextAlive(cur);
+        else if (used >= len) { next = nextAlive(cur); used = 0; len = slice(); }
+        else next = cur;
+      }
+      if (next !== cur) { switches++; used = 0; if (cfg.mode !== "malicious") len = slice(); }
+      malPhase = 0;
+      cur = next;
+      const t = T[cur], line = L[t.pc], at = t.pc;
+      const r = line.run(t, S, cur);
+      let acquiredNow = false;
+      if (r.spin) { t.spins++; t.streak++; }
+      else t.streak = 0;
+      if (line.unlock) { t.iter++; if (t.iter >= cfg.loops) { t.done = true; t.pc = 0; } else t.pc = 0; }
+      else if (!r.spin) t.pc = r.next;
+      if (!line.unlock && t.pc === csIdx && !r.spin) { acquiredNow = true; t.acq++; order.push(cur); }
+      used++;
+      if (cfg.mode === "malicious" && cur === 0 && (acquiredNow || t.streak >= 3 || t.done)) malPhase = 1;
+      if (cfg.mode === "malicious" && cur !== 0) used = used; // 其他线程只跑一步
+      const inCS = T.map((x, k) => (!x.done && x.pc >= csIdx ? k : -1)).filter((k) => k >= 0);
+      let viol = false;
+      if (inCS.length > 1) { viol = true; if (!violation) violation = { row: rows.length, who: inCS.slice() }; }
+      let msg = r.msg;
+      if (viol) msg += ` <strong style="color:var(--bad)">⚠ 互斥被破坏：${inCS.map(TN).join(" 和 ")} 同时在临界区里！</strong>`;
+      rows.push({ kind: "step", tid: cur, at, spin: !!r.spin, fail: !!r.fail, acquired: acquiredNow, viol, inCS, cur, msg, ...snap() });
+    }
+    const finished = T.every((t) => t.done);
+    return { rows, order, violation, switches, finished, n, csIdx, lines: L, def: D, spins: T.map((t) => t.spins) };
+  }
+  const PRESETS = {
+    fig282: [0, 1, 1, 0, 0, 1],       // 图 28.2：T1 test；T2 test、set；T1 set；二者进入临界区
+    llsc2: [0, 1, 0, 1, 0, 1],       // 两个线程都 LL 到 0；T1 SC 成功；T2 SC 失败
+  };
+  return { DEFS, simulate, PRESETS };
+})();
+
+// ---------- 模拟器 3b：单 CPU 上的自旋 / yield / park ----------
+const WAIT = (() => {
+  // cfg: {kind, n, q, c, w, s, h}
+  function simulate(cfg) {
+    const { kind, n, q, c, w, s, h } = cfg;
+    const T = Array.from({ length: n }, (_, k) => ({ phase: k === 0 ? "cs" : "acq", rem: k === 0 ? c : 0, blocked: false, acq: k === 0 ? 1 : 0 }));
+    const lock = { held: true, owner: 0, queue: [] };
+    const lanes = Array.from({ length: n }, () => []);   // 每个时间单位：{t, type}
+    const osLane = [];
+    const events = [];
+    const stat = { useful: 0, spin: 0, sw: 0, cs: 0 };
+    let t = 0, cur = 0, used = q - 1;                    // T1 只剩 1 个单位就要被抢占
+    const rq = Array.from({ length: n - 1 }, (_, k) => k + 1);
+    events.push({ t: 0, msg: `初始：T1 持有锁、正在临界区中，还差 1 个时间单位就会被定时器中断抢占。其余 ${n - 1} 个线程在就绪队列里。` });
+    const sw = (why) => {
+      // 选择下一个就绪线程；切换开销 s 个单位
+      if (!rq.length) { if (!T[cur].blocked) return; }
+      const nxt = rq.length ? rq.shift() : -1;
+      if (nxt === -1) return;
+      for (let i = 0; i < s && t < h; i++) { osLane.push({ t, type: "sw" }); stat.sw++; t++; }
+      events.push({ t, msg: `${why} → 切换到 T${nxt + 1}` + (s ? `（上下文切换花费 ${s} 个单位）` : "") + "。" });
+      cur = nxt; used = 0;
+    };
+    while (t < h) {
+      const th = T[cur];
+      let type;
+      if (th.phase === "acq") {
+        if (!lock.held) { lock.held = true; lock.owner = cur; th.phase = "cs"; th.rem = c; th.acq++; type = "lk"; stat.useful++;
+          events.push({ t, msg: `T${cur + 1} 获取锁成功，进入临界区。` }); }
+        else {
+          type = "spin"; stat.spin++;
+          if (kind === "yield") { lanes[cur].push({ t, type }); t++; events.push({ t: t - 1, msg: `T${cur + 1} TestAndSet 发现锁被 T${lock.owner + 1} 持有，调用 yield() 让出 CPU。` }); rq.push(cur); sw("yield"); continue; }
+          if (kind === "park") { lanes[cur].push({ t, type }); t++; th.blocked = true; lock.queue.push(cur);
+            events.push({ t: t - 1, msg: `T${cur + 1} 发现锁被持有：加入等待队列 [${lock.queue.map((x) => "T" + (x + 1)).join(", ")}]，park() 睡眠（不再被调度）。` }); sw("park"); continue; }
+        }
+      } else if (th.phase === "cs") { type = "cs"; stat.useful++; stat.cs++; th.rem--; if (th.rem <= 0) th.phase = "rel"; }
+      else if (th.phase === "rel") {
+        type = "lk"; stat.useful++;
+        if (kind === "park" && lock.queue.length) {
+          const nx = lock.queue.shift(); lock.owner = nx; T[nx].blocked = false; T[nx].phase = "cs"; T[nx].rem = c; T[nx].acq++; rq.push(nx);
+          events.push({ t, msg: `T${cur + 1} unlock：队列非空，把锁<strong>直接交给</strong> T${nx + 1} 并 unpark 它（flag 保持 1）。` });
+        } else { lock.held = false; lock.owner = -1; events.push({ t, msg: `T${cur + 1} unlock：flag = 0，锁空闲。` }); }
+        th.phase = w > 0 ? "work" : "acq"; th.rem = w;
+      } else { type = "work"; stat.useful++; th.rem--; if (th.rem <= 0) th.phase = "acq"; }
+      lanes[cur].push({ t, type });
+      t++; used++;
+      if (used >= q) {
+        rq.push(cur);
+        const holding = lock.held && lock.owner === cur ? "（仍持有锁！）" : "";
+        const why = type === "spin" ? `T${cur + 1} 自旋了整个时间片，定时器中断` : `时间片用完，定时器中断抢占 T${cur + 1}${holding}`;
+        sw(why);
+      }
+    }
+    // 睡眠区间（park 时）只用于显示
+    const acq = T.map((x) => x.acq);
+    return { lanes, osLane, events, stat, acq, h };
+  }
+  return { simulate };
+})();
+
+// ---------- 模拟器 3a：唤醒/等待竞争 ----------
+const WAKE = (() => {
+  function rows(setpark) {
+    const R = [];
+    const S = { flag: 1, guard: 0, queue: "[]", T2: "运行" , pending: "否" };
+    const push = (who, code, msg, ch = {}, bad = false) => { Object.assign(S, ch); R.push({ who, code, msg, S: { ...S }, bad }); };
+    push("T2", "while (TestAndSet(&m->guard, 1) == 1) ;", "T2 调用 lock()：先拿到 guard（保护 flag 和队列的小自旋锁）。", { guard: 1 });
+    push("T2", "if (m->flag == 0) … else", "flag=1：锁被 T1 持有，走 else 分支。");
+    push("T2", "queue_add(m->q, gettid());", "T2 把自己加入等待队列。", { queue: "[T2]" });
+    if (setpark) push("T2", "setpark();", "T2 调用 setpark()：告诉内核\"我马上要 park 了\"。", { pending: "已声明" });
+    push("T2", "m->guard = 0;", "T2 释放 guard。它<strong>决定要睡</strong>，但还没调用 park()……", { guard: 0 });
+    push("OS", "—— 定时器中断：切换到 T1 ——", "恶意的调度程序偏偏在这里打断 T2。");
+    push("T1", "while (TestAndSet(&m->guard, 1) == 1) ;", "T1 的临界区结束，调用 unlock()，拿到 guard。", { guard: 1 });
+    push("T1", "unpark(queue_remove(m->q));", setpark ? "队列里有 T2：取出并 unpark(T2)。T2 还没睡，但它声明过 setpark，内核记下\"已有一次唤醒\"。" : "队列里有 T2：取出并 unpark(T2)。可 T2 <strong>还没睡着</strong>——这次唤醒什么也没做，落空了！", { queue: "[]", pending: setpark ? "已收到唤醒" : "否" }, !setpark);
+    push("T1", "m->guard = 0;", "T1 释放 guard。锁已（按设计）直接交给 T2，flag 仍为 1。", { guard: 0 });
+    push("OS", "—— 切换回 T2 ——", "T2 从中断处继续。");
+    if (setpark) push("T2", "park();", "T2 调用 park()：因为之前已有 unpark，park <strong>立即返回</strong>。T2 获得了锁，进入临界区。✔", { T2: "持有锁，运行", pending: "已消费" });
+    else push("T2", "park();", "T2 调用 park() 睡眠——但唯一会唤醒它的 unpark 已经发生过了。它<strong>可能永远睡下去</strong>，而锁（flag=1）也永远不会被释放。✘", { T2: "永远睡眠" }, true);
+    return R;
+  }
+  return { rows };
+})();
+</script>
+
+<script>
+/* ===== 界面 ===== */
+(function () {
+  const { h, s } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  const tcol = (k) => `var(--c${k + 1})`;
+
+  // ---------- 模拟器 1、2 的通用界面 ----------
+  function mountLockSim(body, opts) {
+    let manual = opts.preset ? opts.preset.slice() : [];
+    let res;
+    const sel = opts.fixed ? null : h("select", {}, Object.entries(LOCKS.DEFS).filter(([k]) => k !== "flag").map(([k, d]) => h("option", { value: k }, d.name)));
+    const selThreads = h("select", {}, h("option", {}, "2"), h("option", {}, "3"));
+    const inLoops = h("input", { type: "number", value: opts.loops || 1, min: 1, max: 4 });
+    const selMode = h("select", {}, h("option", { value: "manual" }, "手动（你来选）"), h("option", { value: "interval" }, "固定时间片"), h("option", { value: "random" }, "随机时间片"), opts.fixed ? null : h("option", { value: "malicious" }, "恶意调度（T1 一拿到锁就被打断）"));
+    const inInt = h("input", { type: "number", value: 2, min: 1, max: 9 });
+    const inSeed = h("input", { type: "number", value: 1, min: 0, max: 99999 });
+    const mbtns = h("span", {});
+    const bUndo = h("button", {}, "撤销"), bClear = h("button", {}, "清空");
+    const presetBtns = [];
+    if (opts.fixed) {
+      presetBtns.push(h("button", { class: "primary", onclick: () => { selMode.value = "manual"; selThreads.value = "2"; inLoops.value = 1; manual = LOCKS.PRESETS.fig282.slice(); recompute(false); } }, "载入原书图 28.2"));
+    } else {
+      presetBtns.push(h("button", { class: "primary", onclick: () => { selMode.value = "malicious"; selThreads.value = "2"; inLoops.value = 3; recompute(false); } }, "恶意调度（比较公平性）"));
+      presetBtns.push(h("button", { onclick: () => { sel.value = "llsc"; selMode.value = "manual"; selThreads.value = "2"; inLoops.value = 1; manual = LOCKS.PRESETS.llsc2.slice(); recompute(false); } }, "LL/SC：两个线程同时 LL"));
+      presetBtns.push(h("button", { onclick: () => { sel.value = "ticket"; selMode.value = "random"; selThreads.value = "3"; inLoops.value = 2; inInt.value = 3; recompute(false); } }, "ticket：3 线程随机调度"));
+    }
+    const stepHost = h("div", {});
+    const shared = h("div", { class: "shared" });
+    const grid = h("div", { class: "lk-grid" });
+    const acqLine = h("div", { class: "acq" });
+    const narr = h("div", { class: "narrate" });
+    const stats = h("div", { class: "stats" });
+    body.append(
+      h("div", { class: "controls" }, sel ? h("label", {}, "锁 ", sel) : null, h("label", {}, "线程数 ", selThreads), h("label", {}, "每线程进出临界区次数 ", inLoops),
+        h("label", {}, "调度 ", selMode), h("label", {}, "时间片 ", inInt), h("label", {}, "种子 ", inSeed)),
+      h("div", { class: "controls" }, presetBtns, h("span", { class: "sep" }), mbtns, bUndo, bClear),
+      stepHost, h("div", { class: "stage" }, shared, grid, acqLine), narr, stats);
+    const cfg = () => ({ lock: opts.fixed || sel.value, threads: Number(selThreads.value), loops: Math.max(1, Math.min(4, Number(inLoops.value) || 1)),
+      mode: selMode.value, interval: Math.max(1, Number(inInt.value) || 1), seed: Number(inSeed.value) || 0, manual });
+    function recompute(toEnd) { res = LOCKS.simulate(cfg()); buttons(); if (toEnd) step.go(res.rows.length - 1); else step.reset(); }
+    function buttons() {
+      const c = cfg(); mbtns.replaceChildren();
+      const man = c.mode === "manual";
+      bUndo.disabled = !man || !manual.length; bClear.disabled = !man;
+      if (!man) { mbtns.append(h("span", { class: "muted small" }, "（手动模式下这里出现线程按钮） ")); return; }
+      const last = res.rows[res.rows.length - 1];
+      for (let k = 0; k < res.n; k++) mbtns.append(h("button", { style: { borderColor: tcol(k), fontWeight: 600 }, disabled: last.th[k].done, onclick: () => { manual = manual.concat([k]); recompute(true); } }, `▶ T${k + 1} 执行一行`), " ");
+    }
+    const step = OSTEP.stepper(stepHost, {
+      steps: () => res.rows.length, autoplayMs: 900,
+      render(i) {
+        const row = res.rows[i], prev = res.rows[Math.max(0, i - 1)], D = res.def;
+        shared.replaceChildren(...D.shared.map((k) => h("div", { class: "box" + (i > 0 && prev.S[k] !== row.S[k] ? " chg" : "") }, h("span", { class: "k" }, k.replace(/flag(\d)/, "flag[$1]")), h("span", { class: "v" }, row.S[k]))),
+          h("div", { class: "box" }, h("span", { class: "k" }, "counter"), h("span", { class: "v" }, row.S.counter)));
+        grid.replaceChildren(...row.th.map((th, k) => {
+          const inCS = !th.done && th.pc >= res.csIdx;
+          const viol = row.viol && row.inCS.includes(k);
+          const lines = res.lines.map((ln, j) => h("span", { class: "ln" + (ln.cs ? " cs" : "") + (row.kind === "step" && row.tid === k && row.at === j ? " done" : !th.done && th.pc === j ? " next" : "") }, h("span", { class: "no" }, j + 1), ln.code));
+          const state = th.done ? h("span", { class: "st" }, "已完成") : inCS ? h("span", { class: "st cs" }, "持有锁 / 临界区") : (row.kind === "step" && row.tid === k && row.spin) ? h("span", { class: "st spin" }, "自旋中") : h("span", { class: "st" }, "尝试获取锁");
+          return h("div", { class: "tcard" + (row.cur === k ? " cur" : "") + (viol ? " viol" : inCS ? " incs" : "") },
+            h("div", { class: "th" }, h("span", {}, h("span", { class: "dot", style: { background: tcol(k) } }), `线程 T${k + 1}`), state),
+            h("div", { class: "codebox" }, lines),
+            h("div", { class: "regs" },
+              h("span", { class: "reg" }, h("small", {}, "已进出"), `${th.iter}/${cfg().loops}`),
+              h("span", { class: "reg" }, h("small", {}, "自旋"), th.spins),
+              D === LOCKS.DEFS.ticket ? h("span", { class: "reg" }, h("small", {}, "myturn"), th.myturn ?? "—") : null,
+              D === LOCKS.DEFS.llsc ? h("span", { class: "reg" }, h("small", {}, "LL 链接"), th.ll >= 0 ? (th.ll === row.S.ver ? "有效" : "已失效") : "—") : null));
+        }));
+        const order = [];
+        for (let j = 1; j <= i; j++) if (res.rows[j].acquired) order.push(res.rows[j].tid);
+        acqLine.replaceChildren(h("span", { class: "muted", style: { color: "var(--muted)", padding: 0 } }, "获得锁的顺序："), ...order.map((k) => h("span", { style: { background: tcol(k) } }, `T${k + 1}`)));
+        let msg = row.msg;
+        if (i === res.rows.length - 1) {
+          if (res.finished) msg += res.violation ? ` <br><strong>结束：</strong>互斥在第 ${res.violation.row} 步被破坏。` : ` <br><strong>结束：</strong>全程没有两个线程同时在临界区，counter = ${row.S.counter}。`;
+          else if (cfg().mode === "manual") msg += " <br><strong>轮到你：</strong>点 ▶ 按钮选择下一行由哪个线程执行。";
+        }
+        narr.innerHTML = msg;
+        const S2 = (v, l, bad) => h("div", { class: "stat", style: { background: bad ? "var(--bad-soft)" : "" } }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+        stats.replaceChildren(
+          S2(res.violation && res.violation.row <= i ? "破坏！" : "保持", "互斥", res.violation && res.violation.row <= i),
+          ...row.th.map((th, k) => S2(`${th.acq} / ${th.spins}`, `T${k + 1} 获得锁 / 自旋次数`)),
+          S2(res.switches, "线程切换次数"));
+      },
+    });
+    [sel, selThreads, inLoops, selMode, inInt, inSeed].forEach((el) => el && el.addEventListener("change", () => recompute(selMode.value === "manual")));
+    bUndo.onclick = () => { manual = manual.slice(0, -1); recompute(true); };
+    bClear.onclick = () => { manual = []; recompute(true); };
+    res = LOCKS.simulate(cfg());
+    buttons();
+  }
+  mountLockSim(document.querySelector("#sim-flag .sim-body"), { fixed: "flag", preset: LOCKS.PRESETS.fig282 });
+  mountLockSim(document.querySelector("#sim-locks .sim-body"), { preset: [] });
+  // 模拟器 2 默认进入"恶意调度"演示
+  (function () { const b = document.querySelector("#sim-locks .controls button.primary"); if (b) b.click(); })();
+
+  // ---------- 模拟器 3a ----------
+  (function () {
+    let R = WAKE.rows(false);
+    const step = OSTEP.stepper($("wk-step"), {
+      steps: () => R.length, autoplayMs: 1100,
+      render(i) {
+        const r = R[i];
+        $("wk-shared").replaceChildren(...[["flag", r.S.flag], ["guard", r.S.guard], ["等待队列", r.S.queue], ["T2 状态", r.S.T2], ["setpark 标记", r.S.pending]].map(([k, v]) =>
+          h("div", { class: "box" + (i > 0 && String(R[i - 1].S[{ flag: "flag", guard: "guard", "等待队列": "queue", "T2 状态": "T2", "setpark 标记": "pending" }[k]]) !== String(v) ? " chg" : "") }, h("span", { class: "k" }, k), h("span", { class: "v", style: { fontSize: "15px" } }, v))));
+        $("wk-rows").replaceChildren(...R.map((x, j) => h("div", { class: (j === i ? "cur " : j > i ? "fut " : "") + (x.bad && j <= i ? "bad" : "") },
+          h("span", { style: { color: x.who === "OS" ? "var(--muted)" : x.who === "T1" ? "var(--c1)" : "var(--c2)", fontWeight: 700, display: "inline-block", width: "2.6em" } }, x.who), x.code)));
+        $("wk-narr").innerHTML = r.msg;
+      },
+    });
+    $("wk-setpark").onchange = () => { R = WAKE.rows($("wk-setpark").checked); step.reset(); };
+  })();
+
+  // ---------- 模拟器 3b ----------
+  (function () {
+    const ids = ["wt-kind", "wt-n", "wt-q", "wt-c", "wt-w", "wt-s", "wt-h"];
+    let res, cfgNow;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, Number(v) || lo));
+    const cfg = () => ({ kind: $("wt-kind").value, n: clamp($("wt-n").value, 2, 8), q: clamp($("wt-q").value, 2, 30), c: clamp($("wt-c").value, 1, 20), w: clamp($("wt-w").value, 0, 40), s: clamp($("wt-s").value, 0, 5), h: clamp($("wt-h").value, 40, 400) });
+    const NAMES = { spin: "自旋（TAS）", yield: "TAS + yield", park: "队列 + park/unpark" };
+    function draw(tMax) {
+      const { lanes, osLane, h: H } = res, n = lanes.length;
+      const px = Math.max(3, Math.min(8, 760 / H)), rowH = 20, left = 44;
+      const W = left + H * px + 10, Ht = (n + 1) * (rowH + 6) + 30;
+      const svg = s("svg", { viewBox: `0 0 ${W} ${Ht}`, width: W, height: Ht, role: "img", "aria-label": "CPU 时间线" });
+      const y = (k) => 6 + k * (rowH + 6);
+      for (let k = 0; k < n; k++) {
+        svg.append(s("text", { x: 4, y: y(k) + 14, "font-size": 12, style: `fill:${tcol(k)};font-weight:700`, text: `T${k + 1}` }));
+        svg.append(s("rect", { x: left, y: y(k), width: H * px, height: rowH, style: "fill:var(--surface-2);stroke:var(--border)" }));
+        for (const u of lanes[k]) {
+          if (u.t >= tMax) continue;
+          const st = u.type === "spin" ? "fill:var(--bad)" : u.type === "work" ? `fill:${tcol(k)};opacity:.4` : `fill:${tcol(k)}`;
+          svg.append(s("rect", { x: left + u.t * px, y: y(k) + (u.type === "lk" ? 4 : 0), width: px, height: u.type === "lk" ? rowH - 8 : rowH, style: st }));
+        }
+      }
+      svg.append(s("text", { x: 4, y: y(n) + 14, "font-size": 12, class: "t-muted", text: "切换" }));
+      svg.append(s("rect", { x: left, y: y(n), width: H * px, height: rowH, style: "fill:var(--surface-2);stroke:var(--border)" }));
+      for (const u of osLane) if (u.t < tMax) svg.append(s("rect", { x: left + u.t * px, y: y(n), width: px, height: rowH, style: "fill:var(--warn)" }));
+      const step = H <= 100 ? 10 : H <= 200 ? 20 : 50;
+      for (let t = 0; t <= H; t += step) {
+        svg.append(s("line", { x1: left + t * px, x2: left + t * px, y1: y(n) + rowH + 2, y2: y(n) + rowH + 7, class: "stroke", "stroke-width": 1 }));
+        svg.append(s("text", { x: left + t * px, y: y(n) + rowH + 20, "text-anchor": "middle", "font-size": 11, class: "t-muted mono", text: t }));
+      }
+      if (tMax < H) svg.append(s("line", { x1: left + tMax * px, x2: left + tMax * px, y1: 0, y2: y(n) + rowH, style: "stroke:var(--accent);stroke-width:2" }));
+      $("wt-stage").replaceChildren(svg);
+    }
+    function compare() {
+      const c = cfg();
+      const rowsT = ["spin", "yield", "park"].map((k) => { const r = WAIT.simulate({ ...c, kind: k }); return [k, r]; });
+      $("wt-cmp").replaceChildren(
+        h("thead", {}, h("tr", {}, h("th", {}, `同参数对比（N=${c.n}, Q=${c.q}, C=${c.c}, W=${c.w}）`), h("th", { class: "num" }, "有用工作"), h("th", { class: "num" }, "自旋/失败尝试"), h("th", { class: "num" }, "切换开销"), h("th", { class: "num" }, "浪费占比"), h("th", {}, "各线程获得锁次数"))),
+        h("tbody", {}, rowsT.map(([k, r]) => h("tr", { style: { fontWeight: k === c.kind ? 700 : 400 } }, h("td", {}, NAMES[k]), h("td", { class: "num" }, r.stat.useful), h("td", { class: "num" }, r.stat.spin), h("td", { class: "num" }, r.stat.sw),
+          h("td", { class: "num" }, Math.round(100 * (r.stat.spin + r.stat.sw) / r.h) + "%"), h("td", {}, r.acq.map((a, j) => `T${j + 1}:${a}`).join("  "))))));
+    }
+    function recompute() { cfgNow = cfg(); res = WAIT.simulate(cfgNow); compare(); step.reset(); }
+    const step = OSTEP.stepper($("wt-step"), {
+      steps: () => res.events.length + 1, autoplayMs: 900,
+      render(i) {
+        const last = i >= res.events.length;
+        const tMax = last ? res.h : Math.max(1, i + 1 < res.events.length ? res.events[i + 1].t : res.h);
+        draw(tMax);
+        $("wt-narr").innerHTML = last
+          ? `<strong>${NAMES[cfgNow.kind]}</strong>：${res.h} 个时间单位里，有用工作 ${res.stat.useful}，自旋/失败尝试浪费 ${res.stat.spin}，上下文切换 ${res.stat.sw}。` + (cfgNow.kind === "spin" ? " 每次持锁者被抢占，其余线程各自旋一整个时间片。" : cfgNow.kind === "yield" ? " 失败的线程只浪费一次尝试和一次切换，但线程多时切换也不便宜，而且谁拿到锁仍然靠运气。" : " 等待者睡在队列里，不被调度；锁按队列顺序直接交接，获得锁的次数最均匀。代价是每次交接都要切换到被唤醒的线程。")
+          : `t=${res.events[i].t}：${res.events[i].msg}`;
+        const S2 = (v, l, bad) => h("div", { class: "stat", style: { background: bad ? "var(--bad-soft)" : "" } }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+        const r = res.stat;
+        $("wt-stats").replaceChildren(S2(r.useful, "有用工作（单位）"), S2(r.spin, "自旋/失败尝试", r.spin > r.useful / 2), S2(r.sw, "切换开销"),
+          S2(Math.round(100 * (r.spin + r.sw) / res.h) + "%", "CPU 浪费占比"), S2(res.acq.join(" / "), "各线程获得锁次数"));
+      },
+    });
+    ids.forEach((id) => $(id).addEventListener("change", recompute));
+    cfgNow = cfg(); res = WAIT.simulate(cfgNow); compare();
+  })();
+})();
+</script>
+</body></html>

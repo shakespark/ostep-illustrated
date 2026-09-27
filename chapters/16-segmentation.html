@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 16 章 · 分段</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+  .segtab { font: 13px var(--mono); }
+  .segtab td, .segtab th { padding: 4px 8px; white-space: nowrap; }
+  .segtab input[type="text"], .segtab input[type="number"] { width: 5.5em; padding: 3px 6px; }
+  .segtab tr.cur td { background: var(--warn-soft); }
+  .trace { font: 13px var(--mono); }
+  .trace td, .trace th { padding: 4px 10px; white-space: nowrap; }
+  .trace tr.cur td { background: var(--warn-soft); }
+  .trace td.ok { color: var(--ok); } .trace td.bad { color: var(--bad); } .trace td.q { color: var(--faint); }
+  .modebox[hidden] { display: none; }
+  .bits { font-family: var(--mono); }
+</style>
+</head>
+<body data-chapter="16">
+<main>
+
+<h2><span class="num">1</span>一句话 + 关键问题</h2>
+<div class="crux">
+  <p><strong>怎样支持大地址空间？</strong>栈和堆之间可能有大量空闲空间，怎样才能支持这样的大地址空间？在我们的"玩具"例子里浪费看起来不严重；但想象一个 32 位（4GB）的地址空间：典型程序只用几 MB，却要求整个地址空间都驻留在内存里。</p>
+  <p class="small muted">原文：How do we support a large address space with (potentially) a lot of free space between the stack and the heap?</p>
+</div>
+<p>第 15 章的基址/界限把<strong>整个</strong>地址空间连续放进物理内存，堆和栈之间没用的空间也白白占着物理内存；地址空间比物理内存大时甚至根本跑不起来。本章的办法很自然：<strong>不要只给一对 base/bounds，给每个逻辑段一对</strong>——这就是<strong>分段（segmentation）</strong>，一个至少可以追溯到 20 世纪 60 年代初的想法。</p>
+<p>分段解决了稀疏地址空间的浪费，还顺带支持代码共享；但它引入了新问题<strong>外部碎片（external fragmentation）</strong>，这把我们引向第 17 章的空闲空间管理和第 18 章的分页。</p>
+
+<h2><span class="num">2</span>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>段（segment）</h4><p>地址空间中一段连续的部分，有特定长度。经典的三段：代码、堆、栈。</p></div>
+  <div class="card"><h4>每段一对 base/bounds</h4><p>MMU 里放三对寄存器，每段可以独立放到物理内存的任意位置，只为真正使用的部分分配物理内存。</p></div>
+  <div class="card"><h4>显式方式（explicit）</h4><p>用虚拟地址的最高几位选择段、其余位做段内偏移。VAX/VMS 用过；本章例子用 14 位地址的高 2 位。</p></div>
+  <div class="card"><h4>隐式方式（implicit）</h4><p>根据地址怎么产生来判断：来自 PC → 代码段；基于栈指针/基址指针 → 栈段；其他 → 堆。</p></div>
+  <div class="card"><h4>反向增长（negative growth）</h4><p>栈向低地址增长。硬件多存一位"是否正向增长"，反向段用负偏移计算物理地址。</p></div>
+  <div class="card"><h4>保护位（protection bits）</h4><p>每段加读/写/执行位。代码段设为只读+执行，就能在多个进程间安全共享。</p></div>
+  <div class="card"><h4>粗粒度 vs. 细粒度</h4><p>少量大段（代码/堆/栈）是粗粒度；Multics、Burroughs B5000 支持成千上万个小段，需要内存中的段表。</p></div>
+  <div class="card"><h4>外部碎片 &amp; 紧凑</h4><p>变长的段把物理内存切成许多小洞，总空闲够却找不到连续空间。紧凑（compaction）可以缓解，但代价高。</p></div>
+</div>
+
+<h2><span class="num">3</span>图解：把地址空间切成几段</h2>
+
+<h3>3.1 为什么要分段</h3>
+<p>回顾这个 16KB 的地址空间：代码在 0–2KB，堆在 4KB–7KB，栈在 14KB–16KB，中间 7KB–14KB 全是空闲。用一对 base/bounds 就要为整个 16KB 分配物理内存。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 330" width="640" role="img" aria-label="地址空间与段在物理内存中的放置">
+  <defs><marker id="m16a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="110" y="16" text-anchor="middle" font-size="13" style="font-weight:600">图 16.1 地址空间（16KB）</text>
+  <g font-size="10" class="t-muted mono" text-anchor="end">
+    <text x="48" y="32">0KB</text><text x="48" y="68">2KB</text><text x="48" y="104">4KB</text><text x="48" y="158">7KB</text><text x="48" y="284">14KB</text><text x="48" y="320">16KB</text>
+  </g>
+  <rect x="54" y="28" width="120" height="36" rx="2" style="fill:var(--c4)"/><text x="114" y="50" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">Program Code</text>
+  <rect x="54" y="64" width="120" height="36" rx="2" class="box" style="stroke-dasharray:3 3"/>
+  <rect x="54" y="100" width="120" height="54" rx="2" style="fill:var(--c3)"/><text x="114" y="131" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">Heap</text>
+  <rect x="54" y="154" width="120" height="126" rx="2" class="box" style="stroke-dasharray:3 3"/><text x="114" y="221" text-anchor="middle" font-size="11.5" class="t-muted">(free)</text>
+  <rect x="54" y="280" width="120" height="36" rx="2" style="fill:var(--c2)"/><text x="114" y="302" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">Stack</text>
+  <text x="470" y="16" text-anchor="middle" font-size="13" style="font-weight:600">图 16.2 各段独立放进 64KB 物理内存</text>
+  <g font-size="10" class="t-muted mono" text-anchor="end">
+    <text x="394" y="32">0KB</text><text x="394" y="100">16KB</text><text x="394" y="143">26KB</text><text x="394" y="168">32KB</text><text x="394" y="236">48KB</text><text x="394" y="304">64KB</text>
+  </g>
+  <rect x="400" y="28" width="130" height="68" rx="2" style="fill:var(--c8)"/><text x="465" y="66" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">Operating System</text>
+  <rect x="400" y="96" width="130" height="42.5" rx="2" class="box"/><text x="465" y="121" text-anchor="middle" font-size="11" class="t-muted">(not in use)</text>
+  <rect x="400" y="138.5" width="130" height="8.5" style="fill:var(--c2)"/>
+  <rect x="400" y="147" width="130" height="17" class="box"/>
+  <rect x="400" y="164" width="130" height="8.5" style="fill:var(--c4)"/>
+  <rect x="400" y="172.5" width="130" height="12.75" style="fill:var(--c3)"/>
+  <rect x="400" y="185.25" width="130" height="114.75" rx="2" class="box"/><text x="465" y="246" text-anchor="middle" font-size="11" class="t-muted">(not in use)</text>
+  <text x="538" y="146" font-size="11">Stack 26–28KB</text>
+  <text x="538" y="172" font-size="11">Code 32–34KB</text>
+  <text x="538" y="186" font-size="11">Heap 34–37KB</text>
+  <path d="M176 46 C 290 46, 300 168, 396 168" class="arrow" marker-end="url(#m16a)"/>
+  <path d="M176 127 C 290 127, 300 178, 396 178" class="arrow" marker-end="url(#m16a)"/>
+  <path d="M176 298 C 290 298, 300 143, 396 143" class="arrow" marker-end="url(#m16a)"/>
+</svg>
+<figcaption>只有真正使用的部分占用物理内存；这样就能容纳有大量未用空间的<strong>稀疏地址空间（sparse address space）</strong></figcaption>
+</figure>
+<p>MMU 需要的硬件结构正如你所料：三对 base/bounds 寄存器。每个 bounds 存的是段的<strong>大小</strong>（和之前的 bounds 完全一样）：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>段</th><th class="num">基址（Base）</th><th class="num">大小（Size）</th></tr></thead>
+<tbody><tr><td>Code</td><td class="num">32K</td><td class="num">2K</td></tr><tr><td>Heap</td><td class="num">34K</td><td class="num">3K</td></tr><tr><td>Stack</td><td class="num">28K</td><td class="num">2K</td></tr></tbody></table></div>
+<p class="small muted" style="text-align:center">图 16.3 段寄存器的值</p>
+
+<h3>3.2 两个转换例子：先求段内偏移</h3>
+<p><strong>虚拟地址 100</strong> 在代码段。硬件把段内偏移（这里就是 100）加上代码段基址：100 + 32KB = <strong>32868</strong>；检查 100 &lt; 2KB，合法，访问物理地址 32868。</p>
+<p><strong>虚拟地址 4200</strong> 在堆里。如果直接加堆的基址 34KB，得到 39016——<strong>错了</strong>。必须先求出<strong>堆内偏移</strong>：堆从虚拟地址 4KB（4096）开始，偏移 = 4200 − 4096 = <strong>104</strong>，再加基址：104 + 34KB（34816）= <strong>34920</strong>。</p>
+<p>访问 7KB 或更大的地址（超过堆的末尾）呢？硬件发现越界，陷入 OS，进程很可能被终止。这就是所有 C 程序员都害怕的术语<strong>段错误（segmentation violation / segmentation fault）</strong>的由来。</p>
+<div class="aside" data-title="ASIDE · 段错误（The Segmentation Fault）">
+  <p>"segmentation fault / violation"一词源于在分段机器上访问非法地址。有趣的是，即使在完全不支持分段的机器上，这个词也沿用至今。如果你搞不清代码为什么总是段错误，那就不那么有趣了。</p>
+</div>
+
+<h3>3.3 硬件怎么知道是哪个段？显式方式：看最高几位</h3>
+<p>一种常见的<strong>显式（explicit）</strong>做法：用虚拟地址的最高几位选段（VAX/VMS 这样做）。例子里有三段，需要 2 位。14 位虚拟地址的高 2 位是段号，低 12 位是段内偏移：00 → 代码段，01 → 堆。以 4200 为例：</p>
+<figure class="fig">
+<svg viewBox="0 0 620 130" width="620" role="img" aria-label="虚拟地址 4200 的二进制表示">
+  <g id="b16"></g>
+  <text x="310" y="122" text-anchor="middle" font-size="12">段号 01 → 堆；偏移 0000 0110 1000 = 0x068 = 104；物理地址 = 34K + 104 = 34920</text>
+</svg>
+<figcaption>14 位虚拟地址 4200 = <span class="bits">01 0000 0110 1000</span>：高 2 位（段）＋ 低 12 位（偏移）</figcaption>
+</figure>
+<p>用偏移做界限检查也更方便：只要检查偏移是否小于 bounds。如果 base 和 bounds 是以段号为下标的数组，硬件做的事相当于：</p>
+<pre><code>1 // get top 2 bits of 14-bit VA
+2 Segment = (VirtualAddress &amp; SEG_MASK) &gt;&gt; SEG_SHIFT
+3 // now get offset
+4 Offset  = VirtualAddress &amp; OFFSET_MASK
+5 if (Offset &gt;= Bounds[Segment])
+6     RaiseException(PROTECTION_FAULT)
+7 else
+8     PhysAddr = Base[Segment] + Offset
+9     Register = AccessMemory(PhysAddr)</code></pre>
+<p>在我们的例子里 <code>SEG_MASK = 0x3000</code>、<code>SEG_SHIFT = 12</code>、<code>OFFSET_MASK = 0xFFF</code>。第 2 行取高 2 位并右移成 0–3 的段号；第 4 行取低 12 位；第 5 行只需比较偏移和该段的大小；第 8 行才加基址。</p>
+<p>两点代价：(1) 只有三个段却用了 2 位，有一个段号（10）<strong>空着没用</strong>——有些系统把代码和堆放进同一个段，只用 1 位选段；(2) 每个段的<strong>最大尺寸被限制</strong>为 16KB ÷ 4 = 4KB，程序想让堆或栈长得更大就没办法了。</p>
+<p>另一种<strong>隐式（implicit）</strong>做法：硬件看地址是怎么产生的——来自程序计数器（取指）就是代码段；基于栈指针或基址指针的就是栈段；其他都是堆。</p>
+
+<h3>3.4 栈怎么办？反向增长与负偏移</h3>
+<p>栈被放在物理地址 28KB，但它<strong>向低地址增长</strong>：在物理内存中它从 28KB "开始"，长到 26KB，对应虚拟地址 16KB 到 14KB。硬件需要多知道一位：该段是否<strong>正向增长</strong>（1 = 正向，0 = 反向）：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>段</th><th class="num">基址</th><th class="num">大小（最大 4K）</th><th>正向增长？</th><th>保护</th></tr></thead>
+<tbody>
+<tr><td>Code<sub>00</sub></td><td class="num">32K</td><td class="num">2K</td><td>1</td><td>Read-Execute</td></tr>
+<tr><td>Heap<sub>01</sub></td><td class="num">34K</td><td class="num">3K</td><td>1</td><td>Read-Write</td></tr>
+<tr><td>Stack<sub>11</sub></td><td class="num">28K</td><td class="num">2K</td><td>0</td><td>Read-Write</td></tr>
+</tbody></table></div>
+<p class="small muted" style="text-align:center">图 16.4 / 16.5 带反向增长位和保护位的段寄存器</p>
+<p>例子：访问虚拟地址 <strong>15KB</strong>，应该映射到物理地址 <strong>27KB</strong>。二进制是 <span class="bits">11 1100 0000 0000</span>（0x3C00）：高 2 位 11 → 栈段；剩下的偏移是 3KB。要得到正确的<strong>负偏移</strong>，用它减去<strong>段的最大尺寸</strong>：3KB − 4KB = <strong>−1KB</strong>；把负偏移加到基址上：28KB + (−1KB) = <strong>27KB</strong>。界限检查：负偏移的绝对值必须 <strong>≤</strong> 段的当前大小（1KB ≤ 2KB，合法）。</p>
+<figure class="fig">
+<svg viewBox="0 0 660 230" width="660" role="img" aria-label="栈段的负偏移计算">
+  <defs><marker id="m16b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker></defs>
+  <text x="150" y="18" text-anchor="middle" font-size="12.5" style="font-weight:600">虚拟：栈段占用 12KB–16KB 的最后 2KB</text>
+  <rect x="20" y="30" width="260" height="40" class="box"/>
+  <rect x="150" y="30" width="130" height="40" style="fill:var(--c2)"/>
+  <text x="215" y="55" text-anchor="middle" font-size="11.5" style="fill:#fff">栈（14KB–16KB）</text>
+  <g font-size="10" class="t-muted mono"><text x="20" y="84">12KB</text><text x="150" y="84" text-anchor="middle">14KB</text><text x="280" y="84" text-anchor="end">16KB</text></g>
+  <line x1="215" y1="24" x2="215" y2="76" style="stroke:var(--warn);stroke-width:3"/>
+  <text x="215" y="98" text-anchor="middle" font-size="11" class="mono">VA 15KB：偏移 3KB</text>
+  <text x="150" y="126" text-anchor="middle" font-size="12">负偏移 = 偏移 − 最大段大小 = 3KB − 4KB = −1KB</text>
+  <text x="510" y="18" text-anchor="middle" font-size="12.5" style="font-weight:600">物理：基址 28KB 指向栈的"顶端"</text>
+  <rect x="380" y="30" width="260" height="40" class="box"/>
+  <rect x="445" y="30" width="130" height="40" style="fill:var(--c2)"/>
+  <text x="510" y="55" text-anchor="middle" font-size="11.5" style="fill:#fff">栈（26KB–28KB）</text>
+  <g font-size="10" class="t-muted mono"><text x="445" y="84" text-anchor="middle">26KB</text><text x="575" y="84" text-anchor="middle">28KB = base</text></g>
+  <line x1="510" y1="24" x2="510" y2="76" style="stroke:var(--warn);stroke-width:3"/>
+  <text x="510" y="98" text-anchor="middle" font-size="11" class="mono">PA = 28KB + (−1KB) = 27KB</text>
+  <path d="M575 110 C 560 130, 525 130, 512 104" style="fill:none;stroke:var(--accent);stroke-width:1.5" marker-end="url(#m16b)"/>
+  <text x="330" y="168" text-anchor="middle" font-size="12">界限检查：|−1KB| = 1KB ≤ 当前大小 2KB ✓</text>
+  <text x="330" y="190" text-anchor="middle" font-size="12">合法范围：VA 14KB（负偏移 −2KB → PA 26KB）到 16KB−1（负偏移 −1 → PA 28KB−1）</text>
+  <text x="330" y="212" text-anchor="middle" font-size="11.5" class="t-muted">"栈从 28KB 开始"其实指的是反向区域之上的那个字节，第一个有效字节是 28KB−1——这样 PA 就是简单的 base + 负偏移</text>
+</svg>
+<figcaption>反向增长段：负偏移 = 段内偏移 − 最大段大小；物理地址 = base + 负偏移；合法条件：|负偏移| ≤ size</figcaption>
+</figure>
+
+<h3>3.5 共享与保护位</h3>
+<p>为了节省内存，有时在地址空间之间<strong>共享</strong>某些段很有用，尤其是<strong>代码共享</strong>，今天的系统仍在使用。为此硬件要给每个段加几个<strong>保护位（protection bits）</strong>：能否读、能否写、能否执行。把代码段设为只读（读+执行），同一份代码就能被多个进程共享而不破坏隔离：每个进程仍以为自己在访问私有内存，OS 却在暗中共享不能被修改的内存。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 210" width="640" role="img" aria-label="两个进程共享只读代码段">
+  <defs><marker id="m16c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="90" y="18" text-anchor="middle" font-size="12.5" style="font-weight:600">进程 1</text>
+  <rect x="30" y="28" width="120" height="30" rx="3" style="fill:var(--c4)"/><text x="90" y="48" text-anchor="middle" font-size="11.5" style="fill:#fff">代码 R-X</text>
+  <rect x="30" y="62" width="120" height="30" rx="3" style="fill:var(--c3)"/><text x="90" y="82" text-anchor="middle" font-size="11.5" style="fill:#fff">堆 RW-</text>
+  <rect x="30" y="96" width="120" height="30" rx="3" style="fill:var(--c2)"/><text x="90" y="116" text-anchor="middle" font-size="11.5" style="fill:#fff">栈 RW-</text>
+  <text x="550" y="18" text-anchor="middle" font-size="12.5" style="font-weight:600">进程 2</text>
+  <rect x="490" y="28" width="120" height="30" rx="3" style="fill:var(--c4)"/><text x="550" y="48" text-anchor="middle" font-size="11.5" style="fill:#fff">代码 R-X</text>
+  <rect x="490" y="62" width="120" height="30" rx="3" style="fill:var(--c3);opacity:.75"/><text x="550" y="82" text-anchor="middle" font-size="11.5" style="fill:#fff">堆 RW-</text>
+  <rect x="490" y="96" width="120" height="30" rx="3" style="fill:var(--c2);opacity:.75"/><text x="550" y="116" text-anchor="middle" font-size="11.5" style="fill:#fff">栈 RW-</text>
+  <text x="320" y="18" text-anchor="middle" font-size="12.5" style="font-weight:600">物理内存</text>
+  <rect x="250" y="28" width="140" height="150" rx="4" class="box"/>
+  <rect x="260" y="40" width="120" height="30" rx="3" style="fill:var(--c4)"/><text x="320" y="60" text-anchor="middle" font-size="11.5" style="fill:#fff">唯一一份代码</text>
+  <rect x="260" y="80" width="56" height="24" rx="3" style="fill:var(--c3)"/><rect x="324" y="80" width="56" height="24" rx="3" style="fill:var(--c3);opacity:.75"/>
+  <rect x="260" y="112" width="56" height="24" rx="3" style="fill:var(--c2)"/><rect x="324" y="112" width="56" height="24" rx="3" style="fill:var(--c2);opacity:.75"/>
+  <text x="320" y="160" text-anchor="middle" font-size="10.5" class="t-muted">堆、栈各自私有</text>
+  <path d="M152 43 L256 55" class="arrow" marker-end="url(#m16c)"/>
+  <path d="M488 43 L384 55" class="arrow" marker-end="url(#m16c)"/>
+  <text x="320" y="200" text-anchor="middle" font-size="12">写只读段、执行不可执行段 → 硬件引发异常，交给 OS 处理</text>
+</svg>
+<figcaption>保护位让代码段可以安全共享：同一个物理段被映射进多个虚拟地址空间</figcaption>
+</figure>
+<p>有了保护位，硬件算法除了检查界限，还要检查这次访问<strong>是否被允许</strong>。用户进程试图写只读段、或执行不可执行的段，硬件都应引发异常。</p>
+
+<h3>3.6 细粒度与粗粒度分段</h3>
+<p>只有代码、栈、堆寥寥几段属于<strong>粗粒度（coarse-grained）</strong>分段。一些早期系统（如 Multics）更灵活，允许一个地址空间由大量小段组成，这叫<strong>细粒度（fine-grained）</strong>分段，需要在内存中存放某种<strong>段表（segment table）</strong>。Burroughs B5000 支持数千个段，期望编译器把代码和数据切成独立的段。当时的想法是：有了细粒度的段，OS 能更好地了解哪些段在用、哪些没用，从而更有效地利用内存。</p>
+
+<h3>3.7 OS 要操心的事：切换、增长、空闲空间</h3>
+<ol>
+  <li><strong>上下文切换</strong>：段寄存器必须保存和恢复，每个进程有自己的虚拟地址空间。</li>
+  <li><strong>段的增长（或收缩）</strong>：<code>malloc()</code> 在现有堆里找不到空间时，内存分配库会调用系统调用（传统 UNIX 的 <code>sbrk()</code>）来扩大堆。OS 通常会提供更多空间并更新段大小寄存器；但如果物理内存不够，或它认为进程已经拿得太多了，也可以拒绝。</li>
+  <li><strong>管理物理内存中的空闲空间</strong>（最重要）：以前每个地址空间一样大，物理内存可以看成一组槽；现在每个进程有好几个段，每段大小不同。物理内存很快会布满小洞，难以分配新段或让现有段增长。这就是<strong>外部碎片（external fragmentation）</strong>。</li>
+</ol>
+<figure class="fig">
+<svg viewBox="0 0 560 310" width="560" role="img" aria-label="未紧凑与紧凑后的内存">
+  <text x="130" y="16" text-anchor="middle" font-size="13" style="font-weight:600">Not Compacted</text>
+  <text x="430" y="16" text-anchor="middle" font-size="13" style="font-weight:600">Compacted</text>
+  <g id="f166"></g>
+</svg>
+<figcaption>图 16.6 未紧凑与紧凑后的物理内存：左边有 24KB 空闲，却分成三个 8KB 的洞，20KB 的请求无法满足；紧凑后得到一整块 24KB</figcaption>
+</figure>
+<p>解决办法之一是<strong>紧凑（compact）</strong>物理内存：OS 停下正在运行的进程，把它们的数据拷贝到一块连续区域，修改段寄存器指向新位置，于是得到一大块空闲内存。但紧凑<strong>代价很高</strong>：拷贝段是内存密集操作，占用相当多的处理器时间；而且（讽刺的是）紧凑后现有段想<strong>增长</strong>更难了，可能又要重新排列。</p>
+<p>更简单的办法是用空闲链表管理算法尽量保留大块空闲内存：最优适配（best-fit）、最差适配（worst-fit）、首次适配（first-fit），以及更复杂的伙伴算法（buddy algorithm）。可惜<strong>不管算法多聪明，外部碎片都依然存在</strong>，好的算法只是尽量减少它。</p>
+<div class="tip"><p><strong>如果有 1000 种解法，说明没有一种好解法。</strong>有这么多算法试图减少外部碎片，恰恰说明没有"最好"的办法。我们只能选一个合理的，希望它足够好。唯一真正的解决办法是从根本上避免这个问题：<strong>永远不要以变长的块来分配内存</strong>（第 18 章分页）。</p></div>
+
+<h2><span class="num">4</span>模拟器</h2>
+
+<section class="sim" id="sim-seg">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>分段地址转换（原书模型 / 仿 segmentation.py）</h3>
+    <div class="desc">"原书模型"：16KB 地址空间、高 2 位选段、代码/堆/栈三段（栈反向增长），可编辑每段的 base、size、方向、保护位。"segmentation.py 模型"：最高 1 位选段、段 0 正向、段 1 反向，随机数与 segmentation.py 完全一致。每个地址分 6 步：二进制 → 段号 → 偏移 → 负偏移处理 → 界限/保护检查 → 物理地址。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>模型 <select id="sg-model"><option value="book">原书模型（14 位，高 2 位选段）</option><option value="py">segmentation.py 模型（最高位选段）</option></select></label>
+    </div>
+    <div class="modebox" id="sg-bookbox">
+      <div class="table-wrap"><table class="segtab" id="sg-segtab"></table></div>
+      <div class="controls">
+        <label>虚拟地址 <input type="text" id="sg-vas" value="100, 4200, 7K, 15K, 14K, 0x37FF, 0x2000" style="width:22em"></label>
+        <label>访问类型 <select id="sg-acc"><option value="R">读（load）</option><option value="W">写（store）</option><option value="X">取指（execute）</option></select></label>
+        <button id="sg-run" class="primary">翻译</button>
+      </div>
+      <div class="controls">
+        <span class="muted">原书示例：</span>
+        <button data-vas="100">VA 100</button><button data-vas="4200">VA 4200</button><button data-vas="7K">7KB（越界）</button><button data-vas="15K">栈 15KB → 27KB</button><button data-vas="100" data-acc="W">写代码段（保护）</button>
+        <button id="sg-reset">恢复图 16.4 段表</button>
+      </div>
+    </div>
+    <div class="modebox" id="sg-pybox" hidden>
+      <div class="controls">
+        <label>-s <input type="number" id="py-seed" value="0" min="0"></label>
+        <label>-a <input type="text" id="py-asize" value="1k" style="width:4.5em"></label>
+        <label>-p <input type="text" id="py-psize" value="16k" style="width:4.5em"></label>
+        <label>-n <input type="number" id="py-num" value="5" min="1" max="40"></label>
+        <label>-b <input type="text" id="py-b0" value="-1" style="width:4.5em"></label>
+        <label>-l <input type="text" id="py-l0" value="-1" style="width:4.5em"></label>
+        <label>-B <input type="text" id="py-b1" value="-1" style="width:4.5em"></label>
+        <label>-L <input type="text" id="py-l1" value="-1" style="width:4.5em"></label>
+      </div>
+      <div class="controls">
+        <label>-A <input type="text" id="py-A" placeholder="留空则随机，例：0,1,2,…" style="width:16em"></label>
+        <button id="py-run" class="primary">生成</button>
+        <span class="muted">作业 1：</span><button data-hw="0">-s 0</button><button data-hw="1">-s 1</button><button data-hw="2">-s 2</button>
+        <button id="py-q2">作业 2：测边界</button>
+      </div>
+    </div>
+    <div id="sg-step"></div>
+    <div class="stage"><div id="sg-svg"></div></div>
+    <div class="narrate" id="sg-narrate"></div>
+    <div class="table-wrap"><table class="trace" id="sg-trace"></table></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="sg-s1">–</div><div class="l">段号 / 偏移</div></div>
+      <div class="stat"><div class="v" id="sg-s2">–</div><div class="l">物理地址</div></div>
+      <div class="stat"><div class="v" id="sg-s3">–</div><div class="l">合法 / 违规（全部地址）</div></div>
+      <div class="stat"><div class="v" id="sg-s4">–</div><div class="l">占用物理内存 vs. 基址/界限</div></div>
+    </div>
+  </div>
+</section>
+
+<section class="sim" id="sim-frag">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>外部碎片与紧凑</h3>
+    <div class="desc">64KB 物理内存，OS 占 0–16KB。按操作序列逐步分配/释放变长的段：<code>+8</code> 分配 8KB，<code>-2</code> 释放第 #2 个段，<code>C</code> 紧凑。观察总空闲量够、却因不连续而失败的请求，以及紧凑要拷贝多少数据。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>操作 <input type="text" id="fg-ops" value="+8 +8 +8 +8 +8 +8 -0 -2 -4 +20 C +20" style="width:22em"></label>
+      <label>放置策略 <select id="fg-pol"><option value="first">首次适配 first fit</option><option value="best">最优适配 best fit</option><option value="worst">最差适配 worst fit</option></select></label>
+      <button id="fg-run" class="primary">运行</button>
+    </div>
+    <div class="controls">
+      <button id="fg-p1">原书图 16.6 场景</button>
+      <button id="fg-p2">策略对比：best vs. worst</button>
+      <button id="fg-p3">随机负载</button>
+    </div>
+    <div id="fg-step"></div>
+    <div class="stage"><div id="fg-svg"></div></div>
+    <div class="narrate" id="fg-narrate"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="fg-s1">–</div><div class="l">空闲总量（KB）</div></div>
+      <div class="stat"><div class="v" id="fg-s2">–</div><div class="l">最大连续空洞（KB）</div></div>
+      <div class="stat"><div class="v" id="fg-s3">–</div><div class="l">空洞个数</div></div>
+      <div class="stat"><div class="v" id="fg-s4">–</div><div class="l">失败请求 / 紧凑累计拷贝</div></div>
+    </div>
+  </div>
+</section>
+
+<h2><span class="num">5</span>先预测，再验证</h2>
+<div class="exercise"><div class="q">原书模型下，先手算虚拟地址 <code>0x3800</code>（14KB）和 <code>0x37FF</code>（14KB − 1）的结果，再用模拟器验证。</div>
+<details class="reveal"><summary>看答案</summary><div>0x3800 = 11 1000 0000 0000：栈段，偏移 2048，负偏移 2048 − 4096 = −2048，|−2048| ≤ 2048 合法，PA = 28672 − 2048 = <strong>26624（26KB）</strong>。0x37FF = 11 0111 1111 1111：偏移 2047，负偏移 −2049，|−2049| &gt; 2048，<strong>越界</strong>。注意栈段的界限检查用的是 ≤，正向段用的是 &lt;。</div></details></div>
+<div class="exercise"><div class="q">原书模型，访问类型选"写"，翻译 VA 100。再选"取指"，翻译 VA 4200。分别会怎样？</div>
+<details class="reveal"><summary>看答案</summary><div>VA 100 在代码段，界限检查通过，但代码段是 Read-Execute，<strong>写</strong>违反保护位 → 保护异常。VA 4200 在堆，堆是 Read-Write，<strong>执行</strong>被禁止 → 保护异常（现代系统的"不可执行数据"NX 位就是这个思想）。</div></details></div>
+<div class="exercise"><div class="q">（原书作业 1）segmentation.py 模型，<code>-a 128 -p 512 -b 0 -l 20 -B 512 -L 20 -s 0</code>（点"作业 1：-s 0"）。先预测每个地址的结果。</div>
+<details class="reveal"><summary>看答案</summary><div>地址空间 128 字节，最高位选段：0–63 为段 0，64–127 为段 1。段 0 合法 VA：0–19 → PA 0–19；段 1（反向）合法 VA：108–127 → PA 492–511（PA = 512 + (VA − 128)）。-s 0 的 5 个地址：108 → <strong>VALID in SEG1: 492</strong>；97、65 → SEG1 违规；53、33 → SEG0 违规。-s 1：17 → 17、108 → 492 合法，97、32、63 违规。-s 2：122 → 506、121 → 505、7 → 7、10 → 10 合法，106 违规。</div></details></div>
+<div class="exercise"><div class="q">（原书作业 2）同样的参数下：段 0 中最高的合法虚拟地址是多少？段 1 中最低的合法虚拟地址？整个地址空间中最低和最高的非法地址？怎样用 -A 验证？</div>
+<details class="reveal"><summary>看答案</summary><div>段 0 最高合法 <strong>19</strong>；段 1 最低合法 <strong>108</strong>；最低非法 <strong>20</strong>，最高非法 <strong>107</strong>。用 <code>-A 19,20,107,108</code> 验证（点"作业 2：测边界"）：19、108 合法，20、107 违规。</div></details></div>
+<div class="exercise"><div class="q">（原书作业 3–5）16 字节地址空间、128 字节物理内存，想让 <code>-A 0,1,…,15</code> 的结果是"合法、合法、违规……违规、合法、合法"，base/bounds 怎么设？想让大约 90% 的随机地址合法呢？想让所有地址都不合法呢？</div>
+<details class="reveal"><summary>看答案</summary><div>作业 3：<code>-l 2 -L 2</code>，基址只要两段不重叠即可，比如 <code>-b 0 -B 16</code>（段 1 的 base 是顶端，占 14–15）。作业 4：关键是两个段长 l0、l1，合法比例 ≈ (l0 + l1) / asize，让两者都约为 0.9 × asize / 2 即可（每段最多 asize/2）。作业 5：<code>-l 0 -L 0</code>，所有地址都违规。</div></details></div>
+<div class="exercise"><div class="q">外部碎片模拟器，载入"原书图 16.6 场景"。请求 20KB 时总空闲多少？为什么失败？紧凑一共拷贝了多少 KB？</div>
+<details class="reveal"><summary>看答案</summary><div>总空闲 24KB，但分成三个 8KB 的洞，最大连续空洞只有 8KB，所以 20KB 失败。紧凑把段 #1、#3、#5 依次挪到 16、24、32KB，共拷贝 24KB，之后有一块 40–64KB 的 24KB 连续空间，20KB 请求成功。</div></details></div>
+
+<h2><span class="num">6</span>动手实验：分段转换的 C 实现 + 真实系统的保护位</h2>
+<div class="lab">
+  <p>实验目录 <code>labs/16-segmentation/</code>：</p>
+  <ul>
+    <li><code>segtrans.c</code>：把原书的 SEG_MASK / SEG_SHIFT / OFFSET_MASK 伪代码写成 C，加上栈的负偏移，跑原书例子；也可以 <code>./segtrans 0x3C00 4200</code> 自己传地址。</li>
+    <li><code>protect.c</code>：打印本进程 <code>/proc/self/maps</code> 中的各个区域及权限（r/w/x 就是保护位），然后尝试写字符串常量和代码，触发保护异常。</li>
+  </ul>
+<pre><code><span class="cmd">cd labs/16-segmentation &amp;&amp; make</span>
+<span class="cmd">./segtrans</span>
+<span class="cmd">./protect</span></code></pre>
+</div>
+<p><code>segtrans</code> 输出（确定性的，和原书一致）：</p>
+<pre><code>VA   100 = 0x0064  seg=00(Code    ) offset= 100  --&gt; PA 32868 (base 32768 + 100)
+VA  4200 = 0x1068  seg=01(Heap    ) offset= 104  --&gt; PA 34920 (base 34816 + 104)
+VA  7168 = 0x1c00  seg=01(Heap    ) offset=3072  --&gt; FAULT: offset 3072 &gt;= size 3072
+VA 15360 = 0x3c00  seg=11(Stack   ) offset=3072  neg=-1024 --&gt; PA 27648 (base 28672 -1024)
+VA 14336 = 0x3800  seg=11(Stack   ) offset=2048  neg=-2048 --&gt; PA 26624 (base 28672 -2048)
+VA 14335 = 0x37ff  seg=11(Stack   ) offset=2047  neg=-2049 --&gt; FAULT: |-2049| &gt; size 2048
+VA  8192 = 0x2000  seg=10((unused)) offset=   0  --&gt; FAULT: segment not in use
+VA  2047 = 0x07ff  seg=00(Code    ) offset=2047  --&gt; PA 34815 (base 32768 + 2047)
+VA  2048 = 0x0800  seg=00(Code    ) offset=2048  --&gt; FAULT: offset 2048 &gt;= size 2048</code></pre>
+<p><code>protect</code> 输出（示例输出，你的机器上地址会不同）：</p>
+<pre><code>main=0x5f3fccb4c261  "hello"=0x5f3fccb4d01c  &amp;global=0x5f3fccb4f070  heap=0x5f400b1822a0  &amp;local=0x7ffecd36411c
+
+5f3fccb4b000-5f3fccb4c000 r--p 00000000 08:50 1030445   .../protect
+5f3fccb4c000-5f3fccb4d000 r-xp 00001000 08:50 1030445   .../protect      ← 代码：读+执行
+5f3fccb4d000-5f3fccb4e000 r--p 00002000 08:50 1030445   .../protect      ← 只读数据："hello" 在这
+5f3fccb4e000-5f3fccb4f000 r--p 00002000 08:50 1030445   .../protect
+5f3fccb4f000-5f3fccb50000 rw-p 00003000 08:50 1030445   .../protect      ← 可写数据：global
+5f400b182000-5f400b1a3000 rw-p 00000000 00:00 0         [heap]
+7ffecd346000-7ffecd367000 rw-p 00000000 00:00 0         [stack]
+
+write to heap (rw-p)            0x5f400b1822a0 : OK
+write to global (rw-p)          0x5f3fccb4f070 : OK
+write to string literal (r--p)  0x5f3fccb4d01c : SIGSEGV (protection fault)
+write to code main (r-xp)       0x5f3fccb4c261 : SIGSEGV (protection fault)</code></pre>
+<p>x86-64 Linux 实际上用分页实现内存管理（分段几乎被弃用），但"每块区域一组权限位"的思想和图 16.5 一脉相承：代码 <code>r-x</code>、只读数据 <code>r--</code>、数据/堆/栈 <code>rw-</code>。<code>p</code> 表示私有；共享库的 <code>r-x</code> 代码段在所有进程间共享同一份物理内存——正是 16.4 节说的代码共享。写只读区域得到的信号名字仍然叫 <strong>Segmentation fault</strong>。</p>
+
+<h2><span class="num">7</span>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="0"><div class="q">图 16.3 的段表下，虚拟地址 4200 的物理地址是？</div>
+  <div class="opts"><button>A. 34920</button><button>B. 越界异常</button><button>C. 32868</button><button>D. 39016（4200 + 34KB）</button></div>
+  <div class="explain">先求堆内偏移：4200 − 4096 = 104，再加堆基址 34816，得 34920。直接加基址（D）是原书特意指出的错误。</div></div>
+<div class="mcq" data-answer="3"><div class="q">14 位虚拟地址、高 2 位选段，每个段的最大大小是？</div>
+  <div class="opts"><button>A. 16KB</button><button>B. 2KB</button><button>C. 8KB</button><button>D. 4KB</button></div>
+  <div class="explain">16KB 地址空间被高 2 位切成 4 块，每块 4KB。想让堆或栈长过 4KB 就无能为力了。</div></div>
+<div class="mcq" data-answer="1"><div class="q">栈段 base = 28KB、size = 2KB、反向增长、最大段 4KB。虚拟地址 15KB 的物理地址是？</div>
+  <div class="opts"><button>A. 31KB</button><button>B. 27KB</button><button>C. 43KB</button><button>D. 越界</button></div>
+  <div class="explain">偏移 3KB，负偏移 3KB − 4KB = −1KB，28KB − 1KB = 27KB；|−1KB| ≤ 2KB 合法。</div></div>
+<div class="mcq" data-answer="2"><div class="q">分段相比单一基址/界限的主要好处是？</div>
+  <div class="opts"><button>A. 不再需要任何硬件支持</button><button>B. 彻底消除了碎片</button><button>C. 只为真正使用的段分配物理内存，支持稀疏地址空间，并能共享代码段</button><button>D. 段可以无限增长</button></div>
+  <div class="explain">分段避免了堆栈之间空洞的浪费、转换开销小、还能共享代码。它反而引入了外部碎片，段大小也受限。</div></div>
+<div class="mcq" data-answer="1"><div class="q">要让多个进程安全地共享同一个代码段，硬件还需要什么？</div>
+  <div class="opts"><button>A. TLB</button><button>B. 每段的保护位（如只读+执行）</button><button>C. 更大的 bounds 寄存器</button><button>D. 反向增长位</button></div>
+  <div class="explain">把代码段设为 Read-Execute，任何进程都改不了它，共享就不会破坏隔离。</div></div>
+<div class="mcq" data-answer="2"><div class="q">关于外部碎片，哪项正确？</div>
+  <div class="opts"><button>A. 只有细粒度分段才会出现</button><button>B. 使用最优适配（best fit）就能完全消除</button><button>C. 物理内存布满变长的小洞，总空闲足够却没有足够大的连续空间</button><button>D. 它是已分配单元内部没用上的空间</button></div>
+  <div class="explain">D 是内部碎片。任何算法都只能减少外部碎片，不能消除；唯一根治是不再用变长块分配（分页）。</div></div>
+<div class="mcq" data-answer="0"><div class="q">关于紧凑（compaction），下列哪项<strong>不</strong>正确？</div>
+  <div class="opts"><button>A. 紧凑后现有段增长会变得更容易</button><button>B. 需要停下进程、拷贝段、更新段寄存器</button><button>C. 能得到一大块连续空闲空间</button><button>D. 内存密集，占用大量处理器时间</button></div>
+  <div class="explain">原书："compaction also (ironically) makes requests to grow existing segments hard to serve"——段被紧挨着排在一起，没有增长余地了。</div></div>
+<div class="mcq" data-answer="3"><div class="q">"隐式（implicit）"判断段的方式是指？</div>
+  <div class="opts"><button>A. 由 OS 在每次访问时软件判断</button><button>B. 查内存中的段表</button><button>C. 根据虚拟地址的最高几位</button><button>D. 根据地址的产生方式判断：来自 PC 是代码段，基于栈指针/基址指针是栈段，其余是堆</button></div>
+  <div class="explain">C 是显式方式；隐式方式由硬件观察地址是怎样形成的。</div></div>
+
+<h2><span class="num">8</span>常见误区与小结</h2>
+<div class="warn">
+  <p><strong>误区 1："把虚拟地址直接加上段基址。"</strong>必须先减去段在虚拟地址空间中的起点（或者用低位取偏移）。4200 + 34KB = 39016 是错的。</p>
+  <p><strong>误区 2："栈段的 base 是栈的最低地址。"</strong>反向增长段的 base 指向顶端（28KB），物理地址 = base + 负偏移；负偏移 = 偏移 − <strong>最大段大小</strong>（不是当前大小）。</p>
+  <p><strong>误区 3："分段没有碎片。"</strong>分段消除了（大部分）内部碎片，却带来外部碎片。</p>
+  <p><strong>误区 4："分段让稀疏地址空间完全不浪费。"</strong>如果一个很大的堆只用了零星几处，整个堆段仍必须驻留内存。分段的灵活性还不够。</p>
+</div>
+<div class="key">
+  <p><strong>本章小结</strong></p>
+  <ul>
+    <li>分段是广义的基址/界限：每个逻辑段（代码、堆、栈）一对 base/bounds，各自独立放置，避免了段之间空洞的物理内存浪费。</li>
+    <li>硬件用虚拟地址的高几位（显式）或地址的产生方式（隐式）确定段；段内偏移做界限检查；反向增长段用负偏移。</li>
+    <li>保护位支持代码共享；细粒度分段需要内存中的段表。</li>
+    <li>OS 要在切换时保存/恢复段寄存器、处理段的增长（sbrk），并管理物理内存中的空闲空间。</li>
+    <li>两大问题：<strong>外部碎片</strong>（下一章讨论各种空闲空间管理策略）和<strong>对稀疏使用的大段仍不够灵活</strong>（第 18 章的分页用固定大小的页来根治）。</li>
+  </ul>
+</div>
+
+</main>
+<script>
+(function () {
+  "use strict";
+  const { h, s, color, stepper } = OSTEP;
+  // Python random 兼容：MT19937 + init_by_array + genrand_res53
+  function PyRandom(seed) {
+    const N = 624, M = 397;
+    const mt = new Uint32Array(N); let mti = N + 1;
+    function initGen(s) { mt[0] = s >>> 0; for (mti = 1; mti < N; mti++) { const p = mt[mti - 1] ^ (mt[mti - 1] >>> 30); mt[mti] = (Math.imul(1812433253, p) + mti) >>> 0; } }
+    function initByArray(key) {
+      initGen(19650218);
+      let i = 1, j = 0, k = Math.max(N, key.length);
+      for (; k; k--) { const p = mt[i - 1] ^ (mt[i - 1] >>> 30); mt[i] = ((mt[i] ^ Math.imul(p, 1664525)) + key[j] + j) >>> 0; i++; j++; if (i >= N) { mt[0] = mt[N - 1]; i = 1; } if (j >= key.length) j = 0; }
+      for (k = N - 1; k; k--) { const p = mt[i - 1] ^ (mt[i - 1] >>> 30); mt[i] = ((mt[i] ^ Math.imul(p, 1566083941)) - i) >>> 0; i++; if (i >= N) { mt[0] = mt[N - 1]; i = 1; } }
+      mt[0] = 0x80000000;
+    }
+    function genrand() {
+      let y; const mag = [0, 0x9908b0df];
+      if (mti >= N) {
+        let kk = 0;
+        for (; kk < N - M; kk++) { y = (mt[kk] & 0x80000000) | (mt[kk + 1] & 0x7fffffff); mt[kk] = mt[kk + M] ^ (y >>> 1) ^ mag[y & 1]; }
+        for (; kk < N - 1; kk++) { y = (mt[kk] & 0x80000000) | (mt[kk + 1] & 0x7fffffff); mt[kk] = mt[kk + (M - N)] ^ (y >>> 1) ^ mag[y & 1]; }
+        y = (mt[N - 1] & 0x80000000) | (mt[0] & 0x7fffffff); mt[N - 1] = mt[M - 1] ^ (y >>> 1) ^ mag[y & 1];
+        mti = 0;
+      }
+      y = mt[mti++];
+      y ^= y >>> 11; y ^= (y << 7) & 0x9d2c5680; y ^= (y << 15) & 0xefc60000; y ^= y >>> 18;
+      return y >>> 0;
+    }
+    let n = Math.abs(Math.floor(seed)); const key = [];
+    do { key.push(n % 4294967296); n = Math.floor(n / 4294967296); } while (n > 0);
+    initByArray(key);
+    return () => { const a = genrand() >>> 5, b = genrand() >>> 6; return (a * 67108864 + b) / 9007199254740992; };
+  }
+  // ==CORE-BEGIN==
+  // 通用分段地址转换。cfg = {asize, segBits, segs:[{name, base, size, grow:+1|-1, prot:"RX"/"RW"/..., used}], access:"R"|"W"|"X"}
+  // 负向增长段：base 指向段"顶端"（原书约定：栈 base = 28KB，第一个有效字节是 28KB-1）。
+  function segTranslate(va, cfg) {
+    const n = 1 << cfg.segBits, maxSeg = Math.floor(cfg.asize / n);
+    if (va < 0 || va >= cfg.asize) return { ok: false, reason: "range", seg: -1 };
+    const seg = Math.min(n - 1, Math.floor(va / maxSeg));
+    const s = cfg.segs[seg];
+    const offset = va - seg * maxSeg;
+    const r = { seg, offset, maxSeg, name: s ? s.name : "?" };
+    if (!s || !s.used) return Object.assign(r, { ok: false, reason: "unused" });
+    if (s.grow > 0) {
+      if (offset >= s.size) return Object.assign(r, { ok: false, reason: "bounds" });
+      r.pa = s.base + offset;
+    } else {
+      const top = seg === n - 1 ? cfg.asize : (seg + 1) * maxSeg;
+      r.neg = va - top;                       // = offset - maxSeg（asize 为 2 的幂时）
+      if (-r.neg > s.size) return Object.assign(r, { ok: false, reason: "bounds" });
+      r.pa = s.base + r.neg;
+    }
+    if (cfg.access && s.prot && !s.prot.includes(cfg.access)) return Object.assign(r, { ok: false, reason: "prot" });
+    r.ok = true;
+    return r;
+  }
+  // 仿 segmentation.py：随机数与 Python 一致。返回的 base1 是段 1 的"顶端"（与 segmentation.py 打印的一致）。
+  function segpyGen(o) {
+    const r = PyRandom(o.seed || 0);
+    const asize = o.asize, psize = o.psize;
+    let len0 = o.l0, len1 = o.l1, base0 = o.b0, base1 = o.b1;
+    if (len0 === -1) len0 = Math.floor(asize / 4.0 + (asize / 4.0) * r());
+    if (len1 === -1) len1 = Math.floor(asize / 4.0 + (asize / 4.0) * r());
+    let guard = 0;
+    if (base0 === -1) { do { base0 = Math.floor(psize * r()); } while (!(base0 + len0 < psize) && ++guard < 100000); }
+    let low1;
+    if (base1 === -1) {
+      guard = 0;
+      for (;;) {
+        low1 = Math.floor(psize * r());
+        if (low1 + len1 < psize && (low1 > base0 + len0 || low1 + len1 < base0)) break;
+        if (++guard > 100000) break;
+      }
+    } else low1 = base1 - len1;
+    let vas;
+    if (o.addresses && o.addresses.length) vas = o.addresses.slice();
+    else { vas = []; for (let i = 0; i < o.num; i++) vas.push(Math.floor(asize * r())); }
+    const errs = [];
+    if (base0 + len0 > psize) errs.push("段 0 超出了物理内存");
+    if (low1 < 0 || low1 + len1 > psize) errs.push("段 1 超出了物理内存");
+    if (!(low1 >= base0 + len0 || low1 + len1 <= base0)) errs.push("两个段在物理内存中重叠");
+    if (len0 > asize / 2 || len1 > asize / 2) errs.push("段长度超过了地址空间的一半（最大段大小）");
+    return { base0, len0, base1: low1 + len1, len1, vas, err: errs.join("；") };
+  }
+  // 外部碎片：物理内存按 KB 管理，OS 占开头 osKB。ops："+8" 分配、"-2" 释放第 2 个分配的段、"C" 紧凑。
+  function fragSim(opsStr, policy, memKB, osKB) {
+    let segs = [];          // {id, start, size}
+    let next = 0, copied = 0;
+    const steps = [];
+    const holes = () => {
+      const hs = []; let cur = osKB;
+      for (const g of [...segs].sort((a, b) => a.start - b.start)) { if (g.start > cur) hs.push({ start: cur, size: g.start - cur }); cur = g.start + g.size; }
+      if (cur < memKB) hs.push({ start: cur, size: memKB - cur });
+      return hs;
+    };
+    const snap = (op, msg, extra) => steps.push(Object.assign({ op, msg, segs: segs.map((g) => ({ ...g })), holes: holes(), copied }, extra || {}));
+    snap("", `物理内存 ${memKB}KB，OS 占 0–${osKB}KB，其余空闲。`);
+    for (const op of opsStr.split(/[\s,]+/).filter(Boolean)) {
+      let m;
+      if ((m = op.match(/^\+(\d+)$/))) {
+        const n = +m[1], hs = holes();
+        const free = hs.reduce((a, x) => a + x.size, 0);
+        const fit = hs.filter((x) => x.size >= n);
+        let pick = null;
+        if (fit.length) pick = policy === "best" ? fit.reduce((a, b) => (b.size < a.size ? b : a)) : policy === "worst" ? fit.reduce((a, b) => (b.size > a.size ? b : a)) : fit[0];
+        if (!pick) { snap(op, `请求 ${n}KB 的段 <b>失败</b>：总共有 ${free}KB 空闲，但分散在 ${hs.length} 个不连续的洞里，最大的只有 ${Math.max(0, ...hs.map((x) => x.size))}KB。这就是<b>外部碎片</b>。`, { fail: n }); continue; }
+        const g = { id: next++, start: pick.start, size: n };
+        segs.push(g);
+        snap(op, `请求 ${n}KB：按 ${policy === "best" ? "最优适配（best fit）" : policy === "worst" ? "最差适配（worst fit）" : "首次适配（first fit）"} 选中 ${pick.start}–${pick.start + pick.size}KB 的空洞，放入段 #${g.id}（${g.start}–${g.start + n}KB）。`, { hl: g.id });
+      } else if ((m = op.match(/^-(\d+)$/))) {
+        const id = +m[1], k = segs.findIndex((g) => g.id === id);
+        if (k < 0) { snap(op, `段 #${id} 不存在（或已释放），忽略。`); continue; }
+        const g = segs[k]; segs.splice(k, 1);
+        snap(op, `释放段 #${id}（${g.start}–${g.start + g.size}KB），它变成一个 ${g.size}KB 的洞。`, { freed: g });
+      } else if (/^c$/i.test(op)) {
+        let cur = osKB, moved = 0;
+        const moves = [];
+        for (const g of [...segs].sort((a, b) => a.start - b.start)) { if (g.start !== cur) { moves.push({ id: g.id, from: g.start, to: cur }); moved += g.size; g.start = cur; } cur += g.size; }
+        copied += moved;
+        snap(op, `<b>紧凑（compaction）</b>：OS 停下进程，把 ${moves.length} 个段拷贝到一起（${moves.map((x) => `#${x.id}: ${x.from}→${x.to}KB`).join("，") || "无需移动"}），共拷贝 ${moved}KB，并更新它们的段基址寄存器。现在有一整块 ${memKB - cur}KB 的连续空闲空间。`, { moves });
+      }
+    }
+    return steps;
+  }
+  // ==CORE-END==
+
+  const $ = (id) => document.getElementById(id);
+  const K = 1024;
+  function parseSize(str) {
+    const t = String(str).trim().toLowerCase().replace(/\s+/g, "");
+    let m = t.match(/^(-?\d+(?:\.\d+)?)([km])?b?(?:([+-])(\d+))?$/);
+    if (m) return Math.round(parseFloat(m[1]) * (m[2] === "k" ? 1024 : m[2] === "m" ? 1048576 : 1)) + (m[3] ? (m[3] === "-" ? -1 : 1) * Number(m[4]) : 0);
+    if (/^0x[0-9a-f]+$/.test(t)) return parseInt(t, 16);
+    return NaN;
+  }
+  const kb = (n) => (n % K === 0 ? n / K + "KB" : String(n));
+  const hx = (n) => "0x" + (n >>> 0).toString(16).padStart(8, "0");
+  const isPow2 = (n) => n > 0 && (n & (n - 1)) === 0;
+
+  // ---------- 正文图：4200 的二进制 ----------
+  (function () {
+    const g = document.getElementById("b16");
+    const v = 4200, bits = 14;
+    for (let i = 0; i < bits; i++) {
+      const bit = (v >> (bits - 1 - i)) & 1, x = 30 + i * 40, seg = i < 2;
+      g.append(s("text", { x: x + 18, y: 20, "text-anchor": "middle", "font-size": 11, class: "t-muted mono", text: bits - 1 - i }));
+      g.append(s("rect", { x, y: 28, width: 36, height: 36, rx: 4, class: seg ? "warn-soft" : "accent-soft" }));
+      g.append(s("text", { x: x + 18, y: 52, "text-anchor": "middle", "font-size": 16, class: "mono", text: bit }));
+    }
+    g.append(s("text", { x: 30 + 40, y: 88, "text-anchor": "middle", "font-size": 12, style: "font-weight:600", text: "Segment" }));
+    g.append(s("text", { x: 30 + 8 * 40, y: 88, "text-anchor": "middle", "font-size": 12, style: "font-weight:600", text: "Offset" }));
+  })();
+  // ---------- 正文图 16.6 ----------
+  (function () {
+    const g = document.getElementById("f166");
+    const draw = (x0, layout) => {
+      for (let kb2 = 0; kb2 <= 64; kb2 += 8) g.append(s("text", { x: x0 - 6, y: 30 + kb2 * 4 + 4, "text-anchor": "end", "font-size": 10, class: "t-muted mono", text: kb2 + "KB" }));
+      for (const [a, b, t] of layout) {
+        const y = 30 + a * 4, hh = (b - a) * 4;
+        const st = t === "OS" ? "fill:var(--c8)" : t === "A" ? "fill:var(--c1)" : "fill:var(--surface-2);stroke:var(--border)";
+        g.append(s("rect", { x: x0, y, width: 150, height: hh, rx: 2, style: st }));
+        g.append(s("text", { x: x0 + 75, y: y + hh / 2 + 4, "text-anchor": "middle", "font-size": 11.5, style: t === "F" ? "" : "fill:#fff;font-weight:600", class: t === "F" ? "t-muted" : null, text: t === "OS" ? "Operating System" : t === "A" ? "Allocated" : "(not in use)" }));
+      }
+    };
+    draw(60, [[0, 16, "OS"], [16, 24, "F"], [24, 32, "A"], [32, 40, "F"], [40, 48, "A"], [48, 56, "F"], [56, 64, "A"]]);
+    draw(360, [[0, 16, "OS"], [16, 40, "A"], [40, 64, "F"]]);
+  })();
+
+  // ---------- 模拟器 1：分段地址转换 ----------
+  const BOOK_SEGS = () => [
+    { name: "Code", bits: "00", base: 32 * K, size: 2 * K, grow: 1, prot: "RX", used: true },
+    { name: "Heap", bits: "01", base: 34 * K, size: 3 * K, grow: 1, prot: "RW", used: true },
+    { name: "(unused)", bits: "10", base: 0, size: 0, grow: 1, prot: "", used: false },
+    { name: "Stack", bits: "11", base: 28 * K, size: 2 * K, grow: -1, prot: "RW", used: true },
+  ];
+  let bookSegs = BOOK_SEGS();
+  let C = null;   // 当前配置 {asize, psize, segBits, segs, vas, access, model, err}
+  const SUB = 6;
+  function segTable() {
+    const tb = $("sg-segtab"); tb.replaceChildren();
+    tb.append(h("tr", {}, h("th", {}, "段号"), h("th", {}, "名称"), h("th", {}, "使用"), h("th", {}, "base"), h("th", {}, "size（≤4K）"), h("th", {}, "正向增长?"), h("th", {}, "保护")));
+    bookSegs.forEach((g, i) => {
+      const inp = (key, w) => { const el = h("input", { type: "text", value: key === "base" || key === "size" ? kb(g[key]) : g[key], style: { width: w } }); el.onchange = () => { const v = key === "name" ? el.value : key === "prot" ? el.value.toUpperCase().replace(/[^RWX]/g, "") : parseSize(el.value); if (key !== "name" && key !== "prot" && Number.isNaN(v)) return; g[key] = v; buildBook(); }; return el; };
+      const used = h("input", { type: "checkbox" }); used.checked = g.used; used.onchange = () => { g.used = used.checked; buildBook(); };
+      const grow = h("select", {}, h("option", { value: "1" }, "1（正向）"), h("option", { value: "-1" }, "0（反向）")); grow.value = String(g.grow); grow.onchange = () => { g.grow = +grow.value; buildBook(); };
+      tb.append(h("tr", { "data-seg": i }, h("td", {}, h("span", { class: "pill", style: { background: `color-mix(in srgb, ${color(i)} 25%, var(--surface))` } }, g.bits)), h("td", {}, inp("name", "6em")), h("td", {}, used), h("td", {}, inp("base", "5em")), h("td", {}, inp("size", "5em")), h("td", {}, grow), h("td", {}, inp("prot", "4em"))));
+    });
+  }
+  function buildBook() {
+    const vas = $("sg-vas").value.split(/[,\s]+/).filter(Boolean).map(parseSize);
+    if (!vas.length || vas.some(Number.isNaN)) { $("sg-narrate").textContent = "虚拟地址无法解析（可写 100、7K、0x3C00、14K-1）。"; return; }
+    const errs = bookSegs.filter((g) => g.used && g.size > 4 * K).map((g) => `${g.name} 段大小超过最大段 4KB`);
+    C = { model: "book", asize: 16 * K, psize: 64 * K, segBits: 2, segs: bookSegs.map((g) => ({ ...g })), vas, access: $("sg-acc").value, err: errs.join("；"), osKB: 16 };
+    sgStep.reset();
+  }
+  function buildPy(extra) {
+    const asize = parseSize($("py-asize").value), psize = parseSize($("py-psize").value);
+    const nums = ["b0", "l0", "b1", "l1"].map((k) => parseSize($("py-" + k).value));
+    if ([asize, psize, ...nums].some(Number.isNaN)) { $("sg-narrate").textContent = "参数无法解析。"; return; }
+    const A = $("py-A").value.trim() ? $("py-A").value.split(/[,\s]+/).filter(Boolean).map(parseSize) : null;
+    if (A && A.some(Number.isNaN)) { $("sg-narrate").textContent = "-A 地址无法解析。"; return; }
+    const g = segpyGen({ seed: +$("py-seed").value || 0, asize, psize, num: Math.max(1, Math.min(40, +$("py-num").value || 5)), b0: nums[0], l0: nums[1], b1: nums[2], l1: nums[3], addresses: A });
+    const errs = g.err ? [g.err] : [];
+    if (A && A.some((v) => v < 0 || v >= asize)) errs.push("有地址超出了地址空间");
+    C = { model: "py", asize, psize, segBits: 1, vas: g.vas, access: "", err: errs.join("；"), osKB: 0,
+      segs: [{ name: "SEG0", bits: "0", base: g.base0, size: g.len0, grow: 1, prot: "", used: true }, { name: "SEG1", bits: "1", base: g.base1, size: g.len1, grow: -1, prot: "", used: true }] };
+    sgStep.reset();
+  }
+  function physRange(g) { return g.grow > 0 ? [g.base, g.base + g.size] : [g.base - g.size, g.base]; }
+  function drawSeg(k) {
+    const i = Math.floor(k / SUB), sub = k % SUB, va = C.vas[i];
+    const r = segTranslate(va, { asize: C.asize, segBits: C.segBits, segs: C.segs, access: C.access || undefined });
+    const W = 740, H = 400;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "分段地址转换" });
+    const nb = isPow2(C.asize) ? Math.log2(C.asize) : 0;
+    // 位串
+    if (nb && nb <= 20) {
+      const bw = Math.min(40, 600 / nb);
+      for (let b = 0; b < nb; b++) {
+        const bit = va >= 0 && va < C.asize ? (va >> (nb - 1 - b)) & 1 : "?";
+        const isSeg = b < C.segBits, x = 20 + b * bw;
+        const cls = sub >= 1 && isSeg ? "warn-soft" : sub >= 2 && !isSeg ? "accent-soft" : "box";
+        svg.append(s("text", { x: x + bw / 2 - 1, y: 14, "text-anchor": "middle", "font-size": 9.5, class: "t-muted mono", text: nb - 1 - b }));
+        svg.append(s("rect", { x, y: 18, width: bw - 3, height: 28, rx: 3, class: cls }));
+        svg.append(s("text", { x: x + bw / 2 - 1, y: 37, "text-anchor": "middle", "font-size": 14, class: "mono", text: bit }));
+      }
+      const segW = C.segBits * bw;
+      if (sub >= 1) svg.append(s("text", { x: 20 + segW / 2, y: 62, "text-anchor": "middle", "font-size": 11.5, style: "font-weight:600", text: r.seg >= 0 ? "段 " + C.segs[r.seg].bits : "?" }));
+      if (sub >= 2) svg.append(s("text", { x: 20 + segW + (nb - C.segBits) * bw / 2, y: 62, "text-anchor": "middle", "font-size": 11.5, style: "font-weight:600", text: "偏移 " + (r.offset ?? "?") }));
+    } else svg.append(s("text", { x: 20, y: 36, "font-size": 13, text: `VA ${va}（地址空间 ${C.asize} 不是 2 的幂，按 VA ≥ ${Math.floor(C.asize / 2)} 判断段 1）` }));
+    // 虚拟地址空间条（横向）
+    const bx = 130, bw2 = 590, vy = 90, py = 200;
+    const n = 1 << C.segBits, maxSeg = Math.floor(C.asize / n);
+    svg.append(s("text", { x: 10, y: vy + 20, "font-size": 12, style: "font-weight:600", text: "虚拟地址空间" }));
+    svg.append(s("rect", { x: bx, y: vy, width: bw2, height: 30, class: "box" }));
+    C.segs.forEach((g, j) => {
+      if (!g.used) return;
+      const lo = g.grow > 0 ? j * maxSeg : (j === n - 1 ? C.asize : (j + 1) * maxSeg) - g.size;
+      const hi = g.grow > 0 ? j * maxSeg + Math.min(g.size, maxSeg) : (j === n - 1 ? C.asize : (j + 1) * maxSeg);
+      const x = bx + Math.max(0, lo) / C.asize * bw2, w = Math.max(1, (hi - Math.max(0, lo)) / C.asize * bw2);
+      svg.append(s("rect", { x, y: vy, width: w, height: 30, style: `fill:${color(j)};opacity:${r.seg === j && sub >= 1 ? 0.95 : 0.55}` }));
+      if (w > 34) svg.append(s("text", { x: x + w / 2, y: vy + 19, "text-anchor": "middle", "font-size": 11, style: "fill:#fff;font-weight:600", text: g.name }));
+    });
+    for (let j = 1; j < n; j++) { const x = bx + j * maxSeg / C.asize * bw2; svg.append(s("line", { x1: x, x2: x, y1: vy - 4, y2: vy + 34, style: "stroke:var(--muted);stroke-dasharray:3 2" })); }
+    svg.append(s("text", { x: bx, y: vy + 44, "font-size": 10, class: "t-muted mono", text: "0" }));
+    svg.append(s("text", { x: bx + bw2, y: vy + 44, "text-anchor": "end", "font-size": 10, class: "t-muted mono", text: kb(C.asize) }));
+    if (va >= 0 && va < C.asize) {
+      const mx = bx + va / C.asize * bw2;
+      svg.append(s("line", { x1: mx, x2: mx, y1: vy - 8, y2: vy + 36, style: "stroke:var(--warn);stroke-width:3" }));
+      svg.append(s("text", { x: mx, y: vy - 11, "text-anchor": "middle", "font-size": 10.5, class: "mono", text: "VA " + va }));
+    }
+    // 物理内存条
+    svg.append(s("text", { x: 10, y: py + 20, "font-size": 12, style: "font-weight:600", text: "物理内存" }));
+    svg.append(s("rect", { x: bx, y: py, width: bw2, height: 30, class: "box" }));
+    if (C.osKB) svg.append(s("rect", { x: bx, y: py, width: C.osKB * K / C.psize * bw2, height: 30, style: "fill:var(--c8)" }), s("text", { x: bx + C.osKB * K / C.psize * bw2 / 2, y: py + 19, "text-anchor": "middle", "font-size": 11, style: "fill:#fff", text: "OS" }));
+    C.segs.forEach((g, j) => {
+      if (!g.used || g.size <= 0) return;
+      const [lo, hi] = physRange(g);
+      const x = bx + Math.max(0, lo) / C.psize * bw2, w = Math.max(2, (Math.min(C.psize, hi) - Math.max(0, lo)) / C.psize * bw2);
+      svg.append(s("rect", { x, y: py, width: w, height: 30, style: `fill:${color(j)};opacity:${r.seg === j && sub >= 1 ? 0.95 : 0.55}` }));
+      if (w > 34) svg.append(s("text", { x: x + w / 2, y: py + 19, "text-anchor": "middle", "font-size": 11, style: "fill:#fff;font-weight:600", text: g.name }));
+      const bxp = bx + Math.min(C.psize, Math.max(0, g.base)) / C.psize * bw2;
+      svg.append(s("text", { x: bxp, y: py + 44 + (j % 2) * 12, "text-anchor": "middle", "font-size": 9.5, class: "mono", style: `fill:${color(j)}`, text: "base " + kb(g.base) }));
+    });
+    svg.append(s("text", { x: bx, y: py - 6, "font-size": 10, class: "t-muted mono", text: "0" }));
+    svg.append(s("text", { x: bx + bw2, y: py - 6, "text-anchor": "end", "font-size": 10, class: "t-muted mono", text: kb(C.psize) }));
+    if (sub >= 5 && r.pa != null) {
+      const mx = bx + Math.min(C.psize, Math.max(0, r.pa)) / C.psize * bw2;
+      const col = r.ok ? "var(--ok)" : "var(--bad)";
+      svg.append(s("line", { x1: mx, x2: mx, y1: py - 4, y2: py + 36, style: `stroke:${col};stroke-width:3` }));
+      svg.append(s("text", { x: mx, y: py + 70, "text-anchor": "middle", "font-size": 11, class: "mono", style: r.ok ? "" : "fill:var(--bad)", text: r.ok ? "PA " + r.pa : "（被拦下）" }));
+      if (va >= 0 && va < C.asize) svg.append(s("path", { d: `M${bx + va / C.asize * bw2} ${vy + 36} C ${bx + va / C.asize * bw2} ${vy + 80}, ${mx} ${py - 50}, ${mx} ${py - 4}`, style: `fill:none;stroke:${col};stroke-width:1.5;stroke-dasharray:4 3` }));
+    }
+    // 计算框
+    const lines = [];
+    const g = r.seg >= 0 ? C.segs[r.seg] : null;
+    if (sub >= 1) lines.push(r.seg < 0 ? "VA 不在地址空间内" : `段号 = ${C.model === "book" ? "(VA & 0x3000) >> 12" : "VA ≥ " + Math.floor(C.asize / 2) + " ?"} = ${g.bits} → ${g.name}`);
+    if (sub >= 2 && r.seg >= 0) lines.push(`偏移 = ${C.model === "book" ? "VA & 0xFFF" : "VA − 段起点"} = ${r.offset}`);
+    if (sub >= 3 && r.seg >= 0 && g.used) lines.push(g.grow > 0 ? "正向增长：直接用偏移" : `反向增长：负偏移 = ${r.offset} − ${r.maxSeg} = ${r.neg}`);
+    if (sub >= 4 && r.seg >= 0 && g.used) lines.push(g.grow > 0 ? `界限：${r.offset} < ${g.size} ? ${r.offset < g.size ? "✓" : "✗"}` : `界限：|${r.neg}| ≤ ${g.size} ? ${-r.neg <= g.size ? "✓" : "✗"}`);
+    if (sub >= 4 && C.access && r.seg >= 0 && g.used && r.reason !== "bounds") lines.push(`保护：${{ R: "读", W: "写", X: "执行" }[C.access]} ∈ {${g.prot || "无"}} ? ${r.reason === "prot" ? "✗" : "✓"}`);
+    if (sub >= 5) lines.push(r.ok ? `PA = ${g.base} ${g.grow > 0 ? "+ " + r.offset : "− " + (-r.neg)} = ${r.pa}` : `→ ${r.reason === "prot" ? "保护异常" : "SEGMENTATION VIOLATION"}`);
+    const tx = s("text", { x: 20, y: 300, "font-size": 12, class: "mono" });
+    lines.forEach((t, j) => tx.append(s("tspan", { x: 20, dy: j === 0 ? 0 : 17, text: t, style: j === lines.length - 1 && sub >= 5 ? (r.ok ? "fill:var(--ok)" : "fill:var(--bad)") : "" })));
+    svg.append(tx);
+    $("sg-svg").replaceChildren(svg);
+    // 讲解
+    const acc = C.access ? `（${{ R: "读", W: "写", X: "取指" }[C.access]}）` : "";
+    const why = { unused: "这个段号没有被使用（原书例子里的 10 段），硬件直接引发异常。", range: "地址超出了整个虚拟地址空间。", bounds: "偏移超出了段的当前大小，引发异常——段错误（segmentation fault）的由来。", prot: `访问类型违反了该段的保护位（${g ? g.prot || "无权限" : ""}），引发保护异常。` };
+    const T = [
+      `<b>地址 ${i + 1}/${C.vas.length}：</b>虚拟地址 <code>${va}</code>（${"0x" + va.toString(16)}）${acc}。${nb ? `写成 ${nb} 位二进制，看上面的位串。` : ""}`,
+      r.seg < 0 ? why.range : `<b>取段号：</b>最高 ${C.segBits} 位是 <b>${g.bits}</b> → 使用 <b>${g.name}</b> 段的寄存器${g.used ? "" : "——但这个段没有使用！" + why.unused}`,
+      r.seg < 0 || !g.used ? "（已引发异常，后续步骤不执行。）" : `<b>取偏移：</b>剩下的低位就是段内偏移 = <b>${r.offset}</b>。${C.model === "book" ? "（等价于 VA − 段在虚拟空间中的起点 " + r.seg * r.maxSeg + "）" : ""}`,
+      r.seg < 0 || !g.used ? "（已引发异常。）" : g.grow > 0 ? "<b>方向：</b>该段正向增长，偏移直接可用。" : `<b>方向：</b>该段<b>反向增长</b>，需要负偏移：${r.offset} − 最大段大小 ${r.maxSeg} = <b>${r.neg}</b>。`,
+      r.seg < 0 || !g.used ? "（已引发异常。）" : r.reason === "bounds" ? `<b>界限检查失败：</b>${g.grow > 0 ? `${r.offset} ≥ ${g.size}` : `|${r.neg}| > ${g.size}`}。` + why.bounds : r.reason === "prot" ? `<b>界限检查通过</b>，但<b>保护检查失败</b>：` + why.prot : `<b>检查通过：</b>${g.grow > 0 ? `${r.offset} < ${g.size}` : `|${r.neg}| ≤ ${g.size}`}${C.access ? "，保护位允许这次访问" : ""}。`,
+      r.ok ? `<b>物理地址</b> = base ${g.base} ${g.grow > 0 ? "+ " + r.offset : "+ (" + r.neg + ")"} = <b>${r.pa}</b>（${kb(r.pa)}）。` : `<b>结果：</b>${r.reason === "prot" ? "保护异常" : "SEGMENTATION VIOLATION"}${r.seg >= 0 ? `（SEG${r.seg}）` : ""}，陷入 OS，进程很可能被终止。`,
+    ];
+    let t = T[sub];
+    if (C.err) t = `<b style="color:var(--bad)">注意：${C.err}</b><br>` + t;
+    $("sg-narrate").innerHTML = t;
+    // 表格
+    const tb = $("sg-trace"); tb.replaceChildren();
+    tb.append(h("tr", {}, h("th", {}, "#"), h("th", {}, "VA"), h("th", {}, "十进制"), h("th", {}, "结果（segmentation.py -c 格式）")));
+    let okc = 0, badc = 0;
+    C.vas.forEach((v, j) => {
+      const rr = segTranslate(v, { asize: C.asize, segBits: C.segBits, segs: C.segs, access: C.access || undefined });
+      rr.ok ? okc++ : badc++;
+      const shown = j < i || (j === i && sub === SUB - 1);
+      const txt = rr.ok ? `VALID in SEG${rr.seg}: ${hx(rr.pa)} (decimal: ${rr.pa})` : rr.reason === "prot" ? `PROTECTION FAULT (SEG${rr.seg})` : `SEGMENTATION VIOLATION${rr.seg >= 0 ? ` (SEG${rr.seg})` : ""}`;
+      tb.append(h("tr", { class: j === i ? "cur" : "" }, h("td", {}, "VA " + String(j).padStart(2)), h("td", {}, hx(v)), h("td", {}, String(v)), shown ? h("td", { class: rr.ok ? "ok" : "bad" }, txt) : h("td", { class: "q" }, "--> PA or segmentation violation?")));
+    });
+    $("sg-s1").textContent = sub >= 2 && r.seg >= 0 ? `${C.segs[r.seg].bits} / ${r.offset}` : "–";
+    $("sg-s2").textContent = sub >= 5 ? (r.ok ? r.pa : "异常") : "–";
+    $("sg-s3").textContent = `${okc} / ${badc}`;
+    const used = C.segs.filter((x) => x.used).reduce((a, x) => a + x.size, 0);
+    $("sg-s4").textContent = `${kb(used)} vs ${kb(C.asize)}`;
+    // 段表高亮
+    document.querySelectorAll("#sg-segtab tr[data-seg]").forEach((tr) => tr.classList.toggle("cur", sub >= 1 && +tr.dataset.seg === r.seg));
+  }
+  const sgStep = stepper($("sg-step"), { steps: () => (C ? C.vas.length * SUB : 1), autoplayMs: 900, render(k) { if (C) drawSeg(k); } });
+  $("sg-model").onchange = () => { const py = $("sg-model").value === "py"; $("sg-bookbox").hidden = py; $("sg-pybox").hidden = !py; py ? buildPy() : buildBook(); };
+  $("sg-run").onclick = buildBook;
+  $("sg-acc").onchange = buildBook;
+  $("sg-reset").onclick = () => { bookSegs = BOOK_SEGS(); segTable(); buildBook(); };
+  document.querySelectorAll("#sg-bookbox button[data-vas]").forEach((b) => (b.onclick = () => { $("sg-vas").value = b.dataset.vas; $("sg-acc").value = b.dataset.acc || "R"; buildBook(); }));
+  $("py-run").onclick = () => buildPy();
+  const setPy = (v) => { for (const [k, x] of Object.entries(v)) $("py-" + k).value = x; };
+  document.querySelectorAll("#sg-pybox button[data-hw]").forEach((b) => (b.onclick = () => { setPy({ seed: b.dataset.hw, asize: "128", psize: "512", b0: "0", l0: "20", b1: "512", l1: "20", num: 5, A: "" }); buildPy(); }));
+  $("py-q2").onclick = () => { setPy({ seed: 0, asize: "128", psize: "512", b0: "0", l0: "20", b1: "512", l1: "20", A: "19,20,107,108" }); buildPy(); };
+  segTable(); buildBook();
+
+  // ---------- 模拟器 2：外部碎片 ----------
+  let FS = [];
+  function drawFrag(k) {
+    const st = FS[k], MEM = 64, OS = 16;
+    const W = 720, H = 150, bx = 20, bw = 680, sc = bw / MEM;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "物理内存布局" });
+    const defs = s("defs", {}, s("marker", { id: "m16f", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto" }, s("path", { d: "M0,0 L10,5 L0,10 z", style: "fill:var(--accent)" })));
+    svg.append(defs);
+    const y = 40;
+    svg.append(s("rect", { x: bx, y, width: OS * sc, height: 44, rx: 3, style: "fill:var(--c8)" }));
+    svg.append(s("text", { x: bx + OS * sc / 2, y: y + 27, "text-anchor": "middle", "font-size": 12, style: "fill:#fff;font-weight:600", text: "OS" }));
+    for (const hl of st.holes) {
+      svg.append(s("rect", { x: bx + hl.start * sc, y, width: hl.size * sc, height: 44, rx: 3, style: `fill:var(--surface-2);stroke:${st.fail ? "var(--bad)" : "var(--border)"};stroke-dasharray:4 3` }));
+      svg.append(s("text", { x: bx + (hl.start + hl.size / 2) * sc, y: y + 27, "text-anchor": "middle", "font-size": 11, class: "t-muted", text: hl.size * sc > 30 ? hl.size + "KB 空" : "" }));
+    }
+    for (const g of st.segs) {
+      const x = bx + g.start * sc, w = g.size * sc;
+      svg.append(s("rect", { x: x + 0.5, y, width: w - 1, height: 44, rx: 3, style: `fill:${color(g.id)};${st.hl === g.id ? "stroke:var(--fg);stroke-width:2.5" : ""}` }));
+      svg.append(s("text", { x: x + w / 2, y: y + 20, "text-anchor": "middle", "font-size": 11.5, style: "fill:#fff;font-weight:600", text: "#" + g.id }));
+      if (w > 26) svg.append(s("text", { x: x + w / 2, y: y + 35, "text-anchor": "middle", "font-size": 10, style: "fill:#fff", text: g.size + "KB" }));
+    }
+    for (let t = 0; t <= MEM; t += 8) svg.append(s("text", { x: bx + t * sc, y: y + 60, "text-anchor": "middle", "font-size": 10, class: "t-muted mono", text: t + "KB" }));
+    if (st.moves) for (const mv of st.moves) {
+      const g = st.segs.find((x) => x.id === mv.id);
+      const x1 = bx + (mv.from + g.size / 2) * sc, x2 = bx + (mv.to + g.size / 2) * sc;
+      svg.append(s("path", { d: `M${x1} ${y - 4} C ${x1} ${y - 30}, ${x2} ${y - 30}, ${x2} ${y - 4}`, style: "fill:none;stroke:var(--accent);stroke-width:1.8", "marker-end": "url(#m16f)" }));
+    }
+    if (st.fail) svg.append(s("text", { x: bx + bw / 2, y: y + 84, "text-anchor": "middle", "font-size": 12.5, style: "fill:var(--bad);font-weight:600", text: `请求 ${st.fail}KB ✗：没有足够大的连续空洞` }));
+    if (st.freed) svg.append(s("rect", { x: bx + st.freed.start * sc, y: y - 2, width: st.freed.size * sc, height: 48, rx: 3, style: "fill:none;stroke:var(--warn);stroke-width:2.5" }));
+    svg.append(s("text", { x: bx, y: 18, "font-size": 12, class: "mono", text: st.op ? "操作：" + st.op : "初始状态" }));
+    $("fg-svg").replaceChildren(svg);
+    $("fg-narrate").innerHTML = st.msg;
+    const free = st.holes.reduce((a, x) => a + x.size, 0);
+    $("fg-s1").textContent = free;
+    $("fg-s2").textContent = Math.max(0, ...st.holes.map((x) => x.size));
+    $("fg-s3").textContent = st.holes.length;
+    $("fg-s4").textContent = `${FS.slice(0, k + 1).filter((x) => x.fail).length} / ${st.copied}KB`;
+  }
+  const fgStep = stepper($("fg-step"), { steps: () => Math.max(1, FS.length), autoplayMs: 1000, render(k) { if (FS.length) drawFrag(k); } });
+  function runFrag() { FS = fragSim($("fg-ops").value, $("fg-pol").value, 64, 16); fgStep.reset(); }
+  $("fg-run").onclick = runFrag;
+  $("fg-pol").onchange = runFrag;
+  $("fg-p1").onclick = () => { $("fg-ops").value = "+8 +8 +8 +8 +8 +8 -0 -2 -4 +20 C +20"; $("fg-pol").value = "first"; runFrag(); };
+  $("fg-p2").onclick = () => { $("fg-ops").value = "+10 +4 +6 +4 +12 +4 -0 -2 -4 +5 +5 +9 +10"; $("fg-pol").value = "best"; runFrag(); };
+  $("fg-p3").onclick = () => {
+    const r = OSTEP.rng(Date.now() & 0xffff); const ops = []; const live = []; let id = 0;
+    for (let i = 0; i < 16; i++) { if (live.length && r() < 0.4) { const k = r.int(0, live.length - 1); ops.push("-" + live[k]); live.splice(k, 1); } else { ops.push("+" + r.int(2, 12)); live.push(id++); } }
+    ops.push("C", "+" + r.int(10, 20));
+    $("fg-ops").value = ops.join(" "); runFrag();
+  };
+  runFrag();
+})();
+</script>
+</body></html>

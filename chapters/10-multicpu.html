@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 10 章 · 多处理器调度</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+svg.tl { max-width: none; }
+.jobtable input[type="number"] { width: 4.8em; }
+.jobtable select { font-size: 13px; }
+.jobtable td, .jobtable th { padding: 5px 8px; vertical-align: middle; }
+.sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 6px; }
+.presets { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+.presets button { font-size: 13px; padding: 4px 10px; }
+.presets .lbl { font-size: 13px; color: var(--muted); align-self: center; margin-right: 4px; }
+.panel { display: grid; gap: 6px; margin-top: 10px; font-size: 13.5px; }
+.panel .row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.panel .nm { font: 600 12.5px var(--mono); min-width: 4.6em; }
+.cbar { display: inline-flex; height: 22px; width: 220px; border: 1px solid var(--border); border-radius: 5px; overflow: hidden; background: var(--surface); }
+.cbar span { display: inline-flex; align-items: center; justify-content: center; color: #fff; font: 600 11px var(--mono); border-right: 1px solid var(--surface); }
+.cell.run { color: #fff; border-color: transparent; font-weight: 600; }
+.cell small { margin-left: 4px; font-size: 11px; opacity: .8; }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px; color: var(--muted); margin-top: 8px; }
+.legend i { display: inline-block; width: 14px; height: 12px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.codebox { font: 13px/1.7 var(--mono); background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 0; margin: 0; overflow-x: auto; }
+.codebox div { padding: 0 12px; white-space: pre; }
+.codebox div.t1 { background: color-mix(in srgb, var(--c1) 22%, transparent); }
+.codebox div.t2 { background: color-mix(in srgb, var(--c2) 22%, transparent); }
+.codebox div.t12 { background: linear-gradient(90deg, color-mix(in srgb, var(--c1) 22%, transparent) 50%, color-mix(in srgb, var(--c2) 22%, transparent) 50%); }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; align-items: start; }
+</style>
+</head>
+<body data-chapter="10">
+<main>
+
+<h2>一句话 + 关键问题</h2>
+<div class="crux">
+  <p><strong>如何在多个 CPU 上调度作业？</strong>操作系统应该如何在多个 CPU 上调度作业？会出现哪些新问题？老办法还管用吗，还是需要新思路？</p>
+  <p class="muted small">CRUX: HOW TO SCHEDULE JOBS ON MULTIPLE CPUS — How should the OS schedule jobs on multiple CPUs? What new problems arise? Do the same old techniques work, or are new ideas required?</p>
+</div>
+<p>多处理器系统曾经只存在于高端计算领域，如今桌面机、笔记本甚至手机上都有了。原因是<strong>多核处理器（multicore）</strong>：架构师很难在不耗费过多功耗的情况下让单个 CPU 变得更快，于是把多个 CPU 核心封装到一个芯片上。</p>
+<p>多 CPU 带来很多难题。对应用来说，一个普通的 C 程序只用一个 CPU，加再多 CPU 也不会让它变快，得用线程把它改写成并行程序（本书第二部分"并发"会详细讨论）。对操作系统来说，新问题是<strong>多处理器调度（multiprocessor scheduling）</strong>：前几章的单处理器调度原则怎么扩展到多个 CPU？要理解它，关键在于硬件<strong>缓存</strong>在多 CPU 之间如何共享数据。</p>
+<div class="aside" data-title="旁注：高级章节">
+<p>这是一个"高级章节"：它逻辑上属于虚拟化部分（CPU 调度），但要真正理解，最好先学过并发部分。建议可以在学完第二部分后再回来细读；本页已经把需要的并发背景（锁、竞争条件）用图解补上了。</p>
+</div>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>缓存（cache）与局部性</h4><p>小而快的存储，保存主存中热门数据的副本。依赖时间局部性和空间局部性。</p></div>
+  <div class="card"><h4>缓存一致性（cache coherence）</h4><p>多个 CPU 各有缓存时，同一地址可能在不同缓存中有不同的值。硬件负责保证"单一共享内存"的视图。</p></div>
+  <div class="card"><h4>总线窥探（bus snooping）</h4><p>每个缓存监视连接主存的总线；看到别人更新了自己持有的数据，就使之失效或更新它。</p></div>
+  <div class="card"><h4>别忘了同步</h4><p>硬件一致性不等于程序正确：跨 CPU 更新共享数据结构仍需要锁，而锁在 CPU 多时会变慢。</p></div>
+  <div class="card"><h4>缓存亲和性（cache affinity）</h4><p>进程在某个 CPU 上运行时会在其缓存中积累状态，下次最好还在同一个 CPU 上运行。</p></div>
+  <div class="card"><h4>SQMS 单队列</h4><p>所有作业放一个队列。简单、天然负载均衡，但扩展性差（锁）且缺乏亲和性。</p></div>
+  <div class="card"><h4>MQMS 多队列</h4><p>每个 CPU 一个队列。可扩展、天然亲和，但会<strong>负载不均衡（load imbalance）</strong>。</p></div>
+  <div class="card"><h4>迁移与工作窃取</h4><p>把作业从一个 CPU 移到另一个（migration）。工作窃取（work stealing）：作业少的队列偶尔偷看别的队列，并"偷"走作业。</p></div>
+</div>
+
+<h2>图解讲解</h2>
+
+<h3>10.1 背景：多处理器架构</h3>
+<p>单 CPU 系统有一个硬件缓存层次结构，帮助处理器更快地运行程序。缓存保存主存中热门数据的副本；主存保存全部数据，但访问更慢。程序第一次 load 某个数据时，它在主存中，需要很长时间（几十甚至上百纳秒）；处理器预期它会被复用，就把副本放进 CPU 缓存（比如 64KB）。下次再取同一个数据时先查缓存，命中就只需几纳秒。</p>
+<p>缓存依赖<strong>局部性（locality）</strong>：<strong>时间局部性（temporal locality）</strong>——一个数据被访问后很可能很快再次被访问（循环中反复使用的变量和指令）；<strong>空间局部性（spatial locality）</strong>——访问了地址 x 的数据后，很可能访问 x 附近的数据（遍历数组、顺序执行指令）。</p>
+<figure class="fig">
+<svg viewBox="0 0 720 230" width="720" role="img" aria-label="单 CPU 带缓存，以及两个 CPU 各带缓存共享内存">
+  <g font-size="13" text-anchor="middle">
+    <text x="130" y="16" class="t-muted" font-size="12">图 10.1　单 CPU 带缓存</text>
+    <rect class="box-strong" x="80" y="30" width="100" height="36" rx="6"/><text x="130" y="53">CPU</text>
+    <rect class="accent-soft" x="80" y="80" width="100" height="30" rx="6"/><text x="130" y="100">缓存</text>
+    <line class="arrow" x1="130" y1="110" x2="130" y2="165"/>
+    <rect class="box" x="40" y="165" width="180" height="40" rx="6"/><text x="130" y="190">主存（Memory）</text>
+    <text x="490" y="16" class="t-muted" font-size="12">图 10.2　两个 CPU 各带缓存，共享内存</text>
+    <rect class="box-strong" x="370" y="30" width="100" height="36" rx="6"/><text x="420" y="53">CPU 0</text>
+    <rect class="accent-soft" x="370" y="80" width="100" height="30" rx="6"/><text x="420" y="100">缓存</text>
+    <rect class="box-strong" x="530" y="30" width="100" height="36" rx="6"/><text x="580" y="53">CPU 1</text>
+    <rect class="accent-soft" x="530" y="80" width="100" height="30" rx="6"/><text x="580" y="100">缓存</text>
+    <line class="arrow" x1="420" y1="110" x2="420" y2="135"/><line class="arrow" x1="580" y1="110" x2="580" y2="135"/>
+    <line class="stroke" x1="360" y1="135" x2="640" y2="135" stroke-width="3"/><text x="660" y="140" font-size="12" class="t-muted">总线</text>
+    <line class="arrow" x1="500" y1="135" x2="500" y2="165"/>
+    <rect class="box" x="410" y="165" width="180" height="40" rx="6"/><text x="500" y="190">主存（Memory）</text>
+  </g>
+</svg>
+<figcaption>单 CPU 与多 CPU 的缓存结构。多个 CPU 共享一个主存时，缓存会变得复杂得多。</figcaption>
+</figure>
+
+<h4>缓存一致性问题</h4>
+<p>设想 CPU 1 上的程序读地址 A 的数据（值为 D）：缓存中没有，于是从主存取来 D。程序接着把 A 处的值改成 D′，只更新了自己的缓存（一路写回主存很慢，系统通常稍后再写）。然后操作系统把程序移到 CPU 2 上运行，程序再次读地址 A：CPU 2 的缓存中没有，于是从主存取——得到的是旧值 D，而不是正确的 D′。糟糕！这就是<strong>缓存一致性（cache coherence）</strong>问题。单步看看，并对比开启<strong>总线窥探</strong>后的情形：</p>
+<figure class="fig">
+  <div class="controls"><label><input type="checkbox" id="coh-snoop"> 开启总线窥探（写时使其他缓存的副本失效）</label></div>
+  <div id="coh-step"></div>
+  <div id="coh-svg"></div>
+  <div class="narrate" id="coh-nar"></div>
+  <figcaption>缓存一致性：没有一致性协议时，迁移到 CPU 2 的程序读到了过时的 D；有了总线窥探，CPU 1 写 A 时其他缓存中的副本被作废，CPU 2 读 A 时由 CPU 1 的缓存提供最新值 D′。</figcaption>
+</figure>
+<p>基本的解决方案由硬件提供：通过监控内存访问，硬件保证"正确的事"发生，保持单一共享内存的视图。在基于总线的系统上，一种办法是古老的<strong>总线窥探（bus snooping）</strong>技术：每个缓存都监视连接它们与主存的总线上的内存更新；当某个 CPU 看到自己缓存中持有的数据被更新时，就<strong>使其失效（invalidate）</strong>（从自己的缓存中删除）或<strong>更新（update）</strong>它（把新值也放进自己的缓存）。写回缓存（write-back cache）让这件事更复杂（写到主存的操作要稍后才可见），但基本思路可以想象。</p>
+
+<h3>10.2 别忘了同步</h3>
+<p>既然缓存已经做了这么多工作来提供一致性，程序（或操作系统本身）访问共享数据时还需要担心什么吗？很不幸，需要。跨 CPU 访问（特别是更新）共享的数据项或数据结构时，应该使用<strong>互斥原语（如锁）</strong>来保证正确性（无锁数据结构等其他办法很复杂，只偶尔使用）。例如多个 CPU 同时访问一个共享队列，即使底层有一致性协议，不加锁地并发增删元素也不会得到预期结果。下面是从共享链表删除一个元素的代码：</p>
+<figure class="fig">
+  <div class="controls"><label><input type="checkbox" id="pop-lock"> 加锁：在开头 lock(&amp;m)，结尾 unlock(&amp;m)</label></div>
+  <div id="pop-step"></div>
+  <div class="grid2">
+    <div class="codebox" id="pop-code"></div>
+    <div><div id="pop-svg"></div><div class="narrate" id="pop-nar"></div></div>
+  </div>
+  <figcaption>图 10.3　简单的链表删除代码。蓝色 = CPU 1 上的线程 1 刚执行的行，橙色 = CPU 2 上的线程 2 刚执行的行。不加锁时两个线程都拿到同一个旧 head：A 被 free 两次、值被返回两次，B 还被"跳过"丢失了。</figcaption>
+</figure>
+<p>线程 1 执行第一行，把 head 的当前值存进它的 <code>tmp</code>；线程 2 接着也执行第一行，也得到同样的 head 值（<code>tmp</code> 在栈上分配，每个线程各有一份）。于是两个线程不是各删一个元素，而是都试图删除同一个头元素，导致各种问题（例如第 10 行对同一个元素 double free，以及可能两次返回同一个值）。解决方法当然是加锁：分配一个互斥量（如 <code>pthread_mutex_t m;</code>），在函数开头 <code>lock(&amp;m)</code>、结尾 <code>unlock(&amp;m)</code>。但这有性能问题：CPU 数量增加时，访问一个被同步保护的共享数据结构会变得相当慢。</p>
+
+<h3>10.3 最后一个问题：缓存亲和性</h3>
+<p>构建多处理器缓存调度器还有一个问题：<strong>缓存亲和性（cache affinity）</strong>。进程在某个 CPU 上运行时，会在该 CPU 的缓存（和 TLB）中积累相当多的状态。下次运行时，如果还在同一个 CPU 上，由于部分状态已经在缓存中，它会运行得更快；如果每次都换 CPU，它每次都要重新加载状态，性能会变差（注意：因为硬件的缓存一致性协议，它在别的 CPU 上仍能<em>正确</em>运行）。因此多处理器调度器在做决策时应该考虑缓存亲和性，尽可能让进程留在同一个 CPU 上。</p>
+<figure class="fig">
+<svg viewBox="0 0 700 170" width="700" role="img" aria-label="缓存亲和性：留在原 CPU 时缓存是热的，迁移后缓存是冷的">
+  <g font-size="12.5">
+    <text x="20" y="20" style="font-weight:600">留在 CPU 0（有亲和性）</text>
+    <rect x="20" y="30" width="60" height="26" rx="3" style="fill:var(--c1)" opacity=".45"/><text x="50" y="47" text-anchor="middle" style="fill:#fff;font-weight:600">A 冷</text>
+    <rect x="80" y="30" width="60" height="26" rx="3" style="fill:var(--c1)"/><text x="110" y="47" text-anchor="middle" style="fill:#fff;font-weight:600">A 热</text>
+    <rect x="140" y="30" width="60" height="26" rx="3" style="fill:var(--c2)"/><text x="170" y="47" text-anchor="middle" style="fill:#fff;font-weight:600">B</text>
+    <rect x="200" y="30" width="60" height="26" rx="3" style="fill:var(--c1)"/><text x="230" y="47" text-anchor="middle" style="fill:#fff;font-weight:600">A 热</text>
+    <rect x="260" y="30" width="60" height="26" rx="3" style="fill:var(--c1)"/><text x="290" y="47" text-anchor="middle" style="fill:#fff;font-weight:600">A 热</text>
+    <text x="330" y="47" class="t-muted">预热只付一次代价，之后都跑得快</text>
+    <text x="20" y="92" style="font-weight:600">每次换一个 CPU（没有亲和性）</text>
+    <rect x="20" y="102" width="60" height="26" rx="3" style="fill:var(--c1)" opacity=".45"/><text x="50" y="119" text-anchor="middle" style="fill:#fff;font-weight:600">A@0 冷</text>
+    <rect x="80" y="102" width="60" height="26" rx="3" style="fill:var(--c1)" opacity=".45"/><text x="110" y="119" text-anchor="middle" style="fill:#fff;font-weight:600">A@1 冷</text>
+    <rect x="140" y="102" width="60" height="26" rx="3" style="fill:var(--c2)"/><text x="170" y="119" text-anchor="middle" style="fill:#fff;font-weight:600">B</text>
+    <rect x="200" y="102" width="60" height="26" rx="3" style="fill:var(--c1)" opacity=".45"/><text x="230" y="119" text-anchor="middle" style="fill:#fff;font-weight:600">A@2 冷</text>
+    <rect x="260" y="102" width="60" height="26" rx="3" style="fill:var(--c1)" opacity=".45"/><text x="290" y="119" text-anchor="middle" style="fill:#fff;font-weight:600">A@3 冷</text>
+    <text x="330" y="119" class="t-muted">每次都要从主存重新加载工作集</text>
+    <text x="20" y="160" class="t-muted" font-size="12">浅色 = 缓存冷（运行慢），深色 = 缓存热（运行快）</text>
+  </g>
+</svg>
+<figcaption>缓存亲和性示意：同样的 CPU 时间，缓存热的时候完成的工作更多。</figcaption>
+</figure>
+
+<h3>10.4 单队列调度（SQMS）</h3>
+<p>最基本的做法是直接复用单处理器调度的框架：把所有需要调度的作业放进<strong>一个</strong>队列，称为<strong>单队列多处理器调度（single-queue multiprocessor scheduling, SQMS）</strong>。优点是简单：把一个"挑出最佳作业"的现有策略改成在多个 CPU 上工作不需要多少工作（比如有两个 CPU，就挑最好的两个）。但 SQMS 有明显缺陷：</p>
+<ul>
+  <li><strong>缺乏可扩展性（scalability）</strong>：为保证调度器在多 CPU 上正确工作，代码中要加锁；而锁会大大降低性能，特别是 CPU 数目增加时。对这把锁的争用越激烈，系统花在锁开销上的时间越多，做正事的时间越少。</li>
+  <li><strong>缓存亲和性</strong>：假设有 5 个作业（A、B、C、D、E）和 4 个处理器，每个 CPU 运行一个时间片后从全局队列取下一个作业，每个作业都会在 CPU 之间跳来跳去——与缓存亲和性的要求正好相反。</li>
+</ul>
+<figure class="fig"><div id="fig-sqms1"></div><figcaption>SQMS 下的一种可能调度（队列：A B C D E）：每个作业在 CPU 之间来回跳。本图由下方模拟器的 SQMS 策略生成，与原书完全一致。</figcaption></figure>
+<p>为此，大多数 SQMS 调度器加入了某种<strong>亲和性机制</strong>，尽量让进程继续在同一个 CPU 上运行：对部分作业提供亲和性，而移动另一些作业来平衡负载。例如：</p>
+<figure class="fig"><div id="fig-sqms2"></div><figcaption>带亲和性的 SQMS（原书示例）：A 到 D 不在处理器之间移动，只有 E 在 CPU 之间迁移，保住了大多数作业的亲和性。下次还可以换一个作业来迁移，从而实现某种"亲和性公平"——但实现这样的方案可能很复杂。</figcaption></figure>
+<p>所以 SQMS 有长处也有短处：给定一个现成的单 CPU 调度器（按定义只有一个队列），实现 SQMS 很直接；但它扩展性不好（同步开销），也不容易保持缓存亲和性。</p>
+
+<h3>10.5 多队列调度（MQMS）</h3>
+<p>由于单队列调度器的问题，一些系统使用多个队列，比如每个 CPU 一个，称为<strong>多队列多处理器调度（multi-queue multiprocessor scheduling, MQMS）</strong>。每个队列可以使用自己的调度规则（比如轮转，当然任何算法都可以）。作业进入系统时，按某种启发式规则（随机，或者选作业较少的队列）被放入<strong>恰好一个</strong>调度队列，此后基本上独立调度，避免了单队列方法中信息共享和同步的问题。</p>
+<p>例如两个 CPU（CPU 0、CPU 1），作业 A、B、C、D 进入系统，操作系统可能这样放：Q0 = {A, C}，Q1 = {B, D}。用轮转策略，得到的调度可能是：</p>
+<figure class="fig"><div id="fig-mq1"></div><figcaption>MQMS：Q0 = A C，Q1 = B D，每个队列各自轮转。作业待在同一个 CPU 上，天然具有缓存亲和性。</figcaption></figure>
+<p>MQMS 比 SQMS 有明显的优势：天然更具可扩展性——CPU 增多，队列也增多，锁和缓存争用不会成为核心问题；而且天然提供缓存亲和性。但它有一个根本性的新问题：<strong>负载不均衡（load imbalance）</strong>。假设 C 完成了：</p>
+<figure class="fig"><div id="fig-mq2"></div><figcaption>C 完成后：Q0 = A，Q1 = B D。A 得到的 CPU 是 B 和 D 的两倍——这不是我们想要的结果。</figcaption></figure>
+<figure class="fig"><div id="fig-mq3"></div><figcaption>更糟的情况：A 和 C 都完成了，只剩 B 和 D。CPU 0 空闲！（此处插入戏剧性的阴森音乐）</figcaption></figure>
+<div class="crux"><p><strong>如何处理负载不均衡？</strong>多队列多处理器调度器应该如何处理负载不均衡，从而更好地实现它的调度目标？</p><p class="muted small">CRUX: HOW TO DEAL WITH LOAD IMBALANCE</p></div>
+<p>显然的答案是移动作业，这种技术称为<strong>迁移（migration）</strong>。把作业从一个 CPU 迁移到另一个，就能实现真正的负载均衡。只剩 B、D 时很简单：把 B 或 D 之一移到 CPU 0 即可。更棘手的是 A 单独在 CPU 0、B 和 D 在 CPU 1 交替的情形：一次迁移解决不了问题，答案是<strong>持续地迁移</strong>一个或多个作业。例如下面的时间线：一开始 A 独占 CPU 0，B 和 D 在 CPU 1 交替；几个时间片后把 B 移过去与 A 竞争 CPU 0，D 则独享 CPU 1 几个时间片……负载就均衡了：</p>
+<figure class="fig"><div id="fig-mq4"></div><figcaption>持续迁移实现负载均衡（原书示例）。当然还有很多其他可能的迁移模式。</figcaption></figure>
+<p>那系统该如何决定何时迁移？一种基本方法是<strong>工作窃取（work stealing）</strong>：作业较少的（源）队列偶尔<strong>偷看</strong>一下另一个（目标）队列有多满；如果目标队列（明显）比源队列满，源队列就从目标队列"偷"走一个或多个作业来平衡负载。这里有天然的张力：看得太频繁，开销就大，难以扩展——而扩展性正是实现多队列调度的初衷；看得太少，又可能遭受严重的负载不均衡。找到合适的阈值，和系统策略设计中常见的情形一样，是一门黑艺术。</p>
+
+<h3>10.6 Linux 多处理器调度器</h3>
+<p>有趣的是，Linux 社区并没有形成统一的多处理器调度方案，先后出现了三种：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>调度器</th><th>队列</th><th>思路</th></tr></thead>
+<tbody>
+<tr><td>O(1) 调度器</td><td>多队列</td><td>基于优先级（类似 MLFQ），随时间改变进程优先级，调度最高优先级的进程以实现各种目标，特别关注交互性。</td></tr>
+<tr><td>完全公平调度器（CFS）</td><td>多队列</td><td>确定性的比例份额方法（更像第 9 章的步长调度）。</td></tr>
+<tr><td>BF 调度器（BFS）</td><td>单队列</td><td>三者中唯一的单队列方法，也是比例份额，但基于更复杂的"最早合格虚拟截止时间优先（EEVDF）"方案。</td></tr>
+</tbody></table></div>
+<p>这说明单队列和多队列两种方法都能成功。（BF 代表什么请自行查阅——事先警告，不适合胆小者。）</p>
+
+<h2>交互模拟器</h2>
+<section class="sim" id="sim-multi">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>多处理器调度：SQMS vs MQMS，缓存变暖后运行更快</h3>
+    <div class="desc">仿照 OSTEP 作业 multi.py 的模型：每个 CPU 有大小为 M 的缓存；作业有运行时间和工作集大小；作业在某个 CPU 上连续累计运行满"预热时间"且工作集装得下时，该 CPU 的缓存对它变"热"，之后每 tick 完成"加速倍率"份工作。观察：作业在 CPU 间的迁移（▼）、冷/热运行、负载不均衡与工作窃取。</div></div>
+  <div class="sim-body">
+    <div class="presets" id="mp-presets"><span class="lbl">载入示例：</span></div>
+    <div class="controls">
+      <label>策略 <select id="mp-pol"><option value="sqms">SQMS 单队列</option><option value="sqms-aff">SQMS + 亲和性</option><option value="mqms">MQMS 每 CPU 一队列</option></select></label>
+      <label>CPU 数 <input type="number" id="mp-n" min="1" max="8" value="2"></label>
+      <label>时间片 <input type="number" id="mp-q" min="1" max="100" value="10"></label>
+      <label>缓存大小 M <input type="number" id="mp-M" min="1" max="10000" value="100"></label>
+      <label>预热时间 <input type="number" id="mp-w" min="0" max="200" value="10"></label>
+      <label>热缓存加速倍率 <input type="number" id="mp-r" min="1" max="10" step="0.5" value="2"></label>
+    </div>
+    <div class="controls" id="mp-mqrow">
+      <label><input type="checkbox" id="mp-steal"> 工作窃取</label>
+      <label>偷看间隔 P <input type="number" id="mp-P" min="1" max="1000" value="30"></label>
+      <label title="目标队列比自己多至少这么多个作业（含正在运行的）才偷">窃取阈值 <input type="number" id="mp-th" min="1" max="10" value="1"></label>
+    </div>
+    <div class="controls">
+      <button id="mp-add">＋ 添加作业</button>
+      <button id="mp-rand">🎲 随机作业</button>
+      <label>种子 <input type="number" id="mp-seed" value="3"></label>
+    </div>
+    <div class="table-wrap"><table class="jobtable"><thead><tr><th>作业</th><th>运行时间</th><th>工作集</th><th>限定 CPU（-A）</th><th></th></tr></thead><tbody id="mp-jobs"></tbody></table></div>
+    <div id="mp-step"></div>
+    <div class="stage"><div id="mp-chart"></div><div class="panel" id="mp-panel"></div></div>
+    <div class="legend"><span><i style="background:var(--c1)"></i>缓存热（快）</span><span><i style="background:var(--c1);opacity:.4"></i>缓存冷（慢）</span><span>▼ 迁移（换了 CPU）</span><span>竖线 = 当前 tick</span></div>
+    <div class="narrate" id="mp-nar"></div>
+    <div class="stats" id="mp-stats"></div>
+  </div>
+</section>
+
+<h2>先预测再验证</h2>
+<div class="exercise"><div class="q">（课后题 1、2）一个 CPU、一个作业 a（运行时间 30，工作集 200），缓存 100，要多久？把缓存加到 300 呢？（预热时间 10，加速倍率 2）</div>
+<details class="reveal"><summary>看答案</summary><div>缓存 100 时工作集装不下，缓存永远是冷的：<strong>30</strong>。缓存 300 时，前 10 个 tick 冷运行完成 10 份工作，缓存变热后剩下 20 份工作以 2 倍速度用 10 个 tick 完成：<strong>20</strong>。点预设"课后题 1""课后题 2"验证，注意面板中缓存条何时出现 a。</div></details></div>
+<div class="exercise"><div class="q">（课后题 5）两个 CPU，三个作业 a:100:100、b:100:50、c:100:50，用集中式（SQMS）轮转调度，多久完成？缓存被有效利用了吗？</div>
+<details class="reveal"><summary>看答案</summary><div>本模拟器中为 <strong>150</strong>——总工作量 300 平摊到两个 CPU 上，几乎没有得到加速。作业在两个 CPU 之间不断迁移（统计里迁移次数很多），而且 a 的工作集 100 会把整个缓存占满、与 b、c 互相驱逐，缓存很少是热的。</div></details></div>
+<div class="exercise"><div class="q">（课后题 6）同样三个作业，把 a 限定在 CPU 0，b、c 限定在 CPU 1。预测完成时间，并解释为什么更快。</div>
+<details class="reveal"><summary>看答案</summary><div><strong>110</strong>。CPU 0 上 a 独享缓存：10 个冷 tick 后以 2 倍速度完成剩下 90，共 55。CPU 1 上 b、c 的工作集 50+50 = 100 恰好装得下，两者都预热后以 2 倍速度轮转：b 在 105、c 在 110 完成。其他组合（比如 a 和 b 放一起）会让工作集超出缓存，互相驱逐，更慢。</div></details></div>
+<div class="exercise"><div class="q">（课后题 7）三个作业都是 100:100。缓存 50 时，1、2、3 个 CPU 分别要多久？缓存 100 呢？什么是"超线性加速"？</div>
+<details class="reveal"><summary>看答案</summary><div>缓存 50 时工作集永远装不下：300、150、100，线性加速。缓存 100 时：1 个 CPU 300（三者轮流、互相驱逐），2 个 CPU 150，<strong>3 个 CPU 只要 55</strong>——每个作业独占一个 CPU 和它的缓存，变热后跑得更快，加速比 300/55 ≈ 5.5 &gt; 3，这就是<strong>超线性加速（super-linear speedup）</strong>：多了 CPU 的同时也多了缓存。</div></details></div>
+<div class="exercise"><div class="q">（课后题 8）MQMS + 工作窃取，两个 CPU，a:100:100、b:100:50、c:100:50。偷看间隔 P 变小或变大时，完成时间怎样变化？</div>
+<details class="reveal"><summary>看答案</summary><div>初始放置为 Q0 = {a, c}、Q1 = {b}。CPU 1 上的 b 很快完成，之后 CPU 1 空闲，直到下一次偷看才把 c 偷过来。P 越小，空闲越短：本模拟器中 P = 5 时约 85，P = 30 时 105，P = 100 时 130，P = 1000 时（相当于不偷）200。现实中 P 太小的代价是频繁查看其他队列带来的开销和锁争用（本模拟器没有计算这部分开销）。</div></details></div>
+
+<div class="exercise"><div class="q">（C 实验）运行 <code>./affinity</code> 之前先预测：工作集 64KB 时，"每遍都换 CPU"比"一直待在一个 CPU 上"慢几倍？工作集 64MB 时呢？</div>
+<details class="reveal"><summary>看答案</summary><div>本机实测：64KB 时约慢 5 倍（2.9 ns → 15 ns 每条缓存行）。64KB 装得进每个核私有的 L1/L2，固定在一个 CPU 上时全部命中；换了 CPU，新核的缓存是冷的，脏数据还在旧核那边，每一行都要经缓存一致性协议搬过来。64MB 时几乎没有差别：工作集远超 16MB 的共享 L3，无论在哪个 CPU 上，每次访问都要去内存。<strong>亲和性只在"工作集装得进私有缓存"时才重要</strong>。</div></details></div>
+
+<h2>动手实验：测量缓存亲和性</h2>
+<div class="lab">
+<p>程序 <code>affinity.c</code> 把工作集切成 64 字节缓存行，串成随机顺序的环，一遍遍"走"它（读下一跳、写本行）。<strong>pin</strong> 模式用 <code>sched_setaffinity()</code> 把自己固定在 CPU 0；<strong>migrate</strong> 模式每走完一遍就换到另一个 CPU。随机顺序的指针追逐让硬件预取器帮不上忙，测到的就是真实的访存延迟。</p>
+<pre><code><span class="cmd">cd labs/10-multicpu &amp;&amp; make</span>
+<span class="cmd">./affinity</span>                 # 扫描 16KB ~ 64MB 的工作集，约 5 秒
+<span class="cmd">./affinity 256 401 0 1</span>     # 256KB，401 遍，在 CPU 0 和 CPU 1 之间迁移</code></pre>
+</div>
+<p>示例输出（本机：AMD Ryzen 7 8745H，每核 32KB L1d + 1MB L2，8 核共享 16MB L3，WSL2；<strong>你的机器上数字会不同</strong>）：</p>
+<pre><code>$ ./affinity
+在线 CPU 16 个；pin = 一直在 CPU 0；migrate = 每遍之后在 CPU 0 和 CPU 2 之间换
+每种配置取各遍耗时的中位数，单位：纳秒 / 缓存行（随机顺序访问）
+
+ 工作集        pin    migrate    migrate/pin
+     16 KB       1.49      11.74           7.9x
+     64 KB       2.91      15.13           5.2x
+    256 KB       2.87      16.59           5.8x
+      1 MB       7.66      13.99           1.8x
+      4 MB      11.47      16.83           1.5x
+     16 MB      94.21      95.82           1.0x
+     64 MB     126.10     118.63           0.9x</code></pre>
+<p>怎么读这些数字：</p>
+<ul>
+<li><strong>装得进私有缓存（≤ 1MB 的 L2）：迁移慢 4~8 倍。</strong>这正是 10.3 节说的：进程在某个 CPU 上积累了缓存状态，换个 CPU 就要重新预热。数据是脏的，还得靠缓存一致性协议从旧核那边搬过来（10.2 节）。</li>
+<li><strong>只装得进共享 L3（4MB）：差距缩小。</strong>两个核都得去 L3 取数据，在哪儿跑都差不多。</li>
+<li><strong>超过 L3（16MB 以上）：没有差别。</strong>每次都要访问内存（约 100 ns，其中还有随机访问造成的 TLB 未命中），亲和性无关紧要。</li>
+<li>这里每遍都迁移，是最坏情况。真实调度器偶尔迁移一次（比如工作窃取），只付一次预热代价，之后新 CPU 的缓存就热了。所以调度器要在负载均衡和亲和性之间权衡。</li>
+</ul>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="3"><div class="q">1. CPU 1 修改了地址 A 的值（只写在自己的写回缓存里），随后程序被迁移到 CPU 2 并读 A。如果没有缓存一致性机制，会发生什么？</div>
+  <div class="opts"><button>A. CPU 2 的读请求会一直阻塞</button><button>B. 程序崩溃</button><button>C. CPU 2 读到新值，因为主存总是最新的</button><button>D. CPU 2 从主存读到旧值</button></div>
+  <div class="explain">写回缓存不会立即写到主存，CPU 2 的缓存又没有副本，于是从主存读到旧值 D。总线窥探等一致性协议正是为解决这个问题。</div></div>
+<div class="mcq" data-answer="1"><div class="q">2. 硬件已经保证了缓存一致性，为什么多 CPU 并发操作共享链表仍然需要锁？</div>
+  <div class="opts"><button>A. 因为锁能让缓存变热</button><button>B. 一致性只保证单个内存位置的值一致，不能让"读 head、改 head、free"这一串操作成为原子操作</button><button>C. 因为一致性协议只对读有效</button><button>D. 因为一致性协议只在单 CPU 上工作</button></div>
+  <div class="explain">图 10.3 中两个线程都读到了同一个 head，这是操作序列的交错问题，与缓存一致性无关，需要互斥来解决。</div></div>
+<div class="mcq" data-answer="2"><div class="q">3. SQMS 的两个主要缺点是？</div>
+  <div class="opts"><button>A. 负载不均衡；实现复杂</button><button>B. 需要工作窃取；需要知道作业长度</button><button>C. 扩展性差（单个队列的锁争用）；缺乏缓存亲和性</button><button>D. 无法使用轮转策略；无法支持优先级</button></div>
+  <div class="explain">SQMS 简单且天然负载均衡；负载不均衡是 MQMS 的问题。</div></div>
+<div class="mcq" data-answer="1"><div class="q">4. MQMS 相比 SQMS 的优点和新问题分别是？</div>
+  <div class="opts"><button>A. 优点：不需要任何锁；问题：缓存一致性</button><button>B. 优点：可扩展、天然缓存亲和；问题：负载不均衡</button><button>C. 优点：负载自动均衡；问题：缺乏亲和性</button><button>D. 优点：实现简单；问题：锁争用</button></div>
+  <div class="explain">每个 CPU 一个队列，作业待在同一个 CPU 上；但作业完成后各队列长度可能不同，甚至有 CPU 空闲。</div></div>
+<div class="mcq" data-answer="0"><div class="q">5. Q0 = {A}，Q1 = {B, D}，都用轮转。为什么一次迁移解决不了不均衡？</div>
+  <div class="opts"><button>A. 三个作业两个 CPU，无论怎么放总有一个 CPU 上两个作业；要让三者份额相同，只能持续地来回迁移</button><button>B. 因为迁移会破坏缓存一致性</button><button>C. 因为 A 不能被迁移</button><button>D. 因为工作窃取只能偷空闲 CPU 的作业</button></div>
+  <div class="explain">这正是书中"continuous migration"的例子：先让 B 去和 A 竞争 CPU 0，过一阵再换，长期看三者份额相同。</div></div>
+<div class="mcq" data-answer="2"><div class="q">6. 关于工作窃取的"偷看频率"，正确的说法是？</div>
+  <div class="opts"><button>A. 越少越好，因为迁移会破坏亲和性</button><button>B. 只需在作业到达时偷看一次</button><button>C. 太频繁开销大、难以扩展（违背多队列初衷）；太少则可能严重负载不均衡——阈值选择是一门"黑艺术"</button><button>D. 越频繁越好，没有代价</button></div>
+  <div class="explain">原书原话：Finding the right threshold remains, as is common in system policy design, a black art.</div></div>
+<div class="mcq" data-answer="0"><div class="q">7. 3 个作业（工作集都能装进单个 CPU 缓存，但装不下两个）从 1 个 CPU 换到 3 个 CPU，完成时间从 300 降到 55。这种现象叫？</div>
+  <div class="opts"><button>A. 超线性加速：CPU 增加的同时总缓存容量也增加了</button><button>B. 负载均衡</button><button>C. 缓存一致性</button><button>D. 工作窃取</button></div>
+  <div class="explain">加速比 5.5 大于 CPU 数 3，因为每个作业都能独占一个缓存、以热缓存速度运行。</div></div>
+<div class="mcq" data-answer="3"><div class="q">8. Linux 的三种多处理器调度器中，哪一个使用单队列？</div>
+  <div class="opts"><button>A. CFS</button><button>B. O(1)</button><button>C. 三者都是多队列</button><button>D. BFS</button></div>
+  <div class="explain">O(1) 和 CFS 都用多队列，BFS 是唯一的单队列方法——说明两条路都能走通。</div></div>
+
+<h2>常见误区</h2>
+<div class="warn">
+<ul>
+<li><strong>"有了缓存一致性就不需要锁。"</strong>一致性保证的是每个地址的值最终一致，不是多步操作的原子性。共享数据结构仍然需要同步。</li>
+<li><strong>"作业换到别的 CPU 会算错。"</strong>不会——一致性协议保证它照样正确运行，只是缓存是冷的、会变慢。亲和性是<em>性能</em>问题，不是正确性问题。</li>
+<li><strong>"MQMS 天然均衡负载。"</strong>恰恰相反，负载不均衡是 MQMS 的根本问题；SQMS 才天然均衡（所有 CPU 从同一个队列取作业）。</li>
+<li><strong>"多加 CPU，单个程序就会变快。"</strong>普通的单线程程序只能用一个 CPU，要改写成多线程才能利用多个 CPU。</li>
+<li><strong>"迁移越多，负载越均衡，所以越好。"</strong>每次迁移都要付出重新预热缓存的代价，工作窃取本身也有开销；需要在均衡和亲和性之间权衡。</li>
+</ul>
+</div>
+
+<h2>本章小结</h2>
+<ul>
+  <li>多处理器的新问题源于硬件缓存：需要缓存一致性（硬件用总线窥探等协议解决），软件访问共享数据仍需同步（锁，但锁在 CPU 多时变慢），调度要考虑缓存亲和性。</li>
+  <li>SQMS：实现简单、负载天然均衡，但扩展性差（锁争用）且缺乏亲和性；可以加入亲和性机制，让大多数作业留在原 CPU、少数作业迁移。</li>
+  <li>MQMS：扩展性好、天然亲和，但有负载不均衡；用迁移（如工作窃取）解决，偷看的频率和阈值需要仔细权衡。</li>
+  <li>Linux 中 O(1) 与 CFS 是多队列，BFS 是单队列——没有简单答案。构建通用调度器仍然是一项艰巨的任务：小的代码改动可能导致大的行为差异。</li>
+  <li>这一章把 CPU 虚拟化告一段落。接下来进入内存虚拟化（地址空间）；第二部分"并发"会深入讲本章提到的锁、线程和竞争条件。</li>
+</ul>
+
+</main>
+<script>
+(function () {
+"use strict";
+const { h, s, color, letter } = OSTEP;
+
+/* CORE-BEGIN */
+// 多处理器调度 + 缓存预热模型（仿照 OSTEP 作业 multi.py 的思路）。逐 tick 模拟。
+// cfg = { ncpu, quantum, cache, warmup, rate, policy:'sqms'|'sqms-aff'|'mqms', steal, peek, thresh,
+//         jobs:[{name, run, wset, pin}], maxT }
+function multiSim(cfg) {
+  const n = cfg.ncpu, q = cfg.quantum, M = cfg.cache, W = cfg.warmup, R = cfg.rate;
+  const mq = cfg.policy === "mqms", aff = cfg.policy === "sqms-aff";
+  const jobs = cfg.jobs.map((j, i) => ({ i, name: j.name || String.fromCharCode(97 + i), run: +j.run, rem: +j.run, wset: +j.wset,
+    pin: j.pin == null || j.pin === "" || +j.pin < 0 || +j.pin >= n ? -1 : +j.pin, last: -1, done: null, warmCnt: Array(n).fill(0), seq: 0, migr: 0, cpuTicks: 0, warmTicks: 0 }));
+  const ok = (j, c) => j.pin < 0 || j.pin === c;
+  const cache = Array.from({ length: n }, () => []);
+  const cur = Array(n).fill(-1), qLeft = Array(n).fill(0), prevRun = Array(n).fill(-1);
+  let queues;
+  if (mq) { queues = Array.from({ length: n }, () => []); let rr = 0; jobs.forEach((j) => { const c = j.pin >= 0 ? j.pin : rr++ % n; queues[c].push(j.i); }); }
+  else queues = [jobs.map((j) => j.i)];
+  const qOf = (c) => (mq ? queues[c] : queues[0]);
+  let dseq = 0, finished = 0, migrations = 0, t = 0;
+  const ticks = [], maxT = cfg.maxT || 5000;
+  for (; t < maxT && finished < jobs.length; t++) {
+    const ev = [];
+    if (mq && cfg.steal && t > 0 && t % cfg.peek === 0) {
+      for (let c = 0; c < n; c++) {
+        const load = (x) => queues[x].length + (cur[x] >= 0 ? 1 : 0);
+        let tgt = -1; for (let x = 0; x < n; x++) if (x !== c && (tgt < 0 || load(x) > load(tgt))) tgt = x;
+        if (tgt < 0 || load(tgt) - load(c) < (cfg.thresh || 1)) continue;
+        for (let k = queues[tgt].length - 1; k >= 0; k--) {
+          const j = jobs[queues[tgt][k]];
+          if (ok(j, c)) { queues[tgt].splice(k, 1); queues[c].push(j.i); ev.push({ k: "steal", j: j.i, from: tgt, to: c }); break; }
+        }
+      }
+    }
+    // 需要重新选作业的 CPU：空闲或时间片用完
+    const need = []; for (let c = 0; c < n; c++) if (cur[c] < 0 || qLeft[c] <= 0) need.push(c);
+    const rel = need.filter((c) => cur[c] >= 0).map((c) => ({ c, j: cur[c] })).sort((a, b) => jobs[a.j].seq - jobs[b.j].seq);
+    for (const r of rel) { qOf(r.c).push(r.j); cur[r.c] = -1; }
+    const picks = [];
+    for (const c of need) {
+      const Q = qOf(c), k = Q.findIndex((id) => ok(jobs[id], c));
+      if (k >= 0) picks.push({ c, j: Q.splice(k, 1)[0] });
+    }
+    if (aff && picks.length > 1) { // 亲和性重排：尽量让作业回到上次运行的 CPU
+      const cpus = picks.map((p) => p.c), js = picks.map((p) => p.j), asg = new Map(), used = new Set();
+      for (const pass of [0, 1]) for (const id of js) {
+        if (asg.has(id)) continue; const j = jobs[id];
+        if (cpus.includes(j.last) && !used.has(j.last) && ok(j, j.last) && (pass === 1 || prevRun[j.last] === id)) { asg.set(id, j.last); used.add(j.last); }
+      }
+      for (const id of js) {
+        if (asg.has(id)) continue; const c = cpus.find((x) => !used.has(x) && ok(jobs[id], x));
+        if (c == null) queues[0].unshift(id); else { asg.set(id, c); used.add(c); }
+      }
+      picks.length = 0; for (const id of js) if (asg.has(id)) picks.push({ c: asg.get(id), j: id }); // 保持出队顺序（决定下次放回队列的顺序）
+    }
+    for (const p of picks) {
+      const j = jobs[p.j]; cur[p.c] = p.j; qLeft[p.c] = q; j.seq = ++dseq;
+      if (j.last >= 0 && j.last !== p.c) { j.migr++; migrations++; ev.push({ k: "migrate", j: p.j, from: j.last, to: p.c }); }
+    }
+    const run = [];
+    for (let c = 0; c < n; c++) {
+      const id = cur[c];
+      if (id < 0) { run.push(null); prevRun[c] = -1; continue; }
+      const j = jobs[id], L = cache[c], warm = L.includes(id);
+      j.rem = Math.max(0, j.rem - (warm ? R : 1)); j.cpuTicks++; if (warm) j.warmTicks++;
+      if (warm) { L.splice(L.indexOf(id), 1); L.unshift(id); }
+      else if (++j.warmCnt[c] >= W && j.wset <= M) {
+        L.unshift(id);
+        let sum = 0; for (let k = 0; k < L.length; k++) { sum += jobs[L[k]].wset; if (sum > M) { for (const x of L.splice(k)) { jobs[x].warmCnt[c] = 0; ev.push({ k: "evict", j: x, c }); } break; } }
+        ev.push({ k: "warm", j: id, c });
+      }
+      j.last = c; qLeft[c]--; prevRun[c] = id;
+      run.push({ j: id, warm, mig: ev.some((e) => e.k === "migrate" && e.j === id), start: qLeft[c] === q - 1 });
+      if (j.rem <= 0) { j.done = t + 1; finished++; cur[c] = -1; ev.push({ k: "done", j: id, c }); }
+    }
+    ticks.push({ t, run, ev, queues: queues.map((x) => x.slice()), cache: cache.map((x) => x.slice()),
+      warmCnt: jobs.map((j) => j.warmCnt.slice()), rem: jobs.map((j) => j.rem) });
+  }
+  return { ticks, end: t, migrations, per: jobs.map((j) => ({ name: j.name, done: j.done, migr: j.migr, cpuTicks: j.cpuTicks, warmTicks: j.warmTicks })) };
+}
+/* CORE-END */
+
+const $ = (id) => document.getElementById(id);
+const stat = (v, l) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+function niceUnit(end) { for (const u of [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000]) if (end / u <= 12) return u; return 2000; }
+
+// ---------- 多 CPU 时间线 ----------
+// rows = [{label, cells:[{j, warm, mig}|null ...]}]（每个元素 1 tick）
+function cpuChart(host, rows, o = {}) {
+  const T = o.T || Math.max(...rows.map((r) => r.cells.length));
+  const pxPer = o.pxPer || Math.max(2, Math.min(40, 700 / T)), L = 52, rowH = 26, gap = 8, top = 12;
+  const W = L + T * pxPer + 14, H = top + rows.length * (rowH + gap) + 22;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, class: "tl", role: "img", "aria-label": o.aria || "多 CPU 时间线" });
+  const X = (t) => L + t * pxPer;
+  rows.forEach((r, ri) => {
+    const y = top + ri * (rowH + gap);
+    svg.append(s("text", { x: L - 8, y: y + rowH / 2 + 4, "text-anchor": "end", "font-size": 12, class: "mono", text: r.label }));
+    svg.append(s("rect", { x: X(0), y, width: T * pxPer, height: rowH, style: "fill:none;stroke:var(--border)", "stroke-dasharray": "2 3" }));
+    let a = 0;
+    const cells = r.cells;
+    for (let t = 1; t <= Math.min(T, cells.length); t++) {
+      const A = cells[a], B = t < cells.length ? cells[t] : undefined;
+      const same = B !== undefined && t < T && ((A == null && B == null) || (A && B && A.j === B.j && !!A.warm === !!B.warm && !B.mig && !B.brk)) && t !== o.cursor;
+      if (same) continue;
+      if (A) {
+        const dim = o.cursor != null && a >= o.cursor ? 0.18 : 1;
+        const w = (t - a) * pxPer;
+        svg.append(s("rect", { x: X(a) + 0.5, y, width: Math.max(1, w - 1), height: rowH, rx: 2, style: `fill:${color(A.j)}`, opacity: (A.warm === false ? 0.42 : 1) * dim }));
+        if (w >= 12) svg.append(s("text", { x: X(a) + w / 2, y: y + rowH / 2 + 4.5, "text-anchor": "middle", "font-size": 12, style: "fill:#fff;font-weight:700", opacity: dim, text: o.names ? o.names[A.j] : letter(A.j) }));
+        if (A.mig) svg.append(s("path", { d: `M${X(a)} ${y - 2} l-4 -7 h8 z`, style: "fill:var(--bad)", opacity: dim }));
+      }
+      a = t;
+    }
+  });
+  const axY = top + rows.length * (rowH + gap) - gap + 2;
+  if (o.axis !== false) {
+    const unit = o.unit || niceUnit(T);
+    for (let t = 0; t <= T; t += unit) svg.append(s("text", { x: X(t), y: axY + 14, "text-anchor": "middle", "font-size": 10.5, class: "t-muted mono", text: t }));
+  }
+  if (o.cursor != null) svg.append(s("line", { x1: X(o.cursor), x2: X(o.cursor), y1: 0, y2: axY, style: "stroke:var(--accent);stroke-width:2" }));
+  host.replaceChildren(svg);
+}
+// 由字符串画原书的静态时间线：每个字符一个时间片，'-' 为空闲
+function bookRows(host, spec, names) {
+  const rows = spec.map(([label, str]) => {
+    const cells = [];
+    for (const ch of str) { const j = ch === "-" ? null : names.indexOf(ch); for (let k = 0; k < 4; k++) cells.push(j == null ? null : { j, brk: k === 0 }); }
+    return { label, cells };
+  });
+  cpuChart(host, rows, { pxPer: 12, axis: false, names });
+}
+
+// ---------- 原书静态图 ----------
+(function () {
+  const base = { ncpu: 4, quantum: 10, cache: 1000, warmup: 10, rate: 1, steal: false, peek: 30, thresh: 1 };
+  const jobs = "abcde".split("").map((nm) => ({ name: nm, run: 200, wset: 10 }));
+  const r = multiSim(Object.assign({}, base, { policy: "sqms", jobs }));
+  const rows = [3, 2, 1, 0].map((c) => ({ label: "CPU " + c, cells: r.ticks.slice(0, 50).map((k) => (k.run[c] ? { j: k.run[c].j, mig: k.run[c].mig && k.run[c].start } : null)) }));
+  cpuChart($("fig-sqms1"), rows, { pxPer: 9, unit: 10, names: ["A", "B", "C", "D", "E"] });
+  bookRows($("fig-sqms2"), [["CPU 3", "DDDDE"], ["CPU 2", "CCCEC"], ["CPU 1", "BBEBB"], ["CPU 0", "AEAAA"]], ["A", "B", "C", "D", "E"]);
+  bookRows($("fig-mq1"), [["CPU 0", "AACCAACCAACC"], ["CPU 1", "BBDDBBDDBBDD"]], ["A", "B", "C", "D"]);
+  bookRows($("fig-mq2"), [["CPU 0", "AAAAAAAAAAAA"], ["CPU 1", "BBDDBBDDBBDD"]], ["A", "B", "C", "D"]);
+  bookRows($("fig-mq3"), [["CPU 0", "------------"], ["CPU 1", "BBDDBBDDBBDD"]], ["A", "B", "C", "D"]);
+  bookRows($("fig-mq4"), [["CPU 0", "AAAABABABBBB"], ["CPU 1", "BDBDDDDDADAD"]], ["A", "B", "C", "D"]);
+})();
+
+// ---------- 缓存一致性单步 ----------
+(function () {
+  const S = (c1, c2, mem, bus, txt, hl) => ({ c1, c2, mem, bus, txt, hl });
+  const NO = [
+    S("—", "—", "D", "", "初始：地址 A 的值 D 只在主存里，两个缓存都是空的。", ""),
+    S("A: D", "—", "D", "CPU 1 读 A（未命中）", "程序在 CPU 1 上读 A：缓存未命中，从主存取来 D，放入 CPU 1 的缓存。", "c1"),
+    S("A: D′", "—", "D", "", "程序把 A 改成 D′：只更新了 CPU 1 的缓存（写回缓存，稍后才写主存）。主存里仍是 D。", "c1"),
+    S("A: D′", "—", "D", "", "操作系统把程序迁移到 CPU 2 运行。", ""),
+    S("A: D′", "A: D", "D", "CPU 2 读 A（未命中）", "程序在 CPU 2 上再次读 A：CPU 2 缓存未命中，从主存取——得到<b>旧值 D</b>，而不是 D′。糟糕！这就是缓存一致性问题。", "bad"),
+  ];
+  const YES = [
+    NO[0], NO[1],
+    S("A: D′", "—", "D", "CPU 1 广播：使 A 失效", "程序把 A 改成 D′。开启总线窥探后，这次写会在总线上可见：其他缓存如果持有 A 的副本，就把它作废（这里 CPU 2 还没有副本）。", "c1"),
+    NO[3],
+    S("A: D′", "A: D′", "D′", "CPU 2 读 A → CPU 1 窥探到并提供 D′", "CPU 2 读 A：请求出现在总线上，CPU 1 的缓存窥探到自己持有该地址的最新（脏）数据，于是提供 D′（并写回主存）。程序读到<b>正确的值 D′</b>。", "ok"),
+  ];
+  function render(i) {
+    const st = ($("coh-snoop").checked ? YES : NO)[i];
+    const svg = s("svg", { viewBox: "0 0 600 200", width: 600, role: "img", "aria-label": "缓存一致性示意" });
+    const box = (x, y, w, hh, cls, t1, t2, hl) => { svg.append(s("rect", { x, y, width: w, height: hh, rx: 6, class: cls, style: hl })); svg.append(s("text", { x: x + w / 2, y: y + (t2 ? 18 : hh / 2 + 5), "text-anchor": "middle", "font-size": 13, text: t1 })); if (t2) svg.append(s("text", { x: x + w / 2, y: y + 36, "text-anchor": "middle", "font-size": 13, class: "mono", text: t2 })); };
+    const hlStyle = (k) => (st.hl === k ? "stroke-width:2.5" : "");
+    box(80, 10, 120, 30, "box-strong", "CPU 1");
+    box(400, 10, 120, 30, "box-strong", i >= 3 ? "CPU 2（程序在此）" : "CPU 2");
+    box(80, 50, 120, 44, st.hl === "c1" ? "accent-soft" : "box", "缓存 1", st.c1, hlStyle("c1"));
+    box(400, 50, 120, 44, st.hl === "bad" ? "bad-soft" : st.hl === "ok" ? "ok-soft" : "box", "缓存 2", st.c2, st.hl === "bad" || st.hl === "ok" ? "stroke-width:2.5" : "");
+    svg.append(s("line", { class: "stroke", x1: 40, y1: 120, x2: 560, y2: 120, "stroke-width": 3 }));
+    svg.append(s("line", { class: "arrow", x1: 140, y1: 94, x2: 140, y2: 120 })); svg.append(s("line", { class: "arrow", x1: 460, y1: 94, x2: 460, y2: 120 })); svg.append(s("line", { class: "arrow", x1: 300, y1: 120, x2: 300, y2: 146 }));
+    if (st.bus) svg.append(s("text", { x: 300, y: 112, "text-anchor": "middle", "font-size": 12, style: "fill:var(--warn);font-weight:600", text: "总线：" + st.bus }));
+    box(220, 146, 160, 44, "box", "主存", "A: " + st.mem);
+    $("coh-svg").replaceChildren(svg);
+    $("coh-nar").innerHTML = `第 ${i + 1} 步：` + st.txt;
+  }
+  const stp = OSTEP.stepper($("coh-step"), { steps: 5, render, autoplayMs: 1500 });
+  $("coh-snoop").onchange = () => stp.refresh();
+})();
+
+// ---------- List_Pop 竞争 ----------
+(function () {
+  const code = ["typedef struct __Node_t {", "    int value;", "    struct __Node_t *next;", "} Node_t;", "", "int List_Pop() {", "    Node_t *tmp = head;       // 记住旧的 head", "    int value = head->value;  // ……以及它的值", "    head = head->next;        // head 前进到下一个", "    free(tmp);                // 释放旧 head", "    return value;             // 返回旧 head 的值", "}"];
+  $("pop-code").replaceChildren(...code.map((l, k) => h("div", {}, String(k + 1).padStart(2) + "  " + l)));
+  // 列表 A(10) -> B(20) -> C(30)
+  const race = [
+    { l1: 7, t: "线程 1（CPU 1）执行第 7 行：tmp₁ = head = A。", head: "A", tmp1: "A", tmp2: "", freed: [], ret: [] },
+    { l2: 7, t: "线程 2（CPU 2）也执行第 7 行：tmp₂ = head = A——两个线程拿到了同一个节点！", head: "A", tmp1: "A", tmp2: "A", freed: [], ret: [] },
+    { l1: 8, t: "线程 1：value₁ = A->value = 10。", head: "A", tmp1: "A", tmp2: "A", freed: [], ret: [], v1: 10 },
+    { l2: 8, t: "线程 2：value₂ = A->value = 10。", head: "A", tmp1: "A", tmp2: "A", freed: [], ret: [], v1: 10, v2: 10 },
+    { l1: 9, t: "线程 1：head = head->next = B。", head: "B", tmp1: "A", tmp2: "A", freed: [], ret: [], v1: 10, v2: 10 },
+    { l2: 9, t: "线程 2：head = head->next——但此时 head 已经是 B 了，于是 head = C。<b>B 被跳过（丢失、内存泄漏）</b>。", head: "C", tmp1: "A", tmp2: "A", freed: [], ret: [], v1: 10, v2: 10 },
+    { l1: 10, t: "线程 1：free(A)。", head: "C", tmp1: "A", tmp2: "A", freed: ["A"], ret: [], v1: 10, v2: 10 },
+    { l2: 10, t: "线程 2：free(A)——<b>对同一个节点 double free</b>！", head: "C", tmp1: "A", tmp2: "A", freed: ["A", "A"], ret: [], v1: 10, v2: 10, bad: true },
+    { l1: 11, l2: 11, t: "两个线程都返回 10：<b>同一个值被返回了两次</b>，而 B 的 20 永远不会被返回。", head: "C", tmp1: "A", tmp2: "A", freed: ["A", "A"], ret: [10, 10], v1: 10, v2: 10, bad: true },
+  ];
+  const locked = [
+    { l1: 7, t: "线程 1 先拿到锁 lock(&m)，执行第 7 行：tmp₁ = A。线程 2 在 lock(&m) 处等待。", head: "A", tmp1: "A", tmp2: "", freed: [], ret: [] },
+    { l1: 9, t: "线程 1 执行第 8、9 行：value₁ = 10，head = B。", head: "B", tmp1: "A", tmp2: "", freed: [], ret: [], v1: 10 },
+    { l1: 11, t: "线程 1 free(A)，unlock(&m)，返回 10。", head: "B", tmp1: "A", tmp2: "", freed: ["A"], ret: [10], v1: 10 },
+    { l2: 7, t: "线程 2 拿到锁，执行第 7 行：tmp₂ = head = B。", head: "B", tmp1: "", tmp2: "B", freed: ["A"], ret: [10], v1: 10 },
+    { l2: 11, t: "线程 2：value₂ = 20，head = C，free(B)，unlock，返回 20。结果正确：两个线程各删除了一个不同的元素。", head: "C", tmp1: "", tmp2: "B", freed: ["A", "B"], ret: [10, 20], v1: 10, v2: 20, ok: true },
+  ];
+  const cur = () => ($("pop-lock").checked ? locked : race);
+  function render(i) {
+    const st = cur()[i];
+    [...$("pop-code").children].forEach((el, k) => { el.className = st.l1 === k + 1 && st.l2 === k + 1 ? "t12" : st.l1 === k + 1 ? "t1" : st.l2 === k + 1 ? "t2" : ""; });
+    const svg = s("svg", { viewBox: "0 0 380 170", width: 380, role: "img", "aria-label": "共享链表状态" });
+    const nodes = [["A", 10], ["B", 20], ["C", 30]];
+    nodes.forEach(([nm, v], k) => {
+      const x = 30 + k * 115, freedN = st.freed.filter((f) => f === nm).length;
+      svg.append(s("rect", { x, y: 60, width: 80, height: 40, rx: 6, class: freedN > 1 ? "bad-soft" : freedN ? "box" : "box-strong", "stroke-dasharray": freedN ? "4 3" : null }));
+      svg.append(s("text", { x: x + 40, y: 85, "text-anchor": "middle", "font-size": 13, class: freedN ? "t-muted" : "", text: `${nm}: ${v}` + (freedN > 1 ? " ×2 free" : freedN ? " (已 free)" : "") }));
+      if (k < 2) svg.append(s("line", { class: "arrow", x1: x + 80, y1: 80, x2: x + 115, y2: 80 }));
+      if (st.head === nm) { svg.append(s("text", { x: x + 40, y: 30, "text-anchor": "middle", "font-size": 12, class: "mono", text: "head" })); svg.append(s("line", { class: "arrow", x1: x + 40, y1: 36, x2: x + 40, y2: 58 })); }
+      if (st.tmp1 === nm) svg.append(s("text", { x: x + 10, y: 122, "font-size": 12, style: "fill:var(--c1);font-weight:700", text: "tmp₁" }));
+      if (st.tmp2 === nm) svg.append(s("text", { x: x + 44, y: 122, "font-size": 12, style: "fill:var(--c2);font-weight:700", text: "tmp₂" }));
+    });
+    svg.append(s("text", { x: 10, y: 155, "font-size": 12.5, text: `返回值：线程 1 = ${st.ret[0] ?? "—"}，线程 2 = ${st.ret[1] ?? "—"}` }));
+    $("pop-svg").replaceChildren(svg);
+    $("pop-nar").innerHTML = st.t;
+  }
+  const stp = OSTEP.stepper($("pop-step"), { steps: () => cur().length, render, autoplayMs: 1500 });
+  $("pop-lock").onchange = () => stp.reset();
+})();
+
+// ---------- 多处理器调度模拟器 ----------
+(function () {
+  const J = (name, run, wset, pin = -1) => ({ name, run, wset, pin });
+  const PRE = [
+    { name: "课后题 1（冷）", n: 1, M: 100, pol: "sqms", jobs: [J("a", 30, 200)] },
+    { name: "课后题 2（M=300）", n: 1, M: 300, pol: "sqms", jobs: [J("a", 30, 200)] },
+    { name: "课后题 5 SQMS", n: 2, M: 100, pol: "sqms", jobs: [J("a", 100, 100), J("b", 100, 50), J("c", 100, 50)] },
+    { name: "课后题 6 限定 CPU", n: 2, M: 100, pol: "sqms", jobs: [J("a", 100, 100, 0), J("b", 100, 50, 1), J("c", 100, 50, 1)] },
+    { name: "课后题 7 超线性（3 CPU）", n: 3, M: 100, pol: "sqms", jobs: [J("a", 100, 100), J("b", 100, 100), J("c", 100, 100)] },
+    { name: "课后题 8 MQMS+窃取", n: 2, M: 100, pol: "mqms", steal: true, P: 30, jobs: [J("a", 100, 100), J("b", 100, 50), J("c", 100, 50)] },
+    { name: "原书 SQMS：5 作业 4 CPU", n: 4, M: 100, pol: "sqms", jobs: "abcde".split("").map((c) => J(c, 60, 50)) },
+    { name: "同上 + 亲和性", n: 4, M: 100, pol: "sqms-aff", jobs: "abcde".split("").map((c) => J(c, 60, 50)) },
+    { name: "MQMS 负载不均衡", n: 2, M: 100, pol: "mqms", steal: false, jobs: [J("a", 40, 50), J("b", 150, 50), J("c", 40, 50), J("d", 150, 50)] },
+    { name: "同上 + 工作窃取", n: 2, M: 100, pol: "mqms", steal: true, P: 30, jobs: [J("a", 40, 50), J("b", 150, 50), J("c", 40, 50), J("d", 150, 50)] },
+  ];
+  let jobs = PRE[2].jobs.map((j) => ({ ...j })), res = null;
+  const box = $("mp-presets");
+  PRE.forEach((p) => box.append(h("button", { onclick: () => {
+    jobs = p.jobs.map((j) => ({ ...j })); $("mp-n").value = p.n; $("mp-M").value = p.M; $("mp-pol").value = p.pol;
+    $("mp-q").value = 10; $("mp-w").value = 10; $("mp-r").value = 2; $("mp-steal").checked = !!p.steal; $("mp-P").value = p.P || 30; $("mp-th").value = 1;
+    drawJobs(); recompute(); } }, p.name)));
+  const ncpu = () => Math.max(1, Math.min(8, +$("mp-n").value | 0));
+  function drawJobs() {
+    const n = ncpu();
+    $("mp-jobs").replaceChildren(...jobs.map((j, i) => h("tr", {}, h("td", {}, h("span", { class: "sw", style: { background: color(i) } }), h("b", {}, j.name)),
+      h("td", {}, h("input", { type: "number", min: 1, max: 2000, value: j.run, oninput: (e) => { j.run = Math.max(1, +e.target.value | 0); recompute(); } })),
+      h("td", {}, h("input", { type: "number", min: 1, max: 10000, value: j.wset, oninput: (e) => { j.wset = Math.max(1, +e.target.value | 0); recompute(); } })),
+      h("td", {}, h("select", { onchange: (e) => { j.pin = +e.target.value; recompute(); } }, h("option", { value: -1 }, "任意"),
+        Array.from({ length: n }, (_, c) => h("option", { value: c, selected: j.pin === c ? true : null }, "CPU " + c)))),
+      h("td", {}, jobs.length > 1 ? h("button", { title: "删除", onclick: () => { jobs.splice(i, 1); drawJobs(); recompute(); } }, "✕") : ""))));
+  }
+  $("mp-add").onclick = () => { if (jobs.length < 8) { jobs.push(J("abcdefgh"[jobs.length], 100, 50)); drawJobs(); recompute(); } };
+  $("mp-rand").onclick = () => {
+    const r = OSTEP.rng(+$("mp-seed").value || 1), k = r.int(3, 6);
+    jobs = Array.from({ length: k }, (_, i) => J("abcdefgh"[i], r.int(2, 20) * 10, r.pick([25, 50, 50, 75, 100, 150])));
+    $("mp-seed").value = (+$("mp-seed").value || 1) + 1; drawJobs(); recompute();
+  };
+  ["mp-q", "mp-M", "mp-w", "mp-r", "mp-P", "mp-th"].forEach((id) => ($(id).oninput = recompute));
+  $("mp-n").oninput = () => { jobs.forEach((j) => { if (j.pin >= ncpu()) j.pin = -1; }); drawJobs(); recompute(); };
+  $("mp-pol").onchange = $("mp-steal").onchange = recompute;
+  function cfg() {
+    return { ncpu: ncpu(), quantum: Math.max(1, +$("mp-q").value | 0), cache: Math.max(1, +$("mp-M").value | 0), warmup: Math.max(0, +$("mp-w").value | 0),
+      rate: Math.max(1, +$("mp-r").value || 1), policy: $("mp-pol").value, steal: $("mp-steal").checked, peek: Math.max(1, +$("mp-P").value | 0), thresh: Math.max(1, +$("mp-th").value | 0), jobs, maxT: 5000 };
+  }
+  function recompute() {
+    const c = cfg();
+    $("mp-mqrow").style.display = c.policy === "mqms" ? "" : "none";
+    res = multiSim(c); res.cfg = c;
+    const warm = res.per.reduce((a, p) => a + p.warmTicks, 0), tot = res.per.reduce((a, p) => a + p.cpuTicks, 0);
+    const busy = res.ticks.reduce((a, k) => a + k.run.filter(Boolean).length, 0);
+    $("mp-stats").replaceChildren(stat(res.end, "全部完成时刻"), stat((res.per.reduce((a, p) => a + p.done, 0) / res.per.length).toFixed(1), "平均完成时刻"),
+      stat(res.migrations, "迁移次数"), stat(tot ? ((100 * warm) / tot).toFixed(0) + "%" : "—", "热缓存 tick 占比"),
+      stat(((100 * busy) / (res.end * c.ncpu || 1)).toFixed(0) + "%", "CPU 利用率"));
+    stp.reset();
+  }
+  function render(i) {
+    if (!res) return;
+    const c = res.cfg, n = c.ncpu, T = res.ticks.length, fin = i >= T;
+    const names = jobs.map((j) => j.name);
+    const rows = Array.from({ length: n }, (_, cpu) => ({ label: "CPU " + cpu, cells: res.ticks.map((k) => (k.run[cpu] ? { j: k.run[cpu].j, warm: k.run[cpu].warm, mig: k.run[cpu].mig && k.run[cpu].start, brk: k.run[cpu].start } : null)) }));
+    cpuChart($("mp-chart"), rows, { T, cursor: fin ? null : i, names });
+    const k = res.ticks[Math.min(i, T - 1)];
+    const panel = [];
+    if (c.policy === "mqms") k.queues.forEach((Q, cpu) => panel.push(h("div", { class: "row" }, h("span", { class: "nm" }, "Q" + cpu), Q.length ? Q.map((id) => h("span", { class: "cell on" }, names[id])) : h("span", { class: "muted small" }, "（空）"))));
+    else panel.push(h("div", { class: "row" }, h("span", { class: "nm" }, "全局队列"), k.queues[0].length ? k.queues[0].map((id) => h("span", { class: "cell on" }, names[id])) : h("span", { class: "muted small" }, "（空）")));
+    for (let cpu = 0; cpu < n; cpu++) {
+      const r = k.run[cpu];
+      const bar = h("span", { class: "cbar", title: `缓存 ${c.cache}` }, k.cache[cpu].map((id) => h("span", { style: { width: (100 * jobs[id].wset) / c.cache + "%", background: color(id) } }, names[id])));
+      const warming = jobs.map((j, id) => ({ id, w: k.warmCnt[id][cpu] })).filter((x) => x.w > 0 && !k.cache[cpu].includes(x.id));
+      panel.push(h("div", { class: "row" }, h("span", { class: "nm" }, "CPU " + cpu),
+        r ? h("span", { class: "cell run", style: { background: color(r.j), opacity: r.warm ? 1 : 0.6 } }, names[r.j], h("small", {}, r.warm ? "热" : "冷")) : h("span", { class: "cell" }, "空闲"),
+        h("span", { class: "muted small" }, "缓存"), bar,
+        warming.length ? h("span", { class: "muted small" }, "预热中：" + warming.map((x) => `${names[x.id]} ${x.w}/${c.warmup}`).join("，")) : null));
+    }
+    panel.push(h("div", { class: "row muted small" }, "剩余工作：" + jobs.map((j, id) => `${names[id]}=${fin ? 0 : +k.rem[id].toFixed(1)}`).join("  ")));
+    $("mp-panel").replaceChildren(...panel);
+    if (fin) {
+      $("mp-nar").innerHTML = `<b>结束</b>：全部作业在 t = ${res.end} 完成（${res.per.map((p) => `${p.name}=${p.done}`).join("，")}），共迁移 ${res.migrations} 次。`;
+      return;
+    }
+    const parts = [`<b>t = ${i}</b>：`];
+    for (const e of k.ev) {
+      if (e.k === "steal") parts.push(`CPU ${e.to} 偷看后从 Q${e.from} <b>窃取</b>了 ${names[e.j]}。`);
+      if (e.k === "migrate") parts.push(`${names[e.j]} 从 CPU ${e.from} <b>迁移</b>到 CPU ${e.to}（缓存变冷）。`);
+      if (e.k === "warm") parts.push(`CPU ${e.c} 的缓存对 ${names[e.j]} <b>变热</b>了（从下一 tick 起 ×${c.rate}）。`);
+      if (e.k === "evict") parts.push(`CPU ${e.c} 的缓存装不下，<b>驱逐</b>了 ${names[e.j]}。`);
+      if (e.k === "done") parts.push(`${names[e.j]} 在 CPU ${e.c} 上<b>完成</b>。`);
+    }
+    parts.push(k.run.map((r, cpu) => `CPU ${cpu}：${r ? names[r.j] + (r.warm ? "（热，本 tick 完成 " + c.rate + " 份）" : "（冷，完成 1 份）") : "空闲"}`).join("；") + "。");
+    const big = jobs.filter((j) => j.wset > c.cache).map((j) => j.name);
+    if (big.length && i === 0) parts.push(`注意：${big.join("、")} 的工作集大于缓存，永远不会变热。`);
+    $("mp-nar").innerHTML = parts.join("");
+  }
+  const stp = OSTEP.stepper($("mp-step"), { steps: () => (res ? res.ticks.length + 1 : 1), render, autoplayMs: 90 });
+  drawJobs(); recompute();
+})();
+})();
+</script>
+</body></html>

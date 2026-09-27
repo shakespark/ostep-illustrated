@@ -1,0 +1,893 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 4 章 · 抽象：进程</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+  .trace { border-collapse: collapse; font: 12.5px var(--mono); width: auto; min-width: 100%; }
+  .trace th, .trace td { padding: 3px 8px; text-align: center; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .trace td.st-run { color: #fff; font-weight: 600; }
+  .trace td.st-ready { background: var(--surface-2); }
+  .trace td.st-blocked { background: var(--warn-soft); color: var(--warn); font-weight: 600; }
+  .trace td.st-done { color: var(--faint); }
+  .trace tr.cur td { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .trace tr.future td { color: var(--faint); background: none; }
+  .trace td.star { color: var(--accent); font-weight: 700; }
+  .trace-wrap { max-height: 360px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); margin-top: 10px; }
+  .prog-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 4px 0; font-size: 13px; }
+  .prog-row .who { font: 600 13px var(--mono); min-width: 2.6em; }
+  .cell.exe { opacity: .45; }
+  .cell.io { border-style: dashed; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .ptab td, .ptab th { font: 12.5px var(--mono); padding: 4px 8px; }
+  .ptab tr.chg td { background: var(--accent-soft); }
+  .st-pill { display: inline-block; padding: 0 8px; border-radius: 999px; font: 600 11.5px var(--mono); border: 1px solid var(--border); }
+  .st-UNUSED { color: var(--faint); }
+  .st-EMBRYO { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+  .st-RUNNABLE { background: var(--surface-2); }
+  .st-RUNNING { background: var(--ok-soft); color: var(--ok); border-color: var(--ok); }
+  .st-SLEEPING { background: var(--warn-soft); color: var(--warn); border-color: var(--warn); }
+  .st-ZOMBIE { background: var(--bad-soft); color: var(--bad); border-color: var(--bad); }
+  .log { font: 12.5px/1.6 var(--mono); max-height: 180px; overflow: auto; background: var(--code-bg); border-radius: 8px; padding: 8px 12px; margin-top: 10px; }
+  .log div:last-child { color: var(--accent); font-weight: 600; }
+  .ann { list-style: none; padding: 0; }
+  .ann li { padding-left: 1.6em; position: relative; }
+  .ann li b.n { position: absolute; left: 0; color: var(--accent); font-family: var(--mono); }
+</style>
+</head>
+<body data-chapter="4">
+<main>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker>
+    <marker id="arw-acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker>
+  </defs>
+</svg>
+
+<h2><span class="num">1</span>一句话 + 关键问题</h2>
+<div class="crux">
+  <p><strong>只有少数几个物理 CPU，操作系统如何制造出"CPU 几乎无穷多"的假象？</strong></p>
+  <p class="muted small">HOW TO PROVIDE THE ILLUSION OF MANY CPUS? Although there are only a few physical CPUs available, how can the OS provide the illusion of a nearly-endless supply of said CPUs?</p>
+</div>
+<p><strong>一句话：进程（process）就是运行中的程序</strong>。磁盘上的程序只是一堆静止的指令和数据；操作系统把它加载进内存、准备好栈和堆、打开标准输入输出，然后让它在 CPU 上跑起来，它才成为"进程"。</p>
+<p>上一章（第 2 章）我们看到四个 <code>cpu</code> 程序在一个 CPU 上"同时"打印。本章给出背后的核心抽象：操作系统通过<strong>时分共享（time sharing）</strong>——运行一个进程一会儿、停下、再运行另一个——虚拟化 CPU。本章回答"进程是什么、由什么组成、处于哪些状态、操作系统用什么数据结构记录它"；接下来第 5 章讲创建进程的真实 API（<code>fork/exec/wait</code>），第 6 章讲切换进程的底层<strong>机制</strong>，第 7–10 章讲决定运行谁的<strong>策略</strong>。</p>
+
+<h2><span class="num">2</span>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>进程（process）</h4><p>运行中的程序。操作系统对"一个正在执行的程序"的抽象。</p></div>
+  <div class="card"><h4>机器状态（machine state）</h4><p>进程运行时能读写的一切：地址空间里的内存、寄存器（含 PC、栈指针）、打开的文件等 I/O 信息。</p></div>
+  <div class="card"><h4>时分共享（time sharing）</h4><p>让资源先给一个实体用一会儿，再给另一个。CPU 就是这样被共享的；代价是每个进程都跑得慢一些。</p></div>
+  <div class="card"><h4>空分共享（space sharing）</h4><p>把资源在空间上切分给不同使用者，例如磁盘块分配给不同文件。</p></div>
+  <div class="card"><h4>机制 vs 策略</h4><p>机制（mechanism）回答"怎么做"（如何上下文切换）；策略（policy）回答"做哪个"（现在该运行哪个进程）。</p></div>
+  <div class="card"><h4>进程状态</h4><p>运行（Running）、就绪（Ready）、阻塞（Blocked），外加初始状态和最终的僵尸（zombie）状态。</p></div>
+  <div class="card"><h4>进程列表 / PCB</h4><p>OS 用进程列表（process list）记录所有进程；每个进程一项，称为进程控制块（PCB，Process Control Block）。</p></div>
+  <div class="card"><h4>加载（loading）</h4><p>把代码和静态数据从磁盘读进地址空间，分配栈和堆，设置文件描述符，最后跳到 <code>main()</code>。</p></div>
+</div>
+
+<h2><span class="num">3</span>进程由什么组成：机器状态</h2>
+<p>要理解"进程"，就要问：一个程序运行时，<strong>机器的哪些部分</strong>对它的执行是重要的？把这些部分列一张清单，就是进程的<strong>机器状态（machine state）</strong>。原书给出三类：</p>
+<figure class="fig">
+<svg viewBox="0 0 640 270" width="640" role="img" aria-label="进程的机器状态：地址空间、寄存器、I/O 信息">
+  <rect x="10" y="10" width="620" height="250" rx="12" class="box"/>
+  <text x="28" y="34" font-weight="700">一个进程 = 下面三部分的当前内容</text>
+  <!-- 地址空间 -->
+  <text x="40" y="62" font-size="13" class="t-muted">① 内存：地址空间（address space）</text>
+  <rect x="40" y="72" width="170" height="36" rx="4" style="fill:var(--c1);opacity:.85"/><text x="125" y="95" text-anchor="middle" style="fill:#fff" font-size="13">代码 code</text>
+  <rect x="40" y="108" width="170" height="30" rx="4" style="fill:var(--c3);opacity:.85"/><text x="125" y="128" text-anchor="middle" style="fill:#fff" font-size="13">静态数据 static data</text>
+  <rect x="40" y="138" width="170" height="30" rx="4" style="fill:var(--c5);opacity:.85"/><text x="125" y="158" text-anchor="middle" style="fill:#fff" font-size="13">堆 heap ↓</text>
+  <rect x="40" y="168" width="170" height="44" rx="4" class="box-strong" style="stroke-dasharray:4 3"/><text x="125" y="195" text-anchor="middle" font-size="12" class="t-muted">（空闲）</text>
+  <rect x="40" y="212" width="170" height="30" rx="4" style="fill:var(--c2);opacity:.85"/><text x="125" y="232" text-anchor="middle" style="fill:#fff" font-size="13">栈 stack ↑</text>
+  <!-- 寄存器 -->
+  <text x="250" y="62" font-size="13" class="t-muted">② 寄存器（registers）</text>
+  <rect x="250" y="72" width="170" height="32" rx="4" class="accent-soft"/><text x="262" y="93" font-size="13" class="mono">PC / IP</text><text x="410" y="93" font-size="12" text-anchor="end" class="t-muted">下一条指令</text>
+  <rect x="250" y="108" width="170" height="32" rx="4" class="accent-soft"/><text x="262" y="129" font-size="13" class="mono">SP 栈指针</text><text x="410" y="129" font-size="12" text-anchor="end" class="t-muted">栈顶</text>
+  <rect x="250" y="144" width="170" height="32" rx="4" class="accent-soft"/><text x="262" y="165" font-size="13" class="mono">FP 帧指针</text><text x="410" y="165" font-size="12" text-anchor="end" class="t-muted">当前栈帧</text>
+  <rect x="250" y="180" width="170" height="32" rx="4" class="box-strong"/><text x="262" y="201" font-size="13" class="mono">eax ebx …</text><text x="410" y="201" font-size="12" text-anchor="end" class="t-muted">通用寄存器</text>
+  <!-- I/O -->
+  <text x="455" y="62" font-size="13" class="t-muted">③ I/O 信息：打开的文件</text>
+  <g font-size="12.5" class="mono">
+    <rect x="455" y="72" width="160" height="28" rx="4" class="box-strong"/><text x="465" y="91">fd 0  标准输入</text>
+    <rect x="455" y="104" width="160" height="28" rx="4" class="box-strong"/><text x="465" y="123">fd 1  标准输出</text>
+    <rect x="455" y="136" width="160" height="28" rx="4" class="box-strong"/><text x="465" y="155">fd 2  标准错误</text>
+    <rect x="455" y="168" width="160" height="28" rx="4" class="ok-soft"/><text x="465" y="187">fd 3  notes.txt</text>
+  </g>
+  <text x="455" y="226" font-size="12" class="t-muted">进程运行中可能读写的</text>
+  <text x="455" y="244" font-size="12" class="t-muted">持久存储设备</text>
+</svg>
+<figcaption>图 A：进程的机器状态。只要把这三部分的内容保存下来、日后原样恢复，进程就能"无缝"地继续运行——这正是第 6 章上下文切换的依据。</figcaption>
+</figure>
+<ul>
+  <li><strong>内存</strong>：指令在内存里，程序读写的数据也在内存里。进程能寻址的那部分内存叫它的<strong>地址空间（address space）</strong>。</li>
+  <li><strong>寄存器</strong>：很多指令直接读写寄存器。其中有几个特殊的：<strong>程序计数器（PC，program counter，也叫指令指针 IP）</strong>指明下一条要执行的指令；<strong>栈指针（stack pointer）</strong>和<strong>帧指针（frame pointer）</strong>管理存放函数参数、局部变量和返回地址的栈。</li>
+  <li><strong>I/O 信息</strong>：程序经常访问持久存储设备，比如进程当前打开的文件列表。</li>
+</ul>
+
+<h3>时分共享与空分共享</h3>
+<figure class="fig">
+<svg viewBox="0 0 640 200" width="640" role="img" aria-label="时分共享与空分共享对比">
+  <text x="20" y="28" font-weight="700">时分共享：CPU（沿时间轴轮流使用）</text>
+  <g font-size="13">
+    <rect x="20" y="40" width="80" height="34" rx="4" style="fill:var(--c1)"/><text x="60" y="62" text-anchor="middle" style="fill:#fff">A</text>
+    <rect x="102" y="40" width="80" height="34" rx="4" style="fill:var(--c2)"/><text x="142" y="62" text-anchor="middle" style="fill:#fff">B</text>
+    <rect x="184" y="40" width="80" height="34" rx="4" style="fill:var(--c3)"/><text x="224" y="62" text-anchor="middle" style="fill:#fff">C</text>
+    <rect x="266" y="40" width="80" height="34" rx="4" style="fill:var(--c1)"/><text x="306" y="62" text-anchor="middle" style="fill:#fff">A</text>
+    <rect x="348" y="40" width="80" height="34" rx="4" style="fill:var(--c2)"/><text x="388" y="62" text-anchor="middle" style="fill:#fff">B</text>
+    <rect x="430" y="40" width="80" height="34" rx="4" style="fill:var(--c3)"/><text x="470" y="62" text-anchor="middle" style="fill:#fff">C</text>
+    <line x1="20" y1="86" x2="600" y2="86" class="arrow" marker-end="url(#arw)"/><text x="604" y="90" font-size="12" class="t-muted">时间</text>
+  </g>
+  <text x="20" y="128" font-weight="700">空分共享：磁盘（按空间切分，块一旦分给文件就归它）</text>
+  <g font-size="12" class="mono">
+    <rect x="20" y="140" width="46" height="34" rx="3" style="fill:var(--c4)"/><rect x="68" y="140" width="46" height="34" rx="3" style="fill:var(--c4)"/>
+    <rect x="116" y="140" width="46" height="34" rx="3" style="fill:var(--c6)"/><rect x="164" y="140" width="46" height="34" rx="3" style="fill:var(--c6)"/><rect x="212" y="140" width="46" height="34" rx="3" style="fill:var(--c6)"/>
+    <rect x="260" y="140" width="46" height="34" rx="3" style="fill:var(--c5)"/>
+    <rect x="308" y="140" width="46" height="34" rx="3" class="box"/><rect x="356" y="140" width="46" height="34" rx="3" class="box"/><rect x="404" y="140" width="46" height="34" rx="3" class="box"/>
+    <text x="67" y="192" text-anchor="middle" class="t-muted">a.txt</text><text x="187" y="192" text-anchor="middle" class="t-muted">b.c</text><text x="283" y="192" text-anchor="middle" class="t-muted">c.md</text><text x="380" y="192" text-anchor="middle" class="t-muted">空闲</text>
+  </g>
+</svg>
+<figcaption>图 B：CPU 通常时分共享，磁盘空间通常空分共享。时分共享的潜在代价是性能：CPU 被 N 个进程分享时，每个进程都会跑得更慢。</figcaption>
+</figure>
+
+<div class="tip"><p><strong>策略与机制分离（separate policy and mechanism）。</strong>机制回答 <em>how</em>：操作系统<em>怎样</em>完成一次上下文切换（context switch）？策略回答 <em>which</em>：<em>哪个</em>进程现在该运行？两者分开，就能在不改动机制的前提下替换策略——这是模块化（modularity）这一通用软件设计原则的体现。调度策略会利用历史信息（过去一分钟谁跑得多）、负载知识（跑的是什么类型的程序）和性能指标（优化交互性能还是吞吐量）来做决定。</p></div>
+
+<h2><span class="num">4</span>进程 API：任何操作系统都得提供的五类接口</h2>
+<p>真实的 UNIX API 留到第 5 章。这里先看任何现代操作系统的进程接口都必须包含哪几类功能：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>类别</th><th>含义</th><th>UNIX 里的例子（第 5 章）</th></tr></thead>
+  <tbody>
+    <tr><td><strong>创建（Create）</strong></td><td>在 shell 里敲命令、双击图标时，OS 被调用来创建新进程运行指定程序</td><td><code>fork()</code> + <code>exec()</code></td></tr>
+    <tr><td><strong>销毁（Destroy）</strong></td><td>多数进程运行完会自己退出；不退出时用户可能想强行杀掉失控的进程</td><td><code>kill()</code>、Ctrl-C</td></tr>
+    <tr><td><strong>等待（Wait）</strong></td><td>等待某个进程停止运行</td><td><code>wait()</code> / <code>waitpid()</code></td></tr>
+    <tr><td><strong>其他控制（Miscellaneous Control）</strong></td><td>例如挂起（suspend）一个进程，稍后再恢复（resume）它</td><td><code>SIGSTOP</code> / <code>SIGCONT</code>、Ctrl-Z 与 <code>fg</code></td></tr>
+    <tr><td><strong>状态（Status）</strong></td><td>查询进程运行了多久、处于什么状态等</td><td><code>ps</code>、<code>top</code>、<code>/proc/&lt;pid&gt;/status</code></td></tr>
+  </tbody>
+</table></div>
+
+<h2><span class="num">5</span>进程创建：从程序到进程</h2>
+<p>程序最初以某种<strong>可执行格式（executable format）</strong>躺在磁盘（或 SSD）上。操作系统要让它跑起来，大致要做下面这几件事（原书 4.3 节）。用下面的模拟器逐步观察，并对比"一次全部加载"与"懒加载"：</p>
+
+<section class="sim" id="sim-load">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>从磁盘到内存：加载一个程序</h3>
+    <div class="desc">逐步执行原书 4.3 节的加载流程。切换"懒加载"看现代 OS 的做法：代码页只在第一次被用到时才从磁盘读入。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>加载方式 <select id="ld-mode"><option value="eager">一次性加载（eager，早期/简单 OS）</option><option value="lazy">懒加载（lazy，现代 OS）</option></select></label>
+    </div>
+    <div id="ld-step"></div>
+    <div class="stage"><div id="ld-svg"></div></div>
+    <div class="narrate" id="ld-nar"></div>
+  </div>
+</section>
+
+<ol>
+  <li><strong>加载代码和静态数据</strong>（如已初始化的全局变量）到进程的地址空间。早期（或简单）的 OS <strong>急切地（eagerly）</strong>一次全部加载；现代 OS <strong>懒惰地（lazily）</strong>只在用到时才加载某一部分——要真正理解懒加载，需要后面虚拟内存部分的<strong>分页（paging）</strong>和<strong>交换（swapping）</strong>知识。</li>
+  <li><strong>分配运行时栈</strong>：C 程序用栈存放局部变量、函数参数和返回地址。OS 还会用参数初始化栈——具体说，填好 <code>main()</code> 的 <code>argc</code> 和 <code>argv</code>。</li>
+  <li><strong>分配堆</strong>（可能）：C 程序用堆存放 <code>malloc()</code> 显式申请、<code>free()</code> 显式释放的动态数据（链表、哈希表、树……）。堆一开始很小，程序不断 <code>malloc()</code> 时 OS 可能介入分配更多内存。</li>
+  <li><strong>I/O 相关初始化</strong>：UNIX 中每个进程默认有三个打开的<strong>文件描述符（file descriptor）</strong>：标准输入、标准输出、标准错误。</li>
+  <li><strong>从入口点开始运行</strong>：跳到 <code>main()</code>（通过下一章讲的特殊机制），把 CPU 的控制权交给新进程。</li>
+</ol>
+
+<h2><span class="num">6</span>进程状态</h2>
+<p>在简化的视角下，进程在任意时刻处于三种状态之一：</p>
+<ul>
+  <li><strong>运行（Running）</strong>：正在某个处理器上执行指令。</li>
+  <li><strong>就绪（Ready）</strong>：已经准备好运行，但 OS 此刻选择不运行它。</li>
+  <li><strong>阻塞（Blocked）</strong>：执行了某种操作，在另一个事件发生之前不能运行。典型例子：向磁盘发起 I/O 请求后阻塞，于是别的进程可以使用处理器。</li>
+</ul>
+<figure class="fig">
+<svg viewBox="0 0 560 250" width="560" role="img" aria-label="进程状态转换图">
+  <rect x="30" y="40" width="160" height="70" rx="35" class="ok-soft" stroke-width="2"/><text x="110" y="72" text-anchor="middle" font-weight="700">Running</text><text x="110" y="93" text-anchor="middle" font-size="13" class="t-muted">运行</text>
+  <rect x="370" y="40" width="160" height="70" rx="35" class="box-strong" stroke-width="2"/><text x="450" y="72" text-anchor="middle" font-weight="700">Ready</text><text x="450" y="93" text-anchor="middle" font-size="13" class="t-muted">就绪</text>
+  <rect x="200" y="170" width="160" height="70" rx="35" class="warn-soft" stroke-width="2"/><text x="280" y="202" text-anchor="middle" font-weight="700">Blocked</text><text x="280" y="223" text-anchor="middle" font-size="13" class="t-muted">阻塞</text>
+  <path d="M190,58 C260,20 300,20 370,58" class="arrow" marker-end="url(#arw)"/><text x="280" y="22" text-anchor="middle" font-size="12.5">Descheduled（被换下）</text>
+  <path d="M370,95 C300,130 260,130 190,95" class="arrow" marker-end="url(#arw)"/><text x="280" y="140" text-anchor="middle" font-size="12.5">Scheduled（被调度）</text>
+  <path d="M120,110 L215,180" class="arrow" marker-end="url(#arw)"/><text x="100" y="160" font-size="12.5">I/O: initiate</text><text x="100" y="176" font-size="12" class="t-muted">发起 I/O</text>
+  <path d="M345,180 L440,110" class="arrow" marker-end="url(#arw)"/><text x="400" y="160" font-size="12.5">I/O: done</text><text x="400" y="176" font-size="12" class="t-muted">I/O 完成</text>
+</svg>
+<figcaption>图 4.2（重绘）：进程状态转换。Ready ⇄ Running 由 OS 决定；Blocked 的进程要等事件（如 I/O 完成）发生后回到 <strong>Ready</strong>——注意不是直接回到 Running（除非 OS 恰好决定立刻运行它）。</figcaption>
+</figure>
+<p>原书用两个例子追踪两个进程的状态。第一个只用 CPU、不做 I/O（图 4.3）；第二个中进程 0 在运行 3 拍后发起 I/O（图 4.4）：</p>
+<div class="grid2">
+<div class="table-wrap"><table class="small">
+  <thead><tr><th>时间</th><th>进程 0</th><th>进程 1</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>Running</td><td>Ready</td><td></td></tr><tr><td>2</td><td>Running</td><td>Ready</td><td></td></tr>
+    <tr><td>3</td><td>Running</td><td>Ready</td><td></td></tr><tr><td>4</td><td>Running</td><td>Ready</td><td>进程 0 完成</td></tr>
+    <tr><td>5</td><td>–</td><td>Running</td><td></td></tr><tr><td>6</td><td>–</td><td>Running</td><td></td></tr>
+    <tr><td>7</td><td>–</td><td>Running</td><td></td></tr><tr><td>8</td><td>–</td><td>Running</td><td>进程 1 完成</td></tr>
+  </tbody>
+</table><p class="small muted" style="text-align:center">图 4.3：仅 CPU</p></div>
+<div class="table-wrap"><table class="small">
+  <thead><tr><th>时间</th><th>进程 0</th><th>进程 1</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>Running</td><td>Ready</td><td></td></tr><tr><td>2</td><td>Running</td><td>Ready</td><td></td></tr>
+    <tr><td>3</td><td>Running</td><td>Ready</td><td>进程 0 发起 I/O</td></tr>
+    <tr><td>4</td><td>Blocked</td><td>Running</td><td>进程 0 阻塞，</td></tr><tr><td>5</td><td>Blocked</td><td>Running</td><td>于是进程 1 运行</td></tr>
+    <tr><td>6</td><td>Blocked</td><td>Running</td><td></td></tr><tr><td>7</td><td>Ready</td><td>Running</td><td>I/O 完成</td></tr>
+    <tr><td>8</td><td>Ready</td><td>Running</td><td>进程 1 完成</td></tr>
+    <tr><td>9</td><td>Running</td><td>–</td><td></td></tr><tr><td>10</td><td>Running</td><td>–</td><td>进程 0 完成</td></tr>
+  </tbody>
+</table><p class="small muted" style="text-align:center">图 4.4：CPU 与 I/O</p></div>
+</div>
+<p>即使这么简单的例子，OS 也做了两个<strong>决策</strong>：① 进程 0 发起 I/O 时，决定运行进程 1——让 CPU 保持忙碌，提高了资源利用率；② 进程 0 的 I/O 完成时，决定<strong>不</strong>立刻切回进程 0。第二个决定好不好？原书把问题留给你——下面的模拟器可以让你亲手比较两种做法。这类决策由 OS 的<strong>调度器（scheduler）</strong>做出，是第 7 章起的主题。</p>
+
+<section class="sim" id="sim-prun">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>进程状态追踪器（网页版 process-run.py）</h3>
+    <div class="desc">每行描述一个进程。单步执行，观察每一拍各进程的状态、状态机上的转换、CPU 与 I/O 利用率。表格里还没到的行用"·"遮住——先预测，再按"下一步"验证。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <span class="small muted">载入示例：</span>
+      <button data-preset="f43">图 4.3</button><button data-preset="f44">图 4.4</button>
+      <button data-preset="q1">作业 1</button><button data-preset="q2">作业 2</button><button data-preset="q3">作业 3</button>
+      <button data-preset="q4">作业 4</button><button data-preset="q6">作业 6</button><button data-preset="q7">作业 7</button>
+    </div>
+    <div class="controls" style="align-items:flex-start">
+      <label style="flex:1 1 220px;flex-direction:column;align-items:stretch">进程（每行一个）
+        <textarea id="pr-progs" rows="3" spellcheck="false"></textarea></label>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <label>切换行为 <select id="pr-sw"><option value="IO">SWITCH_ON_IO</option><option value="END">SWITCH_ON_END</option></select></label>
+        <label>I/O 完成后 <select id="pr-iod"><option value="LATER">IO_RUN_LATER</option><option value="IMMEDIATE">IO_RUN_IMMEDIATE</option></select></label>
+        <label>I/O 时长 <input type="number" id="pr-iolen" min="1" max="20" value="5"></label>
+        <label>随机种子 <input type="number" id="pr-seed" min="0" value="1"></label>
+      </div>
+    </div>
+    <div class="controls">
+      <button class="primary" id="pr-run">应用参数</button>
+      <label><input type="checkbox" id="pr-reveal"> 显示全部答案</label>
+    </div>
+    <p class="small muted" style="margin:-6px 0 12px">写法：<code>c3,i,c2</code> 表示"计算 3 拍 → 发起一次 I/O → 计算 2 拍"（同 process-run.py 的 <code>-P</code>）；<code>5:100</code> 表示"5 条指令，每条有 100% 概率是 CPU 指令、否则是 I/O"（同 <code>-l</code>，由随机种子决定，结果与 Python 版的随机数不同）。每个 I/O 后面会自动跟一条 <code>io_done</code> 指令，用来处理 I/O 完成（占 1 拍 CPU）。</p>
+    <div id="pr-step"></div>
+    <div class="stage">
+      <div id="pr-err" class="small" style="color:var(--bad)"></div>
+      <div id="pr-diagram"></div>
+      <div id="pr-progress"></div>
+      <div class="trace-wrap"><table class="trace" id="pr-table"></table></div>
+    </div>
+    <div class="narrate" id="pr-nar"></div>
+    <div class="stats" id="pr-stats"></div>
+  </div>
+</section>
+
+<p>几个关键细节（与 <code>process-run.py</code> 一致）：</p>
+<ul>
+  <li>一条 <code>io</code> 指令本身占 1 拍 CPU（发出请求），之后进程阻塞 <em>I/O 时长</em> 拍；I/O 完成的那一拍标 <code>*</code>，进程回到 READY，之后还要执行一条 <code>io_done</code>。</li>
+  <li><strong>SWITCH_ON_IO</strong>：进程发起 I/O 时立即切换到下一个就绪进程；<strong>SWITCH_ON_END</strong>：只有当前进程彻底结束才切换——等 I/O 时 CPU 就白白空着。</li>
+  <li><strong>IO_RUN_LATER</strong>：I/O 完成后，发起者只是回到就绪队列，当前进程继续跑；<strong>IO_RUN_IMMEDIATE</strong>：立刻切回发起者（当前进程被换下）。</li>
+  <li>CPU 利用率 = CPU 忙的拍数 / 总拍数；I/O 利用率 = 至少有一个 I/O 在进行的拍数 / 总拍数。</li>
+</ul>
+
+<h2><span class="num">7</span>数据结构：进程列表与 PCB</h2>
+<p>OS 也是一个程序，也有自己的关键数据结构。为了跟踪每个进程，它会维护一个<strong>进程列表（process list，也叫任务列表 task list）</strong>，记录所有就绪的进程、当前正在运行的进程，并以某种方式跟踪阻塞的进程——这样 I/O 事件完成时，才能唤醒<strong>正确的</strong>进程。列表里描述单个进程的结构，常被称为<strong>进程控制块（PCB，Process Control Block）</strong>或<strong>进程描述符（process descriptor）</strong>——说穿了就是一个 C 结构体。</p>
+<p>下面是教学操作系统 xv6 内核里的 <code>struct proc</code>（原书图 4.5），加了中文注释：</p>
+<pre><code>// xv6 在停止、重新启动一个进程时要保存/恢复的寄存器
+struct context {
+  int eip;   // 指令指针（PC）
+  int esp;   // 栈指针
+  int ebx; int ecx; int edx; int esi; int edi; int ebp;
+};
+// 进程可能处于的状态
+enum proc_state { UNUSED, EMBRYO, SLEEPING,
+                  RUNNABLE, RUNNING, ZOMBIE };
+// xv6 为每个进程记录的信息（包括寄存器上下文和状态）
+struct proc {
+  char *mem;                  // 进程内存的起始地址
+  uint sz;                    // 进程内存大小
+  char *kstack;               // 该进程内核栈的底部
+  enum proc_state state;      // 进程状态
+  int pid;                    // 进程 ID
+  struct proc *parent;        // 父进程
+  void *chan;                 // 非零：正在 chan 上睡眠（等待某事件）
+  int killed;                 // 非零：已被杀死
+  struct file *ofile[NOFILE]; // 打开的文件
+  struct inode *cwd;          // 当前目录
+  struct context context;     // 切换到这里来运行进程
+  struct trapframe *tf;       // 当前中断的陷阱帧
+};</code></pre>
+<ul class="ann">
+  <li><b class="n">①</b><strong>寄存器上下文（register context）</strong>：进程被停下时，它的寄存器值保存到这里；把这些值放回物理寄存器，进程就能从断点继续。这就是第 6 章的<strong>上下文切换（context switch）</strong>。</li>
+  <li><b class="n">②</b><strong>状态</strong>：除了运行（<code>RUNNING</code>）、就绪（<code>RUNNABLE</code>）、阻塞（<code>SLEEPING</code>），还有 <code>UNUSED</code>（空槽）、<code>EMBRYO</code>（正在创建的初始状态）和 <code>ZOMBIE</code>（僵尸，已退出但尚未清理的最终状态）。</li>
+  <li><b class="n">③</b><strong><code>chan</code></strong>：阻塞的进程在等什么。I/O 完成时 OS 据此找到并唤醒正确的进程。</li>
+  <li><b class="n">④</b><strong><code>parent</code> 与 <code>ofile[]</code></strong>：父子关系和打开文件表，第 5 章的 <code>wait()</code> 和重定向都依赖它们。</li>
+</ul>
+<figure class="fig">
+<svg viewBox="0 0 660 200" width="660" role="img" aria-label="进程列表示意图">
+  <text x="10" y="22" font-weight="700" font-size="14">进程列表（process list）</text>
+  <g font-size="12" class="mono">
+    <rect x="10" y="40" width="140" height="130" rx="6" class="box-strong"/>
+    <text x="20" y="60" font-weight="700">proc[0]</text><text x="20" y="80">pid   1</text><text x="20" y="98">state RUNNABLE</text><text x="20" y="116">name  init</text><text x="20" y="134">context {…}</text><text x="20" y="152">ofile[] …</text>
+    <rect x="175" y="40" width="140" height="130" rx="6" class="ok-soft" stroke-width="2"/>
+    <text x="185" y="60" font-weight="700">proc[1]</text><text x="185" y="80">pid   7</text><text x="185" y="98">state RUNNING</text><text x="185" y="116">name  sh</text><text x="185" y="134">parent → proc[0]</text><text x="185" y="152">context {…}</text>
+    <rect x="340" y="40" width="140" height="130" rx="6" class="warn-soft"/>
+    <text x="350" y="60" font-weight="700">proc[2]</text><text x="350" y="80">pid   9</text><text x="350" y="98">state SLEEPING</text><text x="350" y="116">chan  &amp;disk</text><text x="350" y="134">parent → proc[1]</text><text x="350" y="152">context {…}</text>
+    <rect x="505" y="40" width="140" height="130" rx="6" class="bad-soft"/>
+    <text x="515" y="60" font-weight="700">proc[3]</text><text x="515" y="80">pid   12</text><text x="515" y="98">state ZOMBIE</text><text x="515" y="116">xstate 0</text><text x="515" y="134">parent → proc[1]</text><text x="515" y="152">等父进程 wait()</text>
+  </g>
+  <line x1="245" y1="192" x2="245" y2="174" class="arrow" marker-end="url(#arw-acc)" style="stroke:var(--accent)"/>
+  <text x="255" y="196" font-size="12" style="fill:var(--accent)">当前运行（current）</text>
+</svg>
+<figcaption>图 C：进程列表中每一项就是一个 PCB。I/O 完成时，OS 查找 <code>chan</code> 匹配的 SLEEPING 进程并把它改成 RUNNABLE。</figcaption>
+</figure>
+
+<h3>最终状态：僵尸（zombie）</h3>
+<p>进程退出后并不会立刻消失，而是进入<strong>最终状态</strong>：已经退出、但还没被清理——UNIX 称之为<strong>僵尸状态</strong>。这样做的用处是：让其他进程（通常是创建它的<strong>父进程</strong>）检查它的<strong>返回码</strong>，看它是否执行成功（UNIX 程序成功时通常返回 0，否则返回非零）。父进程最后调用 <code>wait()</code> 等待子进程完成，同时告诉 OS 可以清理与这个已消亡进程有关的数据结构了。</p>
+
+<section class="sim" id="sim-xv6">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>xv6 进程表：一个进程的一生</h3>
+    <div class="desc">你来触发事件：fork、时钟中断、发起/完成 I/O、exit、wait。观察 <code>proc[]</code> 表里每个槽位的状态如何在 UNUSED → EMBRYO → RUNNABLE ⇄ RUNNING ⇄ SLEEPING → ZOMBIE → UNUSED 之间流转。</div></div>
+  <div class="sim-body">
+    <div class="controls" id="xv-btns">
+      <button data-act="fork">fork()</button>
+      <button data-act="timer">时钟中断：调度</button>
+      <button data-act="io">发起磁盘 I/O</button>
+      <button data-act="iodone">磁盘 I/O 完成</button>
+      <button data-act="exit">exit()</button>
+      <button data-act="wait">wait()</button>
+      <span class="sep"></span>
+      <button data-act="undo">撤销</button>
+      <button data-act="reset">重置</button>
+      <button data-act="demo">载入演示剧本</button>
+    </div>
+    <div class="stage"><div class="table-wrap" style="margin:0"><table class="ptab" id="xv-table"></table></div></div>
+    <div class="narrate" id="xv-nar"></div>
+    <div class="log" id="xv-log"></div>
+  </div>
+</section>
+
+<h2><span class="num">8</span>先预测，再验证</h2>
+<p>以下题目改编自原书第 4 章作业。先在纸上写出你的预测，再到"进程状态追踪器"里载入对应示例验证（默认 I/O 时长为 5）。</p>
+<div class="exercise"><div class="q">作业 1：两个进程 <code>5:100,5:100</code>（都只用 CPU）。CPU 利用率是多少？为什么不用运行就能知道？</div>
+<details class="reveal"><summary>看答案</summary><div>100%。没有任何 I/O，CPU 从第 1 拍到第 10 拍始终有指令可执行：先是 PID 0 跑 5 拍，结束后 PID 1 跑 5 拍，总时间 10。I/O 利用率为 0。</div></details></div>
+<div class="exercise"><div class="q">作业 2：<code>4:100,1:0</code>——进程 0 计算 4 拍，进程 1 只发起一次 I/O。两个进程总共需要多久完成？</div>
+<details class="reveal"><summary>看答案</summary><div>11 拍。进程 0 先跑满 4 拍（第 1–4 拍）；第 5 拍进程 1 执行 <code>io</code>；第 6–10 拍它阻塞、CPU 空闲；第 11 拍 I/O 完成（<code>*</code>），执行 <code>io_done</code>。CPU 忙 6 拍（54.55%），I/O 忙 5 拍（45.45%）。</div></details></div>
+<div class="exercise"><div class="q">作业 3：把顺序反过来：<code>1:0,4:100</code>。结果有变化吗？为什么顺序很重要？</div>
+<details class="reveal"><summary>看答案</summary><div>总时间缩短为 7 拍。进程 0 第 1 拍发起 I/O 后阻塞，SWITCH_ON_IO 让进程 1 立刻在第 2–5 拍使用 CPU，与 I/O <strong>重叠（overlap）</strong>；第 7 拍 I/O 完成、执行 <code>io_done</code>。CPU 忙 6/7 ≈ 85.71%。先发起 I/O 的进程先跑，I/O 和计算才能并行。</div></details></div>
+<div class="exercise"><div class="q">作业 4：同样是 <code>1:0,4:100</code>，但切换行为改成 SWITCH_ON_END。会怎样？</div>
+<details class="reveal"><summary>看答案</summary><div>回到 11 拍。进程 0 在等 I/O 的第 2–6 拍，OS 不肯切换，CPU 空转；第 7 拍 <code>io_done</code> 后进程 0 结束，进程 1 才在第 8–11 拍运行。这正是"没有多道程序"的样子。</div></details></div>
+<div class="exercise"><div class="q">作业 6 / 7：<code>3:0,5:100,5:100,5:100</code>，SWITCH_ON_IO。比较 IO_RUN_LATER 与 IO_RUN_IMMEDIATE 的总时间和 CPU 利用率。为什么"刚完成 I/O 的进程立刻再运行"可能是好主意？</div>
+<details class="reveal"><summary>看答案</summary><div>IO_RUN_LATER：31 拍，CPU 忙 21 拍（67.74%）——进程 0 的第一次 I/O 完成后一直排队，直到另外三个进程都跑完才轮到它；它后两次 I/O 期间已没有别的进程可以运行，CPU 空转。IO_RUN_IMMEDIATE：21 拍，CPU 100% 忙。I/O 密集型进程通常只跑一小会儿就又发起下一次 I/O，立刻运行它能让 I/O 设备尽早重新忙起来，I/O 与计算重叠得更充分。</div></details></div>
+<div class="exercise"><div class="q">作业 8：输入 <code>3:50</code> 和 <code>3:50</code> 两行，把随机种子分别设为 1、2、3。先根据下方"指令进度"条预测整张表，再逐拍验证；然后换成 IO_RUN_IMMEDIATE、SWITCH_ON_END 各看一次。</div>
+<details class="reveal"><summary>看答案</summary><div>规律：只要有进程在等 I/O 而另一个进程就绪，SWITCH_ON_IO 就会重叠两者；SWITCH_ON_END 下总时间 ≈ 各进程独立运行时间之和。IO_RUN_IMMEDIATE 与 IO_RUN_LATER 只在"I/O 完成时另一个进程正在运行"的那一拍产生分歧。</div></details></div>
+
+<h2><span class="num">9</span>动手实验</h2>
+<div class="lab">
+<p>在真实的 Linux 上看进程状态、地址空间布局和"PCB"。源码与说明见 <code>labs/04-process/</code>。</p>
+<pre><code><span class="cmd">cd labs/04-process &amp;&amp; make</span>
+<span class="cmd">./states</span>     # fork 出 4 个子进程：计算中 / 睡眠 / 被暂停 / 已退出，用 ps 看 STAT 列
+<span class="cmd">./layout</span>     # 代码、静态数据、堆、栈的地址 + 懒加载前后的物理内存占用
+<span class="cmd">./pcb</span>        # 从 /proc/&lt;pid&gt;/status 读 Linux 的"PCB"字段和打开文件表</code></pre>
+<p class="small muted">示例输出（你的机器上 PID、地址会不同）：</p>
+<pre><code>$ ./states
+$ ps -o pid,ppid,stat,cmd --ppid 343636
+    PID    PPID STAT CMD
+ 343637  343636 R    ./states          ← 忙着计算：Running/Ready（Linux 统一记为 R）
+ 343638  343636 S    ./states          ← sleep(2)：Blocked
+ 343639  343636 T    ./states          ← SIGSTOP：被挂起（其他控制）
+ 343640  343636 Z    [states] &lt;defunct&gt;  ← 已退出、未被 wait：僵尸
+waitpid 回收了 343637，退出码 0
+waitpid 回收了 343638，退出码 0
+waitpid 回收了 343639，退出码 0
+waitpid 回收了 343640，退出码 0
+
+$ ./layout
+代码   main()        @ 0x569bf8872273
+静态   initialized   @ 0x569bf8875060
+静态   big[] (.bss)  @ 0x569bf88750a0
+堆     malloc()      @ 0x569c3333d2a0
+栈     local         @ 0x7ffe2464fe44
+栈     argv[0]="./layout" @ 0x7ffe24651034（OS 在栈上准备好的 argc/argv）
+
+懒加载（lazy）：
+  访问 big[] 之前 VmRSS =   1408 KiB
+  写满 big[] 之后 VmRSS =  67072 KiB</code></pre>
+<p>观察：① 代码与静态数据紧挨着（都来自可执行文件），堆在其上方，栈在很高的地址——与图 4.1 的布局一致；② 64 MiB 的数组在被写之前几乎不占物理内存，这就是懒加载；③ Linux 的 <code>R</code> 同时涵盖了原书的 Running 和 Ready。</p>
+</div>
+
+<h2><span class="num">10</span>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="1"><div class="q">1. 下面哪一句最准确地描述了"进程"？</div>
+  <div class="opts"><button>A. 存放在磁盘上的可执行文件</button><button>B. 运行中的程序，可用它当前的机器状态来刻画</button><button>C. 一个 CPU 核心</button><button>D. 操作系统内核本身</button></div>
+  <div class="explain">磁盘上的程序是"没有生命的"指令和数据；OS 把它加载并运行起来才是进程。任意时刻，进程可以用它的机器状态（内存、寄存器、I/O 信息）来概括。</div></div>
+<div class="mcq" data-answer="2"><div class="q">2. 以下哪项<strong>不</strong>属于进程的机器状态？</div>
+  <div class="opts"><button>A. 程序计数器和栈指针</button><button>B. 进程当前打开的文件列表</button><button>C. 磁盘上另一个尚未运行的程序的可执行文件</button><button>D. 地址空间中的代码和数据</button></div>
+  <div class="explain">机器状态是"这个程序运行时能读取或更新的东西"。别的程序的可执行文件与本进程的执行无关。</div></div>
+<div class="mcq" data-answer="0"><div class="q">3. "现在应该让哪个进程运行？"这个问题由什么来回答？</div>
+  <div class="opts"><button>A. 策略（policy），例如调度策略</button><button>B. 机制（mechanism），例如上下文切换</button><button>C. 文件系统</button><button>D. 硬件自动决定</button></div>
+  <div class="explain">策略回答 which，机制回答 how。上下文切换是"怎么换"，调度策略决定"换成谁"。二者分离使得更换策略不必重写机制。</div></div>
+<div class="mcq" data-answer="0"><div class="q">4. 一个阻塞（Blocked）的进程等待的 I/O 完成了，它接下来进入哪个状态？</div>
+  <div class="opts"><button>A. 进入 Ready；是否立刻运行由 OS 决定</button><button>B. 进入 Zombie</button><button>C. 一定立刻进入 Running</button><button>D. 仍然保持 Blocked，直到用户手动恢复</button></div>
+  <div class="explain">原书："at that point, the process moves to the ready state again (and potentially immediately to running again, if the OS so decides)"。图 4.4 中进程 0 在第 7 拍就处于 Ready，直到第 9 拍才再次运行。</div></div>
+<div class="mcq" data-answer="3"><div class="q">5. process-run 中 <code>4:100,1:0</code>、SWITCH_ON_IO、I/O 时长 5，总共需要几拍？</div>
+  <div class="opts"><button>A. 10</button><button>B. 7</button><button>C. 5</button><button>D. 11</button></div>
+  <div class="explain">进程 0 先跑 4 拍；进程 1 在第 5 拍发起 I/O，阻塞 5 拍（第 6–10 拍），第 11 拍执行 io_done。进程 1 排在后面，I/O 无法与计算重叠。</div></div>
+<div class="mcq" data-answer="3"><div class="q">6. 现代操作系统通常如何把程序的代码和静态数据载入内存？</div>
+  <div class="opts"><button>A. 由用户程序自己调用 read() 读入</button><button>B. 运行前一次性全部读入（eagerly）</button><button>C. 不需要载入，CPU 直接从磁盘取指令</button><button>D. 懒加载（lazily）：用到哪部分才读入哪部分</button></div>
+  <div class="explain">早期或简单的 OS 急切加载；现代 OS 借助分页和交换机制做懒加载（第 21 章）。</div></div>
+<div class="mcq" data-answer="1"><div class="q">7. 为什么进程退出后要先停留在僵尸（zombie）状态？</div>
+  <div class="opts"><button>A. 因为 OS 太忙，来不及清理</button><button>B. 为了让父进程能检查它的返回码，再通过 wait() 让 OS 清理</button><button>C. 为了防止它的内存被别的进程使用</button><button>D. 为了让它有机会重新运行</button></div>
+  <div class="explain">最终状态让父进程得以查看子进程是否成功（返回 0 表示成功）。父进程调用 wait() 后，OS 才清理相关数据结构。</div></div>
+<div class="mcq" data-answer="0"><div class="q">8. 磁盘空间被分成块、每块分配给某个文件，直到文件被删除。这是哪种共享方式？</div>
+  <div class="opts"><button>A. 空分共享（space sharing）</button><button>B. 上下文切换</button><button>C. 时分共享（time sharing）</button><button>D. 多级反馈</button></div>
+  <div class="explain">资源在空间上被切分，块一旦分给文件，一般不会再分给别的文件——这是空分共享。CPU 则是典型的时分共享。</div></div>
+<div class="mcq" data-answer="2"><div class="q">9. 在 <code>3:0,5:100,5:100,5:100</code> 这个负载下，从 IO_RUN_LATER 改为 IO_RUN_IMMEDIATE，结果如何？</div>
+  <div class="opts"><button>A. 总时间变长，因为频繁抢占</button><button>B. 没有任何区别</button><button>C. 总时间从 31 拍降到 21 拍，CPU 利用率达到 100%</button><button>D. I/O 利用率降为 0</button></div>
+  <div class="explain">立刻运行刚完成 I/O 的进程，它很快发起下一次 I/O，于是另外三个 CPU 密集进程正好填满 I/O 等待的空档。</div></div>
+
+<h2><span class="num">11</span>常见误区与本章小结</h2>
+<div class="warn">
+  <ul>
+    <li><strong>"程序 = 进程"</strong>：程序是静态的文件；进程是它运行起来的实例。同一个程序可以同时有多个进程（第 2 章的四个 <code>cpu</code>）。</li>
+    <li><strong>"I/O 完成后进程马上继续运行"</strong>：它只是回到 Ready；何时运行是调度器的决定。</li>
+    <li><strong>"Blocked 和 Ready 差不多，都是没在跑"</strong>：Ready 的进程随时可以被调度；Blocked 的进程即使 CPU 空闲也不能运行，必须等事件发生。</li>
+    <li><strong>"进程退出后就立刻从进程列表里消失"</strong>：它会先成为僵尸，等父进程 <code>wait()</code> 回收。</li>
+    <li><strong>"OS 在运行程序之前一定把整个程序读进内存"</strong>：现代 OS 是懒加载的。</li>
+  </ul>
+</div>
+<div class="key">
+  <ul>
+    <li><strong>进程</strong>是 OS 对运行中程序的抽象；它由机器状态刻画：地址空间的内容、CPU 寄存器（含 PC 与栈指针）、I/O 信息（如打开的文件）。</li>
+    <li>OS 用<strong>时分共享</strong>虚拟化 CPU，制造出"很多 CPU"的假象；底层靠<strong>机制</strong>（如上下文切换），上层靠<strong>策略</strong>（如调度）。</li>
+    <li>进程 API 至少包括：创建、销毁、等待、其他控制、状态查询。</li>
+    <li>创建进程：加载代码与静态数据（早期急切、现代懒惰）→ 分配并初始化栈（argc/argv）→ 分配堆 → 设置 fd 0/1/2 → 跳到 <code>main()</code>。</li>
+    <li>进程状态：Running、Ready、Blocked（外加初始状态和僵尸状态）；调度/取消调度、发起/完成 I/O 触发状态转换。</li>
+    <li>OS 用<strong>进程列表</strong>记录所有进程，每个进程的信息存放在 <strong>PCB</strong>（如 xv6 的 <code>struct proc</code>）中。</li>
+  </ul>
+  <p><strong>下一步：</strong>第 5 章看 UNIX 如何用 <code>fork()</code>、<code>exec()</code>、<code>wait()</code> 创建和控制进程；第 6 章揭示"停下一个进程、换上另一个"的底层机制——受限直接执行与上下文切换。</p>
+</div>
+</main>
+
+<script>
+/* CORE:BEGIN */
+const CORE = (() => {
+  // ---- process-run.py 的核心逻辑（逐行移植） ----
+  function parseLine(line, rng) {
+    line = line.trim();
+    if (!line) return null;
+    const m = line.match(/^(\d+)\s*:\s*(\d+)$/);
+    const code = [];
+    if (m) {
+      const n = +m[1], p = +m[2] / 100;
+      if (n > 60) throw new Error("每个进程最多 60 条指令");
+      for (let k = 0; k < n; k++) { if (rng() < p) code.push("cpu"); else code.push("io", "io_done"); }
+      return code;
+    }
+    for (const tok of line.split(/[,\s]+/).filter(Boolean)) {
+      const t = tok.toLowerCase();
+      if (/^c\d*$/.test(t)) { const k = t.length > 1 ? +t.slice(1) : 1; for (let j = 0; j < k; j++) code.push("cpu"); }
+      else if (t === "i") code.push("io", "io_done");
+      else throw new Error('无法识别 "' + tok + '"：只能写 c数字、i，或 指令数:CPU百分比');
+    }
+    if (code.length > 60) throw new Error("每个进程最多 60 条指令");
+    return code;
+  }
+  function parsePrograms(text, seed) {
+    const rng = OSTEP.rng(seed);
+    const codes = [];
+    for (const line of text.split("\n")) { const c = parseLine(line, rng); if (c) codes.push(c); }
+    if (!codes.length) throw new Error("至少需要一个进程");
+    if (codes.length > 6) throw new Error("最多 6 个进程");
+    return codes;
+  }
+  // opt: {sw: 'IO'|'END', iod: 'LATER'|'IMMEDIATE', ioLen}
+  function simulate(codes, opt) {
+    const n = codes.length;
+    const P = codes.map((c) => ({ code: c.slice(), state: "READY", fin: [], exe: 0 }));
+    let cur = 0;
+    P[0].state = "RUNNING";
+    const rows = [];
+    let cpuBusy = 0, ioBusy = 0, t = 0;
+    const active = () => P.filter((p) => p.state !== "DONE").length;
+    const runnable = () => P.filter((p) => p.state === "READY" || p.state === "RUNNING").length;
+    function nextProc(pid) {
+      if (pid !== undefined) { cur = pid; P[cur].state = "RUNNING"; return cur; }
+      for (let k = cur + 1; k < n; k++) if (P[k].state === "READY") { cur = k; P[k].state = "RUNNING"; return k; }
+      for (let k = 0; k <= cur; k++) if (P[k].state === "READY") { cur = k; P[k].state = "RUNNING"; return k; }
+      return null;
+    }
+    function checkIfDone(ev) {
+      if (P[cur].code.length === 0 && P[cur].state === "RUNNING") {
+        const who = cur;
+        P[cur].state = "DONE";
+        const nx = nextProc();
+        ev.push({ k: "done", pid: who, next: nx });
+      }
+    }
+    while (active() > 0) {
+      t++;
+      if (t > 2000) throw new Error("模拟超过 2000 拍，已停止");
+      const ev = [];
+      let ioDone = false;
+      for (let pid = 0; pid < n; pid++) {
+        if (!P[pid].fin.includes(t)) continue;
+        ioDone = true;
+        P[pid].state = "READY";
+        const e = { k: "iodone", pid };
+        if (opt.iod === "IMMEDIATE") {
+          if (cur !== pid && P[cur].state === "RUNNING") { P[cur].state = "READY"; e.preempt = cur; }
+          nextProc(pid); e.act = "imm";
+        } else {
+          e.act = "later-wait"; e.other = P[cur].state === "RUNNING" ? cur : null;
+          if (opt.sw === "END" && runnable() > 1) { nextProc(pid); e.act = "end-run"; }
+          if (runnable() === 1) { nextProc(pid); e.act = "later-only"; }
+        }
+        ev.push(e);
+        checkIfDone(ev);
+      }
+      let ins = "";
+      if (P[cur].state === "RUNNING" && P[cur].code.length > 0) { ins = P[cur].code.shift(); P[cur].exe++; cpuBusy++; }
+      const runPid = ins ? cur : -1;
+      const states = P.map((p, i) => (i === runPid ? "RUN" : p.state));
+      const cells = P.map((p, i) => (i === runPid ? "RUN:" + ins : p.state === "WAIT" ? "BLOCKED" : p.state));
+      let ios = 0;
+      for (const p of P) ios += p.fin.filter((x) => x > t).length;
+      if (ios > 0) ioBusy++;
+      if (ins) ev.push({ k: "exec", pid: runPid, ins });
+      else ev.push({ k: "idle", ready: P.map((p, i) => (p.state === "READY" ? i : -1)).filter((i) => i >= 0) });
+      if (ins === "io") {
+        P[cur].state = "WAIT";
+        P[cur].fin.push(t + opt.ioLen + 1);
+        ev[ev.length - 1].finish = t + opt.ioLen + 1;
+        if (opt.sw === "IO") { const from = cur; const to = nextProc(); ev.push({ k: "switch", from, to }); }
+        else ev.push({ k: "noswitch", pid: cur });
+      }
+      checkIfDone(ev);
+      rows.push({ t, ioDone, states: states.map((x) => (x === "WAIT" ? "BLOCKED" : x)), cells, runPid, ins, ios, ev, exe: P.map((p) => p.exe), cpuBusy, ioBusy });
+    }
+    return { rows, total: t, cpuBusy, ioBusy };
+  }
+
+  // ---- xv6 进程表（事件驱动） ----
+  function xvInit() {
+    const slots = [];
+    for (let i = 0; i < 6; i++) slots.push({ state: "UNUSED", pid: 0, parent: 0, name: "", chan: "", xstate: null });
+    Object.assign(slots[0], { state: "RUNNABLE", pid: 1, parent: 0, name: "init" });
+    Object.assign(slots[1], { state: "RUNNING", pid: 2, parent: 1, name: "sh" });
+    return { slots, nextPid: 3, rr: 1 };
+  }
+  function xvClone(S) { return JSON.parse(JSON.stringify(S)); }
+  function xvRunning(S) { return S.slots.findIndex((p) => p.state === "RUNNING"); }
+  function xvSched(S, log) {
+    if (xvRunning(S) >= 0) return;
+    const n = S.slots.length;
+    for (let k = 1; k <= n; k++) {
+      const i = (S.rr + k) % n;
+      if (S.slots[i].state === "RUNNABLE") { S.slots[i].state = "RUNNING"; S.rr = i; log.push(`调度器选中 pid ${S.slots[i].pid}（${S.slots[i].name}）：RUNNABLE → RUNNING`); return; }
+    }
+    log.push("没有 RUNNABLE 的进程：CPU 空闲");
+  }
+  // 返回 {S, log} 或 {err}
+  function xvAct(S0, act) {
+    const S = xvClone(S0), log = [];
+    // 上一步留下的 EMBRYO 完成初始化
+    S.slots.forEach((p) => { if (p.state === "EMBRYO") { p.state = "RUNNABLE"; log.push(`pid ${p.pid} 初始化完毕（内核栈、陷阱帧、上下文都已准备好）：EMBRYO → RUNNABLE`); } });
+    const r = xvRunning(S), me = r >= 0 ? S.slots[r] : null;
+    const need = () => { if (!me) throw new Error("当前没有进程在运行，这个操作需要一个正在运行的进程来发起"); };
+    try {
+      if (act === "fork") {
+        need();
+        const k = S.slots.findIndex((p) => p.state === "UNUSED");
+        if (k < 0) throw new Error("proc[] 已满：没有 UNUSED 槽位，fork 失败（返回 -1）");
+        Object.assign(S.slots[k], { state: "EMBRYO", pid: S.nextPid++, parent: me.pid, name: me.name + "'", chan: "", xstate: null });
+        log.push(`pid ${me.pid} 调用 fork()：在 proc[${k}] 找到 UNUSED 槽位 → EMBRYO（pid ${S.slots[k].pid}，parent = ${me.pid}），复制地址空间和打开文件表`);
+      } else if (act === "timer") {
+        need();
+        me.state = "RUNNABLE";
+        log.push(`时钟中断：pid ${me.pid} 用完时间片，RUNNING → RUNNABLE`);
+      } else if (act === "io") {
+        need();
+        me.state = "SLEEPING"; me.chan = "&disk";
+        log.push(`pid ${me.pid} 发起磁盘 I/O：RUNNING → SLEEPING（chan = &disk）`);
+      } else if (act === "iodone") {
+        const sl = S.slots.filter((p) => p.state === "SLEEPING" && p.chan === "&disk");
+        if (!sl.length) throw new Error("没有进程在等待磁盘 I/O");
+        sl.forEach((p) => { p.state = "RUNNABLE"; p.chan = ""; });
+        log.push(`磁盘中断：唤醒所有在 &disk 上睡眠的进程（pid ${sl.map((p) => p.pid).join(", ")}）：SLEEPING → RUNNABLE`);
+      } else if (act === "exit") {
+        need();
+        if (me.pid === 1) throw new Error("init（pid 1）不能退出");
+        me.state = "ZOMBIE"; me.xstate = 0;
+        log.push(`pid ${me.pid} 调用 exit(0)：RUNNING → ZOMBIE，保留退出码等父进程回收`);
+        S.slots.forEach((c) => { if (c.state !== "UNUSED" && c.parent === me.pid) { c.parent = 1; log.push(`孤儿 pid ${c.pid} 被过继给 init（parent = 1）`); } });
+        const par = S.slots.find((p) => p.pid === me.parent && p.state !== "UNUSED");
+        if (par && par.state === "SLEEPING" && par.chan === "wait") { par.state = "RUNNABLE"; par.chan = ""; log.push(`父进程 pid ${par.pid} 正在 wait() 中睡眠，被唤醒：SLEEPING → RUNNABLE`); }
+        if (par && par.pid === 1 && par.state !== "RUNNING") log.push("（init 会随后 wait() 回收它）");
+      } else if (act === "wait") {
+        need();
+        const kids = S.slots.filter((p) => p.state !== "UNUSED" && p.parent === me.pid);
+        if (!kids.length) { log.push(`pid ${me.pid} 调用 wait()：没有子进程，立即返回 -1`); }
+        else {
+          const z = kids.find((p) => p.state === "ZOMBIE");
+          if (z) {
+            log.push(`pid ${me.pid} 调用 wait()：发现僵尸子进程 pid ${z.pid}，读取退出码 ${z.xstate}，释放其内存与内核栈：ZOMBIE → UNUSED；wait 返回 ${z.pid}`);
+            Object.assign(z, { state: "UNUSED", pid: 0, parent: 0, name: "", chan: "", xstate: null });
+          } else {
+            me.state = "SLEEPING"; me.chan = "wait";
+            log.push(`pid ${me.pid} 调用 wait()：子进程都还活着，RUNNING → SLEEPING（等待子进程退出）`);
+          }
+        }
+      }
+      // init 自动回收过继来的僵尸
+      S.slots.forEach((z) => {
+        if (z.state === "ZOMBIE" && z.parent === 1) { log.push(`init 回收了僵尸 pid ${z.pid}：ZOMBIE → UNUSED`); Object.assign(z, { state: "UNUSED", pid: 0, parent: 0, name: "", chan: "", xstate: null }); }
+      });
+      xvSched(S, log);
+      return { S, log };
+    } catch (e) { return { err: e.message }; }
+  }
+  return { parseLine, parsePrograms, simulate, xvInit, xvAct };
+})();
+/* CORE:END */
+
+(() => {
+  const { h, s, color } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+
+  // ===================== 模拟器 1：加载 =====================
+  (() => {
+    const host = $("ld-svg"), nar = $("ld-nar"), modeSel = $("ld-mode");
+    // 每一步的状态：code 页（4 页）是否在内存、data、stack、heap、fd、pc
+    function steps() {
+      const lazy = modeSel.value === "lazy";
+      const L = [];
+      const base = { code: [0, 0, 0, 0], mapped: false, data: 0, stack: 0, heap: 0, fd: 0, pc: "", pcPage: -1, hl: "" };
+      const push = (o, text) => { const prev = L.length ? L[L.length - 1].st : base; L.push({ st: Object.assign(JSON.parse(JSON.stringify(prev)), o), text }); };
+      push({}, "程序 <code>prog</code> 以可执行格式躺在磁盘上：几页代码 + 一段已初始化的静态数据。此时它只是一堆“没有生命”的字节。操作系统先在进程列表里为它建一个新条目。");
+      if (!lazy) {
+        push({ code: [1, 1, 1, 1], hl: "code" }, "① <b>一次性（eagerly）</b>把全部代码页从磁盘读入进程的地址空间。程序越大，启动前要等的磁盘读就越多。");
+        push({ data: 1, hl: "data" }, "② 把静态数据（如已初始化的全局变量 <code>int x = 42;</code>）也读进来。");
+      } else {
+        push({ mapped: true, hl: "code" }, "① <b>懒加载（lazily）</b>：OS 只记下“代码和静态数据在磁盘文件的哪里”（虚线框），<b>一个字节都不读</b>。怎么做到的？要等到第 18–21 章的分页与交换。");
+        push({ hl: "data" }, "② 静态数据同样只建立映射，暂不读入。");
+      }
+      push({ stack: 1, hl: "stack" }, "③ 分配运行时<b>栈</b>，并用参数初始化它：填入 <code>main(int argc, char *argv[])</code> 的 <code>argc</code> 和 <code>argv</code>。");
+      push({ heap: 1, hl: "heap" }, "④ 分配（一开始很小的）<b>堆</b>，供 <code>malloc()</code> 使用；程序以后申请更多内存时 OS 可能再扩大它。");
+      push({ fd: 1, hl: "fd" }, "⑤ I/O 初始化：打开三个<b>文件描述符</b>——0 标准输入、1 标准输出、2 标准错误，都连到终端。");
+      if (!lazy) {
+        push({ pc: "main", pcPage: 0, hl: "cpu" }, "⑥ 跳到入口点 <code>main()</code>，把 CPU 交给新进程。所有代码早已在内存里，后续执行不会再为代码读磁盘。");
+      } else {
+        push({ pc: "main", pcPage: 0, code: [1, 0, 0, 0], data: 1, hl: "cpu" }, "⑥ 跳到 <code>main()</code>。第一条指令所在的代码页 0 不在内存 → 这时才从磁盘读入它（以及用到的静态数据）。");
+        push({ pc: "helper()", pcPage: 2, code: [1, 0, 1, 0], hl: "code" }, "⑦ 程序调用了位于代码页 2 的函数 → 第一次访问该页，才从磁盘读入。代码页 1、3 一直没用到，就<b>永远不必读</b>。");
+      }
+      return L;
+    }
+    let L = steps();
+    function render(i) {
+      const { st, text } = L[i];
+      const W = 640, H = 300;
+      const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "程序加载示意图" });
+      // 磁盘
+      svg.append(s("rect", { x: 10, y: 30, width: 170, height: 250, rx: 10, class: "box" }));
+      svg.append(s("text", { x: 95, y: 22, "text-anchor": "middle", "font-weight": 700, text: "磁盘：可执行文件 prog" }));
+      for (let k = 0; k < 4; k++) {
+        svg.append(s("rect", { x: 30, y: 50 + k * 40, width: 130, height: 32, rx: 4, style: "fill:var(--c1);opacity:.85" }));
+        svg.append(s("text", { x: 95, y: 71 + k * 40, "text-anchor": "middle", "font-size": 13, style: "fill:#fff", text: `代码页 ${k}` }));
+      }
+      svg.append(s("rect", { x: 30, y: 215, width: 130, height: 32, rx: 4, style: "fill:var(--c3);opacity:.85" }));
+      svg.append(s("text", { x: 95, y: 236, "text-anchor": "middle", "font-size": 13, style: "fill:#fff", text: "静态数据" }));
+      // 内存：地址空间
+      const MX = 300, MW = 170;
+      svg.append(s("text", { x: MX + MW / 2, y: 22, "text-anchor": "middle", "font-weight": 700, text: "内存：进程的地址空间" }));
+      svg.append(s("rect", { x: MX, y: 30, width: MW, height: 250, rx: 8, class: "box-strong" }));
+      const seg = (y, hgt, on, dashed, col, label, hl) => {
+        const g = s("g");
+        g.append(s("rect", { x: MX + 8, y, width: MW - 16, height: hgt, rx: 4, style: on ? `fill:${col};opacity:.9` : dashed ? "fill:none;stroke:var(--muted);stroke-dasharray:4 3" : "fill:none;stroke:var(--border)" }));
+        if (on || dashed) g.append(s("text", { x: MX + MW / 2, y: y + hgt / 2 + 4, "text-anchor": "middle", "font-size": 12.5, style: on ? "fill:#fff" : "", class: on ? "" : "t-muted", text: label }));
+        if (hl) g.append(s("rect", { x: MX + 4, y: y - 3, width: MW - 8, height: hgt + 6, rx: 6, style: "fill:none;stroke:var(--accent);stroke-width:2.5" }));
+        svg.append(g);
+      };
+      for (let k = 0; k < 4; k++) seg(38 + k * 26, 22, st.code[k], st.mapped && !st.code[k], "var(--c1)", st.code[k] ? `代码页 ${k}` : `代码页 ${k}（未载入）`, st.hl === "code" && (st.code[k] || (st.mapped && i <= 2)));
+      seg(144, 24, st.data, st.mapped && !st.data, "var(--c3)", st.data ? "静态数据" : "静态数据（未载入）", st.hl === "data");
+      seg(172, 26, st.heap, false, "var(--c5)", "堆 heap（很小）", st.hl === "heap");
+      seg(236, 36, st.stack, false, "var(--c2)", "栈：argc=1 argv[0]", st.hl === "stack");
+      // 箭头：磁盘 → 内存
+      if (st.hl === "code" || st.hl === "data") {
+        const on = st.hl === "code" ? st.code.map((v, k) => (v ? k : -1)).filter((k) => k >= 0) : [4];
+        const fresh = i > 0 ? on.filter((k) => k === 4 ? !L[i - 1].st.data : !L[i - 1].st.code[k]) : [];
+        for (const k of fresh) {
+          const y1 = k === 4 ? 231 : 66 + k * 40, y2 = k === 4 ? 156 : 49 + k * 26;
+          svg.append(s("path", { d: `M162,${y1} C230,${y1} 240,${y2} ${MX + 6},${y2}`, class: "arrow", style: "stroke:var(--accent);stroke-width:2", "marker-end": "url(#arw-acc)" }));
+        }
+        if (st.hl === "data" && st.mapped && !st.data) svg.append(s("path", { d: `M162,231 C230,231 240,156 ${MX + 6},156`, class: "arrow", style: "stroke-dasharray:4 3", "marker-end": "url(#arw)" }));
+        if (st.hl === "code" && st.mapped && !st.code.some((v) => v)) for (let k = 0; k < 4; k++) svg.append(s("path", { d: `M162,${66 + k * 40} C230,${66 + k * 40} 240,${49 + k * 26} ${MX + 6},${49 + k * 26}`, class: "arrow", style: "stroke-dasharray:4 3", "marker-end": "url(#arw)" }));
+      }
+      // CPU
+      svg.append(s("rect", { x: 510, y: 30, width: 120, height: 70, rx: 8, class: st.hl === "cpu" ? "accent-soft" : "box" , "stroke-width": st.hl === "cpu" ? 2.5 : 1 }));
+      svg.append(s("text", { x: 570, y: 52, "text-anchor": "middle", "font-weight": 700, text: "CPU" }));
+      svg.append(s("text", { x: 570, y: 80, "text-anchor": "middle", "font-size": 12.5, class: "mono", text: st.pc ? `PC → ${st.pc}` : "PC：其他进程" }));
+      if (st.pcPage >= 0) svg.append(s("path", { d: `M510,70 C490,70 490,${49 + st.pcPage * 26} ${MX + MW + 2},${49 + st.pcPage * 26}`, class: "arrow", style: "stroke:var(--accent)", "marker-end": "url(#arw-acc)" }));
+      // fd 表
+      svg.append(s("rect", { x: 510, y: 130, width: 120, height: 110, rx: 8, class: st.hl === "fd" ? "accent-soft" : "box", "stroke-width": st.hl === "fd" ? 2.5 : 1 }));
+      svg.append(s("text", { x: 570, y: 150, "text-anchor": "middle", "font-weight": 700, "font-size": 13, text: "打开文件表" }));
+      ["0 stdin", "1 stdout", "2 stderr"].forEach((t, k) => svg.append(s("text", { x: 522, y: 175 + k * 22, "font-size": 12.5, class: st.fd ? "mono" : "mono t-muted", text: st.fd ? `fd ${t} → 终端` : `fd ${k}  （空）` })));
+      host.replaceChildren(svg);
+      nar.innerHTML = text;
+    }
+    const st = OSTEP.stepper($("ld-step"), { steps: () => L.length, render });
+    modeSel.onchange = () => { L = steps(); st.reset(); };
+  })();
+
+  // ===================== 模拟器 2：process-run =====================
+  (() => {
+    const PRESETS = {
+      f43: { progs: "c4\nc4", sw: "IO", iod: "LATER", ioLen: 5 },
+      f44: { progs: "c2,i,c1\nc5", sw: "IO", iod: "LATER", ioLen: 3 },
+      q1: { progs: "5:100\n5:100", sw: "IO", iod: "LATER", ioLen: 5 },
+      q2: { progs: "4:100\n1:0", sw: "IO", iod: "LATER", ioLen: 5 },
+      q3: { progs: "1:0\n4:100", sw: "IO", iod: "LATER", ioLen: 5 },
+      q4: { progs: "1:0\n4:100", sw: "END", iod: "LATER", ioLen: 5 },
+      q6: { progs: "3:0\n5:100\n5:100\n5:100", sw: "IO", iod: "LATER", ioLen: 5 },
+      q7: { progs: "3:0\n5:100\n5:100\n5:100", sw: "IO", iod: "IMMEDIATE", ioLen: 5 },
+    };
+    const NOTE = {
+      f43: "图 4.3：两个进程都只用 CPU。进程 0 跑完 4 拍后进程 1 才运行（表中 DONE 对应原书的“–”）。",
+      f44: "图 4.4：进程 0 = 计算 2 拍 + 发起 I/O（第 3 拍）+ io_done + 计算 1 拍；I/O 时长 3；IO_RUN_LATER。对照原书表格：第 4–6 拍 Blocked、第 7–8 拍 Ready、第 9–10 拍 Running。",
+    };
+    let res = null, opt = null, preset = "f44";
+    const ta = $("pr-progs"), swS = $("pr-sw"), iodS = $("pr-iod"), lenI = $("pr-iolen"), seedI = $("pr-seed"), rev = $("pr-reveal");
+    function load(k) { const p = PRESETS[k]; ta.value = p.progs; swS.value = p.sw; iodS.value = p.iod; lenI.value = p.ioLen; preset = k; build(); }
+    function build() {
+      $("pr-err").textContent = "";
+      try {
+        opt = { sw: swS.value, iod: iodS.value, ioLen: Math.max(1, Math.min(20, +lenI.value || 5)) };
+        const codes = CORE.parsePrograms(ta.value, +seedI.value || 0);
+        res = CORE.simulate(codes, opt);
+        res.codes = codes;
+      } catch (e) { $("pr-err").textContent = "参数错误：" + e.message; res = null; }
+      st.reset();
+    }
+    document.querySelectorAll("#sim-prun [data-preset]").forEach((b) => (b.onclick = () => load(b.dataset.preset)));
+    $("pr-run").onclick = () => { preset = null; build(); };
+    rev.onchange = () => st.refresh();
+
+    // 状态机图
+    const BOX = { RUN: { x: 30, y: 40, w: 160, h: 70, name: "Running" }, READY: { x: 370, y: 40, w: 160, h: 70, name: "Ready" }, BLOCKED: { x: 200, y: 175, w: 160, h: 70, name: "Blocked" }, DONE: { x: 30, y: 190, w: 120, h: 55, name: "Done" } };
+    const ARROWS = {
+      desched: { d: "M190,58 C260,20 300,20 370,58", lx: 280, ly: 22, label: "Descheduled" },
+      sched: { d: "M370,95 C300,130 260,130 190,95", lx: 280, ly: 140, label: "Scheduled" },
+      io: { d: "M140,110 L225,178", lx: 150, ly: 160, label: "I/O: initiate" },
+      iodone: { d: "M345,178 L430,110", lx: 405, ly: 160, label: "I/O: done" },
+      exit: { d: "M80,110 L80,188", lx: 88, ly: 150, label: "" },
+    };
+    function transitions(prev, curS) {
+      const used = new Set();
+      prev.forEach((a, k) => {
+        const b = curS[k];
+        if (a === b) return;
+        if (a === "READY" && b === "RUN") used.add("sched");
+        else if (a === "RUN" && b === "READY") used.add("desched");
+        else if (a === "RUN" && b === "BLOCKED") used.add("io");
+        else if (a === "BLOCKED" && b === "READY") used.add("iodone");
+        else if (a === "BLOCKED" && b === "RUN") { used.add("iodone"); used.add("sched"); }
+        else if (b === "DONE") used.add("exit");
+        else if (a === "READY" && b === "BLOCKED") { used.add("sched"); used.add("io"); }
+      });
+      return used;
+    }
+    function drawDiagram(states, used) {
+      const svg = s("svg", { viewBox: "0 0 560 255", width: 560, role: "img", "aria-label": "当前各进程所处状态" });
+      for (const [k, a] of Object.entries(ARROWS)) {
+        const on = used.has(k);
+        svg.append(s("path", { d: a.d, class: "arrow", style: on ? "stroke:var(--accent);stroke-width:3" : "", "marker-end": on ? "url(#arw-acc)" : "url(#arw)" }));
+        if (a.label) svg.append(s("text", { x: a.lx, y: a.ly, "text-anchor": "middle", "font-size": 12, style: on ? "fill:var(--accent);font-weight:700" : "", class: on ? "" : "t-muted", text: a.label }));
+      }
+      for (const [k, b] of Object.entries(BOX)) {
+        const cls = k === "RUN" ? "ok-soft" : k === "BLOCKED" ? "warn-soft" : "box-strong";
+        svg.append(s("rect", { x: b.x, y: b.y, width: b.w, height: b.h, rx: k === "DONE" ? 8 : 35, class: cls, "stroke-width": 1.5 }));
+        svg.append(s("text", { x: b.x + b.w / 2, y: b.y + 20, "text-anchor": "middle", "font-size": 13, "font-weight": 700, text: b.name }));
+        const who = states.map((x, i) => (x === k ? i : -1)).filter((i) => i >= 0);
+        const step = Math.min(28, (b.w - 20) / Math.max(1, who.length));
+        who.forEach((pid, j) => {
+          const cx = b.x + b.w / 2 - ((who.length - 1) * step) / 2 + j * step, cy = b.y + (k === "DONE" ? 38 : 45);
+          svg.append(s("circle", { cx, cy, r: 12, style: `fill:${color(pid)}` }));
+          svg.append(s("text", { x: cx, y: cy + 4, "text-anchor": "middle", "font-size": 11, style: "fill:#fff;font-weight:700", text: "P" + pid }));
+        });
+      }
+      return svg;
+    }
+    function narrate(row) {
+      const P = (i) => `<b style="color:${color(i)}">P${i}</b>`;
+      const out = [];
+      for (const e of row.ev) {
+        if (e.k === "iodone") {
+          let x = `${P(e.pid)} 的 I/O 完成（表中 <b>*</b>）：BLOCKED → READY。`;
+          if (e.act === "imm") x += e.preempt != null ? `IO_RUN_IMMEDIATE：立刻让 ${P(e.pid)} 运行，正在运行的 ${P(e.preempt)} 被换下回到 READY。` : `IO_RUN_IMMEDIATE：立刻让 ${P(e.pid)} 运行。`;
+          else if (e.act === "later-only") x += `此刻没有别的可运行进程，于是立刻运行 ${P(e.pid)}。`;
+          else if (e.act === "end-run") x += `SWITCH_ON_END：CPU 一直为 ${P(e.pid)} 保留着，现在让它继续。`;
+          else x += e.other != null ? `IO_RUN_LATER：${P(e.other)} 继续运行，${P(e.pid)} 在就绪队列里等。` : `IO_RUN_LATER：${P(e.pid)} 进入就绪队列等待。`;
+          out.push(x);
+        } else if (e.k === "exec") {
+          if (e.ins === "cpu") out.push(`${P(e.pid)} 执行一条 CPU 指令。`);
+          else if (e.ins === "io") out.push(`${P(e.pid)} 执行 <code>io</code>：向设备发出请求（占 1 拍 CPU），I/O 将在第 ${e.finish} 拍完成；从下一拍起 ${P(e.pid)} 处于 BLOCKED。`);
+          else out.push(`${P(e.pid)} 执行 <code>io_done</code>：处理 I/O 完成的收尾工作。`);
+        } else if (e.k === "idle") {
+          out.push(e.ready.length ? `CPU <b>空闲</b>——${e.ready.map(P).join("、")} 明明就绪，但 SWITCH_ON_END 规定当前进程结束前不切换。` : "CPU <b>空闲</b>：没有 READY 的进程（都在等 I/O）。");
+        } else if (e.k === "switch") {
+          out.push(e.to != null ? `SWITCH_ON_IO：调度器把 CPU 交给 ${P(e.to)}（Ready → Running）。` : "SWITCH_ON_IO：想切换，但没有 READY 的进程，CPU 将空闲。");
+        } else if (e.k === "noswitch") {
+          out.push(`SWITCH_ON_END：不切换，CPU 等 ${P(e.pid)} 的 I/O 完成。`);
+        } else if (e.k === "done") {
+          out.push(`${P(e.pid)} 的指令全部执行完 → DONE。` + (e.next != null ? `调度 ${P(e.next)}。` : ""));
+        }
+      }
+      return `<b>第 ${row.t} 拍：</b>` + out.join(" ");
+    }
+    function render(i) {
+      const tbl = $("pr-table"), diag = $("pr-diagram"), prog = $("pr-progress"), nar = $("pr-nar"), stats = $("pr-stats");
+      if (!res) { tbl.replaceChildren(); diag.replaceChildren(); prog.replaceChildren(); nar.textContent = "请修正参数后点“应用参数”。"; stats.replaceChildren(); return; }
+      const n = res.codes.length, rows = res.rows, row = rows[i];
+      const prev = i > 0 ? rows[i - 1].states : res.codes.map((_, k) => (k === 0 ? "RUN" : "READY"));
+      diag.replaceChildren(drawDiagram(row.states, transitions(prev, row.states)));
+      // 指令进度
+      prog.replaceChildren(...res.codes.map((code, pid) => {
+        const done = row.exe[pid];
+        return h("div", { class: "prog-row" }, h("span", { class: "who", style: { color: color(pid) } }, "P" + pid),
+          code.map((ins, k) => h("span", { class: "cell" + (k < done ? " exe" : "") + (k === done - 1 && row.runPid === pid ? " hit" : "") + (ins !== "cpu" ? " io" : ""), title: ins }, ins === "cpu" ? "c" : ins === "io" ? "io" : "done")));
+      }));
+      // 表格
+      const reveal = rev.checked;
+      const head = h("tr", {}, h("th", {}, "Time"), res.codes.map((_, k) => h("th", { style: { color: color(k) } }, "PID:" + k)), h("th", {}, "CPU"), h("th", {}, "IOs"));
+      const body = rows.map((r, k) => {
+        const fut = k > i && !reveal;
+        const tr = h("tr", { class: (k === i ? "cur" : "") + (fut ? " future" : "") },
+          h("td", { class: r.ioDone && !fut ? "star" : "" }, fut ? String(r.t) : r.t + (r.ioDone ? "*" : "")),
+          r.cells.map((c, pid) => {
+            if (fut) return h("td", {}, "·");
+            const stt = r.states[pid];
+            const cls = stt === "RUN" ? "st-run" : stt === "READY" ? "st-ready" : stt === "BLOCKED" ? "st-blocked" : "st-done";
+            return h("td", { class: cls, style: stt === "RUN" ? { background: color(pid) } : null }, c);
+          }),
+          h("td", {}, fut ? "·" : r.runPid >= 0 ? "1" : ""), h("td", {}, fut ? "·" : r.ios ? String(r.ios) : ""));
+        return tr;
+      });
+      tbl.replaceChildren(h("thead", {}, head), h("tbody", {}, body));
+      const curTr = tbl.querySelector("tr.cur");
+      if (curTr) { const w = tbl.parentElement; const top = curTr.offsetTop - w.clientHeight / 2; w.scrollTop = Math.max(0, top); }
+      nar.innerHTML = (i === 0 && preset && NOTE[preset] ? NOTE[preset] + "<br>" : "") + narrate(row) + (i === rows.length - 1 ? " <b>全部进程结束。</b>" : "");
+      const pct = (a, b) => (b ? ((100 * a) / b).toFixed(2) + "%" : "–");
+      const last = i === rows.length - 1;
+      stats.replaceChildren(
+        h("div", { class: "stat" }, h("div", { class: "v" }, `${row.t}${last ? "" : " / ?"}`), h("div", { class: "l" }, "已经过的拍数 / 总时间")),
+        h("div", { class: "stat" }, h("div", { class: "v" }, String(row.cpuBusy)), h("div", { class: "l" }, "CPU 忙的拍数")),
+        h("div", { class: "stat" }, h("div", { class: "v" }, pct(row.cpuBusy, row.t)), h("div", { class: "l" }, "CPU 利用率（至今）")),
+        h("div", { class: "stat" }, h("div", { class: "v" }, String(row.ioBusy)), h("div", { class: "l" }, "I/O 忙的拍数")),
+        h("div", { class: "stat" }, h("div", { class: "v" }, pct(row.ioBusy, row.t)), h("div", { class: "l" }, "I/O 利用率（至今）")));
+    }
+    const st = OSTEP.stepper($("pr-step"), { steps: () => (res ? res.rows.length : 1), render, autoplayMs: 700 });
+    load("f44");
+  })();
+
+  // ===================== 模拟器 3：xv6 进程表 =====================
+  (() => {
+    let S = CORE.xvInit(), hist = [], logLines = ["初始：init（pid 1）就绪，shell（pid 2）正在运行。"], changed = new Set();
+    function render() {
+      const run = S.slots.findIndex((p) => p.state === "RUNNING");
+      const head = h("tr", {}, ["槽位", "state", "pid", "parent", "name", "chan"].map((t) => h("th", {}, t)));
+      const rows = S.slots.map((p, k) => h("tr", { class: changed.has(k) ? "chg" : "" },
+        h("td", {}, `proc[${k}]` + (k === run ? " ←" : "")),
+        h("td", {}, h("span", { class: "st-pill st-" + p.state }, p.state)),
+        h("td", {}, p.state === "UNUSED" ? "" : String(p.pid)), h("td", {}, p.state === "UNUSED" || !p.parent ? "" : String(p.parent)),
+        h("td", {}, p.name), h("td", {}, p.chan)));
+      $("xv-table").replaceChildren(h("thead", {}, head), h("tbody", {}, rows));
+      $("xv-log").replaceChildren(...logLines.slice(-40).map((l) => h("div", {}, l)));
+      $("xv-log").scrollTop = 1e6;
+      const r = run >= 0 ? S.slots[run] : null;
+      $("xv-nar").innerHTML = r ? `当前运行：pid ${r.pid}（${r.name}）。按钮都以它的名义发起（fork/exit/wait/发起 I/O）。高亮行是上一步发生变化的槽位。` : "CPU 空闲：没有 RUNNABLE 的进程。试试“磁盘 I/O 完成”。";
+    }
+    function act(a) {
+      if (a === "reset") { S = CORE.xvInit(); hist = []; logLines = ["重置。"]; changed = new Set(); return render(); }
+      if (a === "undo") { if (hist.length) { const hh = hist.pop(); S = hh.S; logLines = hh.log; changed = new Set(); } return render(); }
+      if (a === "demo") { act("reset"); for (const x of ["fork", "wait", "io", "iodone", "timer", "exit", "timer", "wait"]) act(x); logLines.push("—— 演示剧本：sh fork 出子进程 → sh 调用 wait 睡眠、子进程运行 → 子进程发起 I/O、init 运行 → I/O 完成 → 时钟中断切回子进程 → 子进程 exit 成为僵尸并唤醒 sh → 时钟中断轮到 sh → sh 的 wait 回收僵尸。按“撤销”可以一步步倒回去看。"); return render(); }
+      const r = CORE.xvAct(S, a);
+      if (r.err) { $("xv-nar").innerHTML = `<b style="color:var(--bad)">不行：</b>${r.err}`; return; }
+      hist.push({ S, log: logLines.slice() });
+      changed = new Set(r.S.slots.map((p, k) => (JSON.stringify(p) !== JSON.stringify(S.slots[k]) ? k : -1)).filter((k) => k >= 0));
+      S = r.S; logLines = logLines.concat(r.log);
+      render();
+    }
+    document.querySelectorAll("#xv-btns [data-act]").forEach((b) => (b.onclick = () => act(b.dataset.act)));
+    render();
+  })();
+})();
+</script>
+</body></html>

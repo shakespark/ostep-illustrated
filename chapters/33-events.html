@@ -1,0 +1,1006 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 33 章 · 基于事件的并发</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+  .lane { margin: 0 0 14px; }
+  .lane:last-child { margin-bottom: 0; }
+  .lane-title { font-size: 14px; font-weight: 650; margin: 0 0 4px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .lane-title .pill { font-weight: 400; }
+  .lane svg { display: block; }
+  .rqs { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .rq { font: 12px var(--mono); border: 1px solid var(--border); border-left: 4px solid var(--border); border-radius: 5px; padding: 1px 6px; background: var(--surface); white-space: nowrap; }
+  .rq.st-run { background: var(--accent-soft); }
+  .rq.st-wait { background: var(--warn-soft); }
+  .rq.st-io { background: var(--surface-2); }
+  .rq.st-block { background: var(--bad-soft); }
+  .rq.st-done { background: var(--ok-soft); }
+  .rq.st-none { opacity: .45; }
+  .narrate .mline { margin: 2px 0; }
+  .narrate .mline b { display: inline-block; min-width: 7.5em; }
+  .codebox { margin: 0; font-size: 12.5px; line-height: 1.55; }
+  .codebox .ln { color: var(--faint); user-select: none; display: inline-block; width: 2.2em; }
+  .sel-grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 12px; }
+  @media (max-width: 720px) { .sel-grid { grid-template-columns: minmax(0, 1fr); } }
+  .fdrow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 3px 0; font-size: 13.5px; }
+  .fdrow .nm { font-family: var(--mono); min-width: 7.5em; }
+  button.on { border-color: var(--ok); background: var(--ok-soft); }
+  .bits { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; margin: 4px 0; font-size: 13px; }
+  .bits .lbl { min-width: 6.5em; color: var(--muted); }
+  .bits .cell { min-width: 30px; height: 26px; flex-direction: column; line-height: 1.05; font-size: 12px; }
+  .bits .cell small { font-size: 9.5px; color: var(--muted); }
+  .ctab td, .ctab th { padding: 5px 10px; font-family: var(--mono); font-size: 13px; }
+  .ctab tr.hot td { background: var(--accent-soft); }
+  .ctab tr.gone td { opacity: .45; text-decoration: line-through; }
+  .outlog { font: 12.5px/1.6 var(--mono); background: var(--code-bg); border-radius: 8px; padding: 8px 10px; min-height: 3.5em; white-space: pre-wrap; margin-top: 8px; }
+</style>
+</head>
+<body data-chapter="33">
+<main>
+
+<h2>一句话 + 关键问题</h2>
+<p><strong>一句话：</strong>不创建线程，只用一个"事件循环"反复问操作系统"哪些 I/O 已经就绪"，然后一次处理一个事件——这样就不需要锁，调度权也回到了程序手里；代价是<strong>任何处理器都绝不能阻塞</strong>，于是需要异步 I/O 和手动管理状态。</p>
+<div class="crux">
+  <p><strong>如何不用线程构建并发服务器？</strong>既要保留对并发（调度）的控制，又要避开多线程程序中那些困扰人的问题。</p>
+  <p class="small muted">How can we build a concurrent server without using threads, and thus retain control over concurrency as well as avoid some of the problems that seem to plague multi-threaded applications?</p>
+</div>
+<p>前面几章我们一直用<strong>线程 + 锁 + 条件变量/信号量</strong>写并发程序，也在第 32 章见识了它的两大麻烦：一是<strong>正确性难</strong>（忘记加锁、死锁、原子性/顺序违反）；二是<strong>程序员几乎无法控制调度</strong>——创建线程后只能"祈祷"操作系统把它们安排得合理。</p>
+<p>本章介绍另一种并发风格：<strong>基于事件的并发（event-based concurrency）</strong>。它在 GUI 程序和一些互联网服务器里非常常见（今天的 node.js 就是代表），根源则是 C/UNIX 里的 <code>select()</code>/<code>poll()</code>。本章是并发部分的最后一章（原书标注为 Advanced）；其中"轮询还是中断"的取舍，会在下一部分第 36 章 I/O 设备里再次出现。</p>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>事件循环（event loop）</h4><p><code>while(1){ 取事件; 逐个处理 }</code>。整个服务器只有这一个循环。</p></div>
+  <div class="card"><h4>事件处理器（event handler）</h4><p>处理某个事件的一小段代码；它运行时是系统里<strong>唯一</strong>在做事的活动。</p></div>
+  <div class="card"><h4>显式调度</h4><p>"下一个处理哪个事件"由程序自己决定——这本身就是调度，而且完全可控。</p></div>
+  <div class="card"><h4>select() / poll()</h4><p>一次询问一组文件描述符里<strong>哪些已就绪</strong>（可读/可写/异常），把网络 I/O 变成"事件"。</p></div>
+  <div class="card"><h4>阻塞 vs 非阻塞</h4><p>阻塞接口做完才返回；非阻塞（异步）接口发起后立刻返回。事件服务器里<strong>禁止阻塞调用</strong>。</p></div>
+  <div class="card"><h4>异步 I/O（AIO）</h4><p><code>struct aiocb</code> + <code>aio_read()</code> 发起磁盘读并立即返回，再用 <code>aio_error()</code> 轮询或用信号得知完成。</p></div>
+  <div class="card"><h4>续延（continuation）</h4><p>发起异步 I/O 前，把"完成后还要做什么"（如回复哪个 socket）存进表里——即<strong>手动栈管理</strong>。</p></div>
+  <div class="card"><h4>无需加锁（单 CPU）</h4><p>一次只运行一个处理器，不会被别的线程打断，所以不存在临界区竞争。</p></div>
+</div>
+
+<h2>基本思想：事件循环</h2>
+<p>事件驱动的做法简单到有点"可疑"：<strong>等某件事（事件）发生；发生后看它是什么类型，做它需要的那一点点工作</strong>（可能包括发起 I/O 请求、为以后安排别的事件等）。就这样。规范的事件服务器围绕下面这个结构构建：</p>
+<pre><code>while (1) {
+    events = getEvents();      // 等待：哪些事情发生了？
+    for (e in events)
+        processEvent(e);       // 一次处理一个事件（事件处理器）
+}</code></pre>
+<figure class="fig">
+<svg viewBox="0 0 760 250" width="760" role="img" aria-label="事件循环结构示意">
+  <defs><marker id="ar33a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="90" y="12" text-anchor="middle" font-size="12" class="t-muted">事件来源</text>
+  <rect x="10" y="20" width="160" height="36" rx="6" class="box"/><text x="90" y="43" text-anchor="middle" font-size="13">异步 I/O 完成</text>
+  <rect x="10" y="68" width="160" height="36" rx="6" class="box"/><text x="90" y="91" text-anchor="middle" font-size="13">网络 socket：新请求</text>
+  <rect x="10" y="116" width="160" height="36" rx="6" class="box"/><text x="90" y="139" text-anchor="middle" font-size="13">管道 / 终端输入</text>
+  <rect x="10" y="164" width="160" height="36" rx="6" class="box"/><text x="90" y="187" text-anchor="middle" font-size="13">定时器、GUI 点击…</text>
+  <path d="M170,38 L212,108" class="arrow" marker-end="url(#ar33a)"/>
+  <path d="M170,86 L212,116" class="arrow" marker-end="url(#ar33a)"/>
+  <path d="M170,134 L212,126" class="arrow" marker-end="url(#ar33a)"/>
+  <path d="M170,182 L212,136" class="arrow" marker-end="url(#ar33a)"/>
+  <rect x="214" y="95" width="140" height="60" rx="8" class="accent-soft"/>
+  <text x="284" y="120" text-anchor="middle" font-size="13.5" class="mono">getEvents()</text>
+  <text x="284" y="140" text-anchor="middle" font-size="12" class="t-muted">select()/poll()</text>
+  <path d="M354,125 L382,125" class="arrow" marker-end="url(#ar33a)"/>
+  <text x="462" y="100" text-anchor="middle" font-size="12" class="t-muted">本轮就绪的事件</text>
+  <rect x="385" y="108" width="48" height="34" rx="5" class="box-strong"/><text x="409" y="130" text-anchor="middle" font-size="13" class="mono">e1</text>
+  <rect x="438" y="108" width="48" height="34" rx="5" class="box-strong"/><text x="462" y="130" text-anchor="middle" font-size="13" class="mono">e2</text>
+  <rect x="491" y="108" width="48" height="34" rx="5" class="box-strong"/><text x="515" y="130" text-anchor="middle" font-size="13" class="mono">e3</text>
+  <path d="M539,125 L578,125" class="arrow" marker-end="url(#ar33a)"/>
+  <text x="560" y="160" text-anchor="middle" font-size="11" class="t-muted">挑下一个</text>
+  <text x="560" y="174" text-anchor="middle" font-size="11" class="t-muted">= 调度</text>
+  <rect x="580" y="95" width="170" height="60" rx="8" class="ok-soft"/>
+  <text x="665" y="120" text-anchor="middle" font-size="13.5" class="mono">processEvent(e)</text>
+  <text x="665" y="140" text-anchor="middle" font-size="12" class="t-muted">一次只运行一个处理器</text>
+  <path d="M665,155 V222 H284 V160" class="arrow" marker-end="url(#ar33a)"/>
+  <text x="475" y="240" text-anchor="middle" font-size="12" class="t-muted">while (1)：处理完这一批，回到 getEvents()</text>
+  <path d="M665,95 V38 H176" class="arrow" stroke-dasharray="4 3" marker-end="url(#ar33a)"/>
+  <text x="420" y="32" text-anchor="middle" font-size="12" class="t-muted">处理器可能发起新的异步 I/O，完成时又变成新事件</text>
+</svg>
+<figcaption>图 33-A　事件循环：从各种来源收集"就绪"事件，每次挑一个交给处理器。挑选顺序由程序决定，这就是显式的调度。</figcaption>
+</figure>
+<p>这里有两点非常关键：</p>
+<ul>
+  <li><strong>处理器运行时，它是系统里唯一的活动。</strong>没有别的线程会在它执行到一半时插进来修改共享数据。</li>
+  <li><strong>决定下一个处理哪个事件，就等于调度。</strong>线程程序把调度交给操作系统；事件程序自己掌握调度——这种<strong>显式控制</strong>是事件方式的根本优势之一。</li>
+</ul>
+<p>剩下的大问题是：<code>getEvents()</code> 到底怎么知道"网络包到了""磁盘读完了"？这就轮到 <code>select()</code> 了。</p>
+
+<h2>重要的 API：select()（或 poll()）</h2>
+<p>大多数系统都提供 <code>select()</code> 或 <code>poll()</code> 系统调用。它们做的事情很简单：<strong>检查是否有需要处理的 I/O 到达</strong>。例如一个 Web 服务器想知道有没有新的网络包到了，就可以用它们。</p>
+<pre><code>int select(int nfds,
+           fd_set *restrict readfds,    // 关心"可读"的 fd
+           fd_set *restrict writefds,   // 关心"可写"的 fd
+           fd_set *restrict errorfds,   // 关心"异常"的 fd
+           struct timeval *restrict timeout);</code></pre>
+<p>手册的描述（意译）：<code>select()</code> 检查 <code>readfds</code>、<code>writefds</code>、<code>errorfds</code> 这三个描述符集合，看其中哪些已<strong>可读、可写或有异常待处理</strong>。只检查前 <code>nfds</code> 个描述符（0 到 <code>nfds-1</code>）。<strong>返回时，<code>select()</code> 把传入的集合替换成"已就绪的子集"</strong>，返回值是所有集合中就绪描述符的总数。</p>
+<figure class="fig">
+<svg viewBox="0 0 720 250" width="720" role="img" aria-label="select 输入位图与输出位图">
+  <defs><marker id="ar33b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="10" y="40" font-size="13" font-weight="600">传入 readFDs</text>
+  <text x="10" y="56" font-size="11" class="t-muted">"我关心这些 fd"</text>
+  <g font-size="12" class="mono">
+    <rect x="150" y="24" width="44" height="34" rx="4" class="box"/><text x="172" y="46" text-anchor="middle">0</text>
+    <rect x="198" y="24" width="44" height="34" rx="4" class="box"/><text x="220" y="46" text-anchor="middle">0</text>
+    <rect x="246" y="24" width="44" height="34" rx="4" class="box"/><text x="268" y="46" text-anchor="middle">0</text>
+    <rect x="294" y="24" width="44" height="34" rx="4" class="accent-soft"/><text x="316" y="46" text-anchor="middle">1</text>
+    <rect x="342" y="24" width="44" height="34" rx="4" class="accent-soft"/><text x="364" y="46" text-anchor="middle">1</text>
+    <rect x="390" y="24" width="44" height="34" rx="4" class="accent-soft"/><text x="412" y="46" text-anchor="middle">1</text>
+    <rect x="438" y="24" width="44" height="34" rx="4" class="accent-soft"/><text x="460" y="46" text-anchor="middle">1</text>
+    <rect x="486" y="24" width="44" height="34" rx="4" class="box"/><text x="508" y="46" text-anchor="middle">0</text>
+  </g>
+  <g font-size="10.5" class="t-muted mono" text-anchor="middle">
+    <text x="172" y="18">fd0</text><text x="220" y="18">fd1</text><text x="268" y="18">fd2</text><text x="316" y="18">fd3</text><text x="364" y="18">fd4</text><text x="412" y="18">fd5</text><text x="460" y="18">fd6</text><text x="508" y="18">fd7</text>
+  </g>
+  <text x="545" y="46" font-size="12" class="t-muted">nfds = 7（最大 fd + 1）</text>
+  <path d="M340,62 V88" class="arrow" marker-end="url(#ar33b)"/>
+  <rect x="150" y="92" width="380" height="72" rx="8" class="warn-soft"/>
+  <text x="340" y="112" text-anchor="middle" font-size="13" font-weight="600">内核逐个检查（没有就绪的就让进程睡眠，直到超时）</text>
+  <text x="340" y="132" text-anchor="middle" font-size="12">fd3 监听 socket：无新连接　fd4 客户端 A：<tspan style="fill:var(--ok)">有数据</tspan></text>
+  <text x="340" y="152" text-anchor="middle" font-size="12">fd5 客户端 B：无数据　　　fd6 管道：<tspan style="fill:var(--ok)">有数据</tspan></text>
+  <path d="M340,164 V190" class="arrow" marker-end="url(#ar33b)"/>
+  <text x="10" y="212" font-size="13" font-weight="600">返回的 readFDs</text>
+  <text x="10" y="228" font-size="11" class="t-muted">"其中这些就绪了"</text>
+  <g font-size="12" class="mono">
+    <rect x="150" y="196" width="44" height="34" rx="4" class="box"/><text x="172" y="218" text-anchor="middle">0</text>
+    <rect x="198" y="196" width="44" height="34" rx="4" class="box"/><text x="220" y="218" text-anchor="middle">0</text>
+    <rect x="246" y="196" width="44" height="34" rx="4" class="box"/><text x="268" y="218" text-anchor="middle">0</text>
+    <rect x="294" y="196" width="44" height="34" rx="4" class="box"/><text x="316" y="218" text-anchor="middle">0</text>
+    <rect x="342" y="196" width="44" height="34" rx="4" class="ok-soft"/><text x="364" y="218" text-anchor="middle">1</text>
+    <rect x="390" y="196" width="44" height="34" rx="4" class="box"/><text x="412" y="218" text-anchor="middle">0</text>
+    <rect x="438" y="196" width="44" height="34" rx="4" class="ok-soft"/><text x="460" y="218" text-anchor="middle">1</text>
+    <rect x="486" y="196" width="44" height="34" rx="4" class="box"/><text x="508" y="218" text-anchor="middle">0</text>
+  </g>
+  <text x="545" y="218" font-size="13" font-weight="600">rc = 2</text>
+</svg>
+<figcaption>图 33-B　select() 的输入是"关心哪些 fd"的位图，输出被原地改写成"已就绪的子集"，返回值是就绪个数。所以每轮循环都要重新 FD_ZERO/FD_SET。</figcaption>
+</figure>
+<p>关于 <code>select()</code> 有两点值得注意：</p>
+<ol>
+  <li><strong>既能查可读，也能查可写。</strong>可读让服务器知道"新包到了、需要处理"；可写让服务器知道"现在可以回复了"（发送队列没满）。</li>
+  <li><strong>超时参数 <code>timeout</code>。</strong>常见用法是设为 <code>NULL</code>：<strong>无限期阻塞</strong>，直到某个描述符就绪。更健壮的服务器通常会指定超时；一种常见技巧是把超时设为 <strong>0</strong>，让 <code>select()</code> <strong>立即返回</strong>（纯轮询，不睡眠）。</li>
+</ol>
+<p><code>poll()</code> 与之非常相似（传入 <code>struct pollfd</code> 数组而不是位图）。无论哪个，它们都给了我们构建<strong>非阻塞事件循环</strong>的基础：检查哪些包到了，从有消息的 socket 读出来，需要时回复。</p>
+
+<h3>使用 select()：逐行读原书 Figure 33.1</h3>
+<pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;sys/time.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(void) {
+    // open and set up a bunch of sockets (not shown)
+    // main loop
+    while (1) {
+        // initialize the fd_set to all zero
+        fd_set readFDs;
+        FD_ZERO(&amp;readFDs);
+
+        // now set the bits for the descriptors
+        // this server is interested in
+        // (for simplicity, all of them from min to max)
+        int fd;
+        for (fd = minFD; fd &lt; maxFD; fd++)
+            FD_SET(fd, &amp;readFDs);
+
+        // do the select
+        int rc = select(maxFD+1, &amp;readFDs, NULL, NULL, NULL);
+
+        // check which actually have data using FD_ISSET()
+        int fd;
+        for (fd = minFD; fd &lt; maxFD; fd++)
+            if (FD_ISSET(fd, &amp;readFDs))
+                processFD(fd);
+    }
+}</code></pre>
+<ul>
+  <li><code>FD_ZERO(&amp;readFDs)</code>：清空集合。<strong>必须每轮都做</strong>，因为上一轮的 <code>select()</code> 已经把集合改写成了"就绪子集"。</li>
+  <li><code>FD_SET(fd, &amp;readFDs)</code>：把服务器关心的描述符（比如它正在服务的所有网络 socket）加进集合。</li>
+  <li><code>select(maxFD+1, &amp;readFDs, NULL, NULL, NULL)</code>：只关心可读；最后一个 <code>NULL</code> 是超时，表示"一直等到有 fd 就绪"。</li>
+  <li><code>FD_ISSET(fd, &amp;readFDs)</code>：逐个检查哪些 fd 真的有数据，对它们调用 <code>processFD()</code>——这就是事件处理器。</li>
+</ul>
+<p class="small muted">细节：书中的两个 for 循环写的是 <code>fd &lt; maxFD</code>，而 <code>select()</code> 的第一个参数是 <code>maxFD+1</code>。如果 <code>maxFD</code> 本身也是要监听的描述符，循环应写成 <code>fd &lt;= maxFD</code>；下面的模拟器和实验代码都采用 <code>&lt;=</code>。真实服务器还要处理发送消息、发起磁盘 I/O 等更多细节，可参考 Stevens &amp; Rago 的 APUE，以及 Pai 等人、Welsh 等人对事件服务器整体流程的论述。</p>
+
+<section class="sim" id="sim-select">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>select() 一轮循环逐步执行</h3>
+    <div class="desc">先设置哪些 fd"被关心"（FD_SET）、哪些 fd"有数据到达"，再执行一轮 Figure 33.1 的循环。观察：传入位图 → 返回位图 → rc → FD_ISSET 逐个处理。试试"有数据但没 FD_SET"的 fd 和"超时=0 且无数据"的情况。</div></div>
+  <div class="sim-body">
+    <div class="controls" id="sel-fds"></div>
+    <div class="controls">
+      <label>timeout <select id="sel-to"><option value="null">NULL（一直等）</option><option value="zero">{0,0}（立即返回）</option></select></label>
+      <button class="primary" id="sel-run">执行一轮循环</button>
+      <button id="sel-reset">恢复初始数据</button>
+    </div>
+    <div id="sel-step"></div>
+    <div class="stage">
+      <div class="sel-grid">
+        <pre class="codebox" id="sel-code"></pre>
+        <div id="sel-vis"></div>
+      </div>
+    </div>
+    <div class="narrate" id="sel-nar"></div>
+  </div>
+</section>
+
+<h2>为什么更简单：无需加锁</h2>
+<div class="aside" data-title="旁注 · 阻塞与非阻塞接口">
+  <p><strong>阻塞（blocking，同步 synchronous）接口</strong>在返回调用者之前把所有工作做完；<strong>非阻塞（non-blocking，异步 asynchronous）接口</strong>开始一些工作后立即返回，让剩下的工作在后台完成。</p>
+  <p>阻塞调用的罪魁祸首通常是某种 I/O：比如一次调用需要从磁盘读数据才能完成，它就可能阻塞，等待发给磁盘的请求返回。非阻塞接口可以用在任何编程风格里（包括多线程），但对事件方式来说是<strong>必需的</strong>：一个阻塞的调用会让所有进展停下来。</p>
+</div>
+<p>在<strong>单 CPU</strong> 上运行事件驱动程序时，并发程序里那些问题都不存在了。原因很直接：<strong>同一时刻只处理一个事件</strong>，事件服务器不会被另一个线程打断——它毫无疑问是单线程的。因此不需要获取或释放锁，多线程程序里常见的并发 bug（原子性违反、顺序违反、死锁……）在基本的事件方式里不会出现。</p>
+<div class="tip"><p><strong>TIP：在基于事件的服务器里不要阻塞。</strong>事件服务器让你能细粒度地控制任务调度；但为了保持这种控制，<strong>任何会阻塞调用者的调用都不能出现</strong>。违反这条的后果是：服务器被卡住、客户端很沮丧，而且别人会严重怀疑你是否读过这一部分。</p></div>
+
+<h2>问题：阻塞的系统调用</h2>
+<p>听起来很美：写个简单循环，事件来了就处理，连锁都不用想。但问题来了：<strong>如果某个事件需要发起一个可能阻塞的系统调用呢？</strong></p>
+<p>设想客户端请求服务器读一个磁盘文件并返回内容（很像一个简单的 HTTP 请求）。处理器最终要调用 <code>open()</code> 打开文件，再调用一串 <code>read()</code> 读它。只要所需的元数据或数据不在内存里，<code>open()</code> 和 <code>read()</code> 都可能向存储系统发 I/O 请求，从而花很长时间。</p>
+<ul>
+  <li><strong>线程服务器：</strong>没问题。发起 I/O 的线程挂起等待时，其他线程照常运行，服务器继续推进。I/O 与计算的自然重叠，正是线程编程显得自然直接的原因。</li>
+  <li><strong>事件服务器：</strong>没有别的线程可运行，只有主事件循环。处理器一旦阻塞，<strong>整个服务器</strong>就跟着阻塞，直到调用完成；此时系统闲着——巨大的资源浪费。所以事件系统必须遵守一条规则：<strong>不允许阻塞调用</strong>。</li>
+</ul>
+<figure class="fig">
+<svg viewBox="0 0 720 245" width="720" role="img" aria-label="线程服务器与阻塞事件服务器时间线对比">
+  <g font-size="11" class="t-muted mono" text-anchor="middle">
+    <text x="130" y="238">0</text><text x="230" y="238">5</text><text x="330" y="238">10</text><text x="430" y="238">15</text><text x="530" y="238">20</text><text x="630" y="238">25</text>
+  </g>
+  <text x="10" y="18" font-size="13" font-weight="600">① 每请求一线程</text>
+  <text x="10" y="46" font-size="12" class="t-muted">CPU</text>
+  <rect x="130" y="30" width="40" height="24" rx="3" style="fill:var(--c1)"/><text x="150" y="47" text-anchor="middle" font-size="11" style="fill:#fff">T1</text>
+  <rect x="170" y="30" width="60" height="24" rx="3" style="fill:var(--c2)"/><text x="200" y="47" text-anchor="middle" font-size="11" style="fill:#fff">T2</text>
+  <rect x="230" y="30" width="60" height="24" rx="3" style="fill:var(--c3)"/><text x="260" y="47" text-anchor="middle" font-size="11" style="fill:#fff">T3</text>
+  <rect x="290" y="30" width="40" height="24" rx="3" class="box"/><text x="310" y="47" text-anchor="middle" font-size="10.5">空闲</text>
+  <rect x="330" y="30" width="20" height="24" rx="3" style="fill:var(--c1)"/>
+  <text x="10" y="76" font-size="12" class="t-muted">磁盘</text>
+  <rect x="170" y="64" width="160" height="16" rx="3" style="fill:var(--c1);opacity:.35"/><text x="250" y="76" text-anchor="middle" font-size="11">T1 的 read()：T1 睡眠</text>
+  <text x="400" y="47" font-size="12">T2、T3 在 T1 等磁盘时就完成了（R2 响应 = 5 − 2 = 3）</text>
+  <line x1="120" y1="104" x2="700" y2="104" style="stroke:var(--border)"/>
+  <text x="10" y="126" font-size="13" font-weight="600">② 事件循环 + 阻塞 read()</text>
+  <text x="10" y="154" font-size="12" class="t-muted">CPU</text>
+  <rect x="130" y="138" width="40" height="24" rx="3" style="fill:var(--c1)"/><text x="150" y="155" text-anchor="middle" font-size="11" style="fill:#fff">R1</text>
+  <rect x="170" y="138" width="160" height="24" rx="3" class="bad-soft"/><text x="250" y="155" text-anchor="middle" font-size="11.5">整个事件循环卡在 read() 里</text>
+  <rect x="330" y="138" width="20" height="24" rx="3" style="fill:var(--c1)"/>
+  <rect x="350" y="138" width="60" height="24" rx="3" style="fill:var(--c2)"/><text x="380" y="155" text-anchor="middle" font-size="11" style="fill:#fff">R2</text>
+  <rect x="410" y="138" width="60" height="24" rx="3" style="fill:var(--c3)"/><text x="440" y="155" text-anchor="middle" font-size="11" style="fill:#fff">R3</text>
+  <text x="10" y="184" font-size="12" class="t-muted">磁盘</text>
+  <rect x="170" y="172" width="160" height="16" rx="3" style="fill:var(--c1);opacity:.35"/><text x="250" y="184" text-anchor="middle" font-size="11">R1 的 read()</text>
+  <path d="M170,196 V204 M180,196 V204" style="stroke:var(--c2);stroke-width:2"/><text x="178" y="214" font-size="10.5" class="t-muted">R2、R3 在 t=2、3 就到了，却只能等</text>
+  <text x="490" y="155" font-size="12">R2 响应 = 16 − 2 = 14</text>
+</svg>
+<figcaption>图 33-C　同样三个请求：只有 R1 需要读磁盘（10 个时间单位）。线程版里 T2、T3 在 T1 睡眠时照常运行；阻塞事件版里，一个处理器的阻塞调用让所有请求一起等。</figcaption>
+</figure>
+
+<h2>解决方案：异步 I/O</h2>
+<p>为克服这个限制，许多现代操作系统引入了向磁盘发起 I/O 的新方式，统称<strong>异步 I/O（asynchronous I/O）</strong>：应用发起 I/O 请求后，<strong>在 I/O 完成之前</strong>就把控制权还给调用者；另有接口让应用判断各个 I/O 是否已完成。</p>
+<p>以 Mac 上的接口为例（其他系统类似），核心是 <code>struct aiocb</code>，即 <strong>AIO 控制块（AIO control block）</strong>。简化版如下：</p>
+<pre><code>struct aiocb {
+    int             aio_fildes;   // 文件描述符 File descriptor
+    off_t           aio_offset;   // 文件内偏移 File offset
+    volatile void  *aio_buf;      // 结果放到哪块内存 Location of buffer
+    size_t          aio_nbytes;   // 读多少字节 Length of transfer
+};</code></pre>
+<figure class="fig">
+<svg viewBox="0 0 720 250" width="720" role="img" aria-label="aiocb 结构与 aio_read aio_error 流程">
+  <defs><marker id="ar33c" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="95" y="18" text-anchor="middle" font-size="13" font-weight="600">struct aiocb cb</text>
+  <rect x="10" y="26" width="170" height="30" class="box-strong"/><text x="18" y="46" font-size="12" class="mono">aio_fildes = 5</text>
+  <rect x="10" y="56" width="170" height="30" class="box-strong"/><text x="18" y="76" font-size="12" class="mono">aio_offset = 4096</text>
+  <rect x="10" y="86" width="170" height="30" class="box-strong"/><text x="18" y="106" font-size="12" class="mono">aio_buf = buf</text>
+  <rect x="10" y="116" width="170" height="30" class="box-strong"/><text x="18" y="136" font-size="12" class="mono">aio_nbytes = 8192</text>
+  <rect x="230" y="22" width="210" height="46" rx="6" class="box"/>
+  <text x="335" y="40" text-anchor="middle" font-size="12">磁盘上的文件（fd 5）</text>
+  <rect x="300" y="48" width="90" height="14" style="fill:var(--accent-soft);stroke:var(--accent)"/><text x="345" y="59" text-anchor="middle" font-size="10" class="mono">[4096, 12288)</text>
+  <path d="M180,41 H228" class="arrow" marker-end="url(#ar33c)"/>
+  <path d="M180,71 C240,71 270,70 298,58" class="arrow" marker-end="url(#ar33c)"/>
+  <rect x="230" y="96" width="210" height="44" rx="6" class="box"/>
+  <text x="335" y="114" text-anchor="middle" font-size="12">内存缓冲区 buf</text>
+  <text x="335" y="131" text-anchor="middle" font-size="11" class="t-muted">完成后数据被拷到这里</text>
+  <path d="M180,101 H228" class="arrow" marker-end="url(#ar33c)"/>
+  <text x="590" y="18" text-anchor="middle" font-size="13" font-weight="600">应用（事件循环）视角</text>
+  <rect x="470" y="28" width="240" height="26" rx="5" class="accent-soft"/><text x="480" y="46" font-size="12" class="mono">aio_read(&amp;cb) → 立即返回</text>
+  <rect x="470" y="62" width="240" height="26" rx="5" class="box"/><text x="480" y="80" font-size="12" class="mono">…去处理别的事件…</text>
+  <rect x="470" y="96" width="240" height="26" rx="5" class="warn-soft"/><text x="480" y="114" font-size="12" class="mono">aio_error(&amp;cb) → EINPROGRESS</text>
+  <rect x="470" y="130" width="240" height="26" rx="5" class="warn-soft"/><text x="480" y="148" font-size="12" class="mono">aio_error(&amp;cb) → EINPROGRESS</text>
+  <rect x="470" y="164" width="240" height="26" rx="5" class="ok-soft"/><text x="480" y="182" font-size="12" class="mono">aio_error(&amp;cb) → 0 完成！</text>
+  <text x="590" y="212" text-anchor="middle" font-size="11.5" class="t-muted">轮询：一遍遍问"好了没？"</text>
+  <text x="10" y="180" font-size="12">① 填好控制块：读哪个文件、从哪、读多少、放哪。</text>
+  <text x="10" y="200" font-size="12">② aio_read() 只"发起"请求，成功就马上返回。</text>
+  <text x="10" y="220" font-size="12">③ 之后用 aio_error() 检查：未完成返回 EINPROGRESS，</text>
+  <text x="10" y="238" font-size="12">　 完成返回 0，此时 aio_buf 里已有数据。</text>
+</svg>
+<figcaption>图 33-D　异步读的三步：填 aiocb → aio_read() 发起并立即返回 → aio_error() 轮询是否完成。</figcaption>
+</figure>
+<pre><code>int aio_read(struct aiocb *aiocbp);         // 发起异步读；成功则立即返回
+int aio_error(const struct aiocb *aiocbp);  // 完成返回 0；否则返回 EINPROGRESS</code></pre>
+<p>接口名 <code>aio_error()</code> 有点让人困惑，但它确实就是"查询这个请求完成没有"。于是，对每个未完成的异步 I/O，应用都可以<strong>周期性地轮询（poll）</strong>系统。</p>
+<p>不过，逐个检查很痛苦：如果某一时刻有几十上百个 I/O 在飞，是一直反复检查、还是先等一会儿？为此一些系统提供了<strong>基于中断（interrupt）</strong>的办法：用 <strong>UNIX 信号（signal）</strong>在异步 I/O 完成时通知应用，从而无需反复询问。这种"轮询 vs 中断"的取舍在设备层面同样存在（第 36 章）。</p>
+<div class="aside" data-title="旁注 · UNIX 信号">
+  <p>所有现代 UNIX 变体里都有一套庞大而有趣的基础设施：<strong>信号</strong>。最简单地说，信号是与进程通信的一种方式：信号被递送给应用时，应用停下正在做的事，去运行一段<strong>信号处理程序（signal handler）</strong>；结束后进程恢复原来的行为。</p>
+  <p>每个信号都有名字，如 HUP（挂断）、INT（中断）、SEGV（段错误）。有时信号由内核发出：程序段错误时，操作系统给它发 <code>SIGSEGV</code>；若程序配置了捕获该信号，就可以运行一段代码来应对（便于调试）。未配置处理程序时执行默认行为——对 SEGV 来说就是杀死进程。</p>
+<pre><code>void handle(int arg) {
+    printf("stop wakin' me up...\n");
+}
+int main(int argc, char *argv[]) {
+    signal(SIGHUP, handle);
+    while (1)
+        ; // doin' nothin' except catchin' some sigs
+    return 0;
+}</code></pre>
+<pre><code>prompt&gt; ./main &amp;
+[3] 36705
+prompt&gt; kill -HUP 36705
+stop wakin' me up...
+prompt&gt; kill -HUP 36705
+stop wakin' me up...</code></pre>
+  <p>用 <code>kill</code> 命令行工具（名字确实有点凶）发信号，会打断主循环、运行 <code>handle()</code>。信号远不止这些，经典参考仍是 Stevens &amp; Rago。</p>
+</div>
+<p>没有异步 I/O 的系统上，纯粹的事件方式<strong>无法实现</strong>。但研究者想出了效果不错的替代方案：Pai 等人（Flash Web 服务器）描述了一种<strong>混合方案</strong>——用事件处理网络包，用<strong>线程池</strong>管理未完成的磁盘 I/O。</p>
+<figure class="fig">
+<svg viewBox="0 0 720 190" width="720" role="img" aria-label="事件加线程池的混合方案">
+  <defs><marker id="ar33d" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--muted)"/></marker></defs>
+  <rect x="10" y="60" width="190" height="70" rx="8" class="accent-soft"/>
+  <text x="105" y="88" text-anchor="middle" font-size="13" font-weight="600">事件循环</text>
+  <text x="105" y="108" text-anchor="middle" font-size="11.5">select() 监听网络 socket</text>
+  <text x="105" y="123" text-anchor="middle" font-size="11.5">+ 完成通知管道</text>
+  <path d="M200,80 H268" class="arrow" marker-end="url(#ar33d)"/>
+  <text x="234" y="72" text-anchor="middle" font-size="11" class="t-muted">磁盘请求</text>
+  <rect x="270" y="55" width="150" height="50" rx="6" class="box"/>
+  <text x="345" y="77" text-anchor="middle" font-size="12.5">请求队列</text>
+  <text x="345" y="95" text-anchor="middle" font-size="11" class="t-muted">（读 file.html…）</text>
+  <path d="M420,80 H478" class="arrow" marker-end="url(#ar33d)"/>
+  <rect x="480" y="20" width="220" height="130" rx="8" class="warn-soft"/>
+  <text x="590" y="42" text-anchor="middle" font-size="13" font-weight="600">辅助线程池</text>
+  <rect x="500" y="54" width="180" height="24" rx="4" class="box-strong"/><text x="590" y="71" text-anchor="middle" font-size="11.5">helper 1：阻塞 read() 没关系</text>
+  <rect x="500" y="84" width="180" height="24" rx="4" class="box-strong"/><text x="590" y="101" text-anchor="middle" font-size="11.5">helper 2</text>
+  <rect x="500" y="114" width="180" height="24" rx="4" class="box-strong"/><text x="590" y="131" text-anchor="middle" font-size="11.5">helper 3</text>
+  <path d="M590,150 V175 H105 V132" class="arrow" marker-end="url(#ar33d)"/>
+  <text x="345" y="168" text-anchor="middle" font-size="11.5" class="t-muted">完成后写一个字节到管道 → 该 fd 可读 → 变成事件</text>
+</svg>
+<figcaption>图 33-E　混合方案（Pai 等人）：阻塞只发生在辅助线程里，事件循环本身永不阻塞。</figcaption>
+</figure>
+
+<h2>另一个问题：状态管理</h2>
+<p>事件方式的另一个问题是：代码通常<strong>比线程版更难写</strong>。原因如下：事件处理器发起异步 I/O 后，必须<strong>把一些程序状态打包起来</strong>，留给 I/O 完成时的下一个处理器使用。线程程序不需要这一步，因为所需状态就在线程的<strong>栈</strong>上。Adya 等人把这项工作称为<strong>手动栈管理（manual stack management）</strong>，它是事件编程的根本特征。</p>
+<p>看一个具体例子：服务器要从文件描述符 <code>fd</code> 读数据，读完后把数据写到网络 socket <code>sd</code>。线程版（忽略错误检查）简单到不值一提：</p>
+<pre><code>int rc = read(fd, buffer, size);   // 阻塞：线程睡眠，别的线程照跑
+rc = write(sd, buffer, size);      // 醒来后 sd 就在栈上，直接用</code></pre>
+<p>事件版呢？先用 AIO 异步发起读，再周期性地用 <code>aio_error()</code> 检查完成情况。等它告诉我们"读完了"，<strong>事件服务器怎么知道接下来该干什么——写到哪个 socket？</strong>发起读的那个处理器早就返回了，它的局部变量 <code>sd</code> 随栈帧一起没了。</p>
+<p>解决办法（Adya 等人）是用一个古老的程序设计语言构造：<strong>续延（continuation）</strong>。听起来复杂，其实很简单：<strong>把完成这个事件所需的信息记在某个数据结构里；事件发生（磁盘 I/O 完成）时，查出这些信息并继续处理。</strong>本例中，就是把 socket 描述符 <code>sd</code> 记在一张以 <code>fd</code> 为键的哈希表里；磁盘 I/O 完成时，事件处理器用 <code>fd</code> 查表得到 <code>sd</code>，终于可以把数据写到 socket。</p>
+<figure class="fig">
+<svg viewBox="0 0 720 230" width="720" role="img" aria-label="线程栈保存状态与事件版 continuation 表对比">
+  <defs><marker id="ar33e" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="150" y="18" text-anchor="middle" font-size="13" font-weight="600">线程版：状态天然在栈上</text>
+  <rect x="30" y="30" width="240" height="100" rx="6" class="box"/>
+  <text x="40" y="48" font-size="11.5" class="t-muted">线程 T7 的栈帧</text>
+  <rect x="40" y="56" width="100" height="26" class="box-strong"/><text x="48" y="74" font-size="12" class="mono">fd = 7</text>
+  <rect x="150" y="56" width="110" height="26" class="box-strong"/><text x="158" y="74" font-size="12" class="mono">sd = 12</text>
+  <rect x="40" y="90" width="220" height="26" class="box-strong"/><text x="48" y="108" font-size="12" class="mono">buffer[...]</text>
+  <text x="30" y="156" font-size="12" class="mono">read(fd, buffer, size);  // 睡眠</text>
+  <text x="30" y="176" font-size="12" class="mono">write(sd, buffer, size); // sd 还在</text>
+  <line x1="340" y1="10" x2="340" y2="220" style="stroke:var(--border)"/>
+  <text x="535" y="18" text-anchor="middle" font-size="13" font-weight="600">事件版：手动把状态存进表</text>
+  <rect x="360" y="30" width="160" height="50" rx="6" class="accent-soft"/>
+  <text x="440" y="50" text-anchor="middle" font-size="12">处理器①：请求到达</text>
+  <text x="440" y="68" text-anchor="middle" font-size="11" class="mono">aio_read(fd 7); 返回</text>
+  <rect x="560" y="40" width="150" height="104" rx="6" class="warn-soft"/>
+  <text x="635" y="58" text-anchor="middle" font-size="12" font-weight="600">continuation 表</text>
+  <text x="575" y="80" font-size="12" class="mono">fd 3  → sd 9</text>
+  <text x="575" y="102" font-size="12" class="mono" style="fill:var(--accent)">fd 7  → sd 12</text>
+  <text x="575" y="124" font-size="12" class="mono">fd 11 → sd 4</text>
+  <path d="M520,55 H558" class="arrow" marker-end="url(#ar33e)"/>
+  <text x="540" y="48" text-anchor="middle" font-size="10.5" class="t-muted">记下</text>
+  <rect x="360" y="150" width="160" height="56" rx="6" class="ok-soft"/>
+  <text x="440" y="170" text-anchor="middle" font-size="12">处理器②：fd 7 读完</text>
+  <text x="440" y="190" text-anchor="middle" font-size="11" class="mono">sd = 查表(7); write(sd)</text>
+  <path d="M600,144 C600,178 560,178 522,178" class="arrow" marker-end="url(#ar33e)"/>
+  <text x="598" y="196" font-size="10.5" class="t-muted">查出 sd 12</text>
+</svg>
+<figcaption>图 33-F　同一件事"读 fd 7 再写 sd 12"：线程版靠栈保存 sd；事件版必须在发起 aio_read 前把 fd→sd 存进 continuation 表，完成时再查回来。</figcaption>
+</figure>
+<pre><code>// 事件版的伪代码（示意）
+void on_request(int sd, const char *path) {         // 处理器①
+    int fd = open(path, O_RDONLY);                   // （open 本身也可能阻塞！）
+    struct aiocb *cb = make_aiocb(fd, buffer, size);
+    aio_read(cb);                                    // 立即返回
+    table_put(fd, (cont_t){ .sd = sd, .cb = cb });   // ← 续延：记住"之后要写给谁"
+}
+void on_io_done(int fd) {                            // 处理器②：aio_error()==0 或收到信号
+    cont_t c = table_get(fd);                        // ← 查回状态
+    write(c.sd, (void *)c.cb-&gt;aio_buf, size);
+    table_remove(fd);
+}</code></pre>
+
+<section class="sim" id="sim-cont">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>continuation 表：多个异步读乱序完成</h3>
+    <div class="desc">4 个客户端（sd 10–13）各请求一个文件（fd 20–23）。先逐个"发起 aio_read 并登记续延"，然后 I/O 按随机顺序完成。观察：完成顺序和发起顺序无关，但每次都能靠 fd 查表找回正确的 sd。换个种子看看不同的完成顺序。</div></div>
+  <div class="sim-body">
+    <div class="controls"><label>完成顺序种子 <input type="number" id="ct-seed" value="7" min="1"></label><button id="ct-shuffle">换一个顺序</button></div>
+    <div id="ct-step"></div>
+    <div class="stage" id="ct-stage"></div>
+    <div class="narrate" id="ct-nar"></div>
+  </div>
+</section>
+
+<h2>模拟器：三种服务器正面对比</h2>
+<p>把上面的讨论放进同一个场景：一批请求按时间到达，有的只需一点 CPU（数据在内存里），有的还要读磁盘。三种服务器在<strong>单 CPU</strong>上处理同一批请求：</p>
+<ol>
+  <li><strong>每请求一线程</strong>：线程调用阻塞 <code>read()</code> 时睡眠，调度器运行别的就绪线程（这里用非抢占的 FIFO 调度）。</li>
+  <li><strong>事件循环 + 阻塞 I/O</strong>：处理器直接调用阻塞 <code>read()</code>，整个循环卡住直到磁盘返回。</li>
+  <li><strong>事件循环 + 异步 I/O</strong>：处理器发起 <code>aio_read()</code>、登记续延后立即返回；I/O 完成后作为新事件排队，由另一个处理器查表并回复。</li>
+</ol>
+<p class="small muted">模型假设：请求 = CPU 计算 c₁ →（若需要）磁盘读 L → 回复 CPU 1 个单位；磁盘可以同时处理多个请求；事件按"就绪时间，再按请求编号"排队。"线程切换开销"只加在线程版上，用来体会线程的额外成本。</p>
+<section class="sim" id="sim-srv">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>线程 vs 阻塞事件循环 vs 异步事件循环</h3>
+    <div class="desc">单步推进时间，三条时间线上的竖线同步移动。红色块 = 事件循环卡在阻塞调用里；淡色块 = 尚未发生。对比平均响应时间和 CPU 利用率。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <button id="srv-p1">预设：一个磁盘读卡住所有人</button>
+      <button id="srv-p2">预设：全部命中内存（无 I/O）</button>
+      <button id="srv-p3">预设：I/O 密集</button>
+    </div>
+    <div class="controls">
+      <label>请求数 <input type="number" id="srv-n" value="8" min="2" max="14"></label>
+      <label>需 I/O 比例 % <input type="number" id="srv-io" value="40" min="0" max="100" step="10"></label>
+      <label>I/O 延迟 L <input type="number" id="srv-L" value="30" min="2" max="80"></label>
+      <label>CPU 时间 c₁ <input type="number" id="srv-c" value="3" min="1" max="10"></label>
+      <label>平均到达间隔 <input type="number" id="srv-gap" value="2" min="0" max="10"></label>
+      <label>种子 <input type="number" id="srv-seed" value="3" min="1"></label>
+      <label>线程切换开销 <input type="number" id="srv-sw" value="0" min="0" max="3"></label>
+      <button class="primary" id="srv-gen">随机生成</button>
+    </div>
+    <div id="srv-step"></div>
+    <div class="stage" id="srv-stage"></div>
+    <div class="narrate" id="srv-nar"></div>
+    <div class="table-wrap"><table id="srv-tab"></table></div>
+    <div class="stats" id="srv-stats"></div>
+  </div>
+</section>
+
+<h2>事件方式仍然困难的地方</h2>
+<ul>
+  <li><strong>多 CPU。</strong>从单 CPU 走向多 CPU 时，事件方式的一部分简单性消失了：要用上多个 CPU，事件服务器就得<strong>并行运行多个事件处理器</strong>，于是临界区等常见同步问题又出现了，也就又需要锁。在现代多核系统上，"无锁的简单事件处理"已经不再可能。</li>
+  <li><strong>与系统活动（如分页）集成不好。</strong>如果事件处理器发生<strong>缺页（page fault）</strong>，它就会阻塞，服务器在缺页处理完之前毫无进展。尽管服务器刻意避免了<strong>显式</strong>阻塞，这种由缺页造成的<strong>隐式阻塞</strong>很难避免，频繁时会造成严重的性能问题。</li>
+  <li><strong>代码随时间难以维护。</strong>各种例程的确切语义会变化。例如某个例程从非阻塞变成阻塞，调用它的事件处理器也必须跟着改——把自己<strong>拆成两半</strong>。由于阻塞对事件服务器是灾难性的，程序员必须时刻留意所用 API 的语义变化。</li>
+  <li><strong>异步磁盘 I/O 与网络 I/O 难以统一。</strong>虽然如今大多数平台都有异步磁盘 I/O，但花了很长时间才走到这一步，而且它与异步网络 I/O 的集成并不像想象中那样简单统一：我们希望只用 <code>select()</code> 管理所有未完成 I/O，实际上通常要把 <code>select()</code>（网络）和 AIO 调用（磁盘）组合起来用。</li>
+</ul>
+<figure class="fig">
+<svg viewBox="0 0 720 120" width="720" role="img" aria-label="缺页导致事件循环隐式阻塞">
+  <defs><marker id="ar33f" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--muted)"/></marker></defs>
+  <rect x="10" y="30" width="170" height="50" rx="6" class="ok-soft"/><text x="95" y="52" text-anchor="middle" font-size="12.5">处理器访问 cache[k]</text><text x="95" y="70" text-anchor="middle" font-size="11" class="t-muted">（没有任何系统调用）</text>
+  <path d="M180,55 H228" class="arrow" marker-end="url(#ar33f)"/>
+  <rect x="230" y="30" width="150" height="50" rx="6" class="warn-soft"/><text x="305" y="52" text-anchor="middle" font-size="12.5">页不在内存</text><text x="305" y="70" text-anchor="middle" font-size="11" class="t-muted">缺页异常 → 内核</text>
+  <path d="M380,55 H428" class="arrow" marker-end="url(#ar33f)"/>
+  <rect x="430" y="30" width="130" height="50" rx="6" class="box"/><text x="495" y="52" text-anchor="middle" font-size="12.5">从交换区读页</text><text x="495" y="70" text-anchor="middle" font-size="11" class="t-muted">毫秒级磁盘 I/O</text>
+  <path d="M560,55 H598" class="arrow" marker-end="url(#ar33f)"/>
+  <rect x="600" y="30" width="110" height="50" rx="6" class="bad-soft"/><text x="655" y="52" text-anchor="middle" font-size="12.5">整个循环停住</text><text x="655" y="70" text-anchor="middle" font-size="11" class="t-muted">隐式阻塞</text>
+  <text x="360" y="108" text-anchor="middle" font-size="12" class="t-muted">代码里一个阻塞调用都没有，事件循环照样会被一次缺页卡住（参见第 21 章交换机制）</text>
+</svg>
+<figcaption>图 33-G　隐式阻塞：缺页不经过任何你能替换成"异步版"的 API。</figcaption>
+</figure>
+
+<h3>线程 vs 事件：对比表</h3>
+<div class="table-wrap"><table>
+  <tr><th>方面</th><th>多线程（阻塞 I/O）</th><th>基于事件（非阻塞/异步 I/O）</th></tr>
+  <tr><td>调度由谁决定</td><td>操作系统；程序员难以控制</td><td>程序自己：挑下一个事件 = 调度</td></tr>
+  <tr><td>锁（单 CPU）</td><td>需要：线程随时可能被抢占</td><td>不需要：一次只运行一个处理器</td></tr>
+  <tr><td>锁（多 CPU）</td><td>需要</td><td>并行跑多个处理器时同样需要</td></tr>
+  <tr><td>遇到磁盘 I/O</td><td>该线程睡眠，其他线程继续，I/O 与计算自然重叠</td><td>必须用异步 I/O；一次阻塞调用卡住整个服务器</td></tr>
+  <tr><td>跨 I/O 的状态</td><td>在线程栈上，自动保存</td><td>手动栈管理：续延（continuation）表</td></tr>
+  <tr><td>代码形态</td><td>顺序、直观</td><td>被 I/O 切成多个处理器（回调）</td></tr>
+  <tr><td>缺页等隐式阻塞</td><td>只阻塞出事的那个线程</td><td>阻塞整个事件循环</td></tr>
+  <tr><td>API 语义变化（非阻塞→阻塞）</td><td>影响不大</td><td>调用方处理器必须拆成两半</td></tr>
+  <tr><td>典型代表</td><td>每连接一线程的服务器、线程池</td><td>GUI 事件循环、node.js、Flash、SEDA（混合）</td></tr>
+</table></div>
+<p>原书的结论：事件服务器把调度控制权交给应用本身，但代价是复杂性，以及与现代系统其他部分（如分页）集成的困难。<strong>没有哪种方法胜出</strong>，线程和事件很可能会作为同一个并发问题的两种解法长期共存。</p>
+
+<h2>先预测再验证</h2>
+<div class="exercise"><div class="q">在"三种服务器正面对比"里点<strong>预设：全部命中内存（无 I/O）</strong>。先预测：三条时间线会有什么不同？平均响应时间谁最小？</div>
+<details class="reveal"><summary>看答案</summary><div>三条时间线<strong>完全相同</strong>，统计也一样。没有 I/O 时，三种服务器做的都是"按到达顺序依次计算"，阻塞与否根本不会发生。事件方式的麻烦（以及线程的优势）只在出现阻塞 I/O 时才会显现。（线程切换开销设为非 0 时，线程版会略慢。）</div></details></div>
+<div class="exercise"><div class="q">点<strong>预设：一个磁盘读卡住所有人</strong>。R1 在 t=2 到达，只需 3 个单位 CPU。预测它在"事件循环 + 阻塞 I/O"里的响应时间，再单步到 t=2 附近验证。</div>
+<details class="reveal"><summary>看答案</summary><div>R0 在 t=0 到达，算 2 个单位后在 t=2 调用阻塞 read()，循环卡到 t=32，回复到 t=33。R1 虽然 t=2 就到了，直到 t=33 才被分派，t=36 完成：响应时间 <strong>34</strong>。线程版和异步版里 R1 在 t=2~5 就跑完了，响应时间只有 <strong>3</strong>。平均响应时间：阻塞版约 50.3，另外两种约 14.2。</div></details></div>
+<div class="exercise"><div class="q">仍用这个预设，把 I/O 延迟 L 从 30 改成 60。预测：阻塞版和异步版的平均响应时间各自大约变化多少？</div>
+<details class="reveal"><summary>看答案</summary><div>异步版只有两个需要 I/O 的请求（R0、R3）的响应时间各增加 30，平均约 +10。阻塞版里每次阻塞都让<strong>之后到达的所有请求</strong>多等 30，两次阻塞叠加：平均响应从约 50.3 升到约 95.3（+45），而异步版从约 14.2 升到约 24.2。阻塞调用的代价会被所有排队者分摊并放大。</div></details></div>
+<div class="exercise"><div class="q">把"线程切换开销"设为 1，重新生成。线程版和异步版还相等吗？这能说明"事件方式一定更快"吗？</div>
+<details class="reveal"><summary>看答案</summary><div>线程版变慢了（预设场景平均响应从约 14.2 升到 17.0），因为每次换线程都要付出开销，而事件循环里分派处理器只是一次函数调用。但这不能说明事件方式一定更快：原书强调的优势是<strong>对调度的控制</strong>和<strong>单 CPU 下无需加锁</strong>，代价是复杂的状态管理，以及阻塞（包括缺页）带来的风险。本模型也忽略了 select() 系统调用本身的成本。</div></details></div>
+<div class="exercise"><div class="q">在 select() 模拟器里：让 fd7（客户端 C）有数据但<strong>不勾选</strong> FD_SET，其他 fd 都没数据，timeout 分别选 NULL 和 {0,0}。预测 select() 的行为和 rc。</div>
+<details class="reveal"><summary>看答案</summary><div>fd7 不在传入集合里，内核根本不看它。timeout=NULL 时，select() 在所关心的 fd 上<strong>睡眠</strong>，一直等下去（fd7 的数据被晾着）；timeout={0,0} 时立即返回 <strong>rc=0</strong>，FD_ISSET 循环什么也找不到。这就是"忘记 FD_SET 某个连接"的 bug：那个客户端永远得不到服务。</div></details></div>
+<div class="exercise"><div class="q">continuation 模拟器里，如果不用表，而是用一个全局变量 <code>current_sd</code> 记住"下一次要回复的 socket"，会出什么问题？换几个种子想一想。</div>
+<details class="reveal"><summary>看答案</summary><div>多个异步读同时在飞，完成顺序与发起顺序无关。全局变量只能记住最后一次发起时的 sd，先完成的 I/O 会把数据写给错误的客户端。续延必须<strong>以 I/O 本身（fd 或 aiocb）为键</strong>来保存，才能在任意完成顺序下找回正确的上下文。</div></details></div>
+
+<h2>动手实验：用 select() 写事件循环</h2>
+<div class="lab">
+  <p>实验目录 <code>labs/33-events/</code>：</p>
+  <ul>
+    <li><code>echo_server.c</code>：单线程、基于 <code>select()</code> 的多客户端 TCP echo 服务器（只监听 127.0.0.1）。<code>-b 毫秒</code> 让每个处理器调用一次阻塞的 <code>usleep()</code>，模拟"处理器里做了阻塞 I/O"。</li>
+    <li><code>client.c</code>：连接服务器、发 N 条消息、测每条的往返时间（RTT）。<code>run_demo.sh</code> 同时启动 3 个客户端，分别以 <code>-b 0</code> 和 <code>-b 100</code> 各跑一轮，跑完自动关闭服务器。</li>
+    <li><code>pipes.c</code>：fork 3 个子进程，分别每 150/250/400 ms 往自己的管道写一条消息；父进程用 <code>select()</code> 同时监听三个管道，按就绪顺序读取。</li>
+  </ul>
+<pre><code><span class="cmd">cd labs/33-events &amp;&amp; make</span>
+<span class="cmd">./pipes</span>
+<span class="cmd">./run_demo.sh 9090</span></code></pre>
+  <p>示例输出（你的机器上数字会不同）——<code>./pipes</code>：</p>
+<pre><code>[parent] child0 间隔 150ms 写 4 条，读端 fd=3
+[parent] child1 间隔 250ms 写 3 条，读端 fd=4
+[parent] child2 间隔 400ms 写 2 条，读端 fd=5
+[ 150.8ms] select rc=1 → fd3 可读: "child0 msg0"
+[ 250.9ms] select rc=1 → fd4 可读: "child1 msg0"
+[ 300.9ms] select rc=1 → fd3 可读: "child0 msg1"
+[ 401.1ms] select rc=1 → fd5 可读: "child2 msg0"
+[ 451.0ms] select rc=1 → fd3 可读: "child0 msg2"
+[ 501.0ms] select rc=1 → fd4 可读: "child1 msg1"
+[ 601.2ms] select rc=1 → fd3 可读: "child0 msg3"
+[ 601.2ms] fd3 EOF（child0 结束）
+[ 751.2ms] select rc=1 → fd4 可读: "child1 msg2"
+[ 751.2ms] fd4 EOF（child1 结束）
+[ 801.3ms] select rc=1 → fd5 可读: "child2 msg1"
+[ 801.3ms] fd5 EOF（child2 结束）
+[parent] 全部管道关闭，事件循环结束</code></pre>
+  <p>示例输出（你的机器上数字会不同）——<code>./run_demo.sh 9191</code>（节选）：</p>
+<pre><code>===== 服务器阻塞模拟 -b 0 ms =====
+[client A] 5 条消息，平均 RTT = 0.24 ms，最大 RTT = 0.41 ms
+[client B] 5 条消息，平均 RTT = 0.15 ms，最大 RTT = 0.19 ms
+[client C] 5 条消息，平均 RTT = 0.18 ms，最大 RTT = 0.33 ms
+--- 服务器日志前 12 行 ---
+[server] 监听 127.0.0.1:9191，阻塞模拟 = 0 ms，listen fd = 3
+[server   302.2ms] select 第 1 轮返回 rc=1，就绪: fd3
+[server   302.3ms]   accept → 新连接 fd4
+[server   302.3ms] select 第 2 轮返回 rc=1，就绪: fd4
+[server   302.4ms]   fd4 收到 "A#0" 并回显
+[server   304.9ms] select 第 3 轮返回 rc=1，就绪: fd3
+[server   304.9ms]   accept → 新连接 fd5
+...
+===== 服务器阻塞模拟 -b 100 ms =====
+[client A] 5 条消息，平均 RTT = 140.36 ms，最大 RTT = 150.58 ms
+[client B] 5 条消息，平均 RTT = 240.89 ms，最大 RTT = 350.90 ms
+[client C] 5 条消息，平均 RTT = 260.88 ms，最大 RTT = 400.19 ms
+--- 服务器日志前 12 行 ---
+[server] 监听 127.0.0.1:9191，阻塞模拟 = 100 ms，listen fd = 3
+[server   303.3ms] select 第 1 轮返回 rc=1，就绪: fd3
+[server   303.4ms]   accept → 新连接 fd4
+[server   303.4ms] select 第 2 轮返回 rc=2，就绪: fd3 fd4
+[server   303.4ms]   accept → 新连接 fd5
+[server   403.6ms]   fd4 收到 "A#0" 并回显
+[server   403.7ms] select 第 3 轮返回 rc=2，就绪: fd3 fd5
+[server   403.7ms]   accept → 新连接 fd6
+[server   504.0ms]   fd5 收到 "B#0" 并回显
+[server   504.1ms] select 第 4 轮返回 rc=2，就绪: fd4 fd6
+[server   604.3ms]   fd4 收到 "A#1" 并回显
+[server   704.6ms]   fd6 收到 "C#0" 并回显</code></pre>
+  <p><strong>该观察什么：</strong></p>
+  <ul>
+    <li><code>pipes</code> 只有一个线程，却按 150、250、300、400… ms 的"归并顺序"处理三个管道：谁先就绪先处理谁。子进程退出后读端也会"就绪"，只是 <code>read()</code> 返回 0（EOF）。</li>
+    <li><code>-b 0</code>：三个客户端的 RTT 都不到 1 ms。日志里 <code>select</code> 每轮报告就绪的 fd：监听 socket（fd3）就绪就 <code>accept()</code>，客户端 socket 就绪就 <code>read()</code> 并回显，全程没有一把锁。</li>
+    <li><code>-b 100</code>：每个处理器只"阻塞" 100 ms，但 B、C 的平均 RTT 被拖到 240～260 ms，最大 350～400 ms。看日志：t=303.4 时 fd5 的连接已就绪，服务器却在 fd4 的处理器里睡到 403.6 才去 <code>accept</code> 它。这正是"事件处理器里不要阻塞"的真实代价。</li>
+  </ul>
+  <p>也可以用 bash 手动当客户端：<code>exec 3&lt;&gt;/dev/tcp/127.0.0.1/9090; echo hi &gt;&amp;3; head -c 3 &lt;&amp;3</code>。用完记得 <code>kill</code> 掉后台服务器。</p>
+</div>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="1"><div class="q">1. select() 返回后，传入的 readFDs 集合里是什么？</div>
+  <div class="opts"><button>A. 被改写为未就绪的描述符</button><button>B. 被改写为其中已就绪（可读）的描述符子集</button><button>C. 保持不变，仍是调用前设置的集合</button><button>D. 被清零，就绪信息只在返回值里</button></div>
+  <div class="explain">select() 原地把集合替换成"已就绪的子集"，返回值是就绪总数。所以每轮循环都要重新 FD_ZERO + FD_SET，再用 FD_ISSET 逐个检查。</div></div>
+<div class="mcq" data-answer="0"><div class="q">2. 把 select() 的 timeout 参数设为 NULL 意味着什么？</div>
+  <div class="opts"><button>A. 无限期阻塞，直到至少一个描述符就绪</button><button>B. 使用系统默认超时（通常 1 秒）</button><button>C. 立即返回，相当于轮询</button><button>D. 不检查任何描述符</button></div>
+  <div class="explain">NULL 表示一直等；若想立即返回，要传一个值为 0 的 timeval。更健壮的服务器通常会指定某种超时。</div></div>
+<div class="mcq" data-answer="3"><div class="q">3. 为什么在单 CPU 上，基本的事件驱动服务器不需要锁？</div>
+  <div class="opts"><button>A. 事件处理器都是只读的</button><button>B. 操作系统禁止事件程序被中断</button><button>C. select() 内部自动为每个 fd 加锁</button><button>D. 同一时刻只运行一个事件处理器，它不会被另一个线程打断</button></div>
+  <div class="explain">事件服务器是单线程的，处理器一个接一个地运行，因此不存在多个执行流交错访问共享数据的问题。注意：硬件中断照样会发生，只是不会让另一个处理器插进来运行。</div></div>
+<div class="mcq" data-answer="2"><div class="q">4. 事件处理器里调用了阻塞的 read() 读磁盘文件，而数据不在内存中。会发生什么？</div>
+  <div class="opts"><button>A. read() 立即返回 EINPROGRESS</button><button>B. 只有这个请求被延迟，其他事件照常处理</button><button>C. 整个事件循环阻塞，所有已就绪的请求都要等这次 I/O 完成</button><button>D. 操作系统自动把它改成异步读</button></div>
+  <div class="explain">事件服务器只有一个执行流。它阻塞，整个服务器就停下，CPU 空闲。这正是"不要在事件服务器中阻塞"这条 TIP 的由来；在模拟器的阻塞版时间线上表现为红色块。</div></div>
+<div class="mcq" data-answer="3"><div class="q">5. 对一个已提交的异步读调用 aio_error()，返回 EINPROGRESS，说明什么？</div>
+  <div class="opts"><button>A. 该文件不支持异步 I/O</button><button>B. 请求出错，需要重新提交</button><button>C. 请求已完成，可以读 aio_buf</button><button>D. 请求尚未完成，aio_buf 里的数据还不可用</button></div>
+  <div class="explain">aio_error() 完成时返回 0，未完成时返回 EINPROGRESS。应用可以周期性地轮询它，或改用信号在完成时得到通知。</div></div>
+<div class="mcq" data-answer="1"><div class="q">6. 事件编程中的"续延（continuation）"主要解决什么问题？</div>
+  <div class="opts"><button>A. 让 select() 能同时监听磁盘和网络</button><button>B. 异步 I/O 完成时，找回发起它时的上下文（例如要把数据写给哪个 socket）</button><button>C. 把阻塞调用自动转换成非阻塞调用</button><button>D. 防止多个处理器同时运行</button></div>
+  <div class="explain">线程版的状态在栈上；事件处理器发起异步 I/O 后就返回了，局部变量随之消失。所以要把所需信息（如 fd→sd）存进数据结构，完成时再查回来，这就是手动栈管理。</div></div>
+<div class="mcq" data-answer="0"><div class="q">7. 下面哪一种阻塞，即使把所有 I/O 调用都换成异步版本，事件服务器也很难避免？</div>
+  <div class="opts"><button>A. 处理器访问的内存页已被换出，引发缺页</button><button>B. 调用 select() 等待事件</button><button>C. 调用 open() 打开文件</button><button>D. 调用 read() 读 socket</button></div>
+  <div class="explain">缺页是隐式阻塞，不经过任何可替换的 API；处理器一缺页，整个循环就停住。C、D 都有办法用非阻塞/异步方式或辅助线程处理；B 本来就是循环"无事可做时"的等待点。</div></div>
+<div class="mcq" data-answer="2"><div class="q">8. 在多核机器上想让事件服务器利用所有 CPU，会怎样？</div>
+  <div class="opts"><button>A. 什么都不用改，select() 会自动把事件分给多个 CPU</button><button>B. 需要把所有 I/O 改成阻塞的</button><button>C. 需要并行运行多个事件处理器，于是临界区问题重新出现，又需要锁</button><button>D. 只能用一个 CPU，这是事件方式的硬性限制</button></div>
+  <div class="explain">原书指出：多 CPU 让事件方式失去一部分简单性，并行处理器之间照样要同步。所以在现代多核系统上，"不用锁的简单事件处理"已不再可能。</div></div>
+<div class="mcq" data-answer="0"><div class="q">9. 原书认为，与线程相比，事件方式的一个根本优势是什么？</div>
+  <div class="opts"><button>A. 应用对调度有显式控制：选择下一个处理哪个事件就是调度</button><button>B. 天然避免缺页带来的阻塞</button><button>C. 不需要操作系统支持</button><button>D. 事件代码总是更短、更容易维护</button></div>
+  <div class="explain">原书在介绍事件循环时说，决定处理哪个事件就等于调度，这种显式控制是根本优势之一。B、D 恰恰是事件方式的弱点；C 不对，它依赖 select()/poll()/AIO 等系统调用。</div></div>
+
+<h2>常见误区与小结</h2>
+<div class="warn">
+  <ul>
+    <li><strong>"事件驱动 = 不会阻塞。"</strong>错。事件方式的前提是<strong>你保证</strong>不阻塞；一次阻塞 read()、一次同步 open()、甚至一次缺页，都会让整个服务器停下。</li>
+    <li><strong>"select() 能告诉我磁盘文件的数据是否已在内存。"</strong>不能。普通磁盘文件总是被报告为"可读"，读的时候照样可能阻塞，所以磁盘 I/O 需要 AIO 或线程池这类方案；这也是网络 I/O 与磁盘 I/O 难以统一的原因。</li>
+    <li><strong>"select() 调用一次后，集合可以直接复用。"</strong>不行。返回时集合已被改写成就绪子集，每轮都要重新设置（或者从一份备份复制）。</li>
+    <li><strong>"事件程序永远不需要锁。"</strong>只在单 CPU、单个事件循环时成立。多个处理器并行运行时，锁又回来了。</li>
+    <li><strong>"异步 I/O 发起后，数据马上就在 aio_buf 里。"</strong>aio_read() 返回只表示"已提交"。必须等 aio_error() 返回 0（或收到完成信号）后，缓冲区里的数据才有效。</li>
+  </ul>
+</div>
+<div class="key">
+  <p><strong>本章小结</strong></p>
+  <ul>
+    <li>事件并发 = <strong>事件循环</strong>（<code>getEvents</code> + 逐个 <code>processEvent</code>）；选择下一个事件就是调度，程序自己掌握。</li>
+    <li><code>select()</code>/<code>poll()</code> 检查一组描述符中哪些就绪：传入"关心的集合"，返回"就绪的子集"和就绪个数；timeout 为 NULL 时一直等，为 0 时立即返回。</li>
+    <li>单 CPU 上一次只运行一个处理器，<strong>不需要锁</strong>；但<strong>任何阻塞调用都会卡住整个服务器</strong>。</li>
+    <li>磁盘 I/O 用<strong>异步 I/O</strong>（<code>aiocb</code>、<code>aio_read</code>、<code>aio_error</code>，或用信号通知）；没有 AIO 时，可以用"事件 + 线程池"的混合方案。</li>
+    <li>异步化的代价是<strong>手动栈管理</strong>：用续延（continuation）表保存跨 I/O 的状态。</li>
+    <li>仍然困难的地方：多核又需要锁；缺页造成隐式阻塞；API 语义变化会迫使处理器拆分；网络与磁盘异步接口不统一。线程与事件会长期共存。</li>
+    <li><strong>承上启下：</strong>并发部分到此结束。下一部分"持久化"从第 36 章 I/O 设备开始，你会再次看到<strong>轮询 vs 中断</strong>的权衡（对应本章的 aio_error 轮询与信号通知），以及磁盘 I/O 为什么慢，也就是为什么阻塞在它上面代价这么高。</li>
+  </ul>
+</div>
+
+</main>
+<script>
+(function () {
+"use strict";
+const { h, s, color, rng, stepper } = OSTEP;
+
+// === CORE BEGIN ===
+// 服务器对比模拟的核心：纯函数，无 DOM 依赖，便于用 node 验证。
+// 请求 q = {id, arr, c1, io, c2}：到达时刻 arr；先做 c1 的 CPU 计算；若 io>0 再读磁盘 io 个时间单位；读完再做 c2 的 CPU（发送回复）。
+// mode: 'thread' 每请求一线程（单 CPU，非抢占 FIFO，I/O 时线程睡眠）
+//       'block'  事件循环 + 阻塞 I/O（处理器调用阻塞 read，整个循环卡住）
+//       'async'  事件循环 + 异步 I/O（aio_read 立即返回，完成后作为新事件处理）
+// sw: 线程模式下 CPU 在不同线程之间切换的开销（时间单位），事件模式无此开销。
+function makeRequests(o, rng) {
+  const out = [];
+  let t = 0;
+  for (let i = 0; i < o.n; i++) {
+    if (i > 0) t += rng.int(0, 2 * o.gap);
+    const io = rng() * 100 < o.ioPct ? o.L : 0;
+    const c1 = Math.max(1, o.cpu + rng.int(-1, 1));
+    out.push({ id: i, arr: t, c1, io, c2: io ? 1 : 0 });
+  }
+  return out;
+}
+function simulate(reqs, mode, sw) {
+  sw = mode === "thread" ? (sw || 0) : 0;
+  const R = reqs.map((q) => Object.assign({}, q, { s1: null, e1: null, ioS: null, ioE: null, s2: null, e2: null }));
+  const segs = [], ios = [], log = [];
+  let evs = R.map((q) => ({ t: q.arr, id: q.id, phase: 1 }));
+  const ready = [];
+  let t = 0, last = -1, left = R.length;
+  const L = (tt, text) => log.push({ t: tt, text });
+  const byT = (a, b) => a.t - b.t || a.id - b.id;
+  while (left > 0) {
+    evs.sort(byT);
+    while (evs.length && evs[0].t <= t) {
+      const e = evs.shift();
+      ready.push(e);
+      if (e.phase === 1) L(e.t, mode === "thread" ? `R${e.id} 到达 → 创建线程 T${e.id}，进入就绪队列` : `R${e.id} 到达 → 其 socket 变为可读，成为待处理事件`);
+      else L(e.t, mode === "thread" ? `R${e.id} 的磁盘读完成 → 中断唤醒线程 T${e.id}（睡眠→就绪）` : `R${e.id} 的 aio_read 完成 → 产生一个"I/O 完成"事件排队`);
+    }
+    if (!ready.length) {
+      const nt = evs[0].t;
+      segs.push({ kind: "idle", who: -1, start: t, end: nt });
+      L(t, mode === "block" ? "没有待处理事件：select() 睡眠等待，CPU 空闲" : mode === "async" ? "没有待处理事件（I/O 还在飞）：select() 睡眠等待，CPU 空闲" : "没有就绪线程（都在等 I/O 或还没到）：CPU 空闲");
+      t = nt;
+      continue;
+    }
+    const e = ready.shift(), q = R[e.id];
+    if (sw > 0 && last !== -1 && last !== q.id) {
+      segs.push({ kind: "switch", who: q.id, start: t, end: t + sw });
+      L(t, `上下文切换 T${last} → T${q.id}（开销 ${sw}）`);
+      t += sw;
+    }
+    last = q.id;
+    if (e.phase === 1) {
+      q.s1 = t;
+      segs.push({ kind: "cpu", who: q.id, phase: 1, start: t, end: t + q.c1 });
+      L(t, mode === "thread" ? `调度器运行 T${q.id}：解析 R${q.id}（CPU ${q.c1}）` : `事件循环分派 R${q.id} 的请求事件 → 处理器运行（CPU ${q.c1}）`);
+      t += q.c1;
+      q.e1 = t;
+      if (q.io > 0) {
+        q.ioS = t;
+        q.ioE = t + q.io;
+        ios.push({ who: q.id, start: t, end: q.ioE });
+        if (mode === "block") {
+          segs.push({ kind: "block", who: q.id, start: t, end: q.ioE });
+          L(t, `R${q.id} 的处理器调用阻塞 read() 读磁盘 → 整个事件循环卡住 ${q.io}，别的请求再急也只能排队`);
+          t = q.ioE;
+          q.s2 = t;
+          segs.push({ kind: "cpu", who: q.id, phase: 2, start: t, end: t + q.c2 });
+          L(t, `read() 终于返回，R${q.id} 发送回复（CPU ${q.c2}）`);
+          t += q.c2;
+          q.e2 = t;
+          left--;
+          L(t, `R${q.id} 完成，响应时间 ${q.e2 - q.arr}`);
+        } else {
+          evs.push({ t: q.ioE, id: q.id, phase: 2 });
+          L(t, mode === "thread" ? `T${q.id} 调用 read() 读磁盘 → 线程睡眠 ${q.io}，CPU 交给其他就绪线程` : `R${q.id} 的处理器发起 aio_read()，把 fd→sd 记入 continuation 表后立即返回`);
+        }
+      } else {
+        q.ioS = q.ioE = q.s2 = q.e2 = t;
+        left--;
+        L(t, `R${q.id} 完成（无需磁盘），响应时间 ${q.e2 - q.arr}`);
+      }
+    } else {
+      q.s2 = t;
+      segs.push({ kind: "cpu", who: q.id, phase: 2, start: t, end: t + q.c2 });
+      L(t, mode === "thread" ? `T${q.id} 从 read() 返回，发送回复（CPU ${q.c2}）` : `处理 R${q.id} 的 I/O 完成事件：查 continuation 表取回 sd，write() 回复（CPU ${q.c2}）`);
+      t += q.c2;
+      q.e2 = t;
+      left--;
+      L(t, `R${q.id} 完成，响应时间 ${q.e2 - q.arr}`);
+    }
+  }
+  const T = Math.max(...R.map((q) => q.e2));
+  const busy = segs.filter((g) => g.kind === "cpu").reduce((a, g) => a + g.end - g.start, 0);
+  const resp = R.map((q) => q.e2 - q.arr);
+  const peak = (ivs) => { let m = 0; const pts = []; ivs.forEach(([a, b]) => { if (b > a) { pts.push([a, 1], [b, -1]); } }); pts.sort((x, y) => x[0] - y[0] || x[1] - y[1]); let c = 0; pts.forEach((p) => { c += p[1]; m = Math.max(m, c); }); return m; };
+  return {
+    mode, R, segs, ios, log, T, busy,
+    avgResp: resp.reduce((a, b) => a + b, 0) / R.length,
+    maxResp: Math.max(...resp),
+    util: T > 0 ? busy / T : 0,
+    thru: T > 0 ? (R.length / T) * 100 : 0,
+    peakThreads: peak(R.map((q) => [q.arr, q.e2])),
+    peakIO: peak(ios.map((g) => [g.start, g.end])),
+  };
+}
+// t 时刻请求 q 的状态（给可视化用）
+function stateAt(q, t, mode) {
+  if (t < q.arr) return "未到达";
+  if (t < q.s1) return mode === "thread" ? "就绪" : "事件排队";
+  if (t < q.e1) return "运行";
+  if (t >= q.e2) return "完成";
+  if (t < q.ioE) return mode === "block" ? "阻塞 I/O" : mode === "thread" ? "睡眠等 I/O" : "aio 在飞";
+  if (t < q.s2) return mode === "thread" ? "就绪" : "完成事件排队";
+  return "运行(回复)";
+}
+// === CORE END ===
+
+// ---------------- 服务器对比模拟器 ----------------
+const MODES = [
+  { key: "thread", name: "① 每请求一线程" },
+  { key: "block", name: "② 事件循环 + 阻塞 I/O" },
+  { key: "async", name: "③ 事件循环 + 异步 I/O" },
+];
+const PRESET1 = [
+  { id: 0, arr: 0, c1: 2, io: 30, c2: 1 }, { id: 1, arr: 2, c1: 3, io: 0, c2: 0 }, { id: 2, arr: 4, c1: 3, io: 0, c2: 0 },
+  { id: 3, arr: 6, c1: 2, io: 30, c2: 1 }, { id: 4, arr: 8, c1: 3, io: 0, c2: 0 }, { id: 5, arr: 10, c1: 2, io: 0, c2: 0 },
+];
+const $ = (id) => document.getElementById(id);
+let srv = null;   // {reqs, res:[3], times:[]}
+function numv(id, lo, hi) { let v = Math.round(Number($(id).value)); if (!Number.isFinite(v)) v = lo; v = Math.max(lo, Math.min(hi, v)); $(id).value = v; return v; }
+function build(reqs) {
+  const sw = numv("srv-sw", 0, 3);
+  const res = MODES.map((m) => simulate(reqs, m.key, sw));
+  const ts = new Set([0]);
+  res.forEach((r) => {
+    r.R.forEach((q) => [q.arr, q.s1, q.e1, q.ioE, q.s2, q.e2].forEach((x) => ts.add(x)));
+    r.segs.forEach((g) => { ts.add(g.start); ts.add(g.end); });
+  });
+  srv = { reqs, res, times: [...ts].sort((a, b) => a - b) };
+  renderTable();
+  srvStep.reset();
+}
+function genRandom() {
+  const o = { n: numv("srv-n", 2, 14), ioPct: numv("srv-io", 0, 100), L: numv("srv-L", 2, 80), cpu: numv("srv-c", 1, 10), gap: numv("srv-gap", 0, 10), seed: numv("srv-seed", 1, 1e9) };
+  build(makeRequests(o, rng(o.seed)));
+}
+const stClass = (st) => st === "未到达" ? "st-none" : st.startsWith("运行") ? "st-run" : st === "完成" ? "st-done" : st === "阻塞 I/O" ? "st-block" : (st === "睡眠等 I/O" || st === "aio 在飞") ? "st-io" : "st-wait";
+function laneSvg(r, t, Tmax) {
+  const px = Math.max(5, Math.min(22, 640 / Tmax));
+  const X = (u) => 52 + u * px;
+  // 给同时进行的 I/O 分配子行
+  const lanes = [];
+  const ioRows = r.ios.map((g) => { let k = lanes.findIndex((end) => end <= g.start); if (k < 0) { k = lanes.length; lanes.push(0); } lanes[k] = g.end; return k; });
+  const nIo = Math.max(1, lanes.length);
+  const yCpu = 26, hCpu = 24, yIo = 58, hIo = 13;
+  const H = yIo + nIo * (hIo + 3) + 20;
+  const W = X(Tmax) + 16;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "时间线" });
+  svg.append(s("text", { x: 4, y: 16, "font-size": 11, class: "t-muted", text: "到达" }));
+  svg.append(s("text", { x: 4, y: yCpu + 16, "font-size": 11, class: "t-muted", text: "CPU" }));
+  svg.append(s("text", { x: 4, y: yIo + 11, "font-size": 11, class: "t-muted", text: "磁盘" }));
+  svg.append(s("rect", { x: X(0), y: yCpu, width: Tmax * px, height: hCpu, style: "fill:var(--surface-2)" }));
+  r.R.forEach((q) => {
+    const x = X(q.arr), op = q.arr <= t ? 1 : 0.25;
+    svg.append(s("path", { d: `M${x - 4},4 L${x + 4},4 L${x},12 z`, style: `fill:${color(q.id)};opacity:${op}` }));
+    svg.append(s("text", { x: x + 5, y: 20, "font-size": 9.5, class: "mono", style: `opacity:${op}`, text: "R" + q.id }));
+  });
+  const piece = (g, y, hh, style, fadedStyle) => {
+    if (g.start < t) svg.append(s("rect", { x: X(g.start), y, width: Math.max(1, (Math.min(g.end, t) - g.start) * px - 1), height: hh, rx: 2, style }));
+    if (g.end > t) { const a = Math.max(g.start, t); svg.append(s("rect", { x: X(a), y, width: Math.max(1, (g.end - a) * px - 1), height: hh, rx: 2, style: fadedStyle })); }
+  };
+  r.segs.forEach((g) => {
+    if (g.kind === "idle") return;
+    const w = (g.end - g.start) * px;
+    let st, fs, label = "", lstyle = "";
+    if (g.kind === "cpu") { st = `fill:${color(g.who)};opacity:${g.phase === 2 ? 0.7 : 1}`; fs = `fill:${color(g.who)};opacity:.18`; label = "R" + g.who + (g.phase === 2 ? "↩" : ""); lstyle = "fill:#fff;font-weight:600"; }
+    else if (g.kind === "block") { st = "fill:var(--bad-soft);stroke:var(--bad)"; fs = "fill:var(--bad-soft);opacity:.35"; label = w > 90 ? `卡在 R${g.who} 的 read()` : w > 34 ? "卡住" : ""; lstyle = "fill:var(--bad)"; }
+    else { st = "fill:var(--warn)"; fs = "fill:var(--warn);opacity:.25"; }
+    piece(g, yCpu, hCpu, st, fs);
+    if (label && w > 18) svg.append(s("text", { x: X(g.start) + w / 2, y: yCpu + 16, "text-anchor": "middle", "font-size": 10.5, style: lstyle + (g.start < t ? "" : ";opacity:.35"), text: label }));
+  });
+  r.ios.forEach((g, k) => {
+    const y = yIo + ioRows[k] * (hIo + 3);
+    piece(g, y, hIo, `fill:${color(g.who)};opacity:.45`, `fill:${color(g.who)};opacity:.12`);
+    const w = (g.end - g.start) * px;
+    if (w > 40) svg.append(s("text", { x: X(g.start) + 4, y: y + 10, "font-size": 9.5, class: "mono", text: "R" + g.who + " 读盘" }));
+  });
+  const yAx = H - 6, step = Tmax > 120 ? 20 : Tmax > 50 ? 10 : 5;
+  for (let u = 0; u <= Tmax; u += step) svg.append(s("text", { x: X(u), y: yAx, "text-anchor": "middle", "font-size": 9.5, class: "t-muted mono", text: u }));
+  svg.append(s("line", { x1: X(t), x2: X(t), y1: 0, y2: H - 14, style: "stroke:var(--accent);stroke-width:2" }));
+  return svg;
+}
+function renderSrv(i) {
+  if (!srv) return;
+  const t = srv.times[i];
+  const Tmax = Math.max(...srv.res.map((r) => r.T));
+  const stage = $("srv-stage");
+  stage.replaceChildren();
+  const nar = [h("div", {}, h("b", {}, `t = ${t}`), t >= Tmax ? "（全部完成）" : "")];
+  srv.res.forEach((r, k) => {
+    const m = MODES[k];
+    const done = r.R.filter((q) => q.e2 <= t).length;
+    stage.append(h("div", { class: "lane" },
+      h("div", { class: "lane-title" }, m.name, h("span", { class: "pill" }, `已完成 ${done}/${r.R.length}`), h("span", { class: "pill" }, `全部完成于 t=${r.T}`)),
+      laneSvg(r, t, Tmax),
+      h("div", { class: "rqs" }, r.R.map((q) => { const st = stateAt(q, t, m.key); return h("span", { class: "rq " + stClass(st), style: { borderLeftColor: color(q.id) } }, `R${q.id}${q.io ? "(盘)" : ""} ${st}`); }))));
+    const msgs = r.log.filter((e) => e.t === t).map((e) => e.text);
+    if (!msgs.length) {
+      const g = r.segs.find((g) => g.start <= t && t < g.end);
+      if (!g || g.kind === "idle") msgs.push(t >= r.T ? "全部请求已完成" : "CPU 空闲，等待事件");
+      else if (g.kind === "block") msgs.push(`仍卡在 R${g.who} 的阻塞 read() 里（到 t=${g.end}）`);
+      else if (g.kind === "switch") msgs.push("正在做上下文切换");
+      else msgs.push(`CPU 正在运行 R${g.who}（到 t=${g.end}）`);
+    }
+    nar.push(h("div", { class: "mline" }, h("b", {}, ["① 线程", "② 阻塞事件", "③ 异步事件"][k]), msgs.join("；")));
+  });
+  $("srv-nar").replaceChildren(...nar);
+}
+function renderTable() {
+  const tab = $("srv-tab");
+  tab.replaceChildren(h("tr", {}, ["方式", "平均响应", "最大响应", "全部完成", "CPU 利用率", "吞吐（个/100 单位）", "峰值"].map((x, k) => h("th", { class: k ? "num" : "" }, x))));
+  srv.res.forEach((r, k) => tab.append(h("tr", {},
+    h("td", {}, MODES[k].name), h("td", { class: "num" }, r.avgResp.toFixed(2)), h("td", { class: "num" }, r.maxResp), h("td", { class: "num" }, "t=" + r.T),
+    h("td", { class: "num" }, (r.util * 100).toFixed(1) + "%"), h("td", { class: "num" }, r.thru.toFixed(1)),
+    h("td", { class: "num" }, k === 0 ? `同时存在 ${r.peakThreads} 个线程` : k === 1 ? "在飞 I/O 最多 1 个" : `continuation 表最多 ${r.peakIO} 项`))));
+  const [th, bl, as] = srv.res;
+  const nio = srv.reqs.filter((q) => q.io).length;
+  $("srv-stats").replaceChildren(
+    h("div", { class: "stat" }, h("div", { class: "v" }, `${srv.reqs.length} / ${nio}`), h("div", { class: "l" }, "请求数 / 其中需读盘")),
+    h("div", { class: "stat" }, h("div", { class: "v" }, th.avgResp > 0 ? (bl.avgResp / th.avgResp).toFixed(2) + "×" : "—"), h("div", { class: "l" }, "阻塞版平均响应 ÷ 线程版")),
+    h("div", { class: "stat" }, h("div", { class: "v" }, as.avgResp > 0 ? (as.avgResp / th.avgResp).toFixed(2) + "×" : "—"), h("div", { class: "l" }, "异步版平均响应 ÷ 线程版")),
+    h("div", { class: "stat" }, h("div", { class: "v" }, (bl.T - as.T) + ""), h("div", { class: "l" }, "阻塞版比异步版晚完成")));
+}
+const srvStep = stepper($("srv-step"), { steps: () => (srv ? srv.times.length : 1), render: renderSrv, autoplayMs: 700 });
+$("srv-gen").onclick = genRandom;
+$("srv-p1").onclick = () => { $("srv-sw").value = 0; build(PRESET1.map((q) => Object.assign({}, q))); };
+$("srv-p2").onclick = () => { $("srv-io").value = 0; $("srv-n").value = 8; $("srv-sw").value = 0; genRandom(); };
+$("srv-p3").onclick = () => { $("srv-io").value = 70; $("srv-L").value = 40; $("srv-n").value = 10; $("srv-gap").value = 2; $("srv-sw").value = 0; genRandom(); };
+["srv-n", "srv-io", "srv-L", "srv-c", "srv-gap", "srv-seed", "srv-sw"].forEach((id) => $(id).addEventListener("change", genRandom));
+build(PRESET1.map((q) => Object.assign({}, q)));
+
+// ---------------- select() 模拟器 ----------------
+const FD_INIT = [
+  { fd: 3, name: "监听 socket", listen: true, interest: true, data: false },
+  { fd: 4, name: "客户端 A", interest: true, data: true },
+  { fd: 5, name: "客户端 B", interest: true, data: false },
+  { fd: 6, name: "管道", interest: true, data: true },
+  { fd: 7, name: "客户端 C", interest: false, data: true },
+];
+let fds = FD_INIT.map((f) => Object.assign({}, f));
+const MINFD = 3, MAXFD = 7, NB = 8;
+const CODE = [
+  [10, "while (1) {"],
+  [12, "    fd_set readFDs;"],
+  [13, "    FD_ZERO(&readFDs);"],
+  [19, "    for (fd = minFD; fd <= maxFD; fd++)"],
+  [20, "        if (interested(fd)) FD_SET(fd, &readFDs);"],
+  [23, "    int rc = select(maxFD+1, &readFDs, NULL, NULL, timeout);"],
+  [27, "    for (fd = minFD; fd <= maxFD; fd++)"],
+  [28, "        if (FD_ISSET(fd, &readFDs))"],
+  [29, "            processFD(fd);"],
+  [30, "}"],
+];
+let selSeq = [{ line: -1, inB: Array(NB).fill(0), outB: null, rc: null, data: fds.map((f) => f.data), note: "设置好每个 fd 的状态后，点击“执行一轮循环”。当前：fd4、fd6 有数据；fd7 有数据但没被 FD_SET。" }];
+function paintFdControls() {
+  const box = $("sel-fds");
+  box.replaceChildren(h("span", { class: "muted small" }, "每个 fd："));
+  fds.forEach((f) => {
+    const cb = h("input", { type: "checkbox" }); cb.checked = f.interest;
+    cb.onchange = () => { f.interest = cb.checked; };
+    const b = h("button", { class: f.data ? "on" : "" }, f.data ? (f.listen ? "有新连接 ✓" : "有数据 ✓") : (f.listen ? "新连接到达" : "数据到达"));
+    b.onclick = () => { f.data = !f.data; paintFdControls(); };
+    box.append(h("span", { class: "fdrow" }, h("span", { class: "nm" }, `fd${f.fd} ${f.name}`), h("label", {}, cb, "FD_SET"), b));
+  });
+}
+function buildSel() {
+  const seq = [];
+  const snap = () => fds.map((f) => f.data);
+  let inB = Array(NB).fill(0);
+  seq.push({ line: 2, inB: inB.slice(), outB: null, rc: null, data: snap(), note: "FD_ZERO：把 readFDs 清零（上一轮 select 已经改写过它）。" });
+  fds.forEach((f) => {
+    if (f.interest) { inB[f.fd] = 1; seq.push({ line: 4, cur: f.fd, inB: inB.slice(), outB: null, rc: null, data: snap(), note: `FD_SET(fd${f.fd})：服务器关心 ${f.name}。` }); }
+    else seq.push({ line: 3, cur: f.fd, inB: inB.slice(), outB: null, rc: null, data: snap(), note: `fd${f.fd}（${f.name}）不在关心列表里，跳过：即使它有数据，这一轮 select 也不会看它。` });
+  });
+  const ready = fds.filter((f) => f.interest && f.data);
+  const outB = Array(NB).fill(0);
+  ready.forEach((f) => (outB[f.fd] = 1));
+  const to = $("sel-to").value;
+  if (!ready.length && to === "null") {
+    seq.push({ line: 5, inB: inB.slice(), outB: null, rc: null, data: snap(), sleep: true, note: "select() 发现所关心的 fd 都没就绪，timeout 又是 NULL：进程在内核里睡眠，直到某个被关心的 fd 有数据。（在上面点“数据到达”，再执行一轮。）" });
+    selSeq = seq; return;
+  }
+  seq.push({ line: 5, inB: inB.slice(), outB: outB.slice(), rc: ready.length, data: snap(), note: ready.length ? `select() 返回 rc=${ready.length}：内核把 readFDs 原地改写成就绪子集 {${ready.map((f) => "fd" + f.fd).join(", ")}}。` : "timeout={0,0}：没有 fd 就绪，select() 立即返回 rc=0（纯轮询，不睡眠）。" });
+  for (let fd = MINFD; fd <= MAXFD; fd++) {
+    const f = fds.find((x) => x.fd === fd);
+    seq.push({ line: 7, cur: fd, inB: inB.slice(), outB: outB.slice(), rc: ready.length, data: snap(), note: `FD_ISSET(fd${fd}) = ${outB[fd]}${outB[fd] ? "，就绪！" : "，跳过。"}` });
+    if (outB[fd]) {
+      f.data = false;
+      seq.push({ line: 8, cur: fd, inB: inB.slice(), outB: outB.slice(), rc: ready.length, data: snap(), note: f.listen ? `processFD(fd${fd})：监听 socket 可读 = 有新连接，调用 accept()（真实服务器会把新连接的 fd 加入下一轮的集合）。` : `processFD(fd${fd})：read() 取走 ${f.name} 的数据并处理/回显。这个处理器运行时，没有别人会打断它。` });
+    }
+  }
+  seq.push({ line: 9, inB: inB.slice(), outB: outB.slice(), rc: ready.length, data: snap(), note: "这一轮结束，回到 while (1) 顶部：下一轮要重新 FD_ZERO/FD_SET。" });
+  selSeq = seq;
+  paintFdControls();
+}
+function renderSel(i) {
+  const st = selSeq[Math.min(i, selSeq.length - 1)];
+  $("sel-code").replaceChildren(...CODE.map(([n, txt], k) => h("span", { class: k === st.line ? "hl" : "" }, h("span", { class: "ln" }, n), txt, "\n")));
+  const bits = (lbl, arr, cls) => h("div", { class: "bits" }, h("span", { class: "lbl" }, lbl),
+    [...Array(NB).keys()].map((fd) => h("span", { class: "cell " + (arr && arr[fd] ? cls : "") + (st.cur === fd ? " pulse" : ""), style: st.cur === fd ? { borderColor: "var(--accent)", borderWidth: "2px" } : null }, arr ? String(arr[fd]) : "·", h("small", {}, "fd" + fd))));
+  const rows = fds.map((f, k) => h("tr", { class: st.cur === f.fd ? "hot" : "" },
+    h("td", {}, "fd" + f.fd), h("td", {}, f.name), h("td", {}, st.data[k] ? (f.listen ? "新连接等待中" : "有数据") : "—")));
+  $("sel-vis").replaceChildren(
+    bits("传入 readFDs", st.inB, "on"),
+    bits("返回 readFDs", st.outB, "hit"),
+    h("div", { class: "bits" }, h("span", { class: "lbl" }, "返回值 rc"), h("b", {}, st.rc == null ? (st.sleep ? "（睡眠中…）" : "—") : String(st.rc))),
+    h("div", { class: "table-wrap" }, h("table", { class: "ctab" }, h("tr", {}, h("th", {}, "fd"), h("th", {}, "是什么"), h("th", {}, "内核缓冲区")), rows)));
+  $("sel-nar").textContent = st.note;
+}
+const selStep = stepper($("sel-step"), { steps: () => selSeq.length, render: renderSel, autoplayMs: 900 });
+$("sel-run").onclick = () => { buildSel(); selStep.reset(); };
+$("sel-reset").onclick = () => { fds = FD_INIT.map((f) => Object.assign({}, f)); paintFdControls(); selSeq = [{ line: -1, inB: Array(NB).fill(0), outB: null, rc: null, data: fds.map((f) => f.data), note: "已恢复初始数据：fd4、fd6 有数据；fd7 有数据但没被 FD_SET。点击“执行一轮循环”。" }]; selStep.reset(); };
+paintFdControls();
+
+// ---------------- continuation 模拟器 ----------------
+const CREQ = [{ sd: 10, fd: 20, file: "a.html" }, { sd: 11, fd: 21, file: "b.png" }, { sd: 12, fd: 22, file: "c.css" }, { sd: 13, fd: 23, file: "d.js" }];
+let ctSeq = [];
+function buildCt() {
+  const r = rng(numv("ct-seed", 1, 1e9));
+  const order = CREQ.map((_, k) => k);
+  for (let k = order.length - 1; k > 0; k--) { const j = r.int(0, k); [order[k], order[j]] = [order[j], order[k]]; }
+  const seq = [];
+  const table = [];  // {fd, sd, file, st}
+  const out = [];
+  const snap = (hot, note) => seq.push({ table: table.map((e) => Object.assign({}, e)), out: out.slice(), hot, note });
+  snap(null, `4 个请求事件已就绪（sd 10–13 上各有一个 GET）。I/O 的完成顺序（由种子决定）将是：${order.map((k) => "fd" + CREQ[k].fd).join(" → ")}。`);
+  CREQ.forEach((q) => {
+    table.push({ fd: q.fd, sd: q.sd, file: q.file, st: "在飞" });
+    out.push(`on_request(sd=${q.sd}): open("${q.file}") → fd ${q.fd}; aio_read(fd ${q.fd}); table[${q.fd}] = sd ${q.sd}; return`);
+    snap(q.fd, `处理 sd ${q.sd} 的请求：发起 aio_read(fd ${q.fd}) 后立即返回。返回前把"读完要写给 sd ${q.sd}"存进 continuation 表——处理器的栈帧马上就没了。`);
+  });
+  order.forEach((k) => {
+    const q = CREQ[k];
+    const e = table.find((x) => x.fd === q.fd);
+    e.st = "查表中";
+    snap(q.fd, `aio_error(fd ${q.fd}) 返回 0（或收到完成信号）：fd ${q.fd} 的数据已在缓冲区。用 fd ${q.fd} 查表 → sd ${q.sd}。`);
+    e.st = "已完成";
+    out.push(`on_io_done(fd=${q.fd}): sd = table[${q.fd}] = ${q.sd}; write(sd ${q.sd}, "${q.file}" 的内容); 删除表项`);
+    snap(q.fd, `write(sd ${q.sd}) 把 ${q.file} 发回正确的客户端，删除表项。注意：完成顺序与发起顺序无关，但靠 fd 做键总能找对人。`);
+  });
+  ctSeq = seq;
+}
+function renderCt(i) {
+  const st = ctSeq[Math.min(i, ctSeq.length - 1)];
+  const rows = st.table.map((e) => h("tr", { class: e.fd === st.hot ? "hot" : e.st === "已完成" ? "gone" : "" },
+    h("td", {}, "fd " + e.fd), h("td", {}, "→ sd " + e.sd), h("td", {}, e.file), h("td", {}, e.st)));
+  $("ct-stage").replaceChildren(
+    h("div", { class: "small muted" }, "continuation 表（以 fd 为键）："),
+    h("div", { class: "table-wrap" }, h("table", { class: "ctab" }, h("tr", {}, h("th", {}, "键 fd"), h("th", {}, "续延：写给谁"), h("th", {}, "文件"), h("th", {}, "状态")), rows.length ? rows : h("tr", {}, h("td", { colspan: 4 }, "（空）")))),
+    h("div", { class: "outlog" }, st.out.length ? st.out.join("\n") : "（尚无动作）"));
+  $("ct-nar").textContent = st.note;
+}
+buildCt();
+const ctStep = stepper($("ct-step"), { steps: () => ctSeq.length, render: renderCt, autoplayMs: 1000 });
+$("ct-seed").addEventListener("change", () => { buildCt(); ctStep.reset(); });
+$("ct-shuffle").onclick = () => { $("ct-seed").value = Number($("ct-seed").value) + 1; buildCt(); ctStep.reset(); };
+})();
+</script>
+</body></html>

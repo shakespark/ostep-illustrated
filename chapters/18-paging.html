@@ -1,0 +1,956 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 18 章 · 分页：介绍</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+/* 位格：VPN / offset / PFN 按位着色 */
+.bits { display: flex; flex-wrap: nowrap; gap: 3px; align-items: flex-end; margin: 4px 0; }
+.bitgrp { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.bitgrp .cells { display: flex; gap: 2px; }
+.bitgrp .cap { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+.bit { width: 24px; height: 30px; display: inline-flex; align-items: center; justify-content: center; font: 600 14px var(--mono); border: 1.5px solid var(--border); border-radius: 5px; background: var(--surface); }
+.bit.vpn { border-color: var(--c1); background: color-mix(in srgb, var(--c1) 16%, var(--surface)); }
+.bit.off { border-color: var(--c3); background: color-mix(in srgb, var(--c3) 16%, var(--surface)); }
+.bit.pfn { border-color: var(--c2); background: color-mix(in srgb, var(--c2) 18%, var(--surface)); }
+.bit.dim { opacity: .35; }
+.rowlab { font-size: 13px; color: var(--muted); min-width: 64px; }
+.addr-row { display: flex; gap: 10px; align-items: center; flex-wrap: nowrap; }
+.tv { font-family: var(--mono); color: var(--c1); font-weight: 650; }
+.to { font-family: var(--mono); color: var(--c3); font-weight: 650; }
+.tp { font-family: var(--mono); color: var(--c2); font-weight: 650; }
+/* 模拟器 1 的两栏 */
+.pt-grid { display: grid; grid-template-columns: minmax(230px, 1fr) minmax(230px, 1.2fr); gap: 12px; margin-top: 12px; }
+@media (max-width: 640px) { .pt-grid { grid-template-columns: 1fr; } }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; min-width: 0; }
+.panel h5 { margin: 0 0 6px; font-size: 13px; color: var(--muted); font-weight: 600; }
+.ptlist { max-height: 260px; overflow: auto; font: 12.5px/1.5 var(--mono); }
+.ptrow { display: grid; grid-template-columns: 4.5em 7.5em 2em 1fr; gap: 6px; padding: 1px 6px; border-radius: 4px; white-space: nowrap; }
+.ptrow.inv { color: var(--faint); }
+.ptrow.hd { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--surface); }
+.ptrow.act { background: var(--accent-soft); outline: 1.5px solid var(--accent); }
+.ptrow.act.bad { background: var(--bad-soft); outline-color: var(--bad); }
+.frames { display: grid; grid-template-columns: repeat(auto-fill, minmax(62px, 1fr)); gap: 4px; }
+.frame { border: 1px solid var(--border); border-radius: 5px; padding: 2px 4px; font: 11.5px/1.35 var(--mono); background: var(--surface-2); min-height: 36px; }
+.frame b { display: block; font-weight: 600; color: var(--muted); font-size: 10.5px; }
+.frame.used { background: color-mix(in srgb, var(--c1) 10%, var(--surface)); }
+.frame.os { background: var(--warn-soft); }
+.frame.act { border-color: var(--c2); outline: 2px solid var(--c2); background: color-mix(in srgb, var(--c2) 18%, var(--surface)); }
+.bytebar { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 8px; }
+.byte { width: 16px; height: 16px; border-radius: 3px; border: 1px solid var(--border); background: var(--surface-2); }
+.byte.act { background: var(--c3); border-color: var(--c3); }
+.pills { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; }
+.pills button { font: 12.5px var(--mono); padding: 3px 8px; }
+.pills button.cur { border-color: var(--accent); background: var(--accent-soft); }
+.pills button.okv { border-left: 4px solid var(--ok); }
+.pills button.badv { border-left: 4px solid var(--bad); }
+.cmdline { font: 12.5px var(--mono); color: var(--muted); margin-top: 6px; word-break: break-all; }
+.err { color: var(--bad); font-weight: 600; }
+/* PTE 解码器 */
+.pte-bits { display: grid; grid-template-columns: repeat(32, minmax(15px, 1fr)); gap: 2px; min-width: 560px; }
+.pte-bits button { padding: 0; height: 28px; font: 600 12px var(--mono); border-radius: 4px; }
+.pte-bits button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+.pte-bits .bn { font: 10px var(--mono); color: var(--faint); text-align: center; }
+.pte-bits .fl { font: 10.5px var(--font); color: var(--muted); text-align: center; white-space: nowrap; overflow: hidden; }
+.decode { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 6px; margin-top: 10px; font-size: 14px; }
+.decode div { background: var(--surface-2); border-radius: 6px; padding: 5px 10px; }
+.calc { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; font-size: 14px; }
+.calc label { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); }
+.trace-log { max-height: 180px; overflow: auto; font: 12.5px/1.55 var(--mono); margin-top: 10px; background: var(--code-bg); border-radius: 8px; padding: 6px 10px; }
+.trace-log div.act { background: var(--accent-soft); border-radius: 3px; }
+</style>
+</head>
+<body data-chapter="18">
+<main>
+
+<h2 id="crux">一句话 + 关键问题</h2>
+<p><strong>一句话：</strong>把地址空间切成大小固定的<strong>页（page）</strong>，把物理内存切成同样大小的<strong>页帧（page frame）</strong>，
+再用一张每个进程一份的<strong>页表（page table）</strong>记下"第几页放在第几帧"——地址转换就变成了"把高位的页号换成帧号，低位的偏移原样保留"。</p>
+<div class="crux">
+<p><strong>如何用页来虚拟化内存？</strong>怎样用页来虚拟化内存，从而避免分段的那些问题？基本技术是什么？怎样让这些技术运转良好，只付出最小的空间和时间开销？</p>
+<p class="small muted">How can we virtualize memory with pages, so as to avoid the problems of segmentation? What are the basic techniques? How do we make those techniques work well, with minimal space and time overheads?</p>
+</div>
+<p>上一章我们看到：分段（segmentation）把地址空间切成<em>大小不一</em>的块，结果物理内存里布满了难以利用的碎片，空闲空间管理越来越难。
+操作系统解决空间管理问题通常只有两条路——切成可变大小的块，或者切成<strong>固定大小</strong>的块。本章走第二条路：分页（paging），
+这个思想可以追溯到早期的重要系统 Atlas。</p>
+<p>分页一出场就带着两个严重问题：页表<strong>太大</strong>（32 位地址空间每个进程就要 4MB），而且每次访存都要<strong>多一次内存访问</strong>去查页表（慢一倍）。
+第 19 章用 TLB 解决"慢"，第 20 章用多级页表解决"大"。这三章是虚拟内存的核心，读懂本章的地址转换是后面一切的基础。</p>
+
+<h2 id="concepts">核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>页（page）</h4><p>虚拟地址空间被切成的固定大小的单元，例如 4KB。本章小例子里是 16 字节。</p></div>
+  <div class="card"><h4>页帧（page frame）</h4><p>物理内存里同样大小的"槽位"，每个页帧正好装下一个虚拟页。</p></div>
+  <div class="card"><h4>页表（page table）</h4><p><strong>每个进程一份</strong>的数据结构，记录每个虚拟页被放到了哪个物理页帧。</p></div>
+  <div class="card"><h4>VPN 与偏移量（offset）</h4><p>虚拟地址 = 高位的虚拟页号（virtual page number）+ 低位的页内偏移。页大小 2<sup>k</sup> 字节 → 偏移占 k 位。</p></div>
+  <div class="card"><h4>PFN</h4><p>物理帧号（physical frame number，也叫 PPN）。转换 = 把 VPN 换成 PFN，偏移量<strong>不变</strong>。</p></div>
+  <div class="card"><h4>页表项（PTE）</h4><p>页表里的一项：PFN + 有效位、保护位、存在位、脏位、访问位等控制位。</p></div>
+  <div class="card"><h4>线性页表（linear page table）</h4><p>最简单的页表：一个数组，用 VPN 当下标直接找到 PTE。</p></div>
+  <div class="card"><h4>页表基址寄存器</h4><p>硬件用它找到当前进程的页表：PTEAddr = 基址 + VPN × sizeof(PTE)。</p></div>
+</div>
+
+<h2 id="overview">从分段到分页：一个 64 字节的小例子</h2>
+<p>原书用一个极小的例子：地址空间只有 <strong>64 字节</strong>，分成 4 个 <strong>16 字节</strong>的页（虚拟页 0～3）；
+物理内存 <strong>128 字节</strong>，有 8 个页帧。真实系统的地址空间通常是 32 位（4GB）甚至 64 位，用小例子只是为了便于看清每一位。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 700 360" width="700" role="img" aria-label="64 字节地址空间放进 128 字节物理内存">
+  <text x="95" y="20" text-anchor="middle" font-size="14" font-weight="600">虚拟地址空间（64 字节）</text>
+  <g font-size="12.5">
+    <rect x="40" y="36" width="110" height="36" rx="4" style="fill:var(--c4);opacity:.85"/><text x="95" y="59" text-anchor="middle" style="fill:#fff;font-weight:600">page 3</text>
+    <rect x="40" y="72" width="110" height="36" rx="4" style="fill:var(--c3);opacity:.85"/><text x="95" y="95" text-anchor="middle" style="fill:#fff;font-weight:600">page 2</text>
+    <rect x="40" y="108" width="110" height="36" rx="4" style="fill:var(--c2);opacity:.85"/><text x="95" y="131" text-anchor="middle" style="fill:#fff;font-weight:600">page 1</text>
+    <rect x="40" y="144" width="110" height="36" rx="4" style="fill:var(--c1);opacity:.85"/><text x="95" y="167" text-anchor="middle" style="fill:#fff;font-weight:600">page 0</text>
+  </g>
+  <g font-size="11" class="t-muted mono" text-anchor="end">
+    <text x="34" y="40" class="t-muted">64</text><text x="34" y="76" class="t-muted">48</text><text x="34" y="112" class="t-muted">32</text><text x="34" y="148" class="t-muted">16</text><text x="34" y="184" class="t-muted">0</text>
+  </g>
+  <!-- 页表 -->
+  <text x="300" y="228" text-anchor="middle" font-size="14" font-weight="600">页表（每进程一份）</text>
+  <g font-size="12.5" class="mono">
+    <rect x="230" y="238" width="140" height="104" rx="6" class="box"/>
+    <text x="250" y="258" class="t-muted">VPN</text><text x="320" y="258" class="t-muted">PFN</text>
+    <text x="258" y="278">0</text><text x="325" y="278">3</text>
+    <text x="258" y="298">1</text><text x="325" y="298">7</text>
+    <text x="258" y="318">2</text><text x="325" y="318">5</text>
+    <text x="258" y="338">3</text><text x="325" y="338">2</text>
+  </g>
+  <!-- 物理内存 -->
+  <text x="580" y="20" text-anchor="middle" font-size="14" font-weight="600">物理内存（128 字节，8 个页帧）</text>
+  <g font-size="12">
+    <rect x="520" y="36" width="120" height="36" rx="4" style="fill:var(--c2);opacity:.85"/><text x="580" y="59" text-anchor="middle" style="fill:#fff;font-weight:600">page 1 of AS</text>
+    <rect x="520" y="72" width="120" height="36" rx="4" class="box"/><text x="580" y="95" text-anchor="middle" class="t-muted">(空闲)</text>
+    <rect x="520" y="108" width="120" height="36" rx="4" style="fill:var(--c3);opacity:.85"/><text x="580" y="131" text-anchor="middle" style="fill:#fff;font-weight:600">page 2 of AS</text>
+    <rect x="520" y="144" width="120" height="36" rx="4" class="box"/><text x="580" y="167" text-anchor="middle" class="t-muted">(空闲)</text>
+    <rect x="520" y="180" width="120" height="36" rx="4" style="fill:var(--c1);opacity:.85"/><text x="580" y="203" text-anchor="middle" style="fill:#fff;font-weight:600">page 0 of AS</text>
+    <rect x="520" y="216" width="120" height="36" rx="4" style="fill:var(--c4);opacity:.85"/><text x="580" y="239" text-anchor="middle" style="fill:#fff;font-weight:600">page 3 of AS</text>
+    <rect x="520" y="252" width="120" height="36" rx="4" class="box"/><text x="580" y="275" text-anchor="middle" class="t-muted">(空闲)</text>
+    <rect x="520" y="288" width="120" height="36" rx="4" class="warn-soft"/><text x="580" y="311" text-anchor="middle">OS 保留</text>
+  </g>
+  <g font-size="11" class="mono">
+    <text x="646" y="58" class="t-muted">帧 7</text><text x="646" y="94" class="t-muted">帧 6</text><text x="646" y="130" class="t-muted">帧 5</text><text x="646" y="166" class="t-muted">帧 4</text>
+    <text x="646" y="202" class="t-muted">帧 3</text><text x="646" y="238" class="t-muted">帧 2</text><text x="646" y="274" class="t-muted">帧 1</text><text x="646" y="310" class="t-muted">帧 0</text>
+    <text x="514" y="40" text-anchor="end" class="t-muted">128</text><text x="514" y="328" text-anchor="end" class="t-muted">0</text>
+  </g>
+  <!-- 映射箭头 -->
+  <defs><marker id="ar18a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <path d="M150,162 C330,162 360,198 518,198" class="arrow" marker-end="url(#ar18a)" style="stroke:var(--c1)"/>
+  <path d="M150,126 C330,126 360,54 518,54" class="arrow" marker-end="url(#ar18a)" style="stroke:var(--c2)"/>
+  <path d="M150,90 C330,90 360,126 518,126" class="arrow" marker-end="url(#ar18a)" style="stroke:var(--c3)"/>
+  <path d="M150,54 C330,54 360,234 518,234" class="arrow" marker-end="url(#ar18a)" style="stroke:var(--c4)"/>
+</svg>
+<figcaption>图 18.1 + 18.2：64 字节地址空间的 4 个页被 OS 放进了物理内存中<strong>不连续</strong>的页帧 3、7、5、2；帧 1、4、6 空闲，帧 0 留给 OS。页表记录这组映射。</figcaption>
+</figure>
+
+<p>和分段相比，分页有两大好处：</p>
+<ul>
+  <li><strong>灵活</strong>：不需要假设堆和栈往哪个方向长、怎么用。地址空间里有用的页放到任意空闲帧即可，没用的页根本不分配。</li>
+  <li><strong>空闲空间管理简单</strong>：所有帧一样大。OS 要放这个 64 字节的地址空间，只需从<strong>空闲帧链表</strong>里取出任意 4 个帧——不存在"找不到足够大的连续空洞"这种<strong>外部碎片（external fragmentation）</strong>问题。</li>
+</ul>
+<div class="aside" data-title="页表是每个进程一份的">
+<p>页表的主要作用是记录地址空间里每个虚拟页的地址转换。如果换另一个进程运行，OS 必须为它管理<strong>另一张</strong>页表，因为它的虚拟页显然映射到不同的物理帧（共享的情况除外）。
+本书讨论的页表结构基本都是每进程一份；唯一的例外是第 20 章会提到的反向页表（inverted page table）。</p>
+</div>
+
+<h2 id="translate">地址转换：把 VPN 换成 PFN</h2>
+<p>假设进程执行 <code>movl 21, %eax</code>，从虚拟地址 21 加载数据（先忽略取指令本身的访存）。</p>
+<ol>
+  <li>64 字节的地址空间需要 6 位虚拟地址（2<sup>6</sup> = 64）。页大小 16 字节 = 2<sup>4</sup>，所以低 4 位是<strong>偏移量</strong>，剩下的高 2 位是 <strong>VPN</strong>（正好选 4 个页之一）。</li>
+  <li>21 的二进制是 <code>010101</code>：VPN = <span class="tv">01</span> = 1，偏移 = <span class="to">0101</span> = 5。也就是"虚拟页 1 的第 5 个字节"。</li>
+  <li>用 VPN 1 查页表 → PFN = 7（二进制 <span class="tp">111</span>）。</li>
+  <li>把 VPN 换成 PFN，偏移量原封不动接在后面：<span class="tp">111</span><span class="to">0101</span> = 117。这就是物理地址。</li>
+</ol>
+
+<figure class="fig">
+<svg viewBox="0 0 560 230" width="560" role="img" aria-label="地址转换：虚拟地址 21 转换为物理地址 117">
+  <text x="30" y="50" font-size="13" class="t-muted">虚拟地址</text>
+  <text x="30" y="68" font-size="12" class="t-muted mono">= 21</text>
+  <g font-size="16" class="mono" font-weight="600" text-anchor="middle">
+    <rect x="130" y="30" width="34" height="38" rx="5" style="fill:color-mix(in srgb, var(--c1) 18%, var(--surface));stroke:var(--c1);stroke-width:1.5"/><text x="147" y="55">0</text>
+    <rect x="168" y="30" width="34" height="38" rx="5" style="fill:color-mix(in srgb, var(--c1) 18%, var(--surface));stroke:var(--c1);stroke-width:1.5"/><text x="185" y="55">1</text>
+    <rect x="216" y="30" width="34" height="38" rx="5" style="fill:color-mix(in srgb, var(--c3) 18%, var(--surface));stroke:var(--c3);stroke-width:1.5"/><text x="233" y="55">0</text>
+    <rect x="254" y="30" width="34" height="38" rx="5" style="fill:color-mix(in srgb, var(--c3) 18%, var(--surface));stroke:var(--c3);stroke-width:1.5"/><text x="271" y="55">1</text>
+    <rect x="292" y="30" width="34" height="38" rx="5" style="fill:color-mix(in srgb, var(--c3) 18%, var(--surface));stroke:var(--c3);stroke-width:1.5"/><text x="309" y="55">0</text>
+    <rect x="330" y="30" width="34" height="38" rx="5" style="fill:color-mix(in srgb, var(--c3) 18%, var(--surface));stroke:var(--c3);stroke-width:1.5"/><text x="347" y="55">1</text>
+  </g>
+  <text x="166" y="20" text-anchor="middle" font-size="12" style="fill:var(--c1)">VPN = 1</text>
+  <text x="290" y="20" text-anchor="middle" font-size="12" style="fill:var(--c3)">offset = 5</text>
+  <!-- 转换框 -->
+  <rect x="112" y="92" width="110" height="40" rx="8" class="accent-soft"/>
+  <text x="167" y="110" text-anchor="middle" font-size="12.5">查页表</text>
+  <text x="167" y="125" text-anchor="middle" font-size="11.5" class="t-muted mono">VPN 1 → PFN 7</text>
+  <path d="M166,70 L166,90" class="arrow"/><path d="M166,134 L166,152" class="arrow"/>
+  <path d="M233,70 L233,152 M271,70 L271,152 M309,70 L309,152 M347,70 L347,152" style="stroke:var(--c3);stroke-dasharray:3 3;fill:none"/>
+  <text x="400" y="118" font-size="12" class="t-muted">偏移量直接照抄，不参与转换</text>
+  <text x="30" y="180" font-size="13" class="t-muted">物理地址</text>
+  <text x="30" y="198" font-size="12" class="t-muted mono">= 117</text>
+  <g font-size="16" class="mono" font-weight="600" text-anchor="middle">
+    <rect x="92" y="156" width="34" height="38" rx="5" style="fill:color-mix(in srgb, var(--c2) 18%, var(--surface));stroke:var(--c2);stroke-width:1.5"/><text x="109" y="181">1</text>
+    <rect x="130" y="156" width="34" height="38" rx="5" style="fill:color-mix(in srgb, var(--c2) 18%, var(--surface));stroke:var(--c2);stroke-width:1.5"/><text x="147" y="181">1</text>
+    <rect x="168" y="156" width="34" height="38" rx="5" style="fill:color-mix(in srgb, var(--c2) 18%, var(--surface));stroke:var(--c2);stroke-width:1.5"/><text x="185" y="181">1</text>
+    <rect x="216" y="156" width="34" height="38" rx="5" style="fill:color-mix(in srgb, var(--c3) 18%, var(--surface));stroke:var(--c3);stroke-width:1.5"/><text x="233" y="181">0</text>
+    <rect x="254" y="156" width="34" height="38" rx="5" style="fill:color-mix(in srgb, var(--c3) 18%, var(--surface));stroke:var(--c3);stroke-width:1.5"/><text x="271" y="181">1</text>
+    <rect x="292" y="156" width="34" height="38" rx="5" style="fill:color-mix(in srgb, var(--c3) 18%, var(--surface));stroke:var(--c3);stroke-width:1.5"/><text x="309" y="181">0</text>
+    <rect x="330" y="156" width="34" height="38" rx="5" style="fill:color-mix(in srgb, var(--c3) 18%, var(--surface));stroke:var(--c3);stroke-width:1.5"/><text x="347" y="181">1</text>
+  </g>
+  <text x="147" y="214" text-anchor="middle" font-size="12" style="fill:var(--c2)">PFN = 7（3 位，因为有 8 个帧）</text>
+  <text x="290" y="214" text-anchor="middle" font-size="12" style="fill:var(--c3)">offset = 5</text>
+</svg>
+<figcaption>图 18.3：地址转换过程。虚拟地址 6 位、物理地址 7 位（128 字节物理内存）——两者位数可以不同，VPN 和 PFN 的位数也可以不同。</figcaption>
+</figure>
+
+<p>硬件用掩码和移位来完成这些操作。对这个例子，<code>VPN_MASK = 0x30</code>（二进制 110000），<code>SHIFT = 4</code>（偏移量的位数）：</p>
+<pre><code>VPN      = (VirtualAddress &amp; VPN_MASK) &gt;&gt; SHIFT   // 010101 &amp; 110000 = 010000，右移 4 位 → 01
+PTEAddr  = PageTableBaseRegister + (VPN * sizeof(PTE))
+offset   = VirtualAddress &amp; OFFSET_MASK           // 010101 &amp; 001111 = 0101
+PhysAddr = (PFN &lt;&lt; SHIFT) | offset                // 111 左移 4 位 = 1110000，再 OR 0101 → 1110101 = 117</code></pre>
+<div class="tip"><p>记住一个口诀：<strong>页大小决定偏移位数，地址空间大小决定 VPN 位数</strong>。偏移位数 = log<sub>2</sub>(页大小)；VPN 位数 = 地址位数 − 偏移位数；页表项个数 = 2<sup>VPN 位数</sup>。</p></div>
+
+<section class="sim" id="sim-linear">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>线性页表地址转换（仿 paging-linear-translate.py）</h3>
+    <div class="desc">设置地址空间、页大小、物理内存和随机种子，生成一张线性页表，然后逐步翻译虚拟地址：拆位 → 查 PTE → 检查有效位 → 拼接 PFN 与偏移。随机数生成器与 Python 相同，<strong>同一组参数和种子得到的页表、地址与官方作业脚本完全一致</strong>，可以用来核对作业答案。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>地址空间 -a <input type="text" id="lt-a" value="64" size="6"></label>
+      <label>页大小 -P <input type="text" id="lt-P" value="16" size="6"></label>
+      <label>物理内存 -p <input type="text" id="lt-p" value="128" size="6"></label>
+      <label>种子 -s <input type="number" id="lt-s" value="0" min="0"></label>
+      <label>已用 -u % <input type="number" id="lt-u" value="50" min="0" max="100"></label>
+      <label>地址数 -n <input type="number" id="lt-n" value="5" min="0" max="50"></label>
+      <button class="primary" id="lt-gen">生成页表</button>
+    </div>
+    <div class="controls">
+      <button id="lt-book">载入原书示例（64B 空间 / 16B 页，VA 21）</button>
+      <button data-preset="-P 1k -a 16k -p 32k -u 50 -s 0">作业题 3：-P 1k -a 16k -p 32k</button>
+      <button data-preset="-P 8 -a 32 -p 1024 -s 1">作业题 4：-P 8 -a 32 -p 1024 -s 1</button>
+      <button data-preset="-P 4k -a 16k -p 64k -s 0">默认参数 -s 0</button>
+    </div>
+    <div class="controls">
+      <label>翻译虚拟地址 <input type="text" id="lt-va" value="21" size="10" placeholder="21 或 0x15"></label>
+      <button id="lt-go">翻译</button>
+      <span class="muted small">支持十进制、0x 十六进制、0b 二进制</span>
+    </div>
+    <div class="cmdline" id="lt-cmd"></div>
+    <div class="pills" id="lt-pills"></div>
+    <div id="lt-step" style="margin-top:10px"></div>
+    <div class="stage" id="lt-stage">
+      <div id="lt-bits"></div>
+      <div class="pt-grid">
+        <div class="panel"><h5 id="lt-pt-title">页表</h5><div class="ptlist" id="lt-pt"></div></div>
+        <div class="panel"><h5 id="lt-pm-title">物理内存</h5><div id="lt-pm"></div></div>
+      </div>
+    </div>
+    <div class="narrate" id="lt-nar"></div>
+    <div class="stats" id="lt-stats"></div>
+  </div>
+</section>
+
+<h2 id="where">页表存在哪里？有多大？</h2>
+<p>页表可能大得吓人。典型的 32 位地址空间、4KB 页：偏移量 12 位，VPN 20 位，于是每个进程要管理 2<sup>20</sup>（约一百万）个转换。
+每个页表项（PTE）按 4 字节算，<strong>一个进程的页表就是 4MB</strong>；如果有 100 个进程，光页表就要 400MB！64 位地址空间就更不敢想了。</p>
+
+<div class="panel" style="margin:14px 0" id="ptsize">
+  <h5>页表大小计算器（线性页表）</h5>
+  <div class="calc">
+    <label>虚拟地址位数 <input type="number" id="ps-bits" value="32" min="4" max="64"></label>
+    <label>页大小 <select id="ps-page"><option value="512">512B</option><option value="1024">1KB</option><option value="4096" selected>4KB</option><option value="16384">16KB</option><option value="2097152">2MB</option></select></label>
+    <label>PTE 大小 <select id="ps-pte"><option>4</option><option>8</option></select> 字节</label>
+    <label>进程数 <input type="number" id="ps-n" value="100" min="1"></label>
+  </div>
+  <div class="readout" id="ps-out"></div>
+</div>
+
+<p>因为页表这么大，MMU 里不可能用专门的片上硬件存放当前进程的页表。页表<strong>存放在内存里</strong>。现在先假设它放在 OS 管理的物理内存中
+（以后会看到，OS 自己的内存也可以被虚拟化，页表甚至可以被换出到磁盘，这里先不管）。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 620 330" width="620" role="img" aria-label="页表存放在内核物理内存中">
+  <defs><marker id="ar18b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker></defs>
+  <text x="80" y="24" text-anchor="middle" font-size="13" font-weight="600">CPU / MMU</text>
+  <rect x="20" y="36" width="120" height="50" rx="8" class="accent-soft"/>
+  <text x="80" y="57" text-anchor="middle" font-size="12.5">页表基址寄存器</text>
+  <text x="80" y="75" text-anchor="middle" font-size="12" class="mono">PTBR = 0</text>
+  <rect x="20" y="110" width="120" height="50" rx="8" class="box"/>
+  <text x="80" y="131" text-anchor="middle" font-size="12.5">上下文切换时</text>
+  <text x="80" y="149" text-anchor="middle" font-size="12">OS 改写 PTBR</text>
+  <g font-size="12">
+    <rect x="300" y="20" width="150" height="36" rx="3" style="fill:var(--c2);opacity:.85"/><text x="375" y="43" text-anchor="middle" style="fill:#fff">page 1 of AS</text>
+    <rect x="300" y="56" width="150" height="36" rx="3" class="box"/><text x="375" y="79" text-anchor="middle" class="t-muted">(空闲)</text>
+    <rect x="300" y="92" width="150" height="36" rx="3" style="fill:var(--c3);opacity:.85"/><text x="375" y="115" text-anchor="middle" style="fill:#fff">page 2 of AS</text>
+    <rect x="300" y="128" width="150" height="36" rx="3" class="box"/><text x="375" y="151" text-anchor="middle" class="t-muted">(空闲)</text>
+    <rect x="300" y="164" width="150" height="36" rx="3" style="fill:var(--c1);opacity:.85"/><text x="375" y="187" text-anchor="middle" style="fill:#fff">page 0 of AS</text>
+    <rect x="300" y="200" width="150" height="36" rx="3" style="fill:var(--c4);opacity:.85"/><text x="375" y="223" text-anchor="middle" style="fill:#fff">page 3 of AS</text>
+    <rect x="300" y="236" width="150" height="36" rx="3" class="box"/><text x="375" y="259" text-anchor="middle" class="t-muted">(空闲)</text>
+    <rect x="300" y="272" width="150" height="36" rx="3" class="warn-soft"/>
+  </g>
+  <g class="mono" font-size="12.5" text-anchor="middle">
+    <rect x="306" y="279" width="33" height="22" rx="3" class="box-strong"/><text x="322" y="295">3</text>
+    <rect x="341" y="279" width="33" height="22" rx="3" class="box-strong"/><text x="357" y="295">7</text>
+    <rect x="376" y="279" width="33" height="22" rx="3" class="box-strong"/><text x="392" y="295">5</text>
+    <rect x="411" y="279" width="33" height="22" rx="3" class="box-strong"/><text x="427" y="295">2</text>
+  </g>
+  <g font-size="10.5" class="mono t-muted" text-anchor="middle">
+    <text x="322" y="322" class="t-muted">地址 0</text><text x="357" y="322" class="t-muted">4</text><text x="392" y="322" class="t-muted">8</text><text x="427" y="322" class="t-muted">12</text>
+  </g>
+  <g font-size="11" class="mono">
+    <text x="456" y="42" class="t-muted">帧 7</text><text x="456" y="78" class="t-muted">帧 6</text><text x="456" y="114" class="t-muted">帧 5</text><text x="456" y="150" class="t-muted">帧 4</text>
+    <text x="456" y="186" class="t-muted">帧 3</text><text x="456" y="222" class="t-muted">帧 2</text><text x="456" y="258" class="t-muted">帧 1</text><text x="456" y="294" class="t-muted">帧 0</text>
+  </g>
+  <path d="M140,62 C220,62 230,290 302,290" class="arrow" style="stroke:var(--accent)" marker-end="url(#ar18b)"/>
+  <text x="498" y="286" font-size="12">← 页表（4 个 PTE，</text>
+  <text x="498" y="302" font-size="12">每个 4 字节）</text>
+  <text x="498" y="186" font-size="12" class="t-muted">PTE[1] 在物理</text>
+  <text x="498" y="202" font-size="12" class="t-muted">地址 0 + 1×4 = 4</text>
+</svg>
+<figcaption>图 18.4：页表本身就放在（内核的）物理内存里——这里放在帧 0，内容正是"3 7 5 2"。硬件通过页表基址寄存器找到它。</figcaption>
+</figure>
+
+<h2 id="pte">页表里到底有什么？</h2>
+<p>页表只是一个把 VPN 映射到 PFN 的数据结构，任何数据结构都行。最简单的是<strong>线性页表</strong>：一个数组，用 VPN 做下标取出页表项（PTE），得到 PFN。
+（后面几章会用更高级的结构解决分页的问题。）每个 PTE 除了 PFN 还有一些控制位：</p>
+<div class="table-wrap"><table>
+<tr><th>位</th><th>含义</th><th>为什么需要</th></tr>
+<tr><td>有效位（valid bit）</td><td>这个转换是否有效</td><td>程序代码和堆在地址空间一端、栈在另一端，中间大片未使用。把这些页标为无效，就<strong>不必为它们分配物理帧</strong>——这是支持稀疏地址空间的关键。访问无效页会陷入 OS，通常进程被终止。</td></tr>
+<tr><td>保护位（protection bits）</td><td>能否读、写、执行</td><td>以不允许的方式访问（例如写只读页）会陷入 OS。</td></tr>
+<tr><td>存在位（present bit）</td><td>这一页在物理内存里还是在磁盘上（被换出了）</td><td>支持比物理内存更大的地址空间（第 21 章）。</td></tr>
+<tr><td>脏位（dirty bit）</td><td>页被调入内存后是否被修改过</td><td>换出时决定要不要写回磁盘。</td></tr>
+<tr><td>参考位 / 访问位（reference / accessed bit）</td><td>页是否被访问过</td><td>判断哪些页"热门"，页面替换时要用（第 22 章）。</td></tr>
+</table></div>
+
+<figure class="fig">
+<svg viewBox="0 0 720 150" width="720" role="img" aria-label="x86 页表项格式">
+  <g font-size="11" class="mono t-muted" text-anchor="middle">
+    <text x="30" y="22" class="t-muted">31</text><text x="410" y="22" class="t-muted">12</text>
+    <text x="432" y="22" class="t-muted">11</text><text x="488" y="22" class="t-muted">9</text>
+    <text x="515" y="22" class="t-muted">8</text><text x="541" y="22" class="t-muted">7</text><text x="567" y="22" class="t-muted">6</text><text x="593" y="22" class="t-muted">5</text>
+    <text x="619" y="22" class="t-muted">4</text><text x="645" y="22" class="t-muted">3</text><text x="671" y="22" class="t-muted">2</text><text x="697" y="22" class="t-muted">1</text>
+  </g>
+  <text x="710" y="22" font-size="11" class="mono t-muted" text-anchor="middle"></text>
+  <rect x="20" y="30" width="400" height="40" rx="3" style="fill:color-mix(in srgb, var(--c2) 20%, var(--surface));stroke:var(--c2)"/>
+  <text x="220" y="55" text-anchor="middle" font-size="14" font-weight="600">PFN（20 位）</text>
+  <rect x="420" y="30" width="78" height="40" class="box"/><text x="459" y="55" text-anchor="middle" font-size="11" class="t-muted">留给 OS</text>
+  <g font-size="11" font-weight="600" text-anchor="middle">
+    <rect x="498" y="30" width="26" height="40" class="box-strong"/><text x="511" y="55">G</text>
+    <rect x="524" y="30" width="26" height="40" class="box-strong"/><text x="537" y="50" font-size="8.5">PA</text><text x="537" y="61" font-size="8.5">T</text>
+    <rect x="550" y="30" width="26" height="40" class="warn-soft"/><text x="563" y="55">D</text>
+    <rect x="576" y="30" width="26" height="40" class="warn-soft"/><text x="589" y="55">A</text>
+    <rect x="602" y="30" width="26" height="40" class="box-strong"/><text x="615" y="50" font-size="8.5">PC</text><text x="615" y="61" font-size="8.5">D</text>
+    <rect x="628" y="30" width="26" height="40" class="box-strong"/><text x="641" y="50" font-size="8.5">PW</text><text x="641" y="61" font-size="8.5">T</text>
+    <rect x="654" y="30" width="26" height="40" class="accent-soft"/><text x="667" y="50" font-size="8.5">U/</text><text x="667" y="61" font-size="8.5">S</text>
+    <rect x="680" y="30" width="26" height="40" class="accent-soft"/><text x="693" y="50" font-size="8.5">R/</text><text x="693" y="61" font-size="8.5">W</text>
+  </g>
+  <rect x="706" y="30" width="12" height="40" class="ok-soft"/><text x="712" y="55" text-anchor="middle" font-size="10" font-weight="700">P</text>
+  <text x="712" y="22" font-size="11" class="mono t-muted" text-anchor="middle">0</text>
+  <g font-size="12">
+    <text x="20" y="98">P：存在位　R/W：是否可写　U/S：用户态能否访问</text>
+    <text x="20" y="118">A：访问位　D：脏位　PWT / PCD / PAT / G：控制硬件缓存如何处理这一页</text>
+    <text x="20" y="138" class="t-muted">32 位 x86，4KB 页：PFN 占高 20 位，低 12 位正好用来放标志（页帧总是 4KB 对齐，低 12 位本来就是 0）</text>
+  </g>
+</svg>
+<figcaption>图 18.5：一个 x86 页表项（PTE）。点击下面的位格，亲手编码 / 解码一个 PTE。</figcaption>
+</figure>
+
+<section class="sim" id="sim-pte">
+  <div class="sim-head"><span class="tag">小工具</span><h3>x86 PTE 解码器</h3>
+    <div class="desc">输入一个 32 位 PTE 的十六进制值，或者直接点位格翻转某一位，看它表示什么。试试让 P=0，看看硬件会怎么做。</div></div>
+  <div class="sim-body">
+    <div class="controls"><label>PTE = <input type="text" id="pte-hex" value="0x0001E067" size="12"></label>
+      <button data-pte="0x0001E067">用户数据页（读写、已访问、已修改）</button>
+      <button data-pte="0x00400025">用户代码页（只读、已访问）</button>
+      <button data-pte="0x00000000">全 0（P=0）</button></div>
+    <div class="stage"><div class="pte-bits" id="pte-bits"></div></div>
+    <div class="decode" id="pte-dec"></div>
+  </div>
+</section>
+
+<div class="aside" data-title="为什么 x86 没有单独的有效位？">
+<p>x86 只有一个存在位 P。P=1 表示这一页既存在又有效；P=0 则可能是"有效但不在内存里（被换出）"，也可能是"根本无效"。
+访问 P=0 的页会陷入 OS，由 OS 用它自己维护的其他数据结构判断属于哪种情况：有效就把页换回来，无效就说明程序非法访问。
+硬件往往只提供最小的一组功能，让 OS 在其上构建完整的服务——这种"克制"在硬件设计里很常见。</p>
+</div>
+
+<h2 id="slow">分页也太慢：每次访存多一次内存访问</h2>
+<p>回到 <code>movl 21, %eax</code>。要把数据取到 <code>eax</code>，系统必须先把虚拟地址 21 翻译成物理地址 117；而要翻译，硬件必须先从内存里的页表<strong>取出对应的 PTE</strong>。
+硬件用页表基址寄存器定位 PTE，完整协议如下（原书图 18.6）：</p>
+<pre><code> 1  // 从虚拟地址中取出 VPN
+ 2  VPN = (VirtualAddress &amp; VPN_MASK) &gt;&gt; SHIFT
+ 3
+ 4  // 算出页表项（PTE）的地址
+ 5  PTEAddr = PTBR + (VPN * sizeof(PTE))
+ 6
+ 7  // 取 PTE —— 这是一次额外的内存访问！
+ 8  PTE = AccessMemory(PTEAddr)
+ 9
+10  // 检查进程能否访问这一页
+11  if (PTE.Valid == False)
+12      RaiseException(SEGMENTATION_FAULT)
+13  else if (CanAccess(PTE.ProtectBits) == False)
+14      RaiseException(PROTECTION_FAULT)
+15  else
+16      // 访问合法：组装物理地址，真正去取数据
+17      offset   = VirtualAddress &amp; OFFSET_MASK
+18      PhysAddr = (PTE.PFN &lt;&lt; PFN_SHIFT) | offset
+19      Register = AccessMemory(PhysAddr)</code></pre>
+<ul>
+  <li><strong>第 2、5 行</strong>只是位运算和加法，硬件做起来很快。</li>
+  <li><strong>第 8 行</strong>是关键：取 PTE 本身就是一次访存。每条指令的取指、每次显式的 load/store，都要先多做这一次。</li>
+  <li><strong>第 11～14 行</strong>：无效页 → 段错误；权限不符 → 保护错误。两者都陷入 OS。</li>
+  <li><strong>第 18 行</strong>：PFN 左移再与偏移做 OR，就是"替换高位、保留低位"。</li>
+</ul>
+
+<figure class="fig">
+<svg viewBox="0 0 640 200" width="640" role="img" aria-label="分页让每次访存变成两次">
+  <defs><marker id="ar18c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="20" y="24" font-size="13" font-weight="600">没有分页（基址/界限）：1 次访存</text>
+  <rect x="20" y="36" width="110" height="36" rx="6" class="accent-soft"/><text x="75" y="59" text-anchor="middle" font-size="12.5">CPU: movl 21</text>
+  <path d="M132,54 L260,54" class="arrow" marker-end="url(#ar18c)"/>
+  <text x="196" y="47" text-anchor="middle" font-size="11.5" class="t-muted">base + 21（寄存器运算）</text>
+  <rect x="262" y="36" width="130" height="36" rx="6" class="ok-soft"/><text x="327" y="59" text-anchor="middle" font-size="12.5">读数据 ①</text>
+  <text x="20" y="112" font-size="13" font-weight="600">线性页表：2 次访存</text>
+  <rect x="20" y="124" width="110" height="36" rx="6" class="accent-soft"/><text x="75" y="147" text-anchor="middle" font-size="12.5">CPU: movl 21</text>
+  <path d="M132,142 L260,142" class="arrow" marker-end="url(#ar18c)"/>
+  <rect x="262" y="124" width="150" height="36" rx="6" class="warn-soft"/><text x="337" y="141" text-anchor="middle" font-size="12.5">读 PTE ①</text><text x="337" y="155" text-anchor="middle" font-size="11" class="mono t-muted">PTBR + 1×4</text>
+  <path d="M414,142 L470,142" class="arrow" marker-end="url(#ar18c)"/>
+  <rect x="472" y="124" width="150" height="36" rx="6" class="ok-soft"/><text x="547" y="141" text-anchor="middle" font-size="12.5">读数据 ②</text><text x="547" y="155" text-anchor="middle" font-size="11" class="mono t-muted">物理地址 117</text>
+  <text x="20" y="188" font-size="12" class="t-muted">访存比大多数 CPU 指令慢得多，额外的一次访存很可能让进程慢一倍甚至更多。</text>
+</svg>
+<figcaption>分页的时间代价：每一次内存引用（取指或显式 load/store）都要先访问一次页表。</figcaption>
+</figure>
+<p>所以分页有两个必须解决的真问题：不仔细设计软硬件，页表会让系统<strong>跑得太慢</strong>，同时<strong>占用太多内存</strong>。</p>
+
+<h2 id="trace">一条内存轨迹：数组清零的每一次访存</h2>
+<p>原书用一段再简单不过的代码（<code>array.c</code>）展示分页下真实发生的全部访存：</p>
+<pre><code>int array[1000];
+...
+for (i = 0; i &lt; 1000; i++)
+    array[i] = 0;</code></pre>
+<p>用 <code>gcc -o array array.c -Wall -O</code> 编译后反汇编，循环体是 4 条指令（原书为简单起见假设每条指令 4 字节，实际 x86 指令是变长的）：</p>
+<pre><code>1024  movl $0x0,(%edi,%eax,4)   ; array[i] = 0：地址 = %edi(数组基址) + %eax(i) × 4
+1028  incl %eax                 ; i++
+1032  cmpl $0x03e8,%eax         ; 和 1000 (0x3e8) 比较
+1036  jne  1024                 ; 不相等就跳回循环开头</code></pre>
+<p>假设：虚拟地址空间 64KB，页大小 1KB；线性页表位于物理地址 1KB（1024）；代码所在的虚拟页 VPN 1 → PFN 4；
+数组占 4000 字节，位于虚拟地址 40000～44000（不含末字节），即 VPN 39～42，映射为 39→7、40→8、41→9、42→10。</p>
+<p>于是每次循环有 <strong>10 次访存</strong>：4 次取指 + 1 次写数组，外加它们各自的 5 次页表访问。下面的模拟器逐次重现原书图 18.7，还可以把起始迭代调大，看看循环跑过 5 次之后会发生什么。</p>
+
+<section class="sim" id="sim-trace">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>数组清零的虚拟 / 物理内存轨迹（原书图 18.7）</h3>
+    <div class="desc">每一步是一次真实的内存访问。上层：页表访问（物理地址）；中层：数组访问；下层：取指令。左轴是虚拟地址，右轴是物理地址。观察页表访问占了多大比例，以及数组跨页时会访问哪个新的 PTE。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>起始迭代 i = <input type="number" id="tr-i0" value="0" min="0" max="999"></label>
+      <label>迭代次数 <input type="number" id="tr-k" value="5" min="1" max="12"></label>
+      <label><input type="checkbox" id="tr-tlb"> 假设有 TLB（第 19 章预告：同一页的转换只查一次页表）</label>
+      <button id="tr-book">原书图 18.7（i = 0～4）</button>
+      <button id="tr-cross">跨页处（i = 237～241）</button>
+    </div>
+    <div id="tr-step"></div>
+    <div class="stage" id="tr-stage"></div>
+    <div class="narrate" id="tr-nar"></div>
+    <div class="trace-log" id="tr-log"></div>
+    <div class="stats" id="tr-stats"></div>
+  </div>
+</section>
+
+<p>看懂这张图，你就能回答原书留下的问题：循环继续跑下去，指令访问和 <code>PageTable[1]</code> 的访问模式永远不变；数组访问的虚拟地址每次 +4，
+每跨过一个 1KB 页的边界，页表访问就从 <code>PageTable[39]</code>（物理地址 1180）换成 <code>PageTable[40]</code>（1184）、<code>PageTable[41]</code>……
+仅仅几行 C 代码，真实的内存行为就已经这么复杂；而后面要介绍的机制只会让它更复杂。</p>
+
+<h2 id="predict">先预测再验证</h2>
+<div class="exercise"><div class="q">（作业题 1）在模拟器里依次用 <code>-P 1k -a 1m -p 512m</code>、<code>-a 2m</code>、<code>-a 4m</code>（地址数设 0）。先预测：页表各有多少项？各占多少字节（每项 4 字节）？</div>
+<details class="reveal"><summary>看答案</summary><div>页数 = 地址空间 / 页大小：1m/1k = 1024 项（4KB）、2048 项（8KB）、4096 项（16KB）。<strong>地址空间翻倍，线性页表就翻倍</strong>——因为无论用没用，每个虚拟页都要有一项。</div></details></div>
+<div class="exercise"><div class="q">（作业题 2）固定 <code>-a 1m -p 512m</code>，页大小分别取 1k、2k、4k。页表大小如何变化？既然大页让页表变小，为什么不一律用大页？</div>
+<details class="reveal"><summary>看答案</summary><div>1024 → 512 → 256 项：<strong>页大小翻倍，页表减半</strong>。但大页会造成<strong>内部碎片（internal fragmentation）</strong>：一页分出去了，程序只用了其中一点点，剩下的全部浪费。第 20 章会专门讨论这个权衡。</div></details></div>
+<div class="exercise"><div class="q">（作业题 3）用 <code>-P 1k -a 16k -p 32k</code>，把 <code>-u</code> 从 0 依次调到 25、50、75、100。先预测：生成的地址里有多少能成功翻译？</div>
+<details class="reveal"><summary>看答案</summary><div><code>-u</code> 是地址空间中有效页的百分比。<code>-u 0</code> 时所有 PTE 都无效，每个地址都会失败；随着 <code>-u</code> 增大，有效 PTE 变多，成功翻译的比例也随之上升，<code>-u 100</code> 时全部成功。在模拟器的地址按钮上，绿色表示成功，红色表示无效。</div></details></div>
+<div class="exercise"><div class="q">（作业题 4）试试 <code>-P 8 -a 32 -p 1024 -s 1</code>、<code>-P 8k -a 32k -p 1m -s 2</code>、<code>-P 1m -a 256m -p 512m -s 3</code>。哪些参数不现实？为什么？</div>
+<details class="reveal"><summary>看答案</summary><div>8 字节的页太小：每 8 字节数据就要一个 4 字节的 PTE，页表开销达到 50%，而且 32 字节的地址空间毫无用处。1MB 的页则太大，内部碎片严重（不过现代系统确实把 2MB/1GB "大页" 作为补充手段）。8KB 页、32KB 地址空间的比例还算合理，只是规模很小。</div></details></div>
+<div class="exercise"><div class="q">（作业题 5）把物理内存设得比地址空间还小（例如 <code>-a 64k -p 32k</code>），会怎样？现实中这可能吗？</div>
+<details class="reveal"><summary>看答案</summary><div>模拟器（和原版脚本一样）直接报错：它要求物理内存大于地址空间。现实中这不仅可能而且很常见——靠的是把部分页换出到磁盘（交换，swapping），这正是第 21、22 章的主题，届时 PTE 里的存在位就派上用场了。</div></details></div>
+<div class="exercise"><div class="q">在原书示例里翻译虚拟地址 63 和 64。先在纸上拆位再验证。</div>
+<details class="reveal"><summary>看答案</summary><div>63 = <span class="tv">11</span><span class="to">1111</span>：VPN 3 → PFN 2 = <span class="tp">010</span>，物理地址 <span class="tp">010</span><span class="to">1111</span> = 47。64 超出了 6 位地址空间（0～63），根本不是合法的虚拟地址。</div></details></div>
+
+<h2 id="lab">动手实验：看看真实进程的 VPN 和 offset</h2>
+<div class="lab">
+<p>这个小程序打印代码、全局变量、堆、栈上几个地址，并按 4KB 页把它们拆成 VPN 和 offset；
+然后读取 <code>/proc/self/pagemap</code>（Linux 为每个虚拟页提供的一个 8 字节记录，bit 63 就是"存在位"），
+观察一块刚用 <code>mmap</code> 申请、还没写过的内存，它的页在写入前后是否"在内存里"。</p>
+<pre><code><span class="cmd">cd labs/18-paging &amp;&amp; make &amp;&amp; ./vpn</span></code></pre>
+<p class="small muted">示例输出（WSL2，gcc 14），你的机器上地址会不同（ASLR 每次运行都会随机化）：</p>
+<pre><code id="vpn-out">页大小 4096 字节 → 偏移量占低 12 位，VPN = 地址 &gt;&gt; 12
+
+virtual address   VPN (hex)       offset  对象
+0x5d54e83a3299    0x5d54e83a3     0x299   main 函数(代码)
+0x5d54e83a6060    0x5d54e83a6     0x060   全局变量 g
+0x5d55227822a0    0x5d5522782     0x2a0   堆(malloc)
+0x7ffe377caaac    0x7ffe377ca     0xaac   栈(局部变量)
+0x5d55227822a4    0x5d5522782     0x2a4   同一页的 heap+1
+
+一块 16 页的新内存（mmap 得到，起始 VPN 0x7d098ea99）：
+  写入前：16 页中有 0 页"存在"（pagemap bit 63）
+  写入后：16 页中有 16 页"存在"
+  第 0 页的 pagemap 记录 = 0x8180000000000000，PFN 字段 = 0（非 root 用户读到的 PFN 被内核隐藏为 0，出于安全考虑）</code></pre>
+<p>观察点：① x86-64 用户态地址是 48 位，按 4KB 页拆分后 VPN 占高 36 位；② <code>heap</code> 和 <code>heap+1</code> 在同一页，VPN 相同、offset 只差 4；
+③ 新映射的内存在第一次写之前并没有对应的物理页——OS 等到真正访问时才分配（按需分配，第 21 章细讲）；④ 普通用户读到的 PFN 是 0，内核出于安全考虑隐藏了物理帧号，用 <code>sudo</code> 运行才能看到。</p>
+</div>
+
+<h2 id="quiz">自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="2"><div class="q">1. 32 位虚拟地址、页大小 8KB，VPN 和偏移量各多少位？</div>
+<div class="opts"><button>A. VPN 21 位，偏移 11 位</button><button>B. VPN 18 位，偏移 14 位</button><button>C. VPN 19 位，偏移 13 位</button><button>D. VPN 20 位，偏移 12 位</button></div>
+<div class="explain">8KB = 2<sup>13</sup> 字节，偏移需要 13 位；VPN = 32 − 13 = 19 位。</div></div>
+<div class="mcq" data-answer="0"><div class="q">2. 地址转换时，下面哪部分<strong>不会</strong>被改变？</div>
+<div class="opts"><button>A. 页内偏移量</button><button>B. 地址的最高位</button><button>C. 所有位都会变</button><button>D. 虚拟页号</button></div>
+<div class="explain">转换只把 VPN 替换为 PFN，偏移量原样保留——它只说明要页内的第几个字节。</div></div>
+<div class="mcq" data-answer="1"><div class="q">3. 在原书 64 字节 / 16 字节页的例子里（页表 3、7、5、2），虚拟地址 36 对应的物理地址是？</div>
+<div class="opts"><button>A. 36</button><button>B. 84</button><button>C. 52</button><button>D. 116</button></div>
+<div class="explain">36 = 10 0100：VPN 2，offset 4。VPN 2 → PFN 5，物理地址 = 5 × 16 + 4 = 84。</div></div>
+<div class="mcq" data-answer="3"><div class="q">4. 为什么页表放在内存里，而不是放在 MMU 的片上硬件里？</div>
+<div class="opts"><button>A. 页表需要被换出到磁盘</button><button>B. 内存比片上寄存器快</button><button>C. MMU 不能读页表</button><button>D. 页表太大（例如每个进程 4MB），片上放不下</button></div>
+<div class="explain">32 位空间 + 4KB 页 + 4 字节 PTE 就是 4MB，而且每个进程一份。只能放在内存里，由页表基址寄存器指向当前进程的页表。</div></div>
+<div class="mcq" data-answer="0"><div class="q">5. 有效位（valid bit）最重要的作用是什么？</div>
+<div class="opts"><button>A. 让地址空间中未使用的大片区域无需分配物理帧，从而支持稀疏地址空间</button><button>B. 控制硬件缓存策略</button><button>C. 标记页是否被修改过</button><button>D. 标记页是否在磁盘上</button></div>
+<div class="explain">C 是脏位，D 是存在位，B 是 PWT/PCD 等位。有效位把堆和栈之间未使用的页标为无效，这些页不占物理内存，访问它们会陷入 OS。</div></div>
+<div class="mcq" data-answer="2"><div class="q">6. 只看数组清零循环的一次迭代（4 条指令），有线性页表、没有 TLB 时一共有几次内存访问？</div>
+<div class="opts"><button>A. 5 次</button><button>B. 4 次</button><button>C. 10 次</button><button>D. 8 次</button></div>
+<div class="explain">4 次取指 + 1 次写数组 = 5 次"真正的"访问，每次前面都要查一次页表，再加 5 次，共 10 次。</div></div>
+<div class="mcq" data-answer="1"><div class="q">7. 下列关于分页的说法，哪个是<strong>错误</strong>的？</div>
+<div class="opts"><button>A. 页表通常是每个进程一份</button><button>B. 分页不需要任何额外的内存访问，所以比分段更快</button><button>C. 一个进程的各个虚拟页可以放在不连续的物理帧里</button><button>D. 分页不会产生外部碎片</button></div>
+<div class="explain">恰恰相反：朴素的分页每次访存都要多访问一次页表，这正是第 19 章 TLB 要解决的问题。</div></div>
+<div class="mcq" data-answer="3"><div class="q">8. x86 的 PTE 中 P=0 时，硬件会怎样？</div>
+<div class="opts"><button>A. 忽略并继续用 PFN</button><button>B. 自动从磁盘读回该页</button><button>C. 直接返回 0</button><button>D. 陷入 OS，由 OS 判断这一页是"被换出了"还是"根本无效"</button></div>
+<div class="explain">x86 没有单独的有效位，P=0 可能是有效但不在内存，也可能是无效，硬件把判断交给 OS。</div></div>
+
+<h2 id="summary">常见误区与本章小结</h2>
+<div class="warn">
+<ul>
+  <li><strong>"物理地址和虚拟地址位数一样"</strong>——不必。本章例子里虚拟地址 6 位、物理地址 7 位；PFN 位数由物理帧的个数决定。</li>
+  <li><strong>"页表只记录用到的页"</strong>——线性页表要为<strong>每一个</strong>虚拟页留一项，哪怕它无效。这正是页表太大的根源（第 20 章来解决）。</li>
+  <li><strong>"偏移量也要查表"</strong>——偏移量从不转换，只有 VPN 需要转换。</li>
+  <li><strong>"页表在 MMU 里"</strong>——页表在内存里，MMU 里只有一个指向它的基址寄存器（后面再加上缓存它的 TLB）。</li>
+  <li><strong>"分页消灭了所有碎片"</strong>——分页消除了<em>外部</em>碎片，但页内用不完的空间仍是<em>内部</em>碎片。</li>
+</ul>
+</div>
+<div class="key">
+<ul>
+  <li>分页把地址空间和物理内存都切成大小固定的页 / 页帧，带来<strong>灵活性</strong>（支持稀疏地址空间，不假设堆栈用法）和<strong>简单的空闲空间管理</strong>（没有外部碎片）。</li>
+  <li>虚拟地址 = VPN | offset。转换 = 用 VPN 查页表得到 PFN，再拼上原 offset：<code>PA = (PFN &lt;&lt; SHIFT) | offset</code>。</li>
+  <li>页表是每个进程一份的数据结构，放在内存中，由页表基址寄存器指向。PTE 里有 PFN 和有效、保护、存在、脏、访问等位。</li>
+  <li>两个大问题：<strong>太慢</strong>——每次访存多一次页表访问；<strong>太大</strong>——32 位 / 4KB 页每进程 4MB。</li>
+  <li>接下来：第 19 章用硬件缓存 TLB 让转换变快；第 20 章用多级页表等结构让页表变小。</li>
+</ul>
+</div>
+
+</main>
+
+<script id="core">
+// ======================= 核心算法（纯函数，无 DOM；自检脚本会单独抽出来用 node 运行） =======================
+// Python random 的精确复刻：MT19937 + random.seed(int) + random.random()（genrand_res53）
+function PyRandom(seed) {
+  const N = 624, M = 397, mt = new Uint32Array(N);
+  let mti = N + 1;
+  function initGenrand(s) {
+    mt[0] = s >>> 0;
+    for (mti = 1; mti < N; mti++) { const p = mt[mti - 1] ^ (mt[mti - 1] >>> 30); mt[mti] = (Math.imul(1812433253, p) + mti) >>> 0; }
+  }
+  function initByArray(key) {
+    initGenrand(19650218);
+    let i = 1, j = 0, k = Math.max(N, key.length);
+    for (; k; k--) {
+      const p = mt[i - 1] ^ (mt[i - 1] >>> 30);
+      mt[i] = ((mt[i] ^ Math.imul(p, 1664525)) + key[j] + j) >>> 0; i++; j++;
+      if (i >= N) { mt[0] = mt[N - 1]; i = 1; }
+      if (j >= key.length) j = 0;
+    }
+    for (k = N - 1; k; k--) {
+      const p = mt[i - 1] ^ (mt[i - 1] >>> 30);
+      mt[i] = ((mt[i] ^ Math.imul(p, 1566083941)) - i) >>> 0; i++;
+      if (i >= N) { mt[0] = mt[N - 1]; i = 1; }
+    }
+    mt[0] = 0x80000000;
+  }
+  function genrand() {
+    let y;
+    if (mti >= N) {
+      let kk;
+      for (kk = 0; kk < N - M; kk++) { y = (mt[kk] & 0x80000000) | (mt[kk + 1] & 0x7fffffff); mt[kk] = mt[kk + M] ^ (y >>> 1) ^ (y & 1 ? 0x9908b0df : 0); }
+      for (; kk < N - 1; kk++) { y = (mt[kk] & 0x80000000) | (mt[kk + 1] & 0x7fffffff); mt[kk] = mt[kk + (M - N)] ^ (y >>> 1) ^ (y & 1 ? 0x9908b0df : 0); }
+      y = (mt[N - 1] & 0x80000000) | (mt[0] & 0x7fffffff); mt[N - 1] = mt[M - 1] ^ (y >>> 1) ^ (y & 1 ? 0x9908b0df : 0);
+      mti = 0;
+    }
+    y = mt[mti++];
+    y ^= y >>> 11; y = (y ^ ((y << 7) & 0x9d2c5680)) >>> 0; y = (y ^ ((y << 15) & 0xefc60000)) >>> 0; y ^= y >>> 18;
+    return y >>> 0;
+  }
+  let n = Math.abs(Math.trunc(Number(seed) || 0)); const key = [];
+  if (n === 0) key.push(0); else while (n > 0) { key.push(n % 4294967296); n = Math.floor(n / 4294967296); }
+  initByArray(key);
+  return function random() { const a = genrand() >>> 5, b = genrand() >>> 6; return (a * 67108864 + b) / 9007199254740992; };
+}
+// "16k" / "1m" / "64" → 字节数（与原脚本的 convert() 一致）
+function parseSize(str) {
+  const m = /^\s*(\d+)\s*([kKmMgG]?)\s*[bB]?\s*$/.exec(String(str));
+  if (!m) return NaN;
+  const mul = { "": 1, k: 1024, K: 1024, m: 1048576, M: 1048576, g: 1073741824, G: 1073741824 }[m[2]];
+  return parseInt(m[1], 10) * mul;
+}
+function log2i(n) { if (!(n >= 1)) return -1; const b = Math.round(Math.log2(n)); return 2 ** b === n ? b : -1; }
+// 复刻 paging-linear-translate.py：同样的参数和种子 → 同样的页表与虚拟地址
+function linearGen(o) {
+  const asize = o.asize, psize = o.psize, pagesize = o.pagesize;
+  if (!(psize > 1)) return { error: "物理内存大小必须大于 1" };
+  if (!(asize >= 1)) return { error: "地址空间大小必须大于 0" };
+  if (!(pagesize >= 1)) return { error: "页大小必须大于 0" };
+  if (psize <= asize) return { error: "物理内存必须大于地址空间（原模拟器的限制；现实中可以借助交换做到，见第 21 章）" };
+  if (psize >= 1073741824 || asize >= 1073741824) return { error: "大小必须小于 1GB（原模拟器的限制）" };
+  const vabits = log2i(asize), pagebits = log2i(pagesize);
+  if (vabits < 0) return { error: "地址空间大小必须是 2 的幂" };
+  if (pagebits < 0) return { error: "页大小必须是 2 的幂" };
+  if (pagesize > asize) return { error: "页大小不能超过地址空间" };
+  if (psize % pagesize) return { error: "物理内存必须是页大小的整数倍" };
+  const pages = psize / pagesize, vpages = asize / pagesize;
+  if (vpages > 1048576) return { error: "页表项超过 100 万，网页版为了流畅限制了规模" };
+  const random = PyRandom(o.seed || 0), usedPct = o.used == null ? 50 : o.used;
+  const usedF = new Uint8Array(pages), pt = new Int32Array(vpages);
+  let usedCount = 0;
+  for (let v = 0; v < vpages; v++) {
+    let done = false;
+    while (!done) {
+      if (random() * 100.0 > 100.0 - usedPct) {
+        if (usedCount >= pages) return { error: "物理页帧不够分配（已用比例太高）" };
+        const u = Math.floor(pages * random());
+        if (usedF[u] === 0) { usedF[u] = 1; usedCount++; done = true; pt[v] = u; }
+      } else { pt[v] = -1; done = true; }
+    }
+  }
+  let addrs;
+  if (o.addresses && o.addresses.length) addrs = o.addresses.slice();
+  else { addrs = []; const num = o.num == null ? 5 : o.num; for (let i = 0; i < num; i++) addrs.push(Math.floor(asize * random())); }
+  const pfnbits = Math.max(1, Math.ceil(Math.log2(pages)));
+  return { asize, psize, pagesize, pages, vpages, vabits, pagebits, vpnbits: vabits - pagebits, pfnbits, pabits: pfnbits + pagebits, pt, addrs };
+}
+// 线性页表翻译一个虚拟地址（与原脚本 -c 的计算一致）
+function linearTranslate(sim, va) {
+  const vpn = Math.floor(va / sim.pagesize), offset = va % sim.pagesize;
+  if (!(va >= 0 && va < sim.asize)) return { va, vpn, offset, out: true };
+  const pfn = sim.pt[vpn];
+  if (pfn < 0) return { va, vpn, offset, pte: 0, valid: false };
+  return { va, vpn, offset, pte: (0x80000000 | pfn) >>> 0, valid: true, pfn, pa: pfn * sim.pagesize + offset };
+}
+// 原书图 18.7：数组清零循环的内存访问序列
+const TRACE = { pageSize: 1024, ptBase: 1024, codeVA: 1024, codeVPN: 1, map: { 1: 4, 39: 7, 40: 8, 41: 9, 42: 10 }, arrayVA: 40000 };
+function traceGen(i0, k, withTLB) {
+  const T = TRACE, out = [], seen = new Set();
+  const tr = (va) => { const vpn = Math.floor(va / T.pageSize); return { vpn, pa: T.map[vpn] * T.pageSize + (va % T.pageSize), pte: T.ptBase + vpn * 4 }; };
+  const code = ["movl $0x0,(%edi,%eax,4)", "incl %eax", "cmpl $0x03e8,%eax", "jne  1024"];
+  for (let i = i0; i < Math.min(1000, i0 + k); i++) {
+    for (let j = 0; j < 4; j++) {
+      const va = T.codeVA + 4 * j, t = tr(va);
+      if (!withTLB || !seen.has(t.vpn)) { seen.add(t.vpn); out.push({ i, kind: "pt", pa: t.pte, vpn: t.vpn, for: "code", ins: code[j] }); }
+      out.push({ i, kind: "code", va, pa: t.pa, vpn: t.vpn, ins: code[j] });
+      if (j === 0) {
+        const ava = T.arrayVA + 4 * i, a = tr(ava);
+        if (!withTLB || !seen.has(a.vpn)) { seen.add(a.vpn); out.push({ i, kind: "pt", pa: a.pte, vpn: a.vpn, for: "array", ins: code[0] }); }
+        out.push({ i, kind: "array", va: ava, pa: a.pa, vpn: a.vpn, ins: code[0] });
+      }
+    }
+  }
+  return out;
+}
+</script>
+<script>
+(function () {
+  "use strict";
+  const { h, s, hex, bin } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  const parseNum = (t) => { t = String(t).trim().toLowerCase(); if (/^0x[0-9a-f]+$/.test(t)) return parseInt(t.slice(2), 16); if (/^0b[01]+$/.test(t)) return parseInt(t.slice(2), 2); if (/^\d+$/.test(t)) return parseInt(t, 10); return NaN; };
+  const fmtSize = (n) => n >= 1073741824 ? (n / 1073741824) + "GB" : n >= 1048576 ? (n / 1048576) + "MB" : n >= 1024 ? (n / 1024) + "KB" : n + "B";
+  const fmtBytes = (n) => { const u = ["B", "KB", "MB", "GB", "TB", "PB", "EB"]; let k = 0; while (n >= 1024 && k < u.length - 1) { n /= 1024; k++; } return (Math.round(n * 100) / 100) + " " + u[k]; };
+
+  // ---------------- 模拟器 1：线性页表地址转换 ----------------
+  let sim = null, bookMode = true, cur = null;
+  const BOOK_PT = [3, 7, 5, 2];
+  function bitsGroup(value, width, cls, caption, dimFrom) {
+    const cells = h("div", { class: "cells" });
+    const b = bin(value, width);
+    for (let k = 0; k < width; k++) cells.append(h("span", { class: "bit " + cls + (dimFrom != null && k >= dimFrom ? " dim" : "") }, b[k]));
+    return h("div", { class: "bitgrp" }, cells, h("span", { class: "cap" }, caption));
+  }
+  function buildSim() {
+    const cmd = $("lt-cmd");
+    if (bookMode) {
+      sim = { asize: 64, psize: 128, pagesize: 16, pages: 8, vpages: 4, vabits: 6, pagebits: 4, vpnbits: 2, pfnbits: 3, pabits: 7, pt: Int32Array.from(BOOK_PT), addrs: [21, 0, 36, 63, 47] };
+      cmd.textContent = "原书示例：64 字节地址空间、16 字节页、128 字节物理内存；页表固定为 VPN 0→3、1→7、2→5、3→2（帧 0 留给 OS 并存放页表，PTBR = 0）";
+    } else {
+      const o = { asize: parseSize($("lt-a").value), pagesize: parseSize($("lt-P").value), psize: parseSize($("lt-p").value), seed: parseInt($("lt-s").value, 10) || 0, used: Math.max(0, Math.min(100, parseInt($("lt-u").value, 10) || 0)), num: Math.max(0, Math.min(50, parseInt($("lt-n").value, 10) || 0)) };
+      sim = linearGen(o);
+      cmd.textContent = "等价命令：./paging-linear-translate.py -a " + $("lt-a").value + " -P " + $("lt-P").value + " -p " + $("lt-p").value + " -s " + o.seed + " -u " + o.used + " -n " + o.num + " -v -c";
+      if (sim.error) { cmd.append(h("div", { class: "err" }, "参数错误：" + sim.error)); }
+    }
+    renderPills();
+  }
+  function renderPills() {
+    const box = $("lt-pills"); box.replaceChildren();
+    if (!sim || sim.error) return;
+    if (!sim.addrs.length) box.append(h("span", { class: "muted small" }, "（-n 0：没有生成地址，可以在上面手动输入）"));
+    else box.append(h("span", { class: "muted small" }, "生成的地址（点击翻译）："));
+    sim.addrs.forEach((va) => {
+      const r = linearTranslate(sim, va);
+      box.append(h("button", { class: (r.valid ? "okv" : "badv") + (cur && cur.va === va ? " cur" : ""), onclick: () => { $("lt-va").value = va; translateNow(); } }, "VA " + va));
+    });
+  }
+  function translateNow() {
+    if (!sim || sim.error) { cur = null; ltStep.reset(); return; }
+    const va = parseNum($("lt-va").value);
+    cur = isNaN(va) ? { bad: true } : linearTranslate(sim, va);
+    renderPills();
+    ltStep.reset();
+  }
+  function ltSteps() { if (!cur || cur.bad || !sim || sim.error || cur.out) return 1; return cur.valid ? 6 : 4; }
+  function renderPT(activeVpn, showAct, bad) {
+    const box = $("lt-pt"); box.replaceChildren();
+    $("lt-pt-title").textContent = "页表（线性数组，" + sim.vpages + " 项 × 4 字节 = " + fmtBytes(sim.vpages * 4) + "）";
+    box.append(h("div", { class: "ptrow hd" }, h("span", {}, "[VPN]"), h("span", {}, "PTE"), h("span", {}, "V"), h("span", {}, "PFN")));
+    let lo = 0, hi = sim.vpages - 1;
+    const WIN = 128;
+    if (sim.vpages > WIN) { const c = activeVpn == null ? 0 : activeVpn; lo = Math.max(0, c - WIN / 2); hi = Math.min(sim.vpages - 1, lo + WIN - 1); lo = Math.max(0, hi - WIN + 1); }
+    if (lo > 0) box.append(h("div", { class: "ptrow inv" }, h("span", {}, "…"), h("span", {}, "（前 " + lo + " 项省略）")));
+    let actEl = null;
+    for (let v = lo; v <= hi; v++) {
+      const p = sim.pt[v], valid = p >= 0;
+      const el = h("div", { class: "ptrow" + (valid ? "" : " inv") + (showAct && v === activeVpn ? " act" + (bad ? " bad" : "") : "") },
+        h("span", {}, "[" + v + "]"), h("span", {}, hex(valid ? (0x80000000 | p) >>> 0 : 0, 8)), h("span", {}, valid ? "1" : "0"), h("span", {}, valid ? String(p) : "—"));
+      if (showAct && v === activeVpn) actEl = el;
+      box.append(el);
+    }
+    if (hi < sim.vpages - 1) box.append(h("div", { class: "ptrow inv" }, h("span", {}, "…"), h("span", {}, "（后 " + (sim.vpages - 1 - hi) + " 项省略）")));
+    if (actEl) box.scrollTop = Math.max(0, actEl.offsetTop - box.clientHeight / 2);
+  }
+  function renderPM(activePfn, offset) {
+    const box = $("lt-pm"); box.replaceChildren();
+    $("lt-pm-title").textContent = "物理内存（" + sim.pages + " 个页帧 × " + fmtSize(sim.pagesize) + " = " + fmtSize(sim.psize) + "）";
+    const owner = new Map(); for (let v = 0; v < sim.vpages; v++) if (sim.pt[v] >= 0) owner.set(sim.pt[v], v);
+    if (sim.pages <= 128) {
+      const g = h("div", { class: "frames" });
+      for (let f = 0; f < sim.pages; f++) {
+        const os = bookMode && f === 0;
+        const o = owner.get(f);
+        g.append(h("div", { class: "frame" + (o != null ? " used" : "") + (os ? " os" : "") + (f === activePfn ? " act" : "") },
+          h("b", {}, "帧 " + f), os ? "OS/页表" : o != null ? "VP " + o : ""));
+      }
+      box.append(g);
+    } else {
+      const W = 300, svg = s("svg", { viewBox: `0 0 ${W} 44`, width: W, height: 44 });
+      svg.append(s("rect", { x: 0, y: 6, width: W, height: 20, rx: 4, class: "box" }));
+      owner.forEach((v, f) => svg.append(s("rect", { x: (f / sim.pages) * W, y: 6, width: Math.max(1, W / sim.pages), height: 20, style: "fill:var(--c1);opacity:.55" })));
+      if (activePfn != null) { const x = (activePfn / sim.pages) * W; svg.append(s("path", { d: `M${x},0 L${x},32`, style: "stroke:var(--c2);stroke-width:3" })); svg.append(s("text", { x: Math.min(W - 60, Math.max(0, x - 20)), y: 42, "font-size": 11, class: "mono", text: "帧 " + activePfn })); }
+      box.append(svg, h("div", { class: "small muted" }, "帧太多，只画比例条：蓝色 = 已分配给本进程的帧（" + owner.size + " 个）"));
+    }
+    if (activePfn != null && offset != null) {
+      if (sim.pagesize <= 64) {
+        const bar = h("div", { class: "bytebar" });
+        for (let k = 0; k < sim.pagesize; k++) bar.append(h("span", { class: "byte" + (k === offset ? " act" : ""), title: "偏移 " + k }));
+        box.append(h("div", { class: "small", style: { marginTop: "8px" } }, "帧 " + activePfn + " 内部：第 " + offset + " 个字节（绿色）"), bar);
+      } else {
+        box.append(h("div", { class: "small", style: { marginTop: "8px" } }, "帧 " + activePfn + " 内部偏移 " + offset + " / " + sim.pagesize + " 字节"));
+      }
+    }
+  }
+  function ltRender(i) {
+    const bitsBox = $("lt-bits"), nar = $("lt-nar"), stats = $("lt-stats");
+    bitsBox.replaceChildren(); stats.replaceChildren();
+    if (!sim || sim.error) { $("lt-pt").replaceChildren(); $("lt-pm").replaceChildren(); nar.innerHTML = '<span class="err">' + (sim ? sim.error : "") + "</span>"; return; }
+    const st = (v, l) => stats.append(h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l)));
+    const validCnt = sim.pt.reduce((a, p) => a + (p >= 0 ? 1 : 0), 0);
+    st(sim.vabits + " = " + sim.vpnbits + "+" + sim.pagebits, "虚拟地址位数 = VPN + offset");
+    st(sim.vpages, "页表项个数 2^" + sim.vpnbits);
+    st(fmtBytes(sim.vpages * 4), "线性页表大小（4 字节/项）");
+    st(validCnt + " / " + sim.vpages, "有效的 PTE");
+    if (!cur || cur.bad) { renderPT(null, false); renderPM(null, null); nar.innerHTML = '<span class="err">无法解析这个虚拟地址。</span>请输入十进制（如 21）、十六进制（如 0x15）或二进制（如 0b010101）。'; return; }
+    if (cur.out) { renderPT(null, false); renderPM(null, null); nar.innerHTML = '<span class="err">虚拟地址 ' + cur.va + " 超出了地址空间</span>（合法范围 0 ～ " + (sim.asize - 1) + "，只有 " + sim.vabits + " 位）。"; return; }
+    const V = sim.vabits, P = sim.pagebits, W = sim.vpnbits;
+    const vaRow = h("div", { class: "addr-row" }, h("span", { class: "rowlab" }, "虚拟地址"));
+    const vbits = h("div", { class: "bits" });
+    if (i === 0) vbits.append(bitsGroup(cur.va, V, "", V + " 位"));
+    else { if (W > 0) vbits.append(bitsGroup(cur.vpn, W, "vpn", "VPN = " + cur.vpn)); vbits.append(bitsGroup(cur.offset, P, "off", "offset = " + cur.offset)); }
+    vaRow.append(vbits, h("span", { class: "mono small" }, "= " + cur.va + " = " + hex(cur.va)));
+    bitsBox.append(vaRow);
+    if (i >= 4 && cur.valid) {
+      const paRow = h("div", { class: "addr-row", style: { marginTop: "6px" } }, h("span", { class: "rowlab" }, "物理地址"));
+      const pb = h("div", { class: "bits" });
+      pb.append(bitsGroup(cur.pfn, sim.pfnbits, "pfn", "PFN = " + cur.pfn), bitsGroup(cur.offset, P, "off", "offset = " + cur.offset));
+      paRow.append(pb, h("span", { class: "mono small" }, "= " + cur.pa + " = " + hex(cur.pa)));
+      bitsBox.append(paRow);
+    }
+    renderPT(cur.vpn, i >= 2, i >= 3 && !cur.valid);
+    renderPM(i >= 4 && cur.valid ? cur.pfn : null, i >= 5 && cur.valid ? cur.offset : null);
+    const vpnMask = ((2 ** V) - 1) - ((2 ** P) - 1), ptbr = bookMode ? "0" : "PTBR";
+    const pteAddr = bookMode ? String(cur.vpn * 4) : "PTBR + " + cur.vpn * 4;
+    const msgs = [
+      `第 1 步：虚拟地址 <b>${cur.va}</b> 写成 ${V} 位二进制是 <code>${bin(cur.va, V)}</code>。地址空间 ${fmtSize(sim.asize)} = 2<sup>${V}</sup>，所以虚拟地址有 ${V} 位。`,
+      `第 2 步：页大小 ${fmtSize(sim.pagesize)} = 2<sup>${P}</sup>，低 <b>${P}</b> 位是 <span class="to">offset = ${cur.offset}</span>，高 <b>${W}</b> 位是 <span class="tv">VPN = ${cur.vpn}</span>。<br>硬件做法：VPN = (VA &amp; VPN_MASK) &gt;&gt; SHIFT，其中 VPN_MASK = ${hex(vpnMask)}，SHIFT = ${P}。`,
+      `第 3 步：计算 PTE 的地址：PTEAddr = ${ptbr} + VPN × sizeof(PTE) = ${ptbr} + ${cur.vpn} × 4 = <b>${pteAddr}</b>。硬件要<b>访问一次内存</b>才能取到这个 PTE。`,
+      cur.valid ? `第 4 步：取到 PTE = <code>${hex(cur.pte, 8)}</code>。最高位（有效位）= 1，其余位是 <span class="tp">PFN = ${cur.pfn}</span>（二进制 ${bin(cur.pfn, sim.pfnbits)}）。权限检查通过。`
+        : `第 4 步：取到 PTE = <code>0x00000000</code>，<b style="color:var(--bad)">有效位 = 0</b>：VPN ${cur.vpn} 不属于这个进程已分配的页。硬件执行 <code>RaiseException(SEGMENTATION_FAULT)</code>，陷入 OS，进程很可能被终止。（原脚本输出：Invalid (VPN ${cur.vpn} not valid)）`,
+      `第 5 步：把 VPN 换成 PFN，偏移原样保留：PA = (PFN &lt;&lt; ${P}) | offset = (${cur.pfn} &lt;&lt; ${P}) | ${cur.offset} = ${cur.pfn * sim.pagesize} + ${cur.offset} = <b>${cur.pa}</b>（${hex(cur.pa)}）。`,
+      `第 6 步：用物理地址 ${cur.pa} 访问内存——帧 ${cur.pfn} 里的第 ${cur.offset} 个字节。这是这条指令的<b>第二次</b>访存（第一次是取 PTE）。${bookMode && cur.va === 21 ? "与原书一致：虚拟地址 21 → VPN 1 → PFN 7 → 物理地址 117。" : ""}`,
+    ];
+    nar.innerHTML = msgs[i];
+  }
+  const ltStep = OSTEP.stepper($("lt-step"), { steps: ltSteps, render: ltRender, autoplayMs: 1300 });
+  $("lt-gen").onclick = () => { bookMode = false; buildSim(); if (sim && !sim.error && sim.addrs.length) $("lt-va").value = sim.addrs[0]; translateNow(); };
+  $("lt-book").onclick = () => { bookMode = true; $("lt-a").value = "64"; $("lt-P").value = "16"; $("lt-p").value = "128"; $("lt-va").value = "21"; buildSim(); translateNow(); };
+  document.querySelectorAll("#sim-linear [data-preset]").forEach((b) => b.onclick = () => {
+    const a = b.dataset.preset.split(/\s+/); const get = (f, d) => { const k = a.indexOf(f); return k >= 0 ? a[k + 1] : d; };
+    $("lt-P").value = get("-P", "4k"); $("lt-a").value = get("-a", "16k"); $("lt-p").value = get("-p", "64k"); $("lt-s").value = get("-s", "0"); $("lt-u").value = get("-u", "50"); $("lt-n").value = "5";
+    $("lt-gen").onclick();
+  });
+  $("lt-go").onclick = translateNow;
+  $("lt-va").addEventListener("keydown", (e) => { if (e.key === "Enter") translateNow(); });
+  buildSim(); translateNow();
+
+  // ---------------- 页表大小计算器 ----------------
+  function psCalc() {
+    const bits = Math.max(4, Math.min(64, parseInt($("ps-bits").value, 10) || 32));
+    const page = Number($("ps-page").value), pte = Number($("ps-pte").value), n = Math.max(1, parseInt($("ps-n").value, 10) || 1);
+    const off = Math.log2(page), vpn = bits - off;
+    if (vpn <= 0) { $("ps-out").textContent = "页比地址空间还大，不合理。"; return; }
+    const entries = 2 ** vpn, bytes = entries * pte;
+    $("ps-out").textContent = `偏移量 ${off} 位，VPN ${vpn} 位 → 页表项 2^${vpn} = ${entries.toLocaleString("en-US")} 个\n` +
+      `每个进程的线性页表：${entries.toLocaleString("en-US")} × ${pte} 字节 = ${fmtBytes(bytes)}\n` +
+      `${n} 个进程合计：${fmtBytes(bytes * n)}` + (bits >= 48 ? "\n（这就是为什么 64 位系统不可能用线性页表——见第 20 章的多级页表）" : "");
+  }
+  ["ps-bits", "ps-page", "ps-pte", "ps-n"].forEach((id) => $(id).addEventListener("input", psCalc));
+  psCalc();
+
+  // ---------------- x86 PTE 解码器 ----------------
+  const FLAGS = { 0: "P", 1: "R/W", 2: "U/S", 3: "PWT", 4: "PCD", 5: "A", 6: "D", 7: "PAT", 8: "G", 9: "AVL", 10: "AVL", 11: "AVL" };
+  let pteVal = 0x0001e067;
+  const btns = [];
+  (function buildPte() {
+    const g = $("pte-bits");
+    for (let b = 31; b >= 0; b--) g.append(h("div", { class: "bn" }, b));
+    for (let b = 31; b >= 0; b--) { const bt = h("button", { title: "位 " + b, onclick: () => { pteVal = (pteVal ^ (1 << b)) >>> 0; paintPte(true); } }, "0"); btns[b] = bt; g.append(bt); }
+    for (let b = 31; b >= 0; b--) g.append(h("div", { class: "fl" }, b >= 12 ? (b === 21 ? "PFN" : "") : FLAGS[b]));
+  })();
+  function paintPte(updateInput) {
+    for (let b = 0; b < 32; b++) { const on = (pteVal >>> b) & 1; btns[b].textContent = on; btns[b].classList.toggle("on", !!on); }
+    if (updateInput) $("pte-hex").value = hex(pteVal, 8);
+    const bit = (k) => (pteVal >>> k) & 1, pfn = pteVal >>> 12;
+    const d = $("pte-dec"); d.replaceChildren();
+    const add = (t) => d.append(h("div", { html: t }));
+    add(`<b>PFN</b> = ${hex(pfn, 5)} = ${pfn} → 页帧起始物理地址 ${hex(pfn * 4096)}`);
+    add(`<b>P</b> = ${bit(0)}：${bit(0) ? "页在内存中，可以转换" : '<span style="color:var(--bad)">不存在 → 访问会陷入 OS（缺页 / 非法访问）</span>'}`);
+    add(`<b>R/W</b> = ${bit(1)}：${bit(1) ? "可读可写" : "只读（写会触发保护错误）"}`);
+    add(`<b>U/S</b> = ${bit(2)}：${bit(2) ? "用户态可访问" : "仅内核态可访问"}`);
+    add(`<b>A</b> = ${bit(5)}：${bit(5) ? "最近被访问过" : "尚未被访问"}（替换策略会用到）`);
+    add(`<b>D</b> = ${bit(6)}：${bit(6) ? "被写过（脏页，换出时要写回）" : "干净"}`);
+    add(`<b>PWT/PCD/PAT/G</b> = ${bit(3)}/${bit(4)}/${bit(7)}/${bit(8)}：硬件缓存相关`);
+  }
+  $("pte-hex").addEventListener("input", () => { const v = parseNum($("pte-hex").value); if (!isNaN(v)) { pteVal = v >>> 0; paintPte(false); } });
+  document.querySelectorAll("[data-pte]").forEach((b) => b.onclick = () => { pteVal = parseNum(b.dataset.pte) >>> 0; paintPte(true); });
+  paintPte(true);
+
+  // ---------------- 模拟器 2：内存轨迹 ----------------
+  let trace = [];
+  function trBuild() {
+    const i0 = Math.max(0, Math.min(999, parseInt($("tr-i0").value, 10) || 0));
+    const k = Math.max(1, Math.min(12, parseInt($("tr-k").value, 10) || 5));
+    trace = traceGen(i0, k, $("tr-tlb").checked);
+    trStep.reset();
+  }
+  // 坐标轴范围：以 base 为起点、按 50 对齐（与原书图 18.7 的刻度一致），至少跨 minSpan
+  function range(vals, base, minSpan) {
+    const lo = base + 50 * Math.floor((Math.min(...vals) - base) / 50);
+    let hi = base + 50 * Math.ceil((Math.max(...vals) + 1 - base) / 50);
+    if (hi - lo < minSpan) hi = lo + minSpan;
+    return [lo, hi];
+  }
+  function trRender(step) {
+    const stage = $("tr-stage");
+    const n = trace.length, Wd = 720, L = 70, R = 70, plotW = Wd - L - R;
+    const panels = [
+      { kind: "pt", title: "页表（PA）", h: 110, col: "var(--c5)" },
+      { kind: "array", title: "数组", h: 80, col: "var(--c2)" },
+      { kind: "code", title: "代码", h: 80, col: "var(--c1)" },
+    ];
+    const Hh = panels.reduce((a, p) => a + p.h + 14, 0) + 36;
+    const svg = s("svg", { viewBox: `0 0 ${Wd} ${Hh}`, width: Wd, role: "img", "aria-label": "内存访问轨迹" });
+    const xOf = (k) => L + 8 + (k + 0.5) * ((plotW - 16) / Math.max(1, n));
+    let y0 = 8;
+    for (const p of panels) {
+      const pts = trace.map((a, k) => ({ a, k })).filter((o) => o.a.kind === p.kind);
+      const key = p.kind === "pt" ? "pa" : "va";
+      const base = p.kind === "pt" ? TRACE.ptBase : p.kind === "code" ? TRACE.codeVA : TRACE.arrayVA;
+      const [lo, hi] = pts.length ? range(pts.map((o) => o.a[key]), base, p.kind === "pt" ? 200 : 100) : [0, 1];
+      const onePage = pts.length && pts.every((o) => o.a.vpn === pts[0].a.vpn);
+      const yOf = (v) => y0 + p.h - 6 - ((v - lo) / (hi - lo)) * (p.h - 12);
+      svg.append(s("rect", { x: L, y: y0, width: plotW, height: p.h, class: "box", rx: 4 }));
+      svg.append(s("text", { x: L + plotW - 8, y: y0 + 15, "font-size": 12, "font-weight": 600, "text-anchor": "end", text: p.title + (p.kind !== "pt" && !onePage ? "（跨页，右轴 PA 见下方日志）" : ""), style: `fill:color-mix(in srgb, ${p.col} 70%, var(--fg))` }));
+      // 左轴（VA）右轴（PA）刻度：每 50 一格
+      const ticks = []; for (let t = lo; t <= hi; t += 50) ticks.push(t);
+      for (const t of ticks) {
+        const y = yOf(t);
+        svg.append(s("line", { x1: L - 4, x2: L, y1: y, y2: y, class: "stroke", "stroke-width": 1 }));
+        if (p.kind === "pt") {
+          svg.append(s("text", { x: Wd - R + 6, y: y + 4, "font-size": 10.5, class: "mono t-muted", text: t }));
+        } else {
+          svg.append(s("text", { x: L - 6, y: y + 4, "font-size": 10.5, "text-anchor": "end", class: "mono t-muted", text: t }));
+          const sample = pts[0];
+          if (sample && onePage) { const paT = t - sample.a.va + sample.a.pa; svg.append(s("text", { x: Wd - R + 6, y: y + 4, "font-size": 10.5, class: "mono t-muted", text: paT })); }
+        }
+      }
+      svg.append(s("text", { x: 4, y: y0 + p.h / 2, "font-size": 10.5, class: "t-muted", text: p.kind === "pt" ? "" : "VA" }));
+      svg.append(s("text", { x: Wd - 16, y: y0 + p.h / 2, "font-size": 10.5, class: "t-muted", text: "PA" }));
+      for (const o of pts) {
+        if (o.k > step) continue;
+        const x = xOf(o.k), y = yOf(o.a[key]), isCur = o.k === step;
+        svg.append(s("rect", { x: x - (isCur ? 5 : 3.5), y: y - (isCur ? 5 : 3.5), width: isCur ? 10 : 7, height: isCur ? 10 : 7, style: `fill:${p.col}` + (isCur ? ";stroke:var(--fg);stroke-width:1.5" : "") }));
+        if (p.kind === "pt" && (o.k === step || pts.findIndex((q) => q.a.pa === o.a.pa) === pts.indexOf(o))) {
+          svg.append(s("text", { x: x + 6, y: y - 6, "font-size": 10.5, class: "mono", text: "PageTable[" + o.a.vpn + "]" }));
+        }
+      }
+      y0 += p.h + 14;
+    }
+    // x 轴
+    for (let k = 0; k <= n; k += 10) { const x = xOf(k) - ((plotW - 16) / Math.max(1, n)) / 2; svg.append(s("text", { x, y: y0 + 6, "font-size": 10.5, "text-anchor": "middle", class: "mono t-muted", text: k })); }
+    svg.append(s("text", { x: L + plotW / 2, y: y0 + 22, "font-size": 11.5, "text-anchor": "middle", class: "t-muted", text: "第几次内存访问" }));
+    stage.replaceChildren(svg);
+    // 日志
+    const log = $("tr-log"); log.replaceChildren();
+    let actEl = null;
+    trace.forEach((a, k) => {
+      if (k > step) return;
+      const txt = a.kind === "pt" ? `#${String(k).padStart(2, "0")}  i=${a.i}  读页表 PageTable[${a.vpn}] @ PA ${a.pa}（为${a.for === "code" ? "取指" : "写数组"}做转换）`
+        : a.kind === "code" ? `#${String(k).padStart(2, "0")}  i=${a.i}  取指 ${a.ins.padEnd(24)} VA ${a.va} → PA ${a.pa}`
+        : `#${String(k).padStart(2, "0")}  i=${a.i}  写数组 array[${a.i}]         VA ${a.va} → PA ${a.pa}`;
+      const el = h("div", { class: k === step ? "act" : "" }, txt);
+      if (k === step) actEl = el;
+      log.append(el);
+    });
+    if (actEl) log.scrollTop = actEl.offsetTop - log.clientHeight + 24;
+    const a = trace[step];
+    const vpnNote = (va) => `VA ${va} = VPN ${Math.floor(va / 1024)} × 1024 + ${va % 1024}`;
+    $("tr-nar").innerHTML = !a ? "" : a.kind === "pt"
+      ? `第 ${step + 1} 次访存：先读页表项 <b>PageTable[${a.vpn}]</b>，物理地址 = 1024 + ${a.vpn} × 4 = <b>${a.pa}</b>，为${a.for === "code" ? "取指令 <code>" + a.ins + "</code>" : "写 <code>array[" + a.i + "]</code>"}提供 VPN ${a.vpn} → PFN ${TRACE.map[a.vpn]} 的转换。`
+      : a.kind === "code"
+        ? `第 ${step + 1} 次访存：取指令 <code>${a.ins}</code>。${vpnNote(a.va)}，VPN 1 → PFN 4，所以物理地址 = 4 × 1024 + ${a.va % 1024} = <b>${a.pa}</b>。`
+        : `第 ${step + 1} 次访存：<code>movl</code> 真正写入 <b>array[${a.i}]</b>。${vpnNote(a.va)}，VPN ${a.vpn} → PFN ${TRACE.map[a.vpn]}，物理地址 = ${TRACE.map[a.vpn]} × 1024 + ${a.va % 1024} = <b>${a.pa}</b>。`;
+    const upto = trace.slice(0, step + 1), ptN = upto.filter((x) => x.kind === "pt").length;
+    const st = $("tr-stats"); st.replaceChildren();
+    const add = (v, l) => st.append(h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l)));
+    add(upto.length + " / " + trace.length, "已发生的访存");
+    add(ptN, "其中页表访问");
+    add(upto.length ? Math.round((ptN / upto.length) * 100) + "%" : "0%", "页表访问占比");
+    add(upto.length - ptN, "程序本身需要的访存");
+  }
+  const trStep = OSTEP.stepper($("tr-step"), { steps: () => Math.max(1, trace.length), render: trRender, autoplayMs: 450 });
+  ["tr-i0", "tr-k", "tr-tlb"].forEach((id) => $(id).addEventListener("change", trBuild));
+  $("tr-book").onclick = () => { $("tr-i0").value = 0; $("tr-k").value = 5; $("tr-tlb").checked = false; trBuild(); };
+  $("tr-cross").onclick = () => { $("tr-i0").value = 237; $("tr-k").value = 5; trBuild(); };
+  trBuild();
+})();
+</script>
+</body></html>

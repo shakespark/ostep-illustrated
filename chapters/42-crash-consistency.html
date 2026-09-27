@@ -1,0 +1,1165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 42 章 · 崩溃一致性：FSCK 和日志</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+  .badge { display: inline-block; font-size: 12.5px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); margin: 2px 4px 2px 0; }
+  .badge.ok { background: var(--ok-soft); border-color: var(--ok); }
+  .badge.bad { background: var(--bad-soft); border-color: var(--bad); }
+  .badge.warn { background: var(--warn-soft); border-color: var(--warn); }
+  .badge.acc { background: var(--accent-soft); border-color: var(--accent); }
+  .tl { font-size: 13px; }
+  .tl th, .tl td { padding: 4px 8px; text-align: center; white-space: nowrap; }
+  .tl td:first-child, .tl th:first-child { text-align: left; color: var(--muted); }
+  .tl tr.cur td { background: var(--accent-soft); }
+  .tl tr.future td { opacity: .38; }
+  .tl tr.lost td { opacity: .3; text-decoration: line-through; }
+  .tl tr.barrier td { border-top: 2px dashed var(--muted); color: var(--muted); font-size: 12px; padding: 2px 8px; background: var(--surface); }
+  .tl tr.crash td { background: var(--bad-soft); color: var(--bad); font-weight: 700; border-top: 2px solid var(--bad); }
+  .tl .iss { color: var(--accent); }
+  .tl .cmp { color: var(--ok); font-weight: 600; }
+  .fsrow { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin: 4px 0 10px; }
+  .fsrow .flab { font-size: 12.5px; color: var(--muted); width: 6.5em; flex: none; }
+  .fsrow .cell { min-width: 64px; height: auto; min-height: 30px; flex-direction: column; line-height: 1.25; padding: 2px 4px; }
+  .fsrow .cell small { color: var(--muted); font-size: 10.5px; }
+  .fsrow .bit { min-width: 22px; }
+  .findings li { margin: 6px 0; }
+  .findings .cat { font-size: 12px; font-weight: 700; color: var(--accent); margin-right: 6px; }
+  .toggle[aria-pressed="true"] { background: var(--bad-soft); border-color: var(--bad); color: var(--bad); font-weight: 700; }
+  .ring { display: flex; gap: 4px; flex-wrap: wrap; }
+  .ring .cell { min-width: 58px; height: 46px; flex-direction: column; line-height: 1.2; }
+  .ring .cell small { font-size: 10.5px; color: var(--muted); }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .kv { font-family: var(--mono); font-size: 13px; background: var(--code-bg); border-radius: 8px; padding: 8px 12px; white-space: pre; overflow-x: auto; }
+</style>
+</head>
+<body data-chapter="42">
+<main>
+
+<h2 id="crux"><span class="num">1</span>本章要解决什么</h2>
+<div class="crux">
+  <p><strong>如何在崩溃的情况下更新磁盘？</strong>系统可能在任意两次写之间崩溃或断电，磁盘上的状态因此只被更新了一部分。
+  崩溃后系统重启、想再次挂载文件系统。既然崩溃可以发生在任意时刻，我们怎样保证磁盘上的文件系统镜像始终处于合理的状态？</p>
+  <p class="small muted">THE CRUX: HOW TO UPDATE THE DISK DESPITE CRASHES — The system may crash or lose power between any two writes, and thus the on-disk state may only partially get updated. … how do we ensure the file system keeps the on-disk image in a reasonable state?</p>
+</div>
+<p>前两章（第 40、41 章）里，文件系统的一次操作（比如给文件追加一块）要修改<strong>好几个</strong>磁盘结构：inode、位图、数据块……
+可磁盘一次只处理一个请求，这些写必然有先有后。如果恰好在两次写之间断电，磁盘上就会留下"改了一半"的结构——这就是<strong>崩溃一致性问题（crash-consistency problem）</strong>，也叫一致性更新问题（consistent-update problem）。</p>
+<p>本章介绍三条路：老派的<strong>文件系统检查程序 fsck</strong>（先让它乱，重启时再全盘修）、现代主流的<strong>日志（journaling，即预写日志 write-ahead logging）</strong>（先在别处记下"我要做什么"，再动手），
+以及软更新、写时复制、反向指针等<strong>其他方案</strong>。下一章的日志结构文件系统（LFS）把"写时复制"推到极致；第 45 章的校验和则会再次出现在日志里。</p>
+
+<h2 id="concepts"><span class="num">2</span>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>崩溃一致性问题</h4><p>一次逻辑更新要写多个块，崩溃可能发生在任意两次写之间，留下部分更新的磁盘镜像。</p></div>
+  <div class="card"><h4>fsck（file system checker）</h4><p>崩溃后、挂载前扫描整个磁盘，让元数据重新自洽。能用但太慢，且修不了"指向垃圾"。</p></div>
+  <div class="card"><h4>日志 / 预写日志（journaling / WAL）</h4><p>覆盖原位置之前，先把要写的内容作为一个事务写进日志；崩溃后只需看日志。</p></div>
+  <div class="card"><h4>事务：TxB … TxE</h4><p>TxB 记录事务号和各块的最终地址，TxE 是提交标记。TxE 落盘 = 事务提交（committed）。</p></div>
+  <div class="card"><h4>检查点（checkpoint）</h4><p>事务提交后，把日志里的块写到它们在文件系统中的最终位置。</p></div>
+  <div class="card"><h4>重做日志（redo logging）</h4><p>恢复时按顺序重放已提交但可能没检查点完的事务；没提交的直接丢弃。</p></div>
+  <div class="card"><h4>有序（元数据）日志</h4><p>只把元数据写进日志，数据块先写到最终位置——"先写被指向的，再写指向它的"。</p></div>
+  <div class="card"><h4>写屏障（write barrier）</h4><p>保证屏障前发出的写全部落盘后，屏障后的写才会落盘；日志协议靠它保证顺序。</p></div>
+</div>
+
+<h2 id="example"><span class="num">3</span>一个具体例子：给文件追加一块</h2>
+<p>工作负载很简单：打开一个已有文件，<code>lseek()</code> 到末尾，写入一个 4KB 块，关闭。文件系统也很小：
+inode 位图 8 位、数据位图 8 位、8 个 inode（编号 0–7，占 4 个块）、8 个数据块（编号 0–7）。现在只有 2 号 inode 被分配，它的唯一一个数据块是 4 号块 Da。</p>
+<figure class="fig"><div id="fig-before"></div><div id="fig-after" style="margin-top:10px"></div>
+<figcaption>上：追加之前，I[v1] 只指向块 4（Da），数据位图 00001000。下：我们希望到达的状态，I[v2] 同时指向块 4、5，数据位图 00001100，块 5 里是新数据 Db。</figcaption></figure>
+<div class="grid2">
+<div><p class="small muted">追加前的 inode I[v1]</p><div class="kv">owner       : remzi
+permissions : read-write
+size        : 1
+pointer     : 4
+pointer     : null
+pointer     : null
+pointer     : null</div></div>
+<div><p class="small muted">追加后的 inode I[v2]</p><div class="kv">owner       : remzi
+permissions : read-write
+size        : 2
+pointer     : 4
+pointer     : 5      ← 新增
+pointer     : null
+pointer     : null</div></div>
+</div>
+<p style="margin-top:14px">于是内存里有<strong>三个脏块</strong>要写回磁盘：新 inode <b>I[v2]</b>、新数据位图 <b>B[v2]</b>（00001100）、新数据块 <b>Db</b>。
+它们通常不会在 <code>write()</code> 时立即写盘，而是先在页缓存（page cache / buffer cache）里待上 5 秒或 30 秒，之后文件系统才发出三个写请求。
+问题是：三个写之间的任何时刻都可能断电。</p>
+
+<h2 id="scenarios"><span class="num">4</span>六种崩溃场景</h2>
+<p>三个写里"只成功了一个"有 3 种情况，"成功了两个"又有 3 种。原书逐一分析了它们：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>落盘的写</th><th>后果</th><th>元数据一致？</th></tr></thead>
+<tbody>
+<tr><td>只有 Db</td><td>数据在盘上，但没有 inode 指向它、位图也没标记——就像这次写从没发生。对文件系统来说不是问题（用户丢了数据）。</td><td>一致</td></tr>
+<tr><td>只有 I[v2]</td><td>inode 指向块 5，但 Db 还没写到那里：相信这个指针就会<strong>读到垃圾</strong>（块 5 的旧内容）。而且位图说块 5 空闲、inode 说它在用——<strong>不一致</strong>。</td><td>不一致</td></tr>
+<tr><td>只有 B[v2]</td><td>位图说块 5 已分配，却没有 inode 指向它——不一致；不修的话块 5 永远不会再被使用，即<strong>空间泄漏（space leak）</strong>。</td><td>不一致</td></tr>
+<tr><td>I[v2] + B[v2]</td><td>从元数据角度看<strong>完全一致</strong>：inode 指向 5，位图也说 5 在用。但块 5 里又是垃圾。</td><td>一致（但指向垃圾）</td></tr>
+<tr><td>I[v2] + Db</td><td>inode 指向正确的数据，但旧位图 B[v1] 说块 5 空闲——不一致，必须先解决才能使用文件系统。</td><td>不一致</td></tr>
+<tr><td>B[v2] + Db</td><td>位图说块 5 在用、块 5 也写好了，但没有 inode 指向它——不一致，而且我们根本不知道这个块属于哪个文件。</td><td>不一致</td></tr>
+</tbody></table></div>
+<p>我们真正想要的是<strong>原子地（atomically）</strong>把文件系统从一个一致状态（追加前）移动到另一个一致状态（追加后）。但磁盘一次只提交一个写，崩溃可能发生在任意两次写之间，所以做不到"天然原子"。下面的模拟器让你亲手制造每一种崩溃。</p>
+
+<section class="sim" id="sim-crash">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>三个写，在哪儿断电？</h3>
+    <div class="desc">选择三个写的发出顺序，用单步按钮决定"断电前落盘了几个写"。观察磁盘镜像、后果和 fsck 能修成什么样。上面一排按钮直接载入原书的 6 种场景。</div></div>
+  <div class="sim-body">
+    <div class="controls" id="crash-presets"></div>
+    <div class="controls">
+      <label>写入顺序 <select id="crash-order"></select></label>
+      <label><input type="checkbox" id="crash-fsck"> 显示 fsck 修复之后的磁盘</label>
+    </div>
+    <div id="crash-step"></div>
+    <div class="stage"><div id="crash-mem" class="small" style="margin-bottom:6px"></div><div id="crash-svg"></div></div>
+    <div class="narrate" id="crash-narr"></div>
+    <div class="stats" id="crash-stats"></div>
+    <div class="readout" id="crash-row"></div>
+  </div>
+</section>
+<div class="tip"><p>把写入顺序换成"Db 先写"的两种顺序（Db → I → B、Db → B → I），逐个崩溃点看一遍：你会发现<strong>任何崩溃点都不会让 inode 指向垃圾</strong>。
+"先写被指向的对象，再写指向它的对象"这条规则，就是后面有序日志和软更新（Soft Updates）的核心。</p></div>
+
+<h2 id="fsck"><span class="num">5</span>方案一：文件系统检查程序 fsck</h2>
+<p>早期文件系统的做法很"懒"：<strong>允许不一致发生，重启时再修</strong>。典型代表是 UNIX 工具 <code>fsck</code>（读作 "eff-ess-see-kay"、"eff-ess-check"……）。
+它在文件系统<strong>挂载之前</strong>运行（假设此时没有其他文件系统活动），完成后磁盘上的元数据应当重新自洽。注意它的目标<strong>只是元数据内部一致</strong>：
+像"inode 和位图都更新了、但数据块是垃圾"这种情况，它根本看不出来。</p>
+<p>按 McKusick 和 Kowalski 的论文，fsck 分几个阶段：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>检查项</th><th>做什么</th><th>出了问题怎么办</th></tr></thead>
+<tbody>
+<tr><td>超级块（Superblock）</td><td>合理性检查，如文件系统大小要大于已分配的块数</td><td>超级块可疑时改用备份副本</td></tr>
+<tr><td>空闲块（Free blocks）</td><td>扫描所有 inode、间接块、二级间接块……得出哪些块真正在用，重建分配位图；inode 位图同理</td><td><strong>以 inode 为准</strong>修正位图</td></tr>
+<tr><td>inode 状态（Inode state）</td><td>每个已分配 inode 的类型字段是否合法（普通文件、目录、符号链接……）</td><td>修不好的可疑 inode 被清除，inode 位图同步更新</td></tr>
+<tr><td>inode 链接（Inode links）</td><td>从根目录遍历整棵目录树，自己数出每个文件/目录的链接数，与 inode 里的链接计数比较</td><td>改正 inode 里的计数；已分配但没有任何目录引用的 inode 移入 <code>lost+found</code></td></tr>
+<tr><td>重复（Duplicates）</td><td>两个不同 inode 指向同一个块</td><td>明显坏的 inode 可以清除；或者复制该块，各给一份</td></tr>
+<tr><td>坏块（Bad blocks）</td><td>指针明显越界（比如地址大于分区大小）</td><td>没什么聪明办法，直接清除该指针</td></tr>
+<tr><td>目录检查（Directory checks）</td><td>目录的格式由文件系统自己定义，可以检查："." 和 ".." 是否是前两项；每个目录项引用的 inode 是否已分配；没有目录在整个层次中被链接超过一次</td><td>修正或删除坏的目录项</td></tr>
+</tbody></table></div>
+<p>fsck 的根本问题是<strong>太慢</strong>：磁盘越来越大、RAID 越来越普及，扫描整个卷找出所有已分配块、读完整棵目录树可能要几分钟甚至几小时。
+而且前提本身就有点不讲理——只为了三个块的更新，就把整块盘扫一遍。原书的比喻：钥匙掉在卧室地板上，你却从地下室开始把整栋房子搜一遍。能找到，但很浪费。</p>
+
+<section class="sim" id="sim-fsck">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>迷你 fsck（仿 fsck.py）</h3>
+    <div class="desc">随机生成一个小文件系统（16 个 inode、16 个数据块），再注入一种损坏。先自己找出不一致在哪、该怎么修，再点"运行 fsck"对答案。格式同 fsck.py：<code>[d a:0 r:4]</code> 表示目录、数据块 0、链接数 4；目录块里是 <code>(名字, inode 号)</code>，<code>u</code> 表示用户数据。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>文件系统种子 <input type="number" id="fk-seed" value="1" min="1" max="9999"></label>
+      <label>损坏 <select id="fk-corrupt"></select></label>
+      <label>损坏种子 <input type="number" id="fk-cseed" value="1" min="1" max="9999"></label>
+      <button class="primary" id="fk-run">运行 fsck</button>
+      <button id="fk-tree">显示目录树</button>
+    </div>
+    <div class="stage" id="fk-stage"></div>
+    <div class="narrate" id="fk-narr"></div>
+  </div>
+</section>
+
+<section class="sim" id="sim-fscktime">
+  <div class="sim-head"><span class="tag">估算</span><h3>fsck 与日志恢复要多久？</h3>
+    <div class="desc">粗略估算（参数可调）：fsck 的工作量正比于<strong>整个卷</strong>的元数据量，日志恢复正比于<strong>日志</strong>大小。原书的结论：日志把恢复时间从 O(卷大小) 降到 O(日志大小)。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>卷大小 <input type="number" id="ft-cap" value="16" min="1" max="1000"> TB</label>
+      <label>元数据占比 <input type="number" id="ft-meta" value="1" min="0.1" max="10" step="0.1"> %</label>
+      <label>fsck 读元数据速度（多为随机读）<input type="number" id="ft-rate" value="50" min="1" max="5000"> MB/s</label>
+      <label>日志大小 <input type="number" id="ft-log" value="128" min="1" max="4096"> MB</label>
+      <label>顺序读速度 <input type="number" id="ft-seq" value="200" min="1" max="5000"> MB/s</label>
+    </div>
+    <div class="stats" id="ft-stats"></div>
+  </div>
+</section>
+
+<h2 id="journal"><span class="num">6</span>方案二：日志（预写日志）</h2>
+<p>最流行的解法借自数据库领域的<strong>预写日志（write-ahead logging）</strong>，文件系统里出于历史原因叫<strong>日志（journaling）</strong>。
+第一个这么做的文件系统是 Cedar；今天的 Linux ext3/ext4、reiserfs、IBM JFS、SGI XFS、Windows NTFS 都用它。</p>
+<p>基本想法：<strong>在原地覆盖之前，先在磁盘上一个众所周知的位置写一条小"笔记"，描述你将要做什么</strong>。写笔记是"预写（write ahead）"，笔记组织成"日志（log）"。
+崩溃发生在覆盖过程中也不怕——回头看笔记，照着再做一遍即可；不必扫描整个磁盘。日志<strong>在更新时多做一点事，换来恢复时少做很多事</strong>。</p>
+<figure class="fig">
+<svg viewBox="0 0 700 120" width="700" height="120" role="img" aria-label="ext2 与 ext3 的磁盘布局">
+  <text x="10" y="30" font-size="13" class="t-muted">ext2</text>
+  <rect x="60" y="12" width="80" height="30" class="box"/><text x="100" y="32" font-size="13" text-anchor="middle">Super</text>
+  <rect x="140" y="12" width="140" height="30" class="box"/><text x="210" y="32" font-size="13" text-anchor="middle">Group 0</text>
+  <rect x="280" y="12" width="140" height="30" class="box"/><text x="350" y="32" font-size="13" text-anchor="middle">Group 1</text>
+  <rect x="420" y="12" width="120" height="30" class="box"/><text x="480" y="32" font-size="13" text-anchor="middle">…</text>
+  <rect x="540" y="12" width="140" height="30" class="box"/><text x="610" y="32" font-size="13" text-anchor="middle">Group N</text>
+  <text x="10" y="88" font-size="13" class="t-muted">ext3</text>
+  <rect x="60" y="70" width="80" height="30" class="box"/><text x="100" y="90" font-size="13" text-anchor="middle">Super</text>
+  <rect x="140" y="70" width="100" height="30" class="accent-soft" stroke-width="2"/><text x="190" y="90" font-size="13" text-anchor="middle" font-weight="700">Journal</text>
+  <rect x="240" y="70" width="120" height="30" class="box"/><text x="300" y="90" font-size="13" text-anchor="middle">Group 0</text>
+  <rect x="360" y="70" width="120" height="30" class="box"/><text x="420" y="90" font-size="13" text-anchor="middle">Group 1</text>
+  <rect x="480" y="70" width="80" height="30" class="box"/><text x="520" y="90" font-size="13" text-anchor="middle">…</text>
+  <rect x="560" y="70" width="120" height="30" class="box"/><text x="620" y="90" font-size="13" text-anchor="middle">Group N</text>
+</svg>
+<figcaption>ext3 的大部分磁盘结构与 ext2 相同（块组里仍是 inode 位图、数据位图、inode、数据块），唯一新增的是日志（这里放在同一分区里；也可放在另一个设备上，或作为文件系统中的一个文件）。</figcaption></figure>
+
+<h3>数据日志（data journaling）</h3>
+<p>还是那个追加：要写 I[v2]、B[v2]、Db。数据日志（ext3 的一种模式）先把它们写进日志，形成一个<strong>事务（transaction）</strong>：</p>
+<figure class="fig">
+<svg viewBox="0 0 640 110" width="640" height="110" role="img" aria-label="日志中的一个事务">
+  <text x="10" y="24" font-size="13" class="t-muted">Journal</text>
+  <g font-size="13" text-anchor="middle">
+  <rect x="80" y="36" width="100" height="40" class="accent-soft"/><text x="130" y="55">TxB</text><text x="130" y="70" font-size="11" class="t-muted">id=1, 地址</text>
+  <rect x="180" y="36" width="100" height="40" class="box"/><text x="230" y="61">I[v2]</text>
+  <rect x="280" y="36" width="100" height="40" class="box"/><text x="330" y="61">B[v2]</text>
+  <rect x="380" y="36" width="100" height="40" class="box"/><text x="430" y="61">Db</text>
+  <rect x="480" y="36" width="100" height="40" class="ok-soft"/><text x="530" y="55">TxE</text><text x="530" y="70" font-size="11" class="t-muted">id=1</text>
+  </g>
+  <path d="M180 88 H480" class="arrow"/><text x="330" y="104" font-size="12" text-anchor="middle" class="t-muted">物理日志（physical logging）：原样记录块的内容</text>
+</svg>
+<figcaption>TxB（transaction begin）记录这次更新的信息：各块的最终地址和事务号 TID；中间三块是块内容本身；TxE（transaction end）是结束标记，也含 TID。</figcaption></figure>
+<p>把块的<strong>原样内容</strong>写进日志叫<strong>物理日志（physical logging）</strong>；另一种<strong>逻辑日志（logical logging）</strong>只记"本次要把数据块 Db 追加到文件 X"，更紧凑、可能更快，但更复杂。
+事务安全落盘后，再把 I[v2]、B[v2]、Db 写到它们的最终位置，这叫<strong>加检查点（checkpointing）</strong>。于是最初的协议是两步：<b>① 日志写入</b>，<b>② 检查点</b>。</p>
+
+<h3>顺序问题：能不能五块一起写？</h3>
+<p>一块一块地写、每写一块等它完成，太慢。理想情况是五个写一次性发出，变成一次顺序写。但这<strong>不安全</strong>：面对一个大写请求，磁盘内部可能调度，以任意顺序完成其中的小块。
+比如磁盘先写完 TxB、I[v2]、B[v2]、TxE，之后才写 Db——如果恰好在这中间断电：</p>
+<figure class="fig">
+<svg viewBox="0 0 640 96" width="640" height="96" role="img" aria-label="Db 没写完但 TxE 已落盘的日志">
+  <text x="10" y="24" font-size="13" class="t-muted">Journal</text>
+  <g font-size="13" text-anchor="middle">
+  <rect x="80" y="34" width="100" height="40" class="accent-soft"/><text x="130" y="52">TxB</text><text x="130" y="67" font-size="11" class="t-muted">id=1</text>
+  <rect x="180" y="34" width="100" height="40" class="box"/><text x="230" y="59">I[v2]</text>
+  <rect x="280" y="34" width="100" height="40" class="box"/><text x="330" y="59">B[v2]</text>
+  <rect x="380" y="34" width="100" height="40" class="bad-soft" stroke-width="2"/><text x="430" y="59" font-weight="700">??</text>
+  <rect x="480" y="34" width="100" height="40" class="ok-soft"/><text x="530" y="52">TxE</text><text x="530" y="67" font-size="11" class="t-muted">id=1</text>
+  </g>
+</svg>
+<figcaption>事务看起来完全合法：有开始、有结束，事务号匹配。文件系统没法判断第四块是不是垃圾——它本来就是任意的用户数据。恢复时会照单全收，把 ?? 拷到 Db 应在的位置。要是这块是超级块之类的关键结构，文件系统甚至可能无法挂载。</figcaption></figure>
+<p>解决办法：<strong>分两步发出</strong>。先一次性发出除 TxE 以外的所有块；等它们<strong>全部完成</strong>后，再发出 TxE。
+磁盘保证任何 512 字节的写要么完整发生、要么完全没发生（不会写一半），所以把 TxE 做成一个 512 字节的块，它的写入就是<strong>原子的</strong>。协议变成三步：</p>
+<ol>
+  <li><b>日志写入（Journal write）</b>：把事务内容（TxB、元数据、数据）写入日志，等待完成。</li>
+  <li><b>日志提交（Journal commit）</b>：写入提交块 TxE，等待完成；此时事务称为<strong>已提交（committed）</strong>。</li>
+  <li><b>检查点（Checkpoint）</b>：把更新的内容（元数据和数据）写到它们在磁盘上的最终位置。</li>
+</ol>
+<div class="aside" data-title="旁注：强制写入磁盘（Forcing writes to disk）">
+<p>过去，要保证 A 在 B 之前落盘很简单：发出 A，等磁盘中断告诉 OS 完成了，再发 B。后来磁盘有了写缓存（write buffering，也叫立即报告 immediate reporting）：
+写进磁盘自己的内存缓存就报告"完成"，这时再发 B，就不能保证 B 落在 A 之后。办法之一是关掉写缓存；更现代的办法是发出显式的<strong>写屏障（write barrier）</strong>——屏障完成时，保证屏障前发出的写都先于屏障后的写到达磁盘。
+遗憾的是，研究发现有些厂商为了"更快"而<strong>故意忽略写屏障请求</strong>。正如 Kahan 所说：快的几乎总能打败慢的，即使快的是错的。</p></div>
+<div class="aside" data-title="旁注：优化日志写入——事务校验和（ext4）">
+<p>先写 TxB 和内容、等完成、再写 TxE，通常会多付出一次磁盘旋转。Vijayan Prabhakaran 的主意：在 TxB 和 TxE 里放一个<strong>日志内容的校验和（checksum）</strong>。
+这样整个事务可以一次写出、不用等；恢复时如果重新计算的校验和与记录的不符，就知道写事务时发生了崩溃，丢弃这次更新。
+常见情况更快，而且从日志读出的内容都受校验和保护，还更可靠。这个改进被 Linux ext4 采用，随 Android 等平台跑在数以百万计的机器上。（校验和本身见第 45 章。）</p></div>
+
+<h3>恢复（Recovery）</h3>
+<p>崩溃可能发生在这串写的任意时刻：</p>
+<ul>
+  <li><b>在事务安全写入日志之前</b>（第 2 步完成前）崩溃：很简单，这次挂起的更新直接跳过。</li>
+  <li><b>事务已提交、检查点未完成</b>时崩溃：重启后恢复程序扫描日志，找出已提交的事务，<strong>按顺序重放（replay）</strong>，再次把块写到最终位置。这种最简单的日志形式叫<strong>重做日志（redo logging）</strong>。</li>
+  <li><b>检查点进行到一半</b>崩溃也没关系：最坏情况就是某些块在恢复时被再写一遍。恢复很少发生，几次多余的写不足为虑。</li>
+</ul>
+
+<h3>批量更新日志（Batching log updates）</h3>
+<p>在同一目录里连续创建 file1、file2：每次创建都要改 inode 位图、新文件的 inode、父目录的数据块（多了一个目录项）、父目录的 inode（修改时间变了）。
+如果每次创建各自提交一个事务，同样这几个块会被反复写进日志。ext3 等文件系统的做法是把所有更新缓冲进一个<strong>全局事务（global transaction）</strong>：
+在内存里把这些块标脏、加进当前事务的块列表，等到该写盘时（比如 5 秒超时）一次提交。这样就避免了大量多余的写流量。</p>
+
+<h3>让日志有限：循环日志</h3>
+<p>日志空间有限。一直往里追加事务会出两个问题：日志越长，恢复要重放的东西越多；更严重的是日志满了以后，<strong>再也提交不了新事务</strong>，文件系统就没法用了。
+所以日志被当作<strong>循环（circular）</strong>数据结构反复使用：事务检查点完成后，释放它在日志里占的空间。一种办法是在<strong>日志超级块（journal superblock）</strong>（不要和文件系统超级块混淆）里记录最老和最新的尚未检查点的事务，其余空间都是空闲的。</p>
+<section class="sim" id="sim-ring">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>循环日志与日志超级块</h3>
+    <div class="desc">日志区有 8 个槽（每个事务假设占 1 槽）。提交事务、加检查点、释放，观察日志超级块记录的范围；日志满时新事务只能等待。随时"崩溃并恢复"，看恢复要重放哪些事务。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <button class="primary" id="rg-commit">提交新事务</button>
+      <button id="rg-ckpt">检查点最老的事务</button>
+      <button id="rg-free">释放（更新日志超级块）</button>
+      <button id="rg-crash">崩溃并恢复</button>
+      <button id="rg-reset">重置</button>
+    </div>
+    <div class="stage"><div id="rg-jsb" class="small" style="margin-bottom:8px"></div><div class="ring" id="rg-ring"></div></div>
+    <div class="narrate" id="rg-narr">点"提交新事务"开始。</div>
+  </div>
+</section>
+<p>加上释放这一步，<strong>数据日志的最终协议</strong>是四步：</p>
+<ol>
+  <li><b>Journal write</b>：把事务内容（TxB 和更新内容）写进日志，等待完成。</li>
+  <li><b>Journal commit</b>：写提交块 TxE，等待完成；事务提交。</li>
+  <li><b>Checkpoint</b>：把更新内容写到文件系统中的最终位置。</li>
+  <li><b>Free</b>：之后某个时刻，更新日志超级块，把该事务标记为空闲。</li>
+</ol>
+
+<h2 id="ordered"><span class="num">7</span>元数据日志（有序日志）</h2>
+<p>数据日志恢复很快，但平时太慢：每个数据块都要<strong>写两遍</strong>（日志一遍、最终位置一遍），顺序写负载只能跑到磁盘峰值带宽的一半；日志和主文件系统之间还要来回寻道。
+更简单、更常见的是<strong>有序日志（ordered journaling）</strong>，也叫<strong>元数据日志（metadata journaling）</strong>：用户数据不进日志，日志里只有</p>
+<figure class="fig">
+<svg viewBox="0 0 540 70" width="540" height="70" role="img" aria-label="元数据日志中的事务">
+  <text x="10" y="24" font-size="13" class="t-muted">Journal</text>
+  <g font-size="13" text-anchor="middle">
+  <rect x="80" y="18" width="100" height="40" class="accent-soft"/><text x="130" y="43">TxB</text>
+  <rect x="180" y="18" width="100" height="40" class="box"/><text x="230" y="43">I[v2]</text>
+  <rect x="280" y="18" width="100" height="40" class="box"/><text x="330" y="43">B[v2]</text>
+  <rect x="380" y="18" width="100" height="40" class="ok-soft"/><text x="430" y="43">TxE</text>
+  </g>
+</svg>
+<figcaption>Db 不再写进日志，而是只写一次、直接写到文件系统中的最终位置。磁盘流量大部分是数据，所以这大大减轻了日志的负担。</figcaption></figure>
+<p>那 Db 什么时候写？<strong>顺序很关键</strong>。如果在事务（I[v2]、B[v2]）提交<strong>之后</strong>才写 Db，而 Db 没来得及落盘就崩溃：恢复程序重放 I[v2] 和 B[v2]，
+元数据是一致的，但 I[v2] 指向垃圾——Db 不在日志里，谁也救不回来。所以 ext3 等系统<strong>先写数据块，再写相关元数据</strong>：</p>
+<ol>
+  <li><b>Data write</b>：把数据写到最终位置，等待完成（等待是可选的，见下）。</li>
+  <li><b>Journal metadata write</b>：把 TxB 和元数据写进日志，等待完成。</li>
+  <li><b>Journal commit</b>：写提交块 TxE，等待完成；事务（包括数据）提交。</li>
+  <li><b>Checkpoint metadata</b>：把元数据写到最终位置。</li>
+  <li><b>Free</b>：之后在日志超级块里标记事务空闲。</li>
+</ol>
+<p>强制先写数据，就能保证<strong>指针永远不会指向垃圾</strong>。"先写被指向的对象，再写指向它的对象"是崩溃一致性的核心规则。
+另外，第 1 步不必在第 2 步之前完成：数据、TxB、日志元数据可以<strong>同时发出</strong>，唯一的要求是第 1、2 步都在第 3 步（发出 TxE）之前完成。</p>
+<p>实践中元数据日志比完整的数据日志更流行：Windows NTFS、SGI XFS 都用某种元数据日志；Linux ext3 可选 data、ordered、unordered（数据任何时候都可以写）三种模式。
+<strong>这几种模式都保证元数据一致，区别只在用户数据的语义。</strong></p>
+
+<h3>时间线（原书 Figure 42.1 / 42.2）</h3>
+<p>时间向下增长，每一行是某个写可以被发出（issue）或可能完成（complete）的逻辑时刻；虚线是必须遵守写顺序的地方。同一段里的写可以任意顺序完成。</p>
+<div>
+<figure class="fig"><div class="table-wrap" style="margin:0"><table class="tl">
+<thead><tr><th></th><th>TxB</th><th>内容<br><small>(元数据)</small></th><th>内容<br><small>(数据)</small></th><th>TxE</th><th>FS 元数据</th><th>FS 数据</th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="iss">issue</td><td class="iss">issue</td><td class="iss">issue</td><td></td><td></td><td></td></tr>
+<tr><td>2</td><td class="cmp">complete</td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td>3</td><td></td><td class="cmp">complete</td><td></td><td></td><td></td><td></td></tr>
+<tr><td>4</td><td></td><td></td><td class="cmp">complete</td><td></td><td></td><td></td></tr>
+<tr class="barrier"><td colspan="7">┄┄ 以上全部完成 ┄┄</td></tr>
+<tr><td>5</td><td></td><td></td><td></td><td class="iss">issue</td><td></td><td></td></tr>
+<tr><td>6</td><td></td><td></td><td></td><td class="cmp">complete</td><td></td><td></td></tr>
+<tr class="barrier"><td colspan="7">┄┄ 已提交 ┄┄</td></tr>
+<tr><td>7</td><td></td><td></td><td></td><td></td><td class="iss">issue</td><td class="iss">issue</td></tr>
+<tr><td>8</td><td></td><td></td><td></td><td></td><td class="cmp">complete</td><td></td></tr>
+<tr><td>9</td><td></td><td></td><td></td><td></td><td></td><td class="cmp">complete</td></tr>
+</tbody></table></div><figcaption>Figure 42.1 数据日志时间线</figcaption></figure>
+<figure class="fig"><div class="table-wrap" style="margin:0"><table class="tl">
+<thead><tr><th></th><th>TxB</th><th>内容<br><small>(元数据)</small></th><th>TxE</th><th>FS 元数据</th><th>FS 数据</th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="iss">issue</td><td class="iss">issue</td><td></td><td></td><td class="iss">issue</td></tr>
+<tr><td>2</td><td></td><td></td><td></td><td></td><td class="cmp">complete</td></tr>
+<tr><td>3</td><td class="cmp">complete</td><td></td><td></td><td></td><td></td></tr>
+<tr><td>4</td><td></td><td class="cmp">complete</td><td></td><td></td><td></td></tr>
+<tr class="barrier"><td colspan="6">┄┄ 以上全部完成（包括数据）┄┄</td></tr>
+<tr><td>5</td><td></td><td></td><td class="iss">issue</td><td></td><td></td></tr>
+<tr><td>6</td><td></td><td></td><td class="cmp">complete</td><td></td><td></td></tr>
+<tr class="barrier"><td colspan="6">┄┄ 已提交 ┄┄</td></tr>
+<tr><td>7</td><td></td><td></td><td></td><td class="iss">issue</td><td></td></tr>
+<tr><td>8</td><td></td><td></td><td></td><td class="cmp">complete</td><td></td></tr>
+</tbody></table></div><figcaption>Figure 42.2 元数据日志时间线：数据写可与 TxB、日志内容同时发出，但必须在 TxE 发出之前完成</figcaption></figure>
+</div>
+<p style="margin-top:14px">注意：图中每个写的完成时刻是任意画的，真实系统里由 I/O 子系统决定，它可能为了性能重排写。我们唯一能依赖的顺序保证，就是协议正确性所要求的那些（虚线）。</p>
+
+<h2 id="sim-journal-sec"><span class="num">8</span>日志模拟器：随时拔电源</h2>
+<p>下面把两张时间线变成可以"拔电源"的模拟器。每一步是一次写的<strong>发出</strong>或<strong>完成（落盘）</strong>；同一批发出的写，磁盘可以按任意顺序完成（改"完成顺序种子"就会重排，种子 0 是原书时间线上的顺序）。
+按下"⚡ 拔电源"后，已发出但没完成的写全部丢失，恢复程序扫描日志、决定重放还是丢弃，然后判断文件系统落在什么状态。拔电源保持按下时继续单步，可以逐个检查每个崩溃点。</p>
+<section class="sim" id="sim-journal">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>日志协议时间线 · 断电 · 恢复（replay）</h3>
+    <div class="desc">对比六种写法：无日志、数据日志、有序元数据日志、错误的"提交后再写数据"、不等屏障一次写出、带事务校验和一次写出。关注：哪个崩溃点会得到"不一致"或"指向垃圾"？</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>协议 <select id="jn-mode">
+        <option value="data">数据日志（data journaling）</option>
+        <option value="ordered">有序元数据日志（ordered）</option>
+        <option value="late">元数据日志，但 Db 在提交之后才写（错误）</option>
+        <option value="nobarrier">数据日志，五块一起发出、不等屏障（错误）</option>
+        <option value="checksum">数据日志 + 事务校验和，一起发出（ext4）</option>
+        <option value="none">无日志：直接原地写</option>
+      </select></label>
+      <label>完成顺序种子 <input type="number" id="jn-seed" value="0" min="0" max="9999"></label>
+      <button id="jn-shuffle">换一种完成顺序</button>
+      <button class="toggle" id="jn-crash" aria-pressed="false">⚡ 拔电源 → 恢复</button>
+      <button id="jn-sweep">枚举所有崩溃点</button>
+    </div>
+    <div id="jn-step"></div>
+    <div class="stage"><div id="jn-svg"></div></div>
+    <div class="narrate" id="jn-narr"></div>
+    <div class="stats" id="jn-stats"></div>
+    <div class="table-wrap"><table class="tl" id="jn-tl"></table></div>
+    <div class="table-wrap" id="jn-sweep-out" hidden></div>
+  </div>
+</section>
+
+<h2 id="reuse"><span class="num">9</span>棘手情况：块复用与撤销记录</h2>
+<p>ext3 的主要作者 Stephen Tweedie 说过："整个系统里最可怕的部分是什么？……是删除文件。与删除有关的一切都很麻烦……你会做噩梦，梦见块被删除后又被重新分配。"</p>
+<p>他举的例子（使用元数据日志，数据块不进日志）：目录 <code>foo</code> 的数据在块 1000。用户在 foo 里创建了一个文件，由于<strong>目录内容算元数据</strong>，foo 的目录块被写进了日志。
+接着用户删除 foo 里的一切和 foo 本身，块 1000 被释放；然后创建新文件 <code>bar</code>，恰好复用了块 1000。bar 的 inode 进了日志，但 bar 的数据是普通用户数据，<strong>不进日志</strong>，直接写到块 1000。
+此时崩溃，日志里这些事务都还在：重放时会把旧的 foo 目录内容写到块 1000——<strong>bar 的用户数据被旧目录内容覆盖了</strong>！</p>
+<section class="sim" id="sim-revoke">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>块复用 + 撤销记录（revoke record）</h3>
+    <div class="desc">单步走一遍 Tweedie 的例子；打开"撤销记录"再走一遍，对比恢复结果。</div></div>
+  <div class="sim-body">
+    <div class="controls"><label><input type="checkbox" id="rv-on"> 启用撤销记录（ext3 的做法）</label></div>
+    <div id="rv-step"></div>
+    <div class="stage" id="rv-stage"></div>
+    <div class="narrate" id="rv-narr"></div>
+  </div>
+</section>
+<p>解决办法有好几种。比如：在块的删除被检查点移出日志之前，干脆<strong>不复用这些块</strong>。Linux ext3 的做法是在日志里加一种新记录——<strong>撤销记录（revoke record）</strong>：
+删除目录时往日志写一条撤销记录；重放时先扫描所有撤销记录，被撤销的数据<strong>永远不会被重放</strong>。</p>
+
+<h2 id="other"><span class="num">10</span>方案三：其他方法</h2>
+<div class="cards">
+  <div class="card"><h4>软更新（Soft Updates）</h4><p>Ganger 和 Patt 提出：<strong>仔细排序所有写</strong>，使磁盘结构永远不会处于不一致状态（例如先写数据块，再写指向它的 inode）。难点是需要了解每一种文件系统数据结构，复杂度很高；而日志层几乎不需要知道这些。</p></div>
+  <div class="card"><h4>写时复制（Copy-on-Write, COW）</h4><p>如 Sun ZFS：<strong>从不原地覆盖</strong>文件或目录，而是把新版本写到未使用的位置；一批更新完成后，翻转文件系统的根结构去指向新结构。下一章的 LFS 是 COW 的早期例子。</p></div>
+  <div class="card"><h4>基于反向指针的一致性（BBC）</h4><p>写之间<strong>不强制任何顺序</strong>。每个块都带一个反向指针（如数据块记录它属于哪个 inode）。访问文件时检查正向指针指向的块是否指回来；是则一致，否则报错。一种新的"懒"一致性。</p></div>
+  <div class="card"><h4>乐观崩溃一致性（Optimistic）</h4><p>尽量减少等待磁盘写完成的次数：用推广的<strong>事务校验和</strong>等技术尽可能多地同时发出写，再检测可能出现的不一致。某些负载下性能提高一个数量级，但需要略微不同的磁盘接口。</p></div>
+</div>
+<figure class="fig">
+<svg viewBox="0 0 720 200" width="720" height="200" role="img" aria-label="写时复制：新版本写到新位置，最后翻转根指针">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="var(--muted)"/></marker></defs>
+  <g font-size="13" text-anchor="middle">
+    <rect x="30" y="20" width="90" height="34" class="box"/><text x="75" y="42">根（旧）</text>
+    <rect x="30" y="90" width="90" height="34" class="box"/><text x="75" y="112">inode（旧）</text>
+    <rect x="30" y="150" width="90" height="34" class="box"/><text x="75" y="172">Da</text>
+    <path d="M75 54 V88" class="arrow" marker-end="url(#ah)"/><path d="M75 124 V148" class="arrow" marker-end="url(#ah)"/>
+    <rect x="300" y="150" width="90" height="34" class="ok-soft"/><text x="345" y="172">Db（新位置）</text>
+    <rect x="300" y="90" width="90" height="34" class="ok-soft"/><text x="345" y="112">inode'（新）</text>
+    <path d="M330 124 V148" class="arrow" marker-end="url(#ah)"/>
+    <path d="M320 124 C 250 150, 170 160, 122 165" class="arrow" marker-end="url(#ah)"/>
+    <rect x="560" y="20" width="110" height="34" class="accent-soft" stroke-width="2"/><text x="615" y="42" font-weight="700">根'（最后写）</text>
+    <path d="M600 54 C 560 80, 440 95, 392 104" class="arrow" marker-end="url(#ah)"/>
+    <text x="200" y="36" font-size="12" class="t-muted">① 新内容写到空闲位置，旧版本原样保留</text>
+    <text x="500" y="160" font-size="12" class="t-muted">② 最后一次原子写翻转根</text>
+    <text x="500" y="178" font-size="12" class="t-muted">崩溃在 ② 之前 → 看到的仍是完整的旧版本</text>
+  </g>
+</svg>
+<figcaption>写时复制本质上也是"先写被指向者、最后写指针"：只有最后那次根指针的更新需要原子，之前任何时刻崩溃，旧版本都完好无损。</figcaption></figure>
+
+<h2 id="predict"><span class="num">11</span>先预测再验证</h2>
+<div class="exercise"><div class="q">在"三个写"模拟器里选择顺序 I → B → Db。预测：断电前落盘 1 个、2 个写时，fsck 分别能把磁盘修成什么样？用户最后能读到什么？</div>
+<details class="reveal"><summary>看答案</summary><div>落盘 1 个（只有 I[v2]）：位图与 inode 不一致，fsck 信任 inode，把位图第 5 位置 1——元数据修好了，但块 5 里仍是垃圾，用户会读到垃圾。
+落盘 2 个（I[v2]+B[v2]）：元数据一致，fsck 什么也发现不了，用户同样读到垃圾。fsck 只能保证元数据自洽，不能保证数据正确。</div></details></div>
+<div class="exercise"><div class="q">在日志模拟器里选"数据日志"，打开"⚡ 拔电源"，从第 1 步单步走到最后。预测：哪些崩溃点恢复后是旧状态、哪些是新状态？有没有"不一致"？再点"枚举所有崩溃点"验证。</div>
+<details class="reveal"><summary>看答案</summary><div>TxE 落盘之前的所有崩溃点：恢复程序找不到匹配的 TxE（或根本没有 TxB），丢弃事务 → 旧状态。TxE 落盘之后（检查点前、中、后、释放前）：重放 → 新状态。释放之后：日志超级块说事务已释放，什么也不做，文件系统本来就是新状态。
+全程没有任何不一致——代价是 9 次块写（Db 写了两次）、三次等待。</div></details></div>
+<div class="exercise"><div class="q">切换到"五块一起发出、不等屏障"，种子 0（原书的重排：TxB、I[v2]、B[v2]、TxE 先完成，Db 最后）。预测哪一个崩溃点是危险的、会得到什么结果；再把种子改成 1、2、3……还能遇到更糟的情况吗？</div>
+<details class="reveal"><summary>看答案</summary><div>危险点是"J:TxE 已完成、J:Db 还没完成"：事务看上去已提交，重放把日志槽里的旧垃圾拷到块 5，得到"元数据一致但指向垃圾"。
+换种子后，如果 TxE 抢在 J:I[v2] 或 J:B[v2] 之前完成，重放甚至会用垃圾覆盖 inode 块或位图块——元数据本身被毁，这就是原书说的"如果恰好是超级块，文件系统可能无法挂载"。</div></details></div>
+<div class="exercise"><div class="q">同样一次写出，切换到"数据日志 + 事务校验和"。预测：还会有危险崩溃点吗？和"等屏障"的数据日志比，写的次数和等待次数有什么区别？</div>
+<details class="reveal"><summary>看答案</summary><div>没有危险点了：只要日志内容有任何一块没写完，恢复时重新计算的校验和就和 TxB/TxE 中记录的不符，事务被丢弃。写的次数一样（仍是 9 次），但日志写入阶段少了一次等待（TxE 不必等前四块），这正是 ext4 的优化。</div></details></div>
+<div class="exercise"><div class="q">选"有序元数据日志"，数一数块写次数；再选"Db 在提交之后才写"，找出危险的崩溃点。为什么有序模式里 Db 可以和 TxB 同时发出，却必须在 TxE 之前完成？</div>
+<details class="reveal"><summary>看答案</summary><div>有序模式 8 次块写（Db 只写一次）。"提交后写数据"时，TxE 已落盘但 FS 数据块 Db 未落盘的崩溃点会得到"元数据一致但指向垃圾"：重放 I[v2]、B[v2]，但 Db 不在日志里。
+TxE 是"这个事务成立"的承诺，一旦它落盘，重放就会让 inode 指向块 5；所以块 5 的内容必须在那之前到位。至于 Db 与 TxB/日志元数据之间谁先谁后无所谓，因为在 TxE 落盘之前它们都不会被任何人"相信"。</div></details></div>
+<div class="exercise"><div class="q">在迷你 fsck 里分别选"inode 位图：已用 inode 被标为空闲"和"数据位图：空闲块被标为已用"。预测 fsck 会以哪一方为准？再选"目录项指向未分配的 inode"和"孤儿 inode"，fsck 该怎么修？（改编自 fsck.py 的作业题）</div>
+<details class="reveal"><summary>看答案</summary><div>位图与 inode 不一致时，fsck 信任 inode（inode 里的信息更丰富，位图只是它的摘要），据此重建位图。
+目录项指向未分配的 inode：这个目录项是悬空的，删除它（或者也可以考虑恢复 inode，但信息不足）。孤儿 inode：已分配却没有目录引用它，fsck 把它移进 lost+found，数据得以保留，只是名字丢了。</div></details></div>
+
+<h2 id="lab"><span class="num">12</span>动手实验：在磁盘镜像上拔电源</h2>
+<div class="lab">
+<p><code>labs/42-crash-consistency/journal.c</code> 把本章的追加例子搬到一个 16 块（每块 512 字节）的镜像文件上，实现了四种写协议（无日志、数据日志、不等屏障的数据日志、有序日志），
+并在子进程里"写满 n 个块就 <code>_exit()</code>"来模拟断电，然后运行恢复（扫描 TxB/TxE、重放）和一个类似 fsck 的检查。它还测量了 <code>fsync()</code> 的真实开销，并演示应用层原子更新文件的标准做法。</p>
+<pre><code><span class="cmd">cd labs/42-crash-consistency && make</span>
+<span class="cmd">./journal crashtest</span>          # 4 种协议 × 每个崩溃点
+<span class="cmd">./journal show nobarrier 4</span>   # 看一个崩溃点：崩溃后/恢复后的整个镜像
+<span class="cmd">./journal fsyncbench</span>         # write / fdatasync / fsync / 原子 rename 的开销</code></pre>
+<p class="small muted">示例输出（节选，你的机器上 fsync 的数字会不同）：</p>
+<pre><code>== 无日志（原地写 I、B、Db）：共 3 次块写 ==
+  写序列：I[v2] → B[v2] → Db
+  崩溃于第 1个写之后 I[v2]      | 恢复：日志中没有事务 → 什么都不做
+                           结果：不一致 + inode 指向垃圾
+  崩溃于第 2个写之后 B[v2]      | 恢复：日志中没有事务 → 什么都不做
+                           结果：元数据一致，但 inode 指向垃圾！
+
+== 数据日志（data journaling）：共 9 次块写 ==
+  写序列：J:TxB → J:I[v2] → J:B[v2] → J:Db → J:TxE → I[v2] → B[v2] → Db → JSB:free
+  崩溃于第 4个写之后 J:Db       | 恢复：有 TxB 无匹配 TxE（未提交）→ 丢弃事务
+                           结果：旧状态（一致；追加丢失）
+  崩溃于第 5个写之后 J:TxE      | 恢复：发现已提交事务 → 重放（replay）
+                           结果：新状态（一致，追加成功）
+
+== 数据日志但不等屏障（磁盘把 TxE 排在 Db 前）：共 9 次块写 ==
+  写序列：J:TxB → J:I[v2] → J:B[v2] → J:TxE → J:Db → I[v2] → B[v2] → Db → JSB:free
+  崩溃于第 4个写之后 J:TxE      | 恢复：发现已提交事务 → 重放（replay）
+                           结果：元数据一致，但 inode 指向垃圾！
+
+== 有序元数据日志（ordered）：共 8 次块写 ==
+  写序列：Db → J:TxB → J:I[v2] → J:B[v2] → J:TxE → I[v2] → B[v2] → JSB:free
+  崩溃于第 1个写之后 Db         | 恢复：日志中没有事务 → 什么都不做
+                           结果：旧状态（一致；Db 写了但没人指向，追加丢失）
+
+$ ./journal show nobarrier 4     （恢复后的镜像，节选）
+  [ 4] J3  GARBAGE(old block 4)        ← 日志里 Db 的槽还是旧垃圾
+  [ 5] J4  TXE tid=1                   ← 但 TxE 已经落盘
+  [ 7] I   INODE size=2 ptr=4,5,-1,-1
+  [13] D5  GARBAGE(old block 4)        ← 重放把垃圾拷到了块 5
+--- 检查：元数据一致，但 inode 指向垃圾！
+
+$ ./journal fsyncbench
+  write()                  200 次 4KB 追加：平均      6.8 us/次
+  write() + fdatasync()    200 次 4KB 追加：平均   5021.0 us/次
+  write() + fsync()        200 次 4KB 追加：平均   6078.9 us/次
+  原子更新（tmp+fsync+rename+fsync目录）100 次：平均  13312.2 us/次
+  config.txt 最终内容：version=99</code></pre>
+<p>该观察到什么：数据日志和有序日志在<strong>任何崩溃点</strong>都不会留下不一致或指向垃圾的文件系统；去掉屏障后，原书描述的"TxB I[v2] B[v2] ?? TxE"立刻出现。
+<code>write()</code> 只把数据拷进页缓存（几微秒），加上 <code>fsync()</code> 要等设备真正落盘，慢了近千倍——这就是日志要批量提交、而不是每个操作都单独等待的原因。
+最后的"写临时文件 → fsync → rename → fsync 目录"是应用程序原子替换文件的标准写法，本质上仍是"先写被指向的内容，再原子地切换指针"。</p>
+</div>
+
+<h2 id="quiz"><span class="num">13</span>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="2"><div class="q">追加一块时只有 I[v2] 和 B[v2] 落盘、Db 没落盘。下列说法正确的是？</div>
+<div class="opts"><button>A. 这相当于写从未发生</button><button>B. 元数据不一致，fsck 会发现并修复</button><button>C. 元数据一致，但 inode 指向垃圾，fsck 发现不了</button><button>D. 发生空间泄漏</button></div>
+<div class="explain">inode 指向 5、位图也标记 5 已用，元数据完全自洽；问题在于块 5 里是旧内容。fsck 只检查元数据，看不出来。</div></div>
+<div class="mcq" data-answer="1"><div class="q">位图与 inode 对某个块是否已分配意见不一时，fsck 以谁为准？</div>
+<div class="opts"><button>A. 以最近修改的那个为准</button><button>B. inode（扫描 inode 和间接块重建位图）</button><button>C. 两者都清零</button><button>D. 位图</button></div>
+<div class="explain">原书：fsck 扫描 inode、间接块等得出真正在用的块，据此生成正确的位图——"trusting the information within the inodes"。</div></div>
+<div class="mcq" data-answer="3"><div class="q">数据日志协议里，事务在什么时刻算"已提交"？</div>
+<div class="opts"><button>A. TxB 写入日志时</button><button>B. 所有内容块写入日志时</button><button>C. 检查点完成时</button><button>D. TxE 写入日志并完成时</button></div>
+<div class="explain">Journal commit 步骤：写 TxE、等待完成，事务才算提交。在此之前崩溃，恢复会丢弃事务。</div></div>
+<div class="mcq" data-answer="0"><div class="q">为什么不能把 TxB、I[v2]、B[v2]、Db、TxE 五个块作为一个大写请求一次发出（不带校验和）？</div>
+<div class="opts"><button>A. 磁盘可能以任意顺序完成其中的块，TxE 可能先于 Db 落盘，使垃圾块被当作合法事务重放</button><button>B. 磁盘不支持多块写</button><button>C. 这会让恢复变慢</button><button>D. 日志空间不够</button></div>
+<div class="explain">磁盘内部会调度大写请求的各部分。若 TxE 已落盘而 Db 没有，事务头尾匹配、看似合法，恢复就会把 ?? 拷到 Db 的最终位置。</div></div>
+<div class="mcq" data-answer="3"><div class="q">关于有序（元数据）日志，下列哪项正确？</div>
+<div class="opts"><button>A. 数据块也写进日志，只是晚一点</button><button>B. 数据块必须在 TxB 发出之前写完</button><button>C. 数据块在检查点阶段才写</button><button>D. 数据块写到最终位置，可以与 TxB/日志元数据并发发出，但必须在 TxE 发出前完成</button></div>
+<div class="explain">原书：强制 Step 1 在 Step 2 前完成并非正确性所必需，唯一要求是 Step 1、2 都在 Step 3（发出提交块）之前完成。</div></div>
+<div class="mcq" data-answer="1"><div class="q">检查点进行到一半时崩溃（I[v2] 已写到最终位置，B[v2]、Db 还没有）。恢复后会怎样？</div>
+<div class="opts"><button>A. 只重放没写完的 B[v2] 和 Db</button><button>B. 重放整个已提交事务，部分块被重复写一遍，结果一致</button><button>C. 丢弃事务，回到旧状态</button><button>D. 文件系统不一致，需要 fsck</button></div>
+<div class="explain">重做日志不关心检查点进行到哪里，已提交的事务整体重放。多写几块没关系，恢复本来就很少发生。</div></div>
+<div class="mcq" data-answer="2"><div class="q">撤销记录（revoke record）解决的是什么问题？</div>
+<div class="opts"><button>A. 事务 TxE 写一半</button><button>B. 磁盘忽略写屏障</button><button>C. 被删除后又被复用的块，在重放旧事务时被旧内容覆盖</button><button>D. 日志空间满了无法提交新事务</button></div>
+<div class="explain">Tweedie 的例子：foo 的目录块 1000 被记入日志，之后 foo 被删、块 1000 被 bar 复用写入用户数据；重放会用旧目录内容覆盖 bar。撤销记录让恢复跳过被撤销的块。</div></div>
+<div class="mcq" data-answer="0"><div class="q">日志超级块（journal superblock）的主要作用是？</div>
+<div class="opts"><button>A. 记录哪些事务还没检查点，从而让日志循环复用并缩短恢复时间</button><button>B. 存放每个事务的校验和</button><button>C. 记录每个文件的日志模式</button><button>D. 备份文件系统超级块</button></div>
+<div class="explain">它标出最老和最新的未检查点事务，其余空间空闲；Free 步骤就是更新它。这既让日志成为循环日志，也减少了恢复时需要扫描重放的内容。</div></div>
+<div class="mcq" data-answer="0"><div class="q">关于各种崩溃一致性方案，哪种说法<strong>错误</strong>？</div>
+<div class="opts"><button>A. 日志把恢复时间从 O(日志大小) 增加到了 O(卷大小)</button><button>B. 反向指针一致性（BBC）不强制写之间的顺序</button><button>C. 软更新需要深入了解每种文件系统结构，实现复杂</button><button>D. COW 从不原地覆盖，最后翻转根结构</button></div>
+<div class="explain">说反了：日志把恢复时间从 O(size-of-the-disk-volume) 降到 O(size-of-the-log)。</div></div>
+
+<h2 id="summary"><span class="num">14</span>常见误区与小结</h2>
+<div class="warn">
+<ul>
+  <li><b>"fsck 能修好一切"</b>：它只保证元数据自洽。inode 和位图都更新了、数据块却是垃圾的情况，fsck 完全看不出来。</li>
+  <li><b>"日志保证不丢数据"</b>：日志保证的是<strong>一致性</strong>——崩溃后要么是旧状态、要么是新状态。未提交的更新照样丢失；有序模式也不把数据写进日志。</li>
+  <li><b>"事务写进日志就算提交了"</b>：只有 TxE 完整落盘才算。TxE 必须在前面的块都完成之后再发（或用事务校验和）。</li>
+  <li><b>"磁盘说写完了就真写完了"</b>：有写缓存的磁盘会"提前报告完成"，必须用写屏障/刷缓存；有些磁盘甚至忽略屏障。</li>
+  <li><b>"有序模式下数据可以随时写"</b>：数据必须在 TxE 发出之前落盘，否则重放出来的 inode 会指向垃圾（那是 unordered 模式的语义）。</li>
+  <li><b>"检查点中途崩溃会留下半新半旧的文件系统"</b>：恢复时会整体重放已提交事务，重复写是无害的。</li>
+</ul>
+</div>
+<div class="key">
+<ul>
+  <li>一次文件系统操作要写多个块，崩溃可能发生在任意两个写之间，导致<strong>不一致、空间泄漏、读到垃圾</strong>。</li>
+  <li><strong>fsck</strong>：允许不一致、重启时全盘扫描修复（超级块、位图、inode 状态、链接数、重复、坏块、目录）。正确但太慢，O(卷大小)。</li>
+  <li><strong>数据日志</strong>四步：Journal write → Journal commit（TxE，512 字节原子写）→ Checkpoint → Free；恢复 = 重放已提交事务（重做日志）。</li>
+  <li><strong>有序元数据日志</strong>五步：Data write → Journal metadata write → Journal commit → Checkpoint metadata → Free；数据只写一次，"先写被指向的"。</li>
+  <li>工程细节：写屏障、事务校验和（ext4）、批量全局事务、循环日志与日志超级块、块复用与撤销记录。</li>
+  <li>其他方案：软更新、写时复制（COW）、反向指针（BBC）、乐观崩溃一致性。</li>
+  <li><strong>下一章</strong>：日志结构文件系统（LFS）把"从不原地覆盖"推向极致——整个磁盘就是一个日志；第 44 章的 SSD FTL 也用了同样的思想。第 45 章会讨论数据块本身损坏时如何用校验和发现。</li>
+</ul>
+</div>
+
+</main>
+<script>
+/* ================== 共享：小文件系统画图 ================== */
+(function () {
+  const { h, s } = OSTEP;
+  // st: {I:'v1'|'v2', B:'v1'|'v2', D5:'old'|'Db', hl:{I,B,D}: 'ok'|'bad'|'new'|undefined}
+  function drawFS(host, st) {
+    const W = 790, H = 104;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "小文件系统的磁盘镜像" });
+    const hl = st.hl || {};
+    const cls = (k) => hl[k] === "bad" ? "bad-soft" : hl[k] === "ok" ? "ok-soft" : hl[k] === "new" ? "accent-soft" : "box";
+    const sw = (k) => hl[k] ? 2.2 : 1;
+    // 标题
+    svg.append(s("text", { x: 10, y: 14, "font-size": 12, class: "t-muted", text: "inode 位图" }));
+    svg.append(s("text", { x: 140, y: 14, "font-size": 12, class: "t-muted", text: "数据位图" }));
+    svg.append(s("text", { x: 280, y: 14, "font-size": 12, class: "t-muted", text: "inode 表（8 个 inode，占 4 块）" }));
+    svg.append(s("text", { x: 566, y: 14, "font-size": 12, class: "t-muted", text: "数据块" }));
+    const y = 24, ch = 36;
+    const ib = "00100000", db = st.B === "v2" ? "00001100" : "00001000";
+    for (let i = 0; i < 8; i++) {
+      svg.append(s("rect", { x: 10 + i * 14, y, width: 14, height: ch, class: "box" }));
+      svg.append(s("text", { x: 17 + i * 14, y: y + 23, "font-size": 12, "text-anchor": "middle", class: "mono", text: ib[i] }));
+      svg.append(s("rect", { x: 140 + i * 14, y, width: 14, height: ch, class: i === 5 ? cls("B") : "box", "stroke-width": i === 5 ? sw("B") : 1 }));
+      svg.append(s("text", { x: 147 + i * 14, y: y + 23, "font-size": 12, "text-anchor": "middle", class: "mono", text: db[i] }));
+      svg.append(s("text", { x: 17 + i * 14, y: y + ch + 14, "font-size": 10, "text-anchor": "middle", class: "t-muted", text: i }));
+      svg.append(s("text", { x: 147 + i * 14, y: y + ch + 14, "font-size": 10, "text-anchor": "middle", class: "t-muted", text: i }));
+    }
+    for (let b = 0; b < 4; b++) {
+      svg.append(s("rect", { x: 280 + b * 70 - 2, y: y - 3, width: 66, height: ch + 6, rx: 3, style: "fill:none;stroke:var(--border);stroke-dasharray:3 3" }));
+      for (let k = 0; k < 2; k++) {
+        const i = b * 2 + k, x = 280 + b * 70 + k * 31;
+        svg.append(s("rect", { x, y, width: 31, height: ch, class: i === 2 ? cls("I") : "box", "stroke-width": i === 2 ? sw("I") : 1 }));
+        if (i === 2) svg.append(s("text", { x: x + 15.5, y: y + 22, "font-size": 10.5, "text-anchor": "middle", class: "mono", text: st.I === "v2" ? "I[v2]" : "I[v1]" }));
+        svg.append(s("text", { x: x + 15.5, y: y + ch + 14, "font-size": 10, "text-anchor": "middle", class: "t-muted", text: i }));
+      }
+    }
+    for (let i = 0; i < 8; i++) {
+      const x = 566 + i * 27;
+      const k = i === 5 ? "D" : null;
+      svg.append(s("rect", { x, y, width: 27, height: ch, class: k ? cls("D") : (i === 4 ? "box" : "box"), "stroke-width": k ? sw("D") : 1 }));
+      const t = i === 4 ? "Da" : i === 5 ? (st.D5 === "Db" ? "Db" : "??") : "";
+      if (t) svg.append(s("text", { x: x + 13.5, y: y + 23, "font-size": 11.5, "text-anchor": "middle", class: "mono", text: t }));
+      svg.append(s("text", { x: x + 13.5, y: y + ch + 14, "font-size": 10, "text-anchor": "middle", class: "t-muted", text: i }));
+    }
+    if (st.note) svg.append(s("text", { x: 10, y: 96, "font-size": 12, class: "t-muted", text: st.note }));
+    host.replaceChildren(svg);
+  }
+  window.drawFS42 = drawFS;
+  drawFS(document.getElementById("fig-before"), { I: "v1", B: "v1", D5: "old", note: "追加之前：I[v1] → 块 4" });
+  drawFS(document.getElementById("fig-after"), { I: "v2", B: "v2", D5: "Db", hl: { I: "new", B: "new", D: "new" }, note: "期望的最终状态：I[v2] → 块 4、5" });
+})();
+
+/* ================== 模拟器 1：三个写，在哪儿断电 ================== */
+(function () {
+  const { h, stepper } = OSTEP;
+  const NAME = { I: "I[v2]", B: "B[v2]", D: "Db" };
+  const ORDERS = ["IBD", "IDB", "BID", "BDI", "DIB", "DBI"];
+  // 纯逻辑：根据落盘集合给出后果（与原书六种场景一一对应）
+  function outcome(S) {
+    const key = ["I", "B", "D"].filter((k) => S.has(k)).join("");
+    const T = {
+      "": { cons: true, garbage: false, leak: false, text: "一个写都没落盘：磁盘仍是追加前的一致状态，这次追加只是丢了。", fsck: "无需修复。", after: "旧状态" },
+      D: { cons: true, garbage: false, leak: false, text: "只写了 Db：数据在盘上，但没有 inode 指向它、位图也没标记——就像这次写从未发生。对文件系统一致性不是问题，但用户丢了数据。", fsck: "fsck 看不出任何问题（块 5 在它眼里就是空闲块）。", after: "旧状态（Db 丢失）" },
+      I: { cons: false, garbage: true, leak: false, text: "只写了 I[v2]：inode 指向块 5，但 Db 还没写到那里——相信这个指针就会读到垃圾。并且位图说块 5 空闲、inode 说它在用：文件系统不一致。", fsck: "fsck 信任 inode，把位图第 5 位置 1。元数据一致了，但块 5 里仍是垃圾，fsck 无法察觉。", after: "元数据一致，但指向垃圾" },
+      B: { cons: false, garbage: false, leak: true, text: "只写了 B[v2]：位图说块 5 已分配，但没有 inode 指向它——不一致；不修的话块 5 永远不会再被使用（空间泄漏）。", fsck: "fsck 扫描所有 inode，发现没人用块 5，清掉位图第 5 位，泄漏被修复。", after: "旧状态" },
+      IB: { cons: true, garbage: true, leak: false, text: "I[v2] 和 B[v2] 落盘、Db 没有：从元数据看完全一致（inode 指向 5，位图也说 5 在用），但块 5 里是垃圾。", fsck: "fsck 的所有检查都通过——它只管元数据，看不出垃圾。", after: "元数据一致，但指向垃圾" },
+      ID: { cons: false, garbage: false, leak: false, text: "I[v2] 和 Db 落盘、B[v2] 没有：inode 指向正确的数据，但旧位图 B[v1] 说块 5 空闲——不一致。不修的话，块 5 可能被再分配给别的文件。", fsck: "fsck 信任 inode，把位图第 5 位置 1——恰好得到完整的新状态（最幸运的一种）。", after: "新状态" },
+      BD: { cons: false, garbage: false, leak: true, text: "B[v2] 和 Db 落盘、I[v2] 没有：位图说块 5 在用、块 5 也写好了，但没有 inode 指向它——不一致，而且根本不知道这个块属于哪个文件。", fsck: "fsck 发现没有 inode 使用块 5，清掉位图位——回到旧状态，Db 丢失。", after: "旧状态（Db 丢失）" },
+      IBD: { cons: true, garbage: false, leak: false, text: "三个写都落盘了：文件系统从一个一致状态到达了另一个一致状态，追加成功。", fsck: "无需修复。", after: "新状态" },
+    };
+    return Object.assign({ key }, T[key]);
+  }
+  window.crashOutcome42 = outcome;
+  const sel = document.getElementById("crash-order");
+  ORDERS.forEach((o) => sel.append(h("option", { value: o }, o.split("").map((k) => NAME[k]).join(" → "))));
+  const presets = [["只写 Db", "DIB", 1], ["只写 I[v2]", "IBD", 1], ["只写 B[v2]", "BID", 1], ["I[v2] + B[v2]", "IBD", 2], ["I[v2] + Db", "IDB", 2], ["B[v2] + Db", "BDI", 2]];
+  const pr = document.getElementById("crash-presets");
+  pr.append(h("span", { class: "muted small" }, "原书场景："));
+  presets.forEach(([t, o, k]) => pr.append(h("button", { onclick: () => { sel.value = o; st.go(k); } }, t)));
+  const fsckCb = document.getElementById("crash-fsck");
+  const mem = document.getElementById("crash-mem"), svgHost = document.getElementById("crash-svg");
+  const narr = document.getElementById("crash-narr"), stats = document.getElementById("crash-stats"), row = document.getElementById("crash-row");
+  const stat = (v, l, cls) => h("div", { class: "stat" }, h("div", { class: "v", style: cls ? { color: `var(--${cls})` } : null }, v), h("div", { class: "l" }, l));
+  function render(k) {
+    const order = sel.value.split("");
+    const S = new Set(order.slice(0, k));
+    const o = outcome(S);
+    mem.replaceChildren(h("span", { class: "muted" }, "内存中的三个脏块（按发出顺序）："),
+      ...order.map((w, i) => h("span", { class: "badge " + (i < k ? "ok" : "bad") }, `${i + 1}. ${NAME[w]} ${i < k ? "✓ 已落盘" : "✗ 断电丢失"}`)));
+    let st2 = { I: S.has("I") ? "v2" : "v1", B: S.has("B") ? "v2" : "v1", D5: S.has("D") ? "Db" : "old" };
+    const hl = {};
+    if (fsckCb.checked) { st2.B = st2.I; } // fsck 以 inode 为准重建位图
+    const iNew = st2.I === "v2", bNew = st2.B === "v2";
+    if (S.has("I") || S.has("B") || S.has("D")) {
+      if (iNew !== bNew) { hl.I = iNew ? "bad" : undefined; hl.B = "bad"; }
+      else { if (S.has("I")) hl.I = "ok"; if (S.has("B") || fsckCb.checked && iNew) hl.B = "ok"; }
+      if (S.has("D")) hl.D = "ok";
+      if (iNew && st2.D5 !== "Db") hl.D = "bad";
+    }
+    st2.hl = hl;
+    st2.note = fsckCb.checked ? "（fsck 修复之后）" : k === 3 ? "（全部落盘）" : `（第 ${k} 个写之后断电）`;
+    window.drawFS42(svgHost, st2);
+    narr.replaceChildren(h("div", {}, h("b", {}, "后果："), o.text), h("div", { style: { marginTop: "4px" } }, h("b", {}, "fsck："), o.fsck));
+    stats.replaceChildren(
+      stat(o.cons ? "一致" : "不一致", "元数据一致性", o.cons ? "ok" : "bad"),
+      stat(o.garbage ? "会" : "不会", "读到垃圾数据", o.garbage ? "bad" : "ok"),
+      stat(o.leak ? "有" : "无", "空间泄漏", o.leak ? "bad" : "ok"),
+      stat(o.after, "fsck 之后", /垃圾|丢失/.test(o.after) ? "warn" : "ok"));
+    const all = [0, 1, 2, 3].map((j) => { const oo = outcome(new Set(order.slice(0, j))); return `${j} 个写后断电 → ${oo.cons ? "一致" : "不一致"}${oo.garbage ? "、指向垃圾" : ""}${oo.leak ? "、空间泄漏" : ""}`; });
+    row.textContent = "这个顺序下的全部崩溃点：\n" + all.join("\n");
+  }
+  const st = stepper(document.getElementById("crash-step"), { steps: 4, render });
+  sel.onchange = () => st.refresh();
+  fsckCb.onchange = () => st.refresh();
+})();
+
+/* ================== 模拟器：迷你 fsck ================== */
+(function () {
+  const { h, rng } = OSTEP;
+  const NI = 16, ND = 16;
+  const CORR = [
+    ["random", "随机（由损坏种子决定）"], ["none", "无损坏"],
+    ["ibm-clear", "inode 位图：已用 inode 被标为空闲"], ["ibm-set", "inode 位图：空闲 inode 被标为已用"],
+    ["dbm-clear", "数据位图：已用块被标为空闲"], ["dbm-set", "数据位图：空闲块被标为已用"],
+    ["refs", "inode 链接数错误"], ["bad-ptr", "块指针越界（坏块）"], ["dup", "两个 inode 指向同一块"],
+    ["dangling", "目录项指向未分配的 inode"], ["orphan", "孤儿 inode（没有目录引用）"],
+    ["dotdot", "目录的 \"..\" 指错"], ["type", "目录 inode 的类型被改成了文件"],
+  ];
+  const clone = (fs) => JSON.parse(JSON.stringify(fs));
+  function genFS(seed) {
+    const r = rng(seed * 7919 + 13);
+    const ino = Array.from({ length: NI }, () => ({ t: "", a: -1, r: 0 }));
+    const dat = Array(ND).fill(null);
+    const freeI = () => { const f = ino.map((x, i) => (x.t ? -1 : i)).filter((i) => i >= 0); return f.length ? r.pick(f) : -1; };
+    const freeD = () => { const f = dat.map((x, i) => (x === null ? i : -1)).filter((i) => i >= 0); return f.length ? r.pick(f) : -1; };
+    ino[0] = { t: "d", a: 0, r: 0 }; dat[0] = [[".", 0], ["..", 0]];
+    const dirs = [0], files = [];
+    const newName = (d) => { const used = new Set(dat[ino[d].a].map((e) => e[0])); let n; do n = String.fromCharCode(97 + r.int(0, 25)); while (used.has(n)); return n; };
+    const nops = r.int(6, 8);
+    for (let k = 0; k < nops; k++) {
+      const d = r.pick(dirs), p = r();
+      if (p < 0.3) {
+        const i = freeI(), b = freeD(); if (i < 0 || b < 0) continue;
+        ino[i] = { t: "d", a: b, r: 0 }; dat[b] = [[".", i], ["..", d]]; dat[ino[d].a].push([newName(d), i]); dirs.push(i);
+      } else if (p < 0.85 || !files.length) {
+        const i = freeI(); if (i < 0) continue;
+        let b = -1; if (r() < 0.6) { b = freeD(); if (b >= 0) dat[b] = "u"; }
+        ino[i] = { t: "f", a: b, r: 0 }; dat[ino[d].a].push([newName(d), i]); files.push(i);
+      } else {
+        const f = r.pick(files); dat[ino[d].a].push([newName(d), f]);
+      }
+    }
+    for (const x of ino) if (x.t === "d") for (const [, i] of dat[x.a]) ino[i].r++;
+    const ibm = ino.map((x) => (x.t ? 1 : 0)), dbm = dat.map((x) => (x === null ? 0 : 1));
+    return { ino, dat, ibm, dbm };
+  }
+  // 注入一种损坏；返回 {fs, desc}
+  function corrupt(fs0, type, cseed) {
+    const fs = clone(fs0), r = rng(cseed * 104729 + 7);
+    const kinds = CORR.slice(2).map((c) => c[0]);
+    if (type === "random") type = kinds[(cseed - 1) % kinds.length];
+    const usedI = fs.ino.map((x, i) => (x.t && i ? i : -1)).filter((i) => i > 0);
+    const freeI = fs.ino.map((x, i) => (x.t ? -1 : i)).filter((i) => i >= 0);
+    const usedD = fs.dbm.map((b, i) => (b && i ? i : -1)).filter((i) => i > 0);
+    const freeD = fs.dbm.map((b, i) => (b ? -1 : i)).filter((i) => i >= 0);
+    const filesWithBlk = usedI.filter((i) => fs.ino[i].t === "f" && fs.ino[i].a >= 0);
+    const subdirs = usedI.filter((i) => fs.ino[i].t === "d");
+    const entries = []; // [dir, idx]
+    fs.ino.forEach((x, d) => { if (x.t === "d") fs.dat[x.a].forEach((e, k) => { if (k >= 2) entries.push([d, k]); }); });
+    switch (type) {
+      case "none": return { fs, desc: "没有注入任何损坏。" };
+      case "ibm-clear": { const i = r.pick(usedI); if (i == null) break; fs.ibm[i] = 0; return { fs, desc: `把 inode 位图第 ${i} 位清零（inode ${i} 实际在用）。` }; }
+      case "ibm-set": { const i = r.pick(freeI); if (i == null) break; fs.ibm[i] = 1; return { fs, desc: `把 inode 位图第 ${i} 位置 1（inode ${i} 实际空闲）。` }; }
+      case "dbm-clear": { const b = r.pick(usedD); if (b == null) break; fs.dbm[b] = 0; return { fs, desc: `把数据位图第 ${b} 位清零（块 ${b} 实际在用）。` }; }
+      case "dbm-set": { const b = r.pick(freeD); if (b == null) break; fs.dbm[b] = 1; return { fs, desc: `把数据位图第 ${b} 位置 1（块 ${b} 实际空闲）——若不修就是空间泄漏。` }; }
+      case "refs": { const i = r.pick(usedI); if (i == null) break; const d = r() < 0.5 ? 1 : -1; const old = fs.ino[i].r; fs.ino[i].r = Math.max(0, old + d); if (fs.ino[i].r === old) fs.ino[i].r++; return { fs, desc: `把 inode ${i} 的链接数从 ${old} 改成 ${fs.ino[i].r}。` }; }
+      case "bad-ptr": { const i = r.pick(filesWithBlk); if (i == null) break; const old = fs.ino[i].a; fs.ino[i].a = ND + r.int(10, 80); return { fs, desc: `把 inode ${i} 的块指针从 ${old} 改成越界的 ${fs.ino[i].a}。` }; }
+      case "dup": { if (filesWithBlk.length < 1) break; const a = r.pick(filesWithBlk); const others = usedI.filter((i) => fs.ino[i].t === "f" && i !== a); if (!others.length) break; const b = r.pick(others); const old = fs.ino[b].a; fs.ino[b].a = fs.ino[a].a; return { fs, desc: `把 inode ${b} 的块指针从 ${old} 改成 ${fs.ino[a].a}，与 inode ${a} 重复。` }; }
+      case "dangling": { const e = r.pick(entries); const i = r.pick(freeI); if (!e || i == null) break; const blk = fs.dat[fs.ino[e[0]].a]; const old = blk[e[1]][1]; blk[e[1]][1] = i; return { fs, desc: `把目录 inode ${e[0]} 中的项 "${blk[e[1]][0]}" 从 inode ${old} 改指向未分配的 inode ${i}。` }; }
+      case "orphan": { const c = entries.filter(([d, k]) => { const i = fs.dat[fs.ino[d].a][k][1]; return fs.ino[i].t === "f" && fs.ino[i].r === 1; }); const e = r.pick(c); if (!e) break; const blk = fs.dat[fs.ino[e[0]].a]; const [n, i] = blk[e[1]]; blk.splice(e[1], 1); return { fs, desc: `从目录 inode ${e[0]} 中删除了项 "${n}"，inode ${i} 成了孤儿（链接数仍为 1）。` }; }
+      case "dotdot": { const d = r.pick(subdirs); if (d == null) break; const blk = fs.dat[fs.ino[d].a]; const old = blk[1][1]; const cand = fs.ino.map((x, i) => (x.t === "d" && i !== old ? i : -1)).filter((i) => i >= 0); blk[1][1] = r.pick(cand); return { fs, desc: `把目录 inode ${d} 的 ".." 从 ${old} 改成 ${blk[1][1]}。` }; }
+      case "type": { const d = r.pick(subdirs); if (d == null) break; fs.ino[d].t = "f"; return { fs, desc: `把 inode ${d} 的类型从目录改成了普通文件。` }; }
+    }
+    return { fs, desc: "（这个文件系统里没有合适的对象可注入该损坏，换个文件系统种子试试）", none: true };
+  }
+  // fsck：返回 {fixed, findings:[{cat, msg, fix, i?, b?}]}
+  const CAT = ["超级块", "空闲块（位图）", "inode 状态", "inode 链接", "重复指针", "坏块", "目录检查"];
+  function fsck(fs0) {
+    const fs = clone(fs0), F = [];
+    const add = (cat, msg, fix, mark) => F.push(Object.assign({ cat, msg, fix }, mark || {}));
+    // inode 状态：类型看起来不对
+    fs.ino.forEach((x, i) => {
+      const blk = x.a >= 0 && x.a < ND ? fs.dat[x.a] : null;
+      if (x.t === "f" && Array.isArray(blk) && blk[0] && blk[0][0] === "." && blk[0][1] === i) { add("inode 状态", `inode ${i} 标为普通文件，但它的数据块 ${x.a} 是以 (.,${i}) 开头的目录`, "把类型改回目录", { i }); x.t = "d"; }
+    });
+    // 坏块
+    fs.ino.forEach((x, i) => { if (x.t && x.a >= ND) { add("坏块", `inode ${i} 的块指针 ${x.a} 超出范围（只有 ${ND} 个数据块）`, "清除该指针（该文件的数据丢失）", { i }); x.a = -1; } });
+    // 重复
+    const owner = {};
+    fs.ino.forEach((x, i) => {
+      if (!x.t || x.a < 0) return;
+      if (owner[x.a] === undefined) { owner[x.a] = i; return; }
+      const used = new Set(fs.ino.filter((y) => y.t && y.a >= 0).map((y) => y.a));
+      const nb = fs.dat.findIndex((d, b) => !used.has(b) && !fs.dbm[b]);
+      add("重复指针", `inode ${owner[x.a]} 和 inode ${i} 都指向块 ${x.a}`, nb >= 0 ? `把块 ${x.a} 复制到空闲块 ${nb}，让 inode ${i} 指向副本` : "没有空闲块，清除 inode " + i + " 的指针", { i, b: x.a });
+      if (nb >= 0) { fs.dat[nb] = clone(fs.dat[x.a]); x.a = nb; } else x.a = -1;
+    });
+    // 目录检查：从根遍历
+    const reach = new Set([0]), seen = new Set();
+    function walk(d, parent) {
+      if (seen.has(d)) return; seen.add(d);
+      const blk = fs.dat[fs.ino[d].a];
+      if (!Array.isArray(blk)) { add("目录检查", `目录 inode ${d} 的数据块不是目录格式`, "无法修复", { i: d }); return; }
+      if (blk[0][0] !== "." || blk[0][1] !== d) { add("目录检查", `目录 inode ${d} 的 "." 指向 ${blk[0][1]}，应指向自己`, `改为 (.,${d})`, { b: fs.ino[d].a }); blk[0] = [".", d]; }
+      if (blk[1][0] !== ".." || blk[1][1] !== parent) { add("目录检查", `目录 inode ${d} 的 ".." 指向 ${blk[1][1]}，但它在目录 inode ${parent} 之下`, `改为 (..,${parent})`, { b: fs.ino[d].a }); blk[1] = ["..", parent]; }
+      for (let k = blk.length - 1; k >= 2; k--) {
+        const [n, i] = blk[k];
+        if (i < 0 || i >= NI || !fs.ino[i].t) { add("目录检查", `目录 inode ${d} 中的项 "${n}" 指向未分配的 inode ${i}`, "删除这个悬空的目录项", { b: fs.ino[d].a }); blk.splice(k, 1); }
+      }
+      for (const [n, i] of blk.slice(2)) {
+        reach.add(i);
+        if (fs.ino[i].t === "d") { if (seen.has(i)) add("目录检查", `目录 inode ${i} 在层次结构中被链接了不止一次（${n}）`, "删除多余的链接", { i }); else walk(i, d); }
+      }
+    }
+    walk(0, 0);
+    // 孤儿 → lost+found
+    for (;;) {
+      const un = fs.ino.map((x, i) => (x.t && !reach.has(i) ? i : -1)).filter((i) => i >= 0);
+      if (!un.length) break;
+      // 先处理"子树的根"：不被其他未到达目录引用的那个
+      const refd = new Set();
+      un.forEach((d) => { const x = fs.ino[d]; if (x.t === "d" && Array.isArray(fs.dat[x.a])) fs.dat[x.a].slice(2).forEach((e) => refd.add(e[1])); });
+      const i = un.find((j) => !refd.has(j)) ?? un[0], x = fs.ino[i];
+      add("inode 链接", `inode ${i} 已分配，但没有任何目录项指向它`, "移入 lost+found（这里简化为根目录下的 #" + i + "）", { i });
+      fs.dat[fs.ino[0].a].push(["#" + i, i]); reach.add(i);
+      if (x.t === "d" && Array.isArray(fs.dat[x.a])) { fs.dat[x.a][1] = ["..", 0]; walk(i, 0); }
+    }
+    // inode 位图
+    fs.ino.forEach((x, i) => {
+      const u = x.t ? 1 : 0;
+      if (u !== fs.ibm[i]) { add("空闲块（位图）", u ? `inode ${i} 在使用中，但 inode 位图第 ${i} 位是 0` : `inode 位图第 ${i} 位是 1，但 inode ${i} 是空的`, "以 inode 为准修正 inode 位图", { i }); fs.ibm[i] = u; }
+    });
+    // 链接数
+    const cnt = Array(NI).fill(0);
+    fs.ino.forEach((x) => { if (x.t === "d" && Array.isArray(fs.dat[x.a])) for (const [, i] of fs.dat[x.a]) if (i >= 0 && i < NI) cnt[i]++; });
+    fs.ino.forEach((x, i) => { if (x.t && x.r !== cnt[i]) { add("inode 链接", `inode ${i} 记录的链接数是 ${x.r}，遍历目录树数出来是 ${cnt[i]}`, `把链接数改为 ${cnt[i]}`, { i }); x.r = cnt[i]; } });
+    // 数据位图
+    const used = new Set(fs.ino.filter((x) => x.t && x.a >= 0).map((x) => x.a));
+    fs.dbm.forEach((v, b) => {
+      const u = used.has(b) ? 1 : 0;
+      if (u !== v) { add("空闲块（位图）", u ? `块 ${b} 被 inode 使用，但数据位图第 ${b} 位是 0` : `数据位图第 ${b} 位是 1，但没有 inode 使用块 ${b}`, "以 inode 为准修正数据位图", { b }); fs.dbm[b] = u; }
+      if (!u && fs.dat[b] !== null) fs.dat[b] = null;
+    });
+    F.sort((a, b) => CAT.indexOf(a.cat) - CAT.indexOf(b.cat));
+    return { fixed: fs, findings: F };
+  }
+  window.fsck42 = { genFS, corrupt, fsck };
+
+  // ---------- UI ----------
+  const selC = document.getElementById("fk-corrupt");
+  CORR.forEach(([v, t]) => selC.append(h("option", { value: v }, t)));
+  const stage = document.getElementById("fk-stage"), narr = document.getElementById("fk-narr");
+  const inoTxt = (x) => (x.t ? `${x.t} a:${x.a} r:${x.r}` : "—");
+  const datTxt = (d) => (d === null ? "—" : d === "u" ? "u" : d.map((e) => `(${e[0]},${e[1]})`).join(" "));
+  function panel(title, fs, ref, markI, markB) {
+    const rowBits = (lab, arr, refArr, mark) => h("div", { class: "fsrow" }, h("span", { class: "flab" }, lab),
+      ...arr.map((v, i) => h("span", { class: "cell bit" + (refArr && refArr[i] !== v ? " hit" : mark.has(i) ? " miss" : v ? " on" : "") }, String(v))));
+    return h("div", {}, h("div", { style: { fontWeight: 650, fontSize: "14px", margin: "4px 0" } }, title),
+      rowBits("inode 位图", fs.ibm, ref && ref.ibm, markI),
+      h("div", { class: "fsrow" }, h("span", { class: "flab" }, "inodes"),
+        ...fs.ino.map((x, i) => h("span", { class: "cell" + (ref && JSON.stringify(ref.ino[i]) !== JSON.stringify(x) ? " hit" : markI.has(i) ? " miss" : x.t ? " on" : "") }, h("small", {}, i), inoTxt(x)))),
+      rowBits("数据位图", fs.dbm, ref && ref.dbm, markB),
+      h("div", { class: "fsrow" }, h("span", { class: "flab" }, "数据块"),
+        ...fs.dat.map((d, b) => h("span", { class: "cell" + (ref && JSON.stringify(ref.dat[b]) !== JSON.stringify(d) ? " hit" : markB.has(b) ? " miss" : d !== null ? " on" : "") }, h("small", {}, b), datTxt(d)))));
+  }
+  function tree(fs) {
+    const out = [];
+    (function rec(d, path, depth) {
+      if (depth > 8) return;
+      out.push(path + "/");
+      for (const [n, i] of fs.dat[fs.ino[d].a].slice(2)) {
+        if (fs.ino[i].t === "d") rec(i, path + "/" + n, depth + 1); else out.push(path + "/" + n + `   (inode ${i}${fs.ino[i].a >= 0 ? "，块 " + fs.ino[i].a : "，空文件"})`);
+      }
+    })(0, "", 0);
+    return out.map((p) => (p === "/" ? "/  (根，inode 0)" : p)).join("\n");
+  }
+  let cur = null, shown = "none";
+  function build() {
+    const seed = Math.max(1, +document.getElementById("fk-seed").value || 1);
+    const cseed = Math.max(1, +document.getElementById("fk-cseed").value || 1);
+    const base = genFS(seed);
+    const c = corrupt(base, selC.value, cseed);
+    cur = { base, c, res: fsck(c.fs) };
+    shown = "none"; render();
+  }
+  function render() {
+    const { base, c, res } = cur;
+    const mI = new Set(), mB = new Set();
+    if (shown === "fsck") res.findings.forEach((f) => { if (f.i != null) mI.add(f.i); if (f.b != null) mB.add(f.b); });
+    const kids = [panel("磁盘上的文件系统（可能已损坏）", c.fs, null, mI, mB)];
+    if (shown === "fsck") kids.push(h("hr", { style: { margin: "12px 0" } }), panel("fsck 修复之后（绿色 = 被 fsck 改动的项）", res.fixed, c.fs, new Set(), new Set()));
+    if (shown === "tree") kids.push(h("div", { class: "readout" }, "目录树（未损坏的原始文件系统）：\n" + tree(base)));
+    stage.replaceChildren(...kids);
+    if (shown === "fsck") {
+      narr.replaceChildren(h("div", {}, h("b", {}, "注入的损坏："), c.desc),
+        res.findings.length ? h("ol", { class: "findings", style: { margin: "6px 0 0" } }, res.findings.map((f) => h("li", {}, h("span", { class: "cat" }, f.cat), f.msg, " → ", h("b", {}, f.fix))))
+          : h("div", {}, "fsck：所有检查通过，没有发现不一致。"));
+    } else if (shown !== "tree") {
+      narr.textContent = "红色标记会在运行 fsck 后出现。先自己比对：位图与 inode 是否吻合？每个目录的 (.,自己) (..,父目录) 对不对？链接数等于指向它的目录项数吗？（目录的链接数包括它自己的 \".\"、父目录中的名字和每个子目录的 \"..\"）";
+    }
+  }
+  document.getElementById("fk-run").onclick = () => { shown = shown === "fsck" ? "none" : "fsck"; render(); };
+  document.getElementById("fk-tree").onclick = () => { shown = shown === "tree" ? "none" : "tree"; render(); };
+  ["fk-seed", "fk-cseed"].forEach((id) => document.getElementById(id).addEventListener("input", build));
+  selC.onchange = build;
+  build();
+})();
+
+/* ================== fsck 耗时估算 ================== */
+(function () {
+  const { h } = OSTEP;
+  const ids = ["ft-cap", "ft-meta", "ft-rate", "ft-log", "ft-seq"];
+  const out = document.getElementById("ft-stats");
+  const fmt = (sec) => sec >= 3600 ? (sec / 3600).toFixed(1) + " 小时" : sec >= 60 ? (sec / 60).toFixed(1) + " 分钟" : sec.toFixed(2) + " 秒";
+  function calc() {
+    const [cap, meta, rate, log, seq] = ids.map((i) => +document.getElementById(i).value || 0);
+    const metaMB = cap * 1024 * 1024 * meta / 100;
+    const tf = metaMB / Math.max(rate, 1e-9), tj = log / Math.max(seq, 1e-9);
+    out.replaceChildren(
+      h("div", { class: "stat" }, h("div", { class: "v" }, (metaMB / 1024).toFixed(1) + " GB"), h("div", { class: "l" }, "fsck 需读的元数据")),
+      h("div", { class: "stat" }, h("div", { class: "v", style: { color: "var(--bad)" } }, fmt(tf)), h("div", { class: "l" }, "fsck 大约耗时")),
+      h("div", { class: "stat" }, h("div", { class: "v", style: { color: "var(--ok)" } }, fmt(tj)), h("div", { class: "l" }, "日志恢复（读完整个日志）")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, Math.round(tf / Math.max(tj, 1e-9)) + "×"), h("div", { class: "l" }, "fsck / 日志恢复")));
+  }
+  ids.forEach((i) => document.getElementById(i).addEventListener("input", calc));
+  calc();
+})();
+
+/* ================== 循环日志 ================== */
+(function () {
+  const { h } = OSTEP;
+  const N = 8;
+  let txs, next, headSlot, msg;
+  const ring = document.getElementById("rg-ring"), jsb = document.getElementById("rg-jsb"), narr = document.getElementById("rg-narr");
+  function reset() { txs = []; next = 1; headSlot = 0; narr.textContent = "点\"提交新事务\"开始。"; render(); }
+  function live() { return txs.filter((t) => t.st !== "freed"); }
+  function render() {
+    const slots = Array(N).fill(null);
+    for (const t of live()) slots[t.slot] = t;
+    ring.replaceChildren(...slots.map((t, i) => h("span", { class: "cell" + (t ? (t.st === "committed" ? " on" : " hit") : "") },
+      h("small", {}, "槽 " + i), t ? `Tx${t.id}` : "空闲", h("small", {}, t ? (t.st === "committed" ? "已提交" : "已检查点") : ""))));
+    const L = live();
+    const nonCk = L.filter((t) => t.st === "committed");
+    jsb.replaceChildren(h("b", {}, "日志超级块："),
+      L.length ? ` 仍在日志中的事务 Tx${L[0].id} … Tx${L[L.length - 1].id}（尾 = 槽 ${L[0].slot}，头 = 槽 ${(headSlot + N - 1) % N}）` : " 日志为空",
+      h("span", { class: "muted" }, `；未检查点：${nonCk.length ? nonCk.map((t) => "Tx" + t.id).join("、") : "无"}；空闲槽 ${N - L.length} 个`));
+  }
+  document.getElementById("rg-commit").onclick = () => {
+    if (live().length >= N) { narr.textContent = "日志已满！新事务无法提交，文件系统只能等待——必须先检查点并释放最老的事务。"; return; }
+    const t = { id: next++, slot: headSlot, st: "committed" }; txs.push(t); headSlot = (headSlot + 1) % N;
+    narr.textContent = `Tx${t.id} 写入槽 ${t.slot} 并提交（TxE 已落盘）。它的块还没写到最终位置。`; render();
+  };
+  document.getElementById("rg-ckpt").onclick = () => {
+    const t = txs.find((x) => x.st === "committed");
+    if (!t) { narr.textContent = "没有等待检查点的事务。"; return; }
+    t.st = "ckpt"; narr.textContent = `Tx${t.id} 的块已写到最终位置（checkpoint）。但日志超级块还没更新，它的日志空间仍不能复用。`; render();
+  };
+  document.getElementById("rg-free").onclick = () => {
+    const L = live(); let k = 0;
+    while (k < L.length && L[k].st === "ckpt") { L[k].st = "freed"; k++; }
+    narr.textContent = k ? `更新日志超级块：释放了 ${k} 个已检查点的事务，它们占的槽可以被循环复用。` : "最老的事务还没检查点，无法释放（日志只能从尾部按顺序释放）。"; render();
+  };
+  document.getElementById("rg-crash").onclick = () => {
+    const L = live();
+    if (!L.length) { narr.textContent = "崩溃并重启：日志超级块说日志为空，恢复立刻结束。"; return; }
+    const redo = L.filter((t) => t.st === "ckpt");
+    narr.textContent = `崩溃并重启：恢复程序读日志超级块，只扫描 Tx${L[0].id}…Tx${L[L.length - 1].id}，按顺序重放 ${L.length} 个事务` +
+      (redo.length ? `（其中 ${redo.map((t) => "Tx" + t.id).join("、")} 其实已检查点，重放只是多写一遍，无害）` : "") + "。之后全部视为已检查点并释放。";
+    L.forEach((t) => (t.st = "freed")); render();
+  };
+  document.getElementById("rg-reset").onclick = reset;
+  reset();
+})();
+
+/* ================== 模拟器 2：日志协议时间线 ================== */
+(function () {
+  const { h, s, rng, stepper } = OSTEP;
+  // 每个写：所在列、显示名
+  const W = {
+    jTxB: { col: 1, label: "TxB" }, jI: { col: 2, label: "I[v2]" }, jB: { col: 2, label: "B[v2]" }, jDb: { col: 3, label: "Db" }, jTxE: { col: 4, label: "TxE" },
+    fI: { col: 5, label: "I[v2]" }, fB: { col: 5, label: "B[v2]" }, fDb: { col: 6, label: "Db" }, jsb: { col: 7, label: "JSB 释放" },
+  };
+  const MODES = {
+    data: { journal: ["I", "B", "Db"], groups: [
+      { ws: ["jTxB", "jI", "jB", "jDb"], phase: "① Journal write：TxB 与事务内容（元数据 + 数据）一起发出" },
+      { ws: ["jTxE"], barrier: true, phase: "② Journal commit：前面全部完成后才发出 TxE" },
+      { ws: ["fI", "fB", "fDb"], barrier: true, phase: "③ Checkpoint：把 I[v2]、B[v2]、Db 写到最终位置" },
+      { ws: ["jsb"], barrier: true, phase: "④ Free：更新日志超级块，释放事务" }] },
+    ordered: { journal: ["I", "B"], groups: [
+      { ws: ["jTxB", "jI", "jB", "fDb"], book: ["fDb", "jTxB", "jI", "jB"], phase: "① Data write + ② Journal metadata write：Db 直接写最终位置，与 TxB、日志元数据同时发出" },
+      { ws: ["jTxE"], barrier: true, phase: "③ Journal commit：数据和日志元数据全部完成后才发出 TxE" },
+      { ws: ["fI", "fB"], barrier: true, phase: "④ Checkpoint metadata" },
+      { ws: ["jsb"], barrier: true, phase: "⑤ Free" }] },
+    late: { journal: ["I", "B"], groups: [
+      { ws: ["jTxB", "jI", "jB"], phase: "日志元数据写入（Db 还没动）" },
+      { ws: ["jTxE"], barrier: true, phase: "提交 TxE" },
+      { ws: ["fI", "fB", "fDb"], barrier: true, phase: "提交之后才写 Db，同时检查点元数据（错误的顺序！）" },
+      { ws: ["jsb"], barrier: true, phase: "Free" }] },
+    nobarrier: { journal: ["I", "B", "Db"], groups: [
+      { ws: ["jTxB", "jI", "jB", "jDb", "jTxE"], book: ["jTxB", "jI", "jB", "jTxE", "jDb"], phase: "五个日志块作为一个大写一次发出，不等待、没有屏障" },
+      { ws: ["fI", "fB", "fDb"], barrier: true, phase: "Checkpoint" },
+      { ws: ["jsb"], barrier: true, phase: "Free" }] },
+    checksum: { journal: ["I", "B", "Db"], checksum: true, groups: [
+      { ws: ["jTxB", "jI", "jB", "jDb", "jTxE"], book: ["jTxB", "jI", "jB", "jTxE", "jDb"], phase: "五个日志块一次发出；TxB/TxE 中含整个事务内容的校验和" },
+      { ws: ["fI", "fB", "fDb"], barrier: true, phase: "Checkpoint" },
+      { ws: ["jsb"], barrier: true, phase: "Free" }] },
+    none: { journal: [], groups: [{ ws: ["fI", "fB", "fDb"], phase: "直接把三个块写到最终位置（无日志）" }] },
+  };
+  function buildEvents(mode, seed) {
+    const M = MODES[mode], r = seed ? rng(seed) : null, ev = [];
+    M.groups.forEach((g, gi) => {
+      ev.push({ kind: "issue", ws: g.ws.slice(), barrier: !!g.barrier, phase: g.phase, gi });
+      let order = (g.book || g.ws).slice();
+      if (r) { order = g.ws.slice(); for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; } }
+      order.forEach((w) => ev.push({ kind: "done", w, gi }));
+    });
+    return ev;
+  }
+  function diskAt(ev, k) {
+    const done = new Set(), inflight = new Set();
+    for (let i = 0; i < k; i++) { const e = ev[i]; if (e.kind === "issue") e.ws.forEach((w) => inflight.add(w)); else { inflight.delete(e.w); done.add(e.w); } }
+    return { done, inflight };
+  }
+  function recover(mode, done) {
+    const M = MODES[mode];
+    const st = { I: done.has("fI") ? "v2" : "v1", B: done.has("fB") ? "v2" : "v1", D5: done.has("fDb") ? "Db" : "old" };
+    const before = Object.assign({}, st);
+    let action, replay = [], short;
+    if (!M.journal.length) { action = "没有日志可查：文件系统只能原样挂载（或者跑一遍 fsck 全盘检查）。"; short = "无日志"; }
+    else if (done.has("jsb")) { action = "日志超级块显示事务 1 已释放 → 无事可做。"; short = "已释放，跳过"; }
+    else if (!done.has("jTxB")) { action = "日志里没有有效的事务开始块 TxB → 无事可做。"; short = "无事务"; }
+    else if (!done.has("jTxE")) { action = "找到 TxB，但没有匹配的 TxE → 事务未提交，丢弃。"; short = "未提交，丢弃"; }
+    else if (M.checksum && M.journal.some((c) => !done.has("j" + c))) { action = "找到 TxB 和 TxE，但重新计算的校验和与记录的不符（有内容块没写完）→ 丢弃事务。"; short = "校验和不符，丢弃"; }
+    else {
+      action = "找到已提交的事务 → 按 TxB 里记录的地址重放：" + M.journal.map((c) => (done.has("j" + c) ? c : c + "（日志槽里是垃圾！）")).join("、") + "。";
+      short = "重放";
+      M.journal.forEach((c) => {
+        const ok = done.has("j" + c); replay.push({ c, ok });
+        if (c === "I") st.I = ok ? "v2" : "junk"; else if (c === "B") st.B = ok ? "v2" : "junk"; else st.D5 = ok ? "Db" : "junk";
+      });
+    }
+    return { before, st, action, short, replay };
+  }
+  function judge(st) {
+    if (st.I === "junk" || st.B === "junk") return { cls: "bad", text: (st.I === "junk" ? "inode 块" : "位图块") + "被日志里的垃圾覆盖——元数据被毁！" };
+    const iN = st.I === "v2", bN = st.B === "v2";
+    if (iN !== bN) return { cls: "bad", text: iN ? "不一致：inode 指向块 5，位图却说它空闲" + (st.D5 === "Db" ? "" : "（且块 5 是垃圾）") : "不一致：位图占用块 5，却没有 inode 指向它（空间泄漏）" };
+    if (!iN) return { cls: "ok", text: "旧状态：一致，本次追加没有生效" };
+    if (st.D5 !== "Db") return { cls: "bad", text: "元数据一致，但 inode 指向垃圾数据！" };
+    return { cls: "ok", text: "新状态：一致，追加成功" };
+  }
+  window.journal42 = { MODES, buildEvents, diskAt, recover, judge };
+
+  // ---------- UI ----------
+  const selM = document.getElementById("jn-mode"), seedIn = document.getElementById("jn-seed");
+  const crashBtn = document.getElementById("jn-crash");
+  const svgHost = document.getElementById("jn-svg"), narr = document.getElementById("jn-narr"), stats = document.getElementById("jn-stats");
+  const tl = document.getElementById("jn-tl"), sweepOut = document.getElementById("jn-sweep-out");
+  let ev = [], crashed = false;
+  const fsLabel = { v1: (x) => x + "[v1]", v2: (x) => x + "[v2]", junk: () => "垃圾", old: () => "??", Db: () => "Db" };
+  function cellBox(svg, x, y, w, label, sub, kind) {
+    const cls = { done: "ok-soft", fly: "accent-soft", none: "box", bad: "bad-soft", replay: "warn-soft" }[kind] || "box";
+    svg.append(s("rect", { x, y, width: w, height: 42, rx: 4, class: cls, "stroke-width": kind === "none" ? 1 : 2, "stroke-dasharray": kind === "fly" ? "4 3" : null }));
+    svg.append(s("text", { x: x + w / 2, y: y + 19, "font-size": 12.5, "text-anchor": "middle", class: "mono", text: label }));
+    if (sub) svg.append(s("text", { x: x + w / 2, y: y + 34, "font-size": 10.5, "text-anchor": "middle", class: "t-muted", text: sub }));
+  }
+  function drawDisk(done, inflight, rec) {
+    const mode = selM.value, M = MODES[mode];
+    const slots = ["jTxB", "jI", "jB"].concat(M.journal.includes("Db") ? ["jDb"] : []).concat(["jTxE"]);
+    const rows = rec ? 2 : 1, H = 30 + rows * 70;
+    const svg = s("svg", { viewBox: `0 0 780 ${H}`, width: 780, height: H, role: "img", "aria-label": "日志区与文件系统区的块状态" });
+    svg.append(s("text", { x: 8, y: 16, "font-size": 12, class: "t-muted", text: M.journal.length ? "日志区（Journal）" : "日志区（本模式不使用）" }));
+    svg.append(s("text", { x: 520, y: 16, "font-size": 12, class: "t-muted", text: "文件系统（最终位置）" }));
+    const st0 = (w) => (done.has(w) ? "done" : inflight.has(w) ? "fly" : "none");
+    const sub = (w) => (done.has(w) ? "已落盘" : inflight.has(w) ? "在途…" : "");
+    const y = 24;
+    cellBox(svg, 8, y, 62, "JSB", done.has("jsb") ? "Tx1 已释放" : inflight.has("jsb") ? "在途…" : "", st0("jsb"));
+    slots.forEach((w, i) => {
+      const lab = done.has(w) ? W[w].label + (w === "jTxB" || w === "jTxE" ? " id=1" : "") : inflight.has(w) ? W[w].label : "??";
+      cellBox(svg, 80 + i * 86, y, 80, M.journal.length ? lab : "—", M.journal.length ? (sub(w) || W[w].label + " 的槽") : "", M.journal.length ? st0(w) : "none");
+    });
+    const fsCells = (yy, st, kinds, tag) => {
+      svg.append(s("text", { x: 516, y: yy + 26, "font-size": 11, "text-anchor": "end", class: "t-muted", text: tag }));
+      cellBox(svg, 520, yy, 80, st.B === "junk" ? "垃圾" : "B[" + st.B + "]", st.B === "v2" ? "00001100" : st.B === "v1" ? "00001000" : "", kinds.B);
+      cellBox(svg, 606, yy, 80, st.I === "junk" ? "垃圾" : "I[" + st.I + "]", st.I === "v2" ? "ptr 4,5" : st.I === "v1" ? "ptr 4" : "", kinds.I);
+      cellBox(svg, 692, yy, 80, st.D5 === "Db" ? "Db" : st.D5 === "junk" ? "垃圾" : "??", "块 5", kinds.D);
+    };
+    const now = { I: done.has("fI") ? "v2" : "v1", B: done.has("fB") ? "v2" : "v1", D5: done.has("fDb") ? "Db" : "old" };
+    fsCells(y, now, { B: st0("fB"), I: st0("fI"), D: st0("fDb") }, "");
+    if (rec) {
+      svg.append(s("line", { x1: 8, x2: 772, y1: y + 56, y2: y + 56, style: "stroke:var(--bad);stroke-dasharray:6 4" }));
+      svg.append(s("text", { x: 8, y: y + 84, "font-size": 12.5, style: "fill:var(--bad);font-weight:700", text: "⚡ 断电 → 恢复之后：" }));
+      svg.append(s("text", { x: 8, y: y + 102, "font-size": 11.5, class: "t-muted", text: rec.short }));
+      const k = (key, fk) => { const a = rec.st[key], b = rec.before[key]; if (a === "junk") return "bad"; if (a !== b) return "replay"; return done.has(fk) ? "done" : "none"; };
+      const kinds = { B: k("B", "fB"), I: k("I", "fI"), D: k("D5", "fDb") };
+      const j = judge(rec.st);
+      if (j.cls === "bad") { if (rec.st.I === "v2" && rec.st.D5 !== "Db") kinds.D = "bad"; if ((rec.st.I === "v2") !== (rec.st.B === "v2")) { kinds.I = kinds.I === "none" ? "bad" : kinds.I; kinds.B = "bad"; } }
+      fsCells(y + 70, rec.st, kinds, "");
+    }
+    svgHost.replaceChildren(svg);
+  }
+  const COLS = ["#", "日志 TxB", "日志内容(元数据)", "日志内容(数据)", "日志 TxE", "FS 元数据", "FS 数据", "日志超级块"];
+  function drawTimeline(k) {
+    const rows = [h("tr", {}, COLS.map((c) => h("th", {}, c)))];
+    ev.forEach((e, i) => {
+      if (e.kind === "issue" && e.barrier) rows.push(h("tr", { class: "barrier" }, h("td", { colspan: 8 }, "┄┄ 写屏障：等待上面的写全部完成 ┄┄")));
+      const cells = Array(8).fill("");
+      cells[0] = String(i + 1);
+      if (e.kind === "issue") e.ws.forEach((w) => { const c = W[w].col; cells[c] = (cells[c] ? cells[c] + " " : "") + "issue " + W[w].label; });
+      else cells[W[e.w].col] = "complete " + W[e.w].label;
+      const cls = i === k - 1 ? "cur" : i >= k ? (crashed ? "lost" : "future") : "";
+      rows.push(h("tr", { class: cls }, cells.map((c, j) => h("td", { class: j && c ? (c.startsWith("issue") ? "iss" : "cmp") : null }, c))));
+      if (crashed && i === k - 1) rows.push(h("tr", { class: "crash" }, h("td", { colspan: 8 }, "⚡ 在这里断电：之后的写全部没有发生，在途的写丢失")));
+    });
+    if (crashed && k === 0) rows.splice(1, 0, h("tr", { class: "crash" }, h("td", { colspan: 8 }, "⚡ 一开始就断电")));
+    tl.replaceChildren(h("tbody", {}, rows));
+  }
+  function explain(e, done) {
+    if (!e) return "初始状态：三个脏块 I[v2]、B[v2]、Db 在内存里，磁盘上是旧版本。按 ▶ 开始。";
+    const M = MODES[selM.value];
+    if (e.kind === "issue") return (e.barrier ? "写屏障：确认上一批写全部落盘后，" : "") + "发出 " + e.ws.map((w) => (w[0] === "j" && w !== "jsb" ? "日志·" : w === "jsb" ? "" : "最终位置·") + W[w].label).join("、") + "。" + e.phase + "。";
+    const w = e.w, name = (w[0] === "j" && w !== "jsb" ? "日志中的 " : w === "jsb" ? "" : "最终位置的 ") + W[w].label;
+    let t = name + " 落盘。";
+    if (w === "jTxE") {
+      const missing = M.journal.filter((c) => !done.has("j" + c));
+      t += missing.length ? ` 危险！TxE 已落盘，但日志里的 ${missing.join("、")} 还没写完——此刻断电，事务看起来"已提交"。` + (M.checksum ? "（幸好 TxE 里有校验和，恢复时能发现。）" : "") : " 事务已提交（committed）：从此刻起断电，恢复程序都会重放它。";
+    }
+    if (w === "fDb" && selM.value === "ordered") t += " 数据先于提交块到位，保证提交后的 inode 不会指向垃圾。";
+    if (w === "fDb" && selM.value === "late" && done.has("jTxE")) t += " 这一步之前的那段时间，TxE 已落盘而 Db 未落盘，是危险窗口。";
+    if (w === "jsb") t += " 这段日志空间可以复用了。";
+    if (selM.value === "none") t += " 无日志时，每个中间状态都可能是不一致的。";
+    return t;
+  }
+  function render(k) {
+    const { done, inflight } = diskAt(ev, k);
+    const rec = crashed ? recover(selM.value, done) : null;
+    drawDisk(done, inflight, rec);
+    drawTimeline(k);
+    if (crashed) {
+      const j = judge(rec.st);
+      narr.replaceChildren(h("div", {}, h("b", {}, `第 ${k} 个事件之后断电。`), inflight.size ? ` 在途的 ${[...inflight].map((w) => W[w].label).join("、")} 丢失。` : ""),
+        h("div", {}, h("b", {}, "恢复："), rec.action), h("div", {}, h("b", {}, "结果："), h("span", { class: "badge " + j.cls }, j.text)));
+    } else narr.textContent = explain(ev[k - 1], done);
+    const nW = ev.filter((e) => e.kind === "done").length, nJ = ev.filter((e) => e.kind === "done" && e.w[0] === "j" && e.w !== "jsb").length;
+    const nB = MODES[selM.value].groups.filter((g) => g.barrier).length;
+    let bad = 0;
+    for (let i = 0; i <= ev.length; i++) if (judge(recover(selM.value, diskAt(ev, i).done).st).cls === "bad") bad++;
+    stats.replaceChildren(
+      h("div", { class: "stat" }, h("div", { class: "v" }, nW), h("div", { class: "l" }, "块写总数（有用的只有 3 个）")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, nJ), h("div", { class: "l" }, "其中写日志的块")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, nB), h("div", { class: "l" }, "写屏障（等待）次数")),
+      h("div", { class: "stat" }, h("div", { class: "v", style: { color: bad ? "var(--bad)" : "var(--ok)" } }, `${bad} / ${ev.length + 1}`), h("div", { class: "l" }, "危险崩溃点（恢复后坏掉）")));
+  }
+  function rebuild() { ev = buildEvents(selM.value, Math.max(0, +seedIn.value || 0)); sweepOut.hidden = true; st.reset(); }
+  const st = stepper(document.getElementById("jn-step"), { steps: () => ev.length + 1, render });
+  selM.onchange = rebuild; seedIn.addEventListener("input", rebuild);
+  document.getElementById("jn-shuffle").onclick = () => { seedIn.value = (+seedIn.value || 0) + 1; rebuild(); };
+  crashBtn.onclick = () => { crashed = !crashed; crashBtn.setAttribute("aria-pressed", crashed); st.refresh(); };
+  document.getElementById("jn-sweep").onclick = () => {
+    const rows = [h("tr", {}, ["断电时刻", "最后一个事件", "恢复动作", "恢复后的文件系统"].map((c) => h("th", {}, c)))];
+    for (let i = 0; i <= ev.length; i++) {
+      const e = ev[i - 1], r = recover(selM.value, diskAt(ev, i).done), j = judge(r.st);
+      const what = !e ? "（开始前）" : (e.kind === "issue" ? "发出 " + e.ws.map((w) => W[w].label).join("、") : "完成 " + (e.w[0] === "j" && e.w !== "jsb" ? "日志·" : e.w === "jsb" ? "" : "最终位置·") + W[e.w].label);
+      rows.push(h("tr", {}, h("td", { class: "num" }, "第 " + i + " 个事件后"), h("td", {}, what), h("td", {}, r.short), h("td", {}, h("span", { class: "badge " + j.cls }, j.text))));
+    }
+    sweepOut.replaceChildren(h("table", { class: "tl" }, h("tbody", {}, rows)));
+    sweepOut.hidden = false;
+  };
+  ev = buildEvents("data", 0);
+})();
+
+/* ================== 块复用与撤销记录 ================== */
+(function () {
+  const { h, stepper } = OSTEP;
+  const on = document.getElementById("rv-on"), stage = document.getElementById("rv-stage"), narr = document.getElementById("rv-narr");
+  const tx = (id, parts, cls) => h("span", { class: "cell " + (cls || "on"), style: { minWidth: "auto", padding: "2px 8px" } }, `Tx${id}: ` + parts.join(" | "));
+  function render(i) {
+    const rv = on.checked;
+    const log = [];
+    let blk = "空闲", blkCls = "", files = "foo/（目录）", note = "";
+    if (i >= 1) log.push(tx(1, ["TxB", "I[foo] ptr:1000", "D[foo] → 1000", "TxE"]));
+    if (i >= 1) { blk = "D[foo]（目录项）"; blkCls = "on"; }
+    if (i >= 2) { log.push(tx(2, rv ? ["TxB", "删除 foo", "Revoke(1000)", "TxE"] : ["TxB", "删除 foo", "TxE"], rv ? "hit" : "on")); blk = "空闲（已释放）"; blkCls = ""; files = "（foo 已删除）"; }
+    if (i >= 3) { log.push(tx(3, ["TxB", "I[bar] ptr:1000", "TxE"])); blk = "bar 的用户数据"; blkCls = "hit"; files = "bar（普通文件，数据在块 1000，不进日志）"; }
+    if (i >= 5) {
+      if (rv) { blk = "bar 的用户数据（完好）"; blkCls = "hit"; note = "恢复先扫描撤销记录：块 1000 被撤销 → 重放 Tx1 时跳过 D[foo]。"; }
+      else { blk = "D[foo] 旧目录内容！"; blkCls = "miss"; note = "重放 Tx1 时把 D[foo] 写回块 1000，bar 的数据被覆盖。"; }
+    }
+    stage.replaceChildren(
+      h("div", { class: "small muted" }, "日志（Journal）" + (i >= 4 ? " — ⚡ 已崩溃，事务都还在日志里" : "")),
+      h("div", { style: { margin: "4px 0 12px" } }, log.length ? log : h("span", { class: "muted small" }, "（空）")),
+      h("div", { class: "small muted" }, "磁盘块 1000 的内容"),
+      h("div", { style: { margin: "4px 0 8px" } }, h("span", { class: "cell " + blkCls, style: { minWidth: "220px" } }, blk)),
+      h("div", { class: "small" }, "文件：" + files));
+    const T = [
+      "初始：目录 foo 的数据位于块 1000。本例使用元数据日志：目录内容算元数据，会进日志；普通文件的数据不进日志。",
+      "用户在 foo 里创建一个文件：foo 的 inode 和目录块 D[foo]（最终地址 1000）作为 Tx1 写进日志并提交。",
+      rv ? "用户删除 foo 中的一切和 foo 本身，块 1000 被释放。ext3 在日志里写入一条撤销记录 Revoke(1000)。" : "用户删除 foo 中的一切和 foo 本身，块 1000 被释放以供复用。",
+      "用户创建新文件 bar，恰好复用块 1000。bar 的 inode 进入日志（Tx3），但 bar 的数据是用户数据，不进日志，直接写到块 1000。",
+      "崩溃！此时这些事务都还留在日志里（尚未检查点并释放）。",
+      (rv ? "恢复：" : "恢复：按顺序重放日志中的所有事务。") + note,
+    ];
+    narr.textContent = T[i];
+  }
+  const st = stepper(document.getElementById("rv-step"), { steps: 6, render });
+  on.onchange = () => st.refresh();
+})();
+</script>
+</body></html>

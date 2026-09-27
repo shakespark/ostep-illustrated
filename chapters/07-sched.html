@@ -1,0 +1,717 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 7 章 · 调度：介绍</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+.jobtable input[type="number"] { width: 5em; }
+.jobtable td, .jobtable th { padding: 5px 8px; vertical-align: middle; }
+.jobtable .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 6px; }
+.presets { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+.presets button { font-size: 13px; padding: 4px 10px; }
+.presets .lbl { font-size: 13px; color: var(--muted); align-self: center; margin-right: 4px; }
+.rq { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 10px; font-size: 13.5px; }
+.rq .lbl { color: var(--muted); margin-right: 6px; }
+.cell.run { color: #fff; border-color: transparent; font-weight: 600; }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px; color: var(--muted); margin-top: 8px; }
+.legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+.assume li.off { color: var(--muted); text-decoration: line-through; }
+.chip { display: inline-block; font-size: 12px; padding: 0 7px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-2); margin-left: 6px; color: var(--muted); }
+.ohbar { height: 22px; border-radius: 6px; overflow: hidden; display: flex; border: 1px solid var(--border); margin-top: 8px; }
+.ohbar div { height: 100%; }
+svg.tl { max-width: none; }
+</style>
+</head>
+<body data-chapter="7">
+<main>
+
+<h2>一句话 + 关键问题</h2>
+<div class="crux">
+  <p><strong>如何设计调度策略？</strong>我们该用什么框架来思考调度策略？关键的假设是什么？哪些指标重要？最早的计算机系统用过哪些基本方法？</p>
+  <p class="muted small">THE CRUX: HOW TO DEVELOP SCHEDULING POLICY — How should we develop a basic framework for thinking about scheduling policies? What are the key assumptions? What metrics are important? What basic approaches have been used in the earliest of computer systems?</p>
+</div>
+<p>前几章讲了<strong>机制（mechanism）</strong>：上下文切换（context switch）、时钟中断、受限直接执行——它们回答"<em>怎么</em>切换进程"。本章开始讲<strong>策略（policy）</strong>：在任一时刻，操作系统<em>该让谁</em>运行？</p>
+<p>本章的方法论非常值得学习：先做一组明显不现实的<strong>工作负载假设（workload assumptions）</strong>，在简化的世界里设计出最优策略，然后一条一条放宽假设，看策略哪里失效、该如何修补。走完这一路，你会得到两大类调度器——优化周转时间的 SJF/STCF 和优化响应时间的 RR——并看清两者之间无法两全的<strong>权衡（trade-off）</strong>。最后一个没解决的问题（操作系统不知道作业有多长）留给下一章的多级反馈队列（MLFQ）。</p>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>工作负载（workload）</h4><p>系统中运行的进程（本章叫"作业 job"）的集合及其特征。对负载了解越多，策略可以调得越精细。</p></div>
+  <div class="card"><h4>周转时间（turnaround time）</h4><p>T<sub>周转</sub> = T<sub>完成</sub> − T<sub>到达</sub>。衡量"作业多久能做完"，是性能指标。</p></div>
+  <div class="card"><h4>响应时间（response time）</h4><p>T<sub>响应</sub> = T<sub>首次运行</sub> − T<sub>到达</sub>。衡量"交互用户多久能看到反应"。</p></div>
+  <div class="card"><h4>FIFO / FCFS</h4><p>先进先出（First In, First Out）。简单，但短作业排在长作业后面会产生<strong>护航效应（convoy effect）</strong>。</p></div>
+  <div class="card"><h4>SJF</h4><p>最短作业优先（Shortest Job First），非抢占。所有作业同时到达时，平均周转时间最优。</p></div>
+  <div class="card"><h4>STCF / PSJF</h4><p>最短完成时间优先（Shortest Time-to-Completion First）：每当有新作业到达，就抢占，改跑剩余时间最短的作业。</p></div>
+  <div class="card"><h4>轮转（Round Robin, RR）</h4><p>每个作业运行一个<strong>时间片（time slice / quantum）</strong>后切到队列中的下一个。响应时间好，周转时间差。</p></div>
+  <div class="card"><h4>重叠（overlap）</h4><p>一个进程等待 I/O 时让另一个进程用 CPU，把每段 CPU 突发当成独立子作业来调度，提高利用率。</p></div>
+</div>
+
+<h2>图解讲解</h2>
+
+<h3>7.1 工作负载假设：先把世界简化</h3>
+<p>书中先做了 5 条（大多不现实的）假设。本章的节奏就是把它们<strong>一条一条划掉</strong>：</p>
+<figure class="fig">
+<svg viewBox="0 0 760 250" width="760" role="img" aria-label="五条工作负载假设以及放宽它们的小节">
+  <g font-size="13.5">
+    <g transform="translate(10,14)">
+      <rect class="box" x="0" y="0" width="360" height="34" rx="6"/><text x="12" y="22">① 每个作业运行相同的时间</text>
+      <line class="arrow" x1="360" y1="17" x2="420" y2="17"/><rect class="accent-soft" x="420" y="0" width="320" height="34" rx="6"/><text x="432" y="22">7.3 放宽 → FIFO 出现护航效应 → SJF</text>
+    </g>
+    <g transform="translate(10,60)">
+      <rect class="box" x="0" y="0" width="360" height="34" rx="6"/><text x="12" y="22">② 所有作业同时到达</text>
+      <line class="arrow" x1="360" y1="17" x2="420" y2="17"/><rect class="accent-soft" x="420" y="0" width="320" height="34" rx="6"/><text x="432" y="22">7.4 放宽 → SJF 也会护航</text>
+    </g>
+    <g transform="translate(10,106)">
+      <rect class="box" x="0" y="0" width="360" height="34" rx="6"/><text x="12" y="22">③ 一旦开始，作业就运行到完成</text>
+      <line class="arrow" x1="360" y1="17" x2="420" y2="17"/><rect class="accent-soft" x="420" y="0" width="320" height="34" rx="6"/><text x="432" y="22">7.5 放宽 → 允许抢占 → STCF；7.7 RR</text>
+    </g>
+    <g transform="translate(10,152)">
+      <rect class="box" x="0" y="0" width="360" height="34" rx="6"/><text x="12" y="22">④ 所有作业只用 CPU（不做 I/O）</text>
+      <line class="arrow" x1="360" y1="17" x2="420" y2="17"/><rect class="accent-soft" x="420" y="0" width="320" height="34" rx="6"/><text x="432" y="22">7.8 放宽 → CPU 与 I/O 重叠</text>
+    </g>
+    <g transform="translate(10,198)">
+      <rect class="box" x="0" y="0" width="360" height="34" rx="6"/><text x="12" y="22">⑤ 每个作业的运行时间是已知的</text>
+      <line class="arrow" x1="360" y1="17" x2="420" y2="17"/><rect class="warn-soft" x="420" y="0" width="320" height="34" rx="6"/><text x="432" y="22">7.9 最难放宽 → 下一章 MLFQ</text>
+    </g>
+  </g>
+</svg>
+<figcaption>五条假设以及本章（和下一章）中放宽它们的位置。第 ⑤ 条相当于让调度器"全知"，最不现实。</figcaption>
+</figure>
+
+<h3>7.2 调度指标：周转时间与响应时间</h3>
+<p>要比较策略，先得有<strong>调度指标（scheduling metric）</strong>。本章先只用一个：</p>
+<p style="text-align:center"><code>T<sub>turnaround</sub> = T<sub>completion</sub> − T<sub>arrival</sub></code>　（式 7.1）</p>
+<p>假设 ② 让所有作业都在 0 时刻到达，所以一开始 T<sub>周转</sub> 就等于完成时刻。到 7.6 节，交互式的分时系统又催生了第二个指标：</p>
+<p style="text-align:center"><code>T<sub>response</sub> = T<sub>firstrun</sub> − T<sub>arrival</sub></code>　（式 7.2）</p>
+<figure class="fig">
+<svg viewBox="0 0 700 150" width="700" role="img" aria-label="到达、首次运行、完成三个时刻与两种指标">
+  <line class="stroke" x1="30" y1="70" x2="680" y2="70" stroke-width="1.5"/>
+  <rect x="80" y="52" width="120" height="36" rx="4" style="fill:var(--surface-2);stroke:var(--border)"/><text x="140" y="75" text-anchor="middle" class="t-muted" font-size="12">在就绪队列里等</text>
+  <rect x="200" y="52" width="160" height="36" rx="4" style="fill:var(--c1)"/><text x="280" y="75" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">运行</text>
+  <rect x="360" y="52" width="110" height="36" rx="4" style="fill:var(--surface-2);stroke:var(--border)"/><text x="415" y="75" text-anchor="middle" class="t-muted" font-size="12">被抢占，等</text>
+  <rect x="470" y="52" width="150" height="36" rx="4" style="fill:var(--c1)"/><text x="545" y="75" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">运行</text>
+  <g font-size="12.5">
+    <line x1="80" y1="40" x2="80" y2="100" style="stroke:var(--fg)" stroke-dasharray="3 3"/><text x="80" y="118" text-anchor="middle">T<tspan font-size="10" dy="3">arrival</tspan></text>
+    <line x1="200" y1="40" x2="200" y2="100" style="stroke:var(--fg)" stroke-dasharray="3 3"/><text x="200" y="118" text-anchor="middle">T<tspan font-size="10" dy="3">firstrun</tspan></text>
+    <line x1="620" y1="40" x2="620" y2="100" style="stroke:var(--fg)" stroke-dasharray="3 3"/><text x="620" y="118" text-anchor="middle">T<tspan font-size="10" dy="3">completion</tspan></text>
+  </g>
+  <path d="M80 30 V22 H200 V30" style="stroke:var(--warn);fill:none;stroke-width:2"/><text x="140" y="16" text-anchor="middle" font-size="12.5" style="fill:var(--warn);font-weight:600">响应时间</text>
+  <path d="M80 132 V140 H620 V132" style="stroke:var(--accent);fill:none;stroke-width:2"/><text x="350" y="138" text-anchor="middle" font-size="12.5" style="fill:var(--accent);font-weight:600" dy="-2">周转时间</text>
+</svg>
+<figcaption>一个作业的生命周期：响应时间只关心"第一次上 CPU"有多快；周转时间关心"最后一次下 CPU"有多快。</figcaption>
+</figure>
+<p>周转时间是<strong>性能（performance）</strong>指标；另一类常见指标是<strong>公平（fairness）</strong>，比如 Jain 公平指数。性能与公平常常矛盾：为了性能，调度器可能让少数作业一直跑不上。</p>
+
+<h3>7.3 先进先出（FIFO）与护航效应</h3>
+<p>最基本的算法是 <strong>FIFO</strong>（也叫 <strong>FCFS</strong>，先到先服务）：谁先到谁先跑。设 A、B、C 几乎同时在 0 时刻到达（A 比 B 早"一根头发丝"，B 比 C 早一点），每个运行 10 秒：</p>
+<figure class="fig"><div data-fig="f71"></div><figcaption>图 7.1　FIFO 简单例子：A、B、C 分别在 10、20、30 完成，平均周转时间 = (10+20+30)/3 = <b data-avg="f71"></b></figcaption></figure>
+<p>现在放宽假设 ①：作业长度可以不同。你能构造一个让 FIFO 很糟的负载吗？（先想一想……）答案是让一个<strong>长作业排在最前面</strong>。A 运行 100 秒，B、C 各 10 秒：</p>
+<figure class="fig"><div data-fig="f72"></div><figcaption>图 7.2　FIFO 为什么不太好：平均周转时间 = (100+110+120)/3 = <b data-avg="f72"></b></figcaption></figure>
+<p>这就是<strong>护航效应（convoy effect）</strong>：一些耗时很短的资源使用者，排在了一个重量级使用者后面。想想超市里只买一瓶水的你，前面排着一位推了三车货还掏出支票本的顾客。</p>
+
+<h3>7.4 最短作业优先（SJF）</h3>
+<p>一个从运筹学借来的简单想法就能解决问题：<strong>最短作业优先（Shortest Job First, SJF）</strong>——先跑最短的，再跑次短的，以此类推。同样的负载：</p>
+<figure class="fig"><div data-fig="f73"></div><figcaption>图 7.3　SJF 简单例子：先跑 B、C，平均周转时间从 110 降到 (10+20+120)/3 = <b data-avg="f73"></b>，提升一倍多</figcaption></figure>
+<div class="aside" data-title="为什么 SJF 最优？一个直觉">
+<p>书中说"在所有作业同时到达的假设下可以证明 SJF 最优，但你在上系统课，不许证明"。直觉可以这样建立：n 个作业依次运行时，排在第 k 位的作业的长度会被计入它自己以及它<strong>后面所有作业</strong>的完成时间，一共被计 n−k+1 次。所以总周转时间 = Σ (n−k+1)·len<sub>k</sub>。要让和最小，就该把权重最大的位置（最前面）留给最短的作业——这正是 SJF。</p>
+</div>
+<p>在超市里，"10 件以下快速通道"就是 SJF 原则的应用。但假设 ② 仍不现实。放宽它：作业可以<strong>随时到达</strong>。设 A 在 t=0 到达、需要 100 秒，B、C 在 t=10 到达、各需 10 秒。纯 SJF 是<strong>非抢占（non-preemptive）</strong>的——A 已经开始了，就只能等它跑完：</p>
+<figure class="fig"><div data-fig="f74"></div><figcaption>图 7.4　B、C 晚到时的 SJF：平均周转时间 = (100 + (110−10) + (120−10))/3 = <b data-avg="f74"></b>，又护航了</figcaption></figure>
+
+<h3>7.5 最短完成时间优先（STCF）</h3>
+<p>要解决它，得放宽假设 ③（作业必须运行到完成），并借用前几章的机制：时钟中断 + 上下文切换让调度器可以<strong>抢占（preempt）</strong>正在运行的作业。给 SJF 加上抢占，就得到<strong>最短完成时间优先（STCF）</strong>，也叫<strong>抢占式最短作业优先（PSJF）</strong>：每当有新作业进入系统，调度器就在所有剩余作业（包括新来的）中挑<strong>剩余时间最短</strong>的运行。</p>
+<figure class="fig"><div data-fig="f75"></div><figcaption>图 7.5　STCF 简单例子：t=10 时 A 还剩 90，B、C 各 10 → 抢占 A。平均周转时间 = ((120−0)+(20−10)+(30−10))/3 = <b data-avg="f75"></b></figcaption></figure>
+<div class="aside" data-title="旁注：抢占式调度器">
+<p>批处理时代有很多<strong>非抢占（non-preemptive）</strong>调度器：一个作业跑完才考虑下一个。现代调度器几乎都是<strong>抢占式（preemptive）</strong>的，随时愿意停下一个进程去跑另一个——这依赖的正是第 6 章讲的时钟中断和上下文切换机制。</p>
+</div>
+<p>在"作业可随时到达、长度已知、只用 CPU、只看周转时间"的假设下，STCF 同样可证明是最优的。</p>
+
+<h3>7.6 新指标：响应时间</h3>
+<p>如果只看周转时间，STCF 很棒；早期批处理系统也确实这么做。但<strong>分时（time-shared）</strong>机器出现后，用户坐在终端前，要求交互性能，于是有了<strong>响应时间（response time）</strong>。以图 7.5 的调度为例：A 的响应时间 0，B 为 0，C 为 10，平均 <b data-resp="f75"></b>。</p>
+<p>STCF 这类策略对响应时间并不友好：三个作业同时到达时，第三个必须等前两个<strong>全部</strong>跑完才第一次被调度。想象你在终端敲了一个键，却因为别人的作业排在前面等了 10 秒才看到回显。</p>
+
+<h3>7.7 轮转（Round Robin）</h3>
+<p><strong>轮转（RR）</strong>的想法很简单：不再把作业跑到结束，而是运行一个<strong>时间片（time slice，也叫调度量子 scheduling quantum）</strong>，然后切换到运行队列中的下一个作业，如此反复，所以 RR 也叫<strong>时间切片（time-slicing）</strong>。注意时间片必须是时钟中断周期的整数倍：中断每 10ms 一次，时间片就只能是 10、20……ms。</p>
+<p>A、B、C 同时到达，每个运行 5 秒：</p>
+<figure class="fig"><div data-fig="f76"></div><figcaption>图 7.6　又是 SJF（对响应时间不利）：平均响应时间 = (0+5+10)/3 = <b data-resp="f76"></b></figcaption></figure>
+<figure class="fig"><div data-fig="f77"></div><figcaption>图 7.7　时间片为 1 秒的 RR（对响应时间有利）：平均响应时间 = (0+1+2)/3 = <b data-resp="f77"></b></figcaption></figure>
+<p>时间片的长度对 RR 至关重要：越短，响应时间越好；但太短的话，<strong>上下文切换的成本</strong>会主导整体性能。于是时间片的选择是一个权衡：要长到足以<strong>摊销（amortize）</strong>切换成本，又不能长到让系统失去响应性。</p>
+<div class="tip">
+<p><strong>摊销可以降低成本（amortization）。</strong>一个操作有固定开销时，少做几次就能降低总开销。时间片 10ms、切换开销 1ms，大约 10% 的时间浪费在切换上；把时间片加到 100ms，浪费就不到 1%。下面的小工具可以拖动试试：</p>
+<div class="controls" style="margin-top:8px">
+  <label>时间片 <input type="range" id="am-q" min="1" max="200" value="10"> <span id="am-qv" class="mono">10</span> ms</label>
+  <label>切换开销 <input type="number" id="am-c" min="0" max="20" step="0.5" value="1"> ms</label>
+</div>
+<div class="ohbar" id="am-bar"></div>
+<p class="small" id="am-txt" style="margin-top:6px"></p>
+</div>
+<p>注意：切换成本不只是操作系统保存/恢复几个寄存器。程序运行时会在 CPU 缓存、TLB、分支预测器等片上硬件中积累大量状态；切换到另一个作业会冲刷掉这些状态，换入新作业相关的状态，这可能带来明显的性能损失。</p>
+<p>RR 对周转时间呢？还是图 7.7：A 在 13 完成，B 在 14，C 在 15，平均 <b data-avg="f77"></b>——很糟！RR 把每个作业尽可能"拉长"，而周转时间只关心作业何时结束，所以 RR 几乎是<strong>最差（pessimal）</strong>的，很多情况下比 FIFO 还差。</p>
+<div class="key">
+<p><strong>核心权衡：</strong>任何在短时间尺度上把 CPU 平均分给活跃进程的<strong>公平</strong>策略（如 RR），在周转时间上都会表现不好。愿意不公平，就可以把短作业跑完，代价是响应时间；重视公平，响应时间降低，代价是周转时间。"鱼与熊掌不可兼得"（You can't have your cake and eat it too）。</p>
+<ul style="margin-bottom:0">
+  <li>第一类（SJF、STCF）：优化<strong>周转时间</strong>，响应时间差。</li>
+  <li>第二类（RR）：优化<strong>响应时间</strong>，周转时间差。</li>
+</ul>
+</div>
+
+<h3>7.8 结合 I/O</h3>
+<p>放宽假设 ④：所有程序都会做 I/O。当作业发起 I/O 请求时，它在 I/O 完成前处于<strong>阻塞（blocked）</strong>状态，不会用 CPU，调度器应该趁机调度别的作业；I/O 完成时会产生中断，操作系统把该进程从阻塞态移回就绪态，此时还可以决定是否立刻运行它。</p>
+<p>例子：A、B 各需要 50ms CPU。A 每运行 10ms 就发起一次 I/O（每次 I/O 10ms）；B 只用 CPU 50ms，不做 I/O。如果调度器把 A 当作一个整体，先跑完 A 再跑 B，那么 A 做 I/O 时 CPU 只能干等：</p>
+<figure class="fig"><div data-fig="f78"></div><figcaption>图 7.8　资源利用很差：A 做 I/O 期间 CPU 空闲，B 直到 90 才开始，140 才结束</figcaption></figure>
+<p>常见的做法是：把 A 的每个 10ms <strong>CPU 突发（CPU burst）</strong>当成一个独立的子作业。系统启动时，STCF 在"10ms 的 A"和"50ms 的 B"之间选更短的 A；A 的第一个子作业结束（开始 I/O）后只剩 B，B 开始运行；A 的 I/O 完成后提交一个新的 10ms 子作业，它比 B 剩下的时间短，于是抢占 B……CPU 和磁盘就<strong>重叠（overlap）</strong>起来了：</p>
+<figure class="fig"><div data-fig="f79"></div><figcaption>图 7.9　重叠带来更好的资源利用：两个作业在 100ms 内全部完成，CPU 一直在忙</figcaption></figure>
+<div class="tip"><p><strong>重叠带来更高的利用率。</strong>只要可能，就把操作重叠起来以最大化系统利用率：发起磁盘 I/O 或向远程机器发消息后，先去做别的工作，是个好主意。</p></div>
+<p>这样一来，"交互式"进程（频繁做 I/O、CPU 突发很短）会被频繁运行；它们做 I/O 的时候，CPU 密集型作业填满空档。</p>
+
+<h3>7.9 不再有先知（No More Oracle）</h3>
+<p>最后一个假设 ⑤：调度器知道每个作业有多长。这可能是最糟糕的假设——通用操作系统通常对作业长度<strong>知之甚少</strong>。那么，如何在没有先验知识的情况下做出行为接近 SJF/STCF 的调度器？又如何融入 RR 的思想让响应时间也不错？答案是用<strong>最近的过去预测未来</strong>：下一章的<strong>多级反馈队列（multi-level feedback queue）</strong>。</p>
+
+<h2>交互模拟器</h2>
+
+<section class="sim" id="sim-sched">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>单 CPU 调度器：FIFO / SJF / STCF / RR</h3>
+    <div class="desc">编辑作业表（到达时间、运行时长），选策略，单步查看每个调度决策点的就绪队列；右边的预设按钮复刻原书图 7.1–7.7。观察：同一组作业，换策略后平均周转时间与平均响应时间如何此消彼长。</div></div>
+  <div class="sim-body">
+    <div class="presets" id="sc-presets"><span class="lbl">载入原书示例：</span></div>
+    <div class="controls">
+      <label>策略 <select id="sc-pol"><option value="FIFO">FIFO</option><option value="SJF">SJF（非抢占）</option><option value="STCF" selected>STCF（抢占）</option><option value="RR">RR（轮转）</option></select></label>
+      <label id="sc-qwrap">时间片 <input type="number" id="sc-q" min="1" max="500" value="1"></label>
+      <label title="每次从一个作业切到另一个作业时额外消耗的时间">切换开销 <input type="number" id="sc-cs" min="0" max="50" step="0.5" value="0"></label>
+      <span class="sep"></span>
+      <button id="sc-add">＋ 添加作业</button>
+      <button id="sc-rand">🎲 随机作业</button>
+      <label>种子 <input type="number" id="sc-seed" value="7"></label>
+    </div>
+    <div class="table-wrap"><table class="jobtable"><thead><tr><th>作业</th><th>到达时间</th><th>运行时长</th><th></th></tr></thead><tbody id="sc-jobs"></tbody></table></div>
+    <div id="sc-step"></div>
+    <div class="stage"><div id="sc-gantt"></div><div class="rq" id="sc-rq"></div></div>
+    <div class="legend"><span><i style="background:var(--surface-2);border:1px solid var(--border)"></i>CPU 空闲</span><span><i style="background:var(--warn-soft);border:1px solid var(--warn)"></i>上下文切换开销</span><span>▲ 作业到达时刻</span><span>竖线 = 当前决策时刻，之后的部分变淡</span></div>
+    <div class="narrate" id="sc-nar"></div>
+    <div class="stats" id="sc-stats"></div>
+    <div class="table-wrap"><table id="sc-res"></table></div>
+  </div>
+</section>
+
+<section class="sim" id="sim-cmp">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>对比视图：同一组作业，四种策略</h3>
+    <div class="desc">直接使用上面模拟器里的作业表与时间片。左图对比四种策略的平均周转/响应时间；右图把 RR 的时间片从 1 扫到更大，看两个指标如何随时间片变化（对应课后题 7）。</div></div>
+  <div class="sim-body">
+    <div class="two">
+      <div class="stage"><div id="cmp-bars"></div></div>
+      <div class="stage"><div id="cmp-sweep"></div></div>
+    </div>
+    <div class="legend"><span><i style="background:var(--c1)"></i>平均周转时间</span><span><i style="background:var(--c2)"></i>平均响应时间</span></div>
+    <div class="narrate" id="cmp-nar"></div>
+  </div>
+</section>
+
+<section class="sim" id="sim-io">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>CPU 与 I/O 的重叠（图 7.8 / 7.9）</h3>
+    <div class="desc">A 由若干个 CPU 突发组成，每个突发之后做一次 I/O（最后一个突发之后不再做 I/O）；B 是纯 CPU 作业。对比"整体调度 A"与"把每个 CPU 突发当子作业 + STCF"，看 CPU 利用率和完成时间。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>方式 <select id="io-mode"><option value="whole">整体调度（先 A 后 B）</option><option value="overlap" selected>子作业 + STCF（重叠）</option></select></label>
+      <label>A 突发数 <input type="number" id="io-n" min="1" max="12" value="5"></label>
+      <label>每个突发 <input type="number" id="io-b" min="1" max="50" value="10"></label>
+      <label>I/O 时长 <input type="number" id="io-t" min="1" max="60" value="10"></label>
+      <label>B 长度 <input type="number" id="io-bl" min="1" max="200" value="50"></label>
+      <button id="io-book">原书参数</button>
+    </div>
+    <div id="io-step"></div>
+    <div class="stage"><div id="io-chart"></div></div>
+    <div class="narrate" id="io-nar"></div>
+    <div class="stats" id="io-stats"></div>
+  </div>
+</section>
+
+<h2>先预测再验证</h2>
+<div class="exercise"><div class="q">（课后题 1）三个长度都是 200 的作业，分别用 SJF 和 FIFO，响应时间和周转时间各是多少？先算，再点模拟器的"课后题 1"预设验证。</div>
+<details class="reveal"><summary>看答案</summary><div>长度相同时 SJF 与 FIFO 的顺序一样。响应时间 0、200、400，平均 <strong>200</strong>；周转时间 200、400、600，平均 <strong>400</strong>。</div></details></div>
+<div class="exercise"><div class="q">（课后题 2、3）作业长度改为 100、200、300（按此顺序到达）。FIFO、SJF 各是多少？再换成时间片为 1 的 RR 呢？</div>
+<details class="reveal"><summary>看答案</summary><div>FIFO 与 SJF 相同（短的本来就在前）：响应 0、100、300，平均 <strong>133.33</strong>；周转 100、300、600，平均 <strong>333.33</strong>。<br>RR(q=1)：响应 0、1、2，平均 <strong>1</strong>；周转：A 在 298 完成（前 300 个时间单位里三者轮流，A 的第 100 次运行在 297–298），B 在 499 完成，C 在 600 完成，平均 <strong>465.67</strong>——响应极好，周转比 FIFO 差得多。</div></details></div>
+<div class="exercise"><div class="q">（课后题 4、5）什么样的负载下 SJF 的周转时间与 FIFO 相同？什么样的负载和时间片下，SJF 的响应时间与 RR 相同？</div>
+<details class="reveal"><summary>看答案</summary><div>① 当作业的到达顺序本来就是"由短到长"（包括所有作业一样长）时，SJF 和 FIFO 选出的顺序完全相同。<br>② 当 RR 的时间片 ≥ 最长作业长度时，RR 退化为按队列顺序运行到完成，也就是 FIFO；若作业又是按短到长排列（或等长），就与 SJF 一致。例如三个 5 秒作业、时间片 5：两者都是 A、B、C，响应时间都是 0、5、10。试试把模拟器时间片改成 5。</div></details></div>
+<div class="exercise"><div class="q">（课后题 6）在 SJF 下，如果作业长度都变大（比如三个等长作业从 5 变到 50），响应时间会怎样？</div>
+<details class="reveal"><summary>看答案</summary><div>线性增长。第 k 个作业的响应时间 = 前面所有作业长度之和，三个长度为 L 的作业平均响应时间 = (0+L+2L)/3 = L。用"随机作业"或手动改长度可以看到这个趋势。</div></details></div>
+<div class="exercise"><div class="q">（课后题 7）RR 下，时间片 q 变大，响应时间会怎样？N 个作业同时到达时，最坏响应时间是多少？</div>
+<details class="reveal"><summary>看答案</summary><div>响应时间随 q 增大而增大（见对比视图右图）。N 个作业同时到达、每个都至少跑满一个时间片时，最后一个作业要等前面 N−1 个各跑一个时间片：最坏响应时间 = <strong>(N−1)·q</strong>（若有切换开销 c，则为 (N−1)(q+c)）。</div></details></div>
+
+<h2>动手实验：命令行调度模拟器</h2>
+<div class="lab">
+<p>原书作业用的是 Python 写的 <code>scheduler.py</code>。<code>labs/07-sched/</code> 里有一个同样思路的 C 版本 <code>sched.c</code>：支持 FIFO / SJF / RR，打印逐步执行轨迹和每个作业的响应、周转、等待时间。用它来核对你手算的课后题答案。</p>
+<pre><code><span class="cmd">cd labs/07-sched && make</span>
+<span class="cmd">./sched -p FIFO -l 100,200,300</span>
+<span class="cmd">./sched -p RR -q 1 -l 100,200,300 -s</span>    # -s 只打印统计，不打印逐步轨迹</code></pre>
+<p class="small muted">示例输出（本机 WSL2 实际运行结果；这是确定性的模拟，你的输出应当完全一样）：</p>
+<pre><code id="lab-out">** Policy: FIFO   jobs: 3
+  [ time   0 ] Run job 0 for 100.00 secs ( DONE at 100.00 )
+  [ time 100 ] Run job 1 for 200.00 secs ( DONE at 300.00 )
+  [ time 300 ] Run job 2 for 300.00 secs ( DONE at 600.00 )
+
+Final statistics:
+  Job   0 -- Response: 0.00  Turnaround 100.00  Wait 0.00
+  Job   1 -- Response: 100.00  Turnaround 300.00  Wait 100.00
+  Job   2 -- Response: 300.00  Turnaround 600.00  Wait 300.00
+
+  Average -- Response: 133.33  Turnaround 333.33  Wait 133.33
+
+** Policy: RR   quantum: 1   jobs: 3
+
+Final statistics:
+  Job   0 -- Response: 0.00  Turnaround 298.00  Wait 198.00
+  Job   1 -- Response: 1.00  Turnaround 499.00  Wait 299.00
+  Job   2 -- Response: 2.00  Turnaround 600.00  Wait 300.00
+
+  Average -- Response: 1.00  Turnaround 465.67  Wait 265.67</code></pre>
+<p>要观察的点：同一组作业，RR 的平均响应时间从 133.33 降到 1，但平均周转时间从 333.33 升到 465.67——这就是本章的核心权衡。再试试 <code>-p SJF -l 300,200,100</code>，对比 <code>-p FIFO</code> 的结果，体会护航效应。</p>
+</div>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="0"><div class="q">1. 周转时间的定义是？</div>
+  <div class="opts"><button>A. 完成时刻 − 到达时刻</button><button>B. 首次运行时刻 − 到达时刻</button><button>C. 作业的实际运行时长</button><button>D. 完成时刻 − 首次运行时刻</button></div>
+  <div class="explain">T<sub>turnaround</sub> = T<sub>completion</sub> − T<sub>arrival</sub>。B 是响应时间；D 忽略了开始前的等待；C 是运行时长，与调度无关。</div></div>
+<div class="mcq" data-answer="2"><div class="q">2. A=100、B=10、C=10 同时到达且按此顺序排队，FIFO 下平均周转时间是多少？</div>
+  <div class="opts"><button>A. 103.33</button><button>B. 120</button><button>C. 110</button><button>D. 50</button></div>
+  <div class="explain">完成时刻 100、110、120，平均 110（图 7.2）。50 是 SJF 的结果；103.33 是 B、C 在 t=10 到达时的 SJF 结果。</div></div>
+<div class="mcq" data-answer="3"><div class="q">3. A(0 时刻到达，100) 与 B、C(10 时刻到达，各 10)。下列哪个说法正确？</div>
+  <div class="opts"><button>A. SJF 会在 t=10 抢占 A</button><button>B. STCF 的平均周转时间是 103.33</button><button>C. STCF 与 SJF 的平均响应时间相同</button><button>D. STCF 的平均周转时间是 50</button></div>
+  <div class="explain">SJF 是非抢占的，A 会跑完（周转 103.33）。STCF 在 t=10 抢占 A，平均周转 ((120−0)+(20−10)+(30−10))/3 = 50。响应时间：STCF 为 0,0,10（均 3.33），SJF 为 0,90,100（均 63.33），不同。</div></div>
+<div class="mcq" data-answer="1"><div class="q">4. 三个 5 秒的作业同时到达，时间片为 1 的 RR，平均周转时间是多少？</div>
+  <div class="opts"><button>A. 15</button><button>B. 14</button><button>C. 1</button><button>D. 10</button></div>
+  <div class="explain">A、B、C 分别在 13、14、15 完成，平均 14。10 是 SJF 的平均周转时间；1 是 RR 的平均响应时间。</div></div>
+<div class="mcq" data-answer="1"><div class="q">5. 时间片 10ms、上下文切换开销 1ms 时，约 10% 的时间用于切换。想把这个比例降到 1% 以下，书中给的做法是？</div>
+  <div class="opts"><button>A. 关闭时钟中断</button><button>B. 把时间片增大到 100ms，摊销切换成本</button><button>C. 把时间片缩短到 1ms</button><button>D. 改用 FIFO</button></div>
+  <div class="explain">这就是"摊销"：固定成本发生得越少，占比越低。代价是响应时间变差，所以时间片大小是权衡。</div></div>
+<div class="mcq" data-answer="0"><div class="q">6. 关于上下文切换的成本，哪个说法最准确？</div>
+  <div class="opts"><button>A. 除了保存/恢复寄存器，还包括 CPU 缓存、TLB、分支预测器等硬件状态被冲刷、需要重新预热的代价</button><button>B. 只和时间片长度有关</button><button>C. 在现代 CPU 上可以忽略不计</button><button>D. 只有保存和恢复寄存器的开销</button></div>
+  <div class="explain">程序运行时会在片上硬件中积累大量状态，切换后这些状态对新作业无用，需要重新建立，这部分间接成本可能很可观。</div></div>
+<div class="mcq" data-answer="3"><div class="q">7. 在 7.8 节 A（5 个 10ms 突发 + 10ms I/O）和 B（50ms 纯 CPU）的例子中，"每个 CPU 突发当作独立作业 + STCF"为什么能提高利用率？</div>
+  <div class="opts"><button>A. 因为 B 被放在了最前面</button><button>B. 因为它减少了上下文切换次数</button><button>C. 因为它让 I/O 本身变快了</button><button>D. 因为 A 做 I/O 时 CPU 去跑 B，CPU 和磁盘同时在工作（重叠）</button></div>
+  <div class="explain">I/O 时长没有变，切换反而更多了；关键是 A 阻塞期间 CPU 不再空闲，两个作业 100ms 内完成（原来 140ms）。</div></div>
+<div class="mcq" data-answer="2"><div class="q">8. 为什么说 RR 在周转时间上"几乎最差"？</div>
+  <div class="opts"><button>A. 因为它不能处理不同到达时间的作业</button><button>B. 因为它的上下文切换开销太大</button><button>C. 它把每个作业都拉长到尽量晚才结束，而周转时间只关心结束时刻</button><button>D. 因为它需要知道作业长度</button></div>
+  <div class="explain">即使切换开销为 0，RR 也会让所有作业"齐头并进"，最后几乎同时结束，平均完成时刻被推迟到接近最后。它也不需要知道作业长度（这正是它的优点之一）。</div></div>
+
+<h2>常见误区</h2>
+<div class="warn">
+<ul>
+<li><strong>"SJF 是抢占式的。"</strong>书中的 SJF 定义是<em>非抢占</em>的；加上抢占的版本叫 STCF（PSJF）。图 7.4 正是 SJF 因为不能抢占而再次护航。</li>
+<li><strong>"响应时间是作业产生第一次输出的时间。"</strong>本书用的是最好情况的定义：到达到<em>首次被调度</em>的时间，假设作业一被调度就立刻产生响应。</li>
+<li><strong>"时间片越短越好。"</strong>只对响应时间成立；切换的直接与间接成本（缓存、TLB 等）会随之占据越来越大的比例。</li>
+<li><strong>"STCF 在任何情况下都最优。"</strong>它只在给定假设下（长度已知、只看周转时间）最优；它对响应时间很差，而且现实中操作系统并不知道作业长度。</li>
+<li><strong>"RR 公平，所以各方面都好。"</strong>公平恰恰是 RR 周转时间差的原因——这是内在的权衡，不是实现问题。</li>
+</ul>
+</div>
+
+<h2>本章小结</h2>
+<ul>
+  <li>先做简化假设，再逐条放宽：这是设计调度策略（乃至很多系统策略）的通用方法。</li>
+  <li>两个指标：<strong>周转时间</strong>（完成 − 到达）和<strong>响应时间</strong>（首次运行 − 到达）。</li>
+  <li>FIFO 简单，但有护航效应；SJF 解决同时到达的情形；STCF 通过抢占处理任意到达时间，在周转时间上最优。</li>
+  <li>RR 用时间片轮转换来很好的响应时间，但周转时间很差；时间片长度需要在响应性与切换成本之间权衡（摊销）。</li>
+  <li>结合 I/O：把每个 CPU 突发当独立作业调度，让 CPU 与 I/O 重叠，交互式进程也得以频繁运行。</li>
+  <li>还剩一个问题：操作系统<strong>不知道作业有多长</strong>。下一章的<strong>多级反馈队列（MLFQ）</strong>用"最近的过去预测未来"来近似 SJF，同时兼顾响应时间；第 9 章的比例份额调度则换一个目标——保证每个作业获得一定比例的 CPU。</li>
+</ul>
+
+</main>
+<script>
+(function () {
+"use strict";
+const { h, s, color, letter } = OSTEP;
+
+/* CORE-BEGIN */
+// 单 CPU 调度核心（纯函数，无 DOM）。jobs: [{arrival, length}]；policy: FIFO|SJF|STCF|RR
+function schedule(jobsIn, policy, q, cs) {
+  q = Math.max(1e-6, +q || 1); cs = Math.max(0, +cs || 0);
+  const jobs = jobsIn.map((j, i) => ({ i, arr: +j.arrival, len: +j.length }));
+  const n = jobs.length, EPS = 1e-9;
+  const rem = jobs.map((j) => j.len), first = Array(n).fill(null), done = Array(n).fill(null);
+  const order = jobs.slice().sort((a, b) => a.arr - b.arr || a.i - b.i).map((j) => j.i);
+  const segs = [], events = [];
+  const queue = [];
+  let ai = 0, t = 0, cur = -1, last = -1, sliceLeft = 0, finished = 0, justDone = -1, guard = 0;
+  const push = (who, a, b, label) => {
+    if (b - a < EPS) return;
+    const L = segs[segs.length - 1];
+    if (L && L.who === who && who >= 0 && Math.abs(L.end - a) < EPS) L.end = b; else segs.push({ who, start: a, end: b, label });
+  };
+  const better = (x, y) => { // STCF/SJF 选择：更短者优先，平局看到达时间、编号
+    const kx = policy === "SJF" ? jobs[x].len : rem[x], ky = policy === "SJF" ? jobs[y].len : rem[y];
+    if (Math.abs(kx - ky) > EPS) return kx < ky;
+    if (jobs[x].arr !== jobs[y].arr) return jobs[x].arr < jobs[y].arr;
+    return x < y;
+  };
+  while (finished < n && guard++ < 100000) {
+    const arrivals = [];
+    while (ai < n && jobs[order[ai]].arr <= t + EPS) { queue.push(order[ai]); arrivals.push(order[ai]); ai++; }
+    const prev = cur;
+    let kind = "", pick = cur, preempted = -1;
+    if (cur >= 0 && policy === "RR" && sliceLeft <= EPS) { queue.push(cur); preempted = cur; cur = -1; kind = "slice"; }
+    if (cur >= 0 && policy === "STCF") {
+      let best = -1;
+      for (const k of queue) if (best < 0 || better(k, best)) best = k;
+      if (best >= 0 && rem[best] < rem[cur] - EPS) { queue.splice(queue.indexOf(best), 1); queue.push(cur); preempted = cur; cur = best; kind = "preempt"; }
+    }
+    if (cur < 0) {
+      if (!queue.length) {
+        if (ai >= n) break;
+        const na = jobs[order[ai]].arr;
+        events.push({ t, kind: "idle", pick: -1, prev, arrivals, justDone, ready: [], rem: rem.slice(), until: na });
+        push(-1, t, na); t = na; justDone = -1; continue;
+      }
+      let idx = 0;
+      if (policy === "SJF" || policy === "STCF") { for (let k = 1; k < queue.length; k++) if (better(queue[k], queue[idx])) idx = k; }
+      cur = queue.splice(idx, 1)[0];
+      sliceLeft = q;
+      if (!kind) kind = justDone >= 0 ? "done" : "start";
+    } else if (!kind) kind = arrivals.length ? "arrive" : "cont";
+    if (kind === "preempt") sliceLeft = q;
+    pick = cur;
+    events.push({ t, kind, pick, prev, preempted, arrivals, justDone, ready: queue.slice(), rem: rem.slice() });
+    justDone = -1;
+    let start = t;
+    if (cs > 0 && last >= 0 && pick !== last) { push(-2, t, t + cs, "切换"); start = t + cs; }
+    if (first[pick] === null) first[pick] = start;
+    let end = start + rem[pick];
+    if (policy === "RR") end = Math.min(end, start + sliceLeft);
+    if (ai < n && jobs[order[ai]].arr > t + EPS) end = Math.min(end, Math.max(start, jobs[order[ai]].arr));
+    push(pick, start, end);
+    rem[pick] -= end - start; sliceLeft -= end - start; t = end; last = pick;
+    if (rem[pick] <= EPS) { rem[pick] = 0; done[pick] = t; finished++; justDone = pick; cur = -1; }
+  }
+  const per = jobs.map((j) => ({ arrival: j.arr, length: j.len, first: first[j.i], done: done[j.i],
+    turnaround: done[j.i] - j.arr, response: first[j.i] - j.arr, wait: done[j.i] - j.arr - j.len }));
+  const avg = (k) => per.reduce((a, p) => a + p[k], 0) / Math.max(1, n);
+  return { segs, events, per, end: t, avgT: avg("turnaround"), avgR: avg("response"), avgW: avg("wait") };
+}
+
+// 图 7.8/7.9：A 由 nb 个长度为 b 的 CPU 突发组成，突发之间做时长 io 的 I/O；B 为长度 bl 的纯 CPU 作业。
+// mode = "whole"：把 A 当整体，先跑完 A 再跑 B；"overlap"：每个突发当作子作业，用 STCF 选择。
+function ioSim(nb, b, io, bl, mode) {
+  const cpu = [], disk = [];
+  let t = 0, aLeftBursts = nb, aCur = b, aReadyAt = 0, bRem = bl, aDone = null, bDone = null, busy = 0;
+  const add = (arr, who, a, e) => { const L = arr[arr.length - 1]; if (L && L.who === who && L.end === a) L.end = e; else arr.push({ who, start: a, end: e }); };
+  const steps = [];
+  for (let guard = 0; guard < 100000 && (aDone === null || bDone === null); guard++) {
+    const aReady = aDone === null && t >= aReadyAt;
+    const bReady = bDone === null;
+    let who = -1;
+    if (mode === "whole") who = aDone === null ? (aReady ? 0 : -1) : (bReady ? 1 : -1);
+    else if (aReady && bReady) who = aCur <= bRem ? 0 : 1; else if (aReady) who = 0; else if (bReady) who = 1;
+    steps.push({ t, who, aReady, aCur: aReady ? aCur : null, bRem });
+    add(cpu, who, t, t + 1);
+    if (who === 0) {
+      busy++; aCur--;
+      if (aCur === 0) {
+        aLeftBursts--;
+        if (aLeftBursts === 0) aDone = t + 1;
+        else { add(disk, 0, t + 1, t + 1 + io); aReadyAt = t + 1 + io; aCur = b; }
+      }
+    } else if (who === 1) { busy++; bRem--; if (bRem === 0) bDone = t + 1; }
+    t++;
+  }
+  return { cpu, disk, aDone, bDone, end: t, util: busy / t, steps };
+}
+/* CORE-END */
+
+// ---------- 画图工具 ----------
+function niceUnit(end) { for (const u of [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000]) if (end / u <= 12) return u; return 5000; }
+function fmt(x) { return x == null ? "—" : (Math.abs(x - Math.round(x)) < 1e-9 ? String(Math.round(x)) : x.toFixed(2)); }
+// 多行时间线：rows = [{label, segs:[{who,start,end,label?}]}]
+function timeline(host, rows, o = {}) {
+  const end = o.end || Math.max(1, ...rows.flatMap((r) => r.segs.map((g) => g.end)));
+  const L = o.labelW ?? (rows.some((r) => r.label) ? 48 : 10);
+  const pxPer = o.pxPer || Math.max(3, Math.min(44, 700 / end));
+  const rowH = 28, gap = 8, top = 6;
+  const arrH = o.arrivals && o.arrivals.length ? 18 : 0;
+  const W = L + end * pxPer + 26, H = top + rows.length * (rowH + gap) + 26 + arrH;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, class: "tl", role: "img", "aria-label": o.aria || "调度时间线" });
+  const X = (t) => L + t * pxPer;
+  rows.forEach((r, ri) => {
+    const y = top + ri * (rowH + gap);
+    if (r.label) svg.append(s("text", { x: L - 8, y: y + rowH / 2 + 4, "text-anchor": "end", "font-size": 12, class: "t-muted", text: r.label }));
+    svg.append(s("rect", { x: X(0), y, width: end * pxPer, height: rowH, style: "fill:none;stroke:var(--border)", "stroke-dasharray": "2 3" }));
+    for (const g of r.segs) {
+      const parts = o.cursor == null ? [[g.start, g.end, 1]] : [[g.start, Math.min(g.end, o.cursor), 1], [Math.max(g.start, o.cursor), g.end, 0.2]];
+      for (const [a, b, op] of parts) {
+        if (b - a <= 1e-9) continue;
+        const x = X(a), w = (b - a) * pxPer;
+        const st = g.who === -1 ? "fill:var(--surface-2);stroke:var(--border)" : g.who === -2 ? "fill:var(--warn-soft);stroke:var(--warn)" : `fill:${color(g.who)}`;
+        svg.append(s("rect", { x: x + 0.5, y, width: Math.max(1, w - 1), height: rowH, rx: 3, style: st, opacity: op }));
+      }
+      const w = (g.end - g.start) * pxPer;
+      const lab = g.label ?? (g.who === -1 ? "空闲" : g.who === -2 ? "切" : (o.names ? o.names[g.who] : letter(g.who)));
+      if (w >= (g.who < 0 ? 26 : 13)) svg.append(s("text", { x: X(g.start) + w / 2, y: y + rowH / 2 + 4.5, "text-anchor": "middle", "font-size": 12,
+        style: g.who >= 0 ? "fill:#fff;font-weight:600" : "", class: g.who < 0 ? "t-muted" : null, opacity: o.cursor != null && g.start >= o.cursor ? 0.35 : 1, text: lab }));
+    }
+  });
+  const axY = top + rows.length * (rowH + gap) - gap + 4;
+  const unit = o.unit || niceUnit(end);
+  for (let t = 0; t <= end + 1e-9; t += unit) {
+    svg.append(s("line", { x1: X(t), x2: X(t), y1: axY, y2: axY + 5, class: "stroke" }));
+    svg.append(s("text", { x: X(t), y: axY + 18, "text-anchor": "middle", "font-size": 11, class: "t-muted mono", text: fmt(t) }));
+  }
+  if (arrH) {
+    const byT = {};
+    o.arrivals.forEach((a) => { (byT[a.t] = byT[a.t] || []).push(a.label); });
+    for (const [t, labs] of Object.entries(byT)) {
+      const x = X(+t), y = axY + 24;
+      svg.append(s("path", { d: `M${x} ${y} l-5 8 h10 z`, style: "fill:var(--accent)" }));
+      svg.append(s("text", { x: x + 8, y: y + 9, "font-size": 11, style: "fill:var(--accent)", text: labs.join(",") + " 到达" }));
+    }
+  }
+  if (o.cursor != null) {
+    const x = X(o.cursor);
+    svg.append(s("line", { x1: x, x2: x, y1: 0, y2: axY + 4, style: "stroke:var(--accent);stroke-width:2" }));
+  }
+  host.replaceChildren(svg);
+  return svg;
+}
+
+// ---------- 静态图（由同一个核心算法生成，数字与原书一致） ----------
+const FIGS = {
+  f71: { jobs: [[0, 10], [0, 10], [0, 10]], pol: "FIFO", end: 120 },
+  f72: { jobs: [[0, 100], [0, 10], [0, 10]], pol: "FIFO", end: 120 },
+  f73: { jobs: [[0, 100], [0, 10], [0, 10]], pol: "SJF", end: 120 },
+  f74: { jobs: [[0, 100], [10, 10], [10, 10]], pol: "SJF", end: 120 },
+  f75: { jobs: [[0, 100], [10, 10], [10, 10]], pol: "STCF", end: 120 },
+  f76: { jobs: [[0, 5], [0, 5], [0, 5]], pol: "SJF", end: 30 },
+  f77: { jobs: [[0, 5], [0, 5], [0, 5]], pol: "RR", q: 1, end: 30 },
+};
+for (const [id, f] of Object.entries(FIGS)) {
+  const jobs = f.jobs.map(([a, l]) => ({ arrival: a, length: l }));
+  const r = schedule(jobs, f.pol, f.q || 1, 0);
+  const host = document.querySelector(`[data-fig="${id}"]`);
+  const late = jobs.map((j, i) => ({ t: j.arrival, label: letter(i) })).filter((a) => a.t > 0);
+  timeline(host, [{ label: "CPU", segs: r.segs }], { end: f.end, pxPer: f.end === 30 ? 22 : 5.5, unit: f.end === 30 ? 5 : 20, arrivals: late });
+  document.querySelectorAll(`[data-avg="${id}"]`).forEach((el) => (el.textContent = fmt(r.avgT)));
+  document.querySelectorAll(`[data-resp="${id}"]`).forEach((el) => (el.textContent = fmt(r.avgR)));
+}
+function ioFig(id, mode) {
+  const r = ioSim(5, 10, 10, 50, mode);
+  timeline(document.querySelector(`[data-fig="${id}"]`), [{ label: "CPU", segs: r.cpu }, { label: "磁盘", segs: r.disk }], { end: 140, pxPer: 5, unit: 20 });
+}
+ioFig("f78", "whole"); ioFig("f79", "overlap");
+
+// ---------- 摊销小工具 ----------
+(function () {
+  const q = document.getElementById("am-q"), c = document.getElementById("am-c");
+  function upd() {
+    const qv = +q.value, cv = Math.max(0, +c.value || 0), oh = cv / (qv + cv || 1);
+    document.getElementById("am-qv").textContent = qv;
+    document.getElementById("am-bar").replaceChildren(
+      h("div", { style: { width: (1 - oh) * 100 + "%", background: "var(--ok)" } }),
+      h("div", { style: { width: oh * 100 + "%", background: "var(--bad)" } }));
+    document.getElementById("am-txt").innerHTML = `每 ${qv} ms 的有用工作要付出 ${cv} ms 切换：<strong>${(oh * 100).toFixed(2)}%</strong> 的 CPU 时间浪费在切换上（绿色 = 有用工作，红色 = 切换）。`;
+  }
+  q.oninput = upd; c.oninput = upd; upd();
+})();
+
+// ---------- 主模拟器 ----------
+const polSel = document.getElementById("sc-pol"), qIn = document.getElementById("sc-q"), csIn = document.getElementById("sc-cs");
+const tbody = document.getElementById("sc-jobs");
+let jobs = [{ arrival: 0, length: 100 }, { arrival: 10, length: 10 }, { arrival: 10, length: 10 }];
+let result = null;
+const PRESETS = [
+  { name: "图 7.1 FIFO", jobs: [[0, 10], [0, 10], [0, 10]], pol: "FIFO" },
+  { name: "图 7.2 护航", jobs: [[0, 100], [0, 10], [0, 10]], pol: "FIFO" },
+  { name: "图 7.3 SJF", jobs: [[0, 100], [0, 10], [0, 10]], pol: "SJF" },
+  { name: "图 7.4 SJF 晚到", jobs: [[0, 100], [10, 10], [10, 10]], pol: "SJF" },
+  { name: "图 7.5 STCF", jobs: [[0, 100], [10, 10], [10, 10]], pol: "STCF" },
+  { name: "图 7.6 SJF(5,5,5)", jobs: [[0, 5], [0, 5], [0, 5]], pol: "SJF" },
+  { name: "图 7.7 RR q=1", jobs: [[0, 5], [0, 5], [0, 5]], pol: "RR", q: 1 },
+  { name: "RR q=5", jobs: [[0, 5], [0, 5], [0, 5]], pol: "RR", q: 5 },
+  { name: "课后题 1", jobs: [[0, 200], [0, 200], [0, 200]], pol: "FIFO" },
+  { name: "课后题 2", jobs: [[0, 100], [0, 200], [0, 300]], pol: "SJF" },
+  { name: "课后题 3", jobs: [[0, 100], [0, 200], [0, 300]], pol: "RR", q: 1 },
+];
+const presetBox = document.getElementById("sc-presets");
+PRESETS.forEach((p) => presetBox.append(h("button", { onclick: () => {
+  jobs = p.jobs.map(([a, l]) => ({ arrival: a, length: l }));
+  polSel.value = p.pol; if (p.q) qIn.value = p.q; csIn.value = 0;
+  drawTable(); recompute();
+} }, p.name)));
+
+function drawTable() {
+  tbody.replaceChildren(...jobs.map((j, i) => h("tr", {},
+    h("td", {}, h("span", { class: "sw", style: { background: color(i) } }), h("b", {}, letter(i))),
+    h("td", {}, h("input", { type: "number", min: 0, max: 1000, step: 1, value: j.arrival, "aria-label": letter(i) + " 到达时间", oninput: (e) => { j.arrival = Math.max(0, +e.target.value || 0); recompute(); } })),
+    h("td", {}, h("input", { type: "number", min: 1, max: 1000, step: 1, value: j.length, "aria-label": letter(i) + " 运行时长", oninput: (e) => { j.length = Math.max(1, +e.target.value || 1); recompute(); } })),
+    h("td", {}, jobs.length > 1 ? h("button", { title: "删除", onclick: () => { jobs.splice(i, 1); drawTable(); recompute(); } }, "✕") : ""))));
+}
+document.getElementById("sc-add").onclick = () => { if (jobs.length >= 8) return; jobs.push({ arrival: 0, length: 20 }); drawTable(); recompute(); };
+document.getElementById("sc-rand").onclick = () => {
+  const r = OSTEP.rng(+document.getElementById("sc-seed").value || 1);
+  const n = r.int(3, 5);
+  jobs = Array.from({ length: n }, () => ({ arrival: r.int(0, 3) * 10, length: r.int(1, 10) * 5 }));
+  document.getElementById("sc-seed").value = (+document.getElementById("sc-seed").value || 1) + 1;
+  drawTable(); recompute();
+};
+polSel.onchange = qIn.oninput = csIn.oninput = () => recompute();
+
+const polName = { FIFO: "FIFO", SJF: "SJF", STCF: "STCF", RR: "RR" };
+function narrate(ev) {
+  const P = polSel.value, L = letter, q = +qIn.value;
+  const list = (arr) => arr.map(L).join("、");
+  const parts = [`<b>t = ${fmt(ev.t)}</b>：`];
+  if (ev.justDone >= 0) parts.push(`${L(ev.justDone)} 完成。`);
+  if (ev.arrivals.length) parts.push(`${list(ev.arrivals)} 到达，进入就绪队列。`);
+  if (ev.kind === "idle") { parts.push(`没有就绪作业，CPU 空闲到 t = ${fmt(ev.until)}。`); return parts.join(""); }
+  const p = L(ev.pick), rem = (i) => fmt(ev.rem[i]);
+  switch (ev.kind) {
+    case "slice": parts.push(`${L(ev.preempted)} 的时间片（${q}）用完，回到队尾；队首的 <b>${p}</b> 获得 CPU。`); break;
+    case "preempt": parts.push(`STCF 比较剩余时间：${[ev.pick, ev.preempted, ...ev.ready.filter((k) => k !== ev.preempted)].map((k) => `${L(k)}=${rem(k)}`).join("，")} → <b>抢占</b> ${L(ev.preempted)}，改跑 <b>${p}</b>。`); break;
+    case "arrive":
+      if (P === "STCF") parts.push(`比较剩余时间：${p} 还剩 ${rem(ev.pick)}，没有更短的作业，${p} 继续。`);
+      else if (P === "RR") parts.push(`RR 不因到达而抢占，${p} 继续跑完当前时间片；新作业排在队尾。`);
+      else parts.push(`${polName[P]} 是非抢占的，<b>${p}</b> 继续运行直到完成${P === "SJF" ? "——即使新来的作业更短" : ""}。`);
+      break;
+    case "cont": parts.push(`<b>${p}</b> 继续运行。`); break;
+    default:
+      if (P === "FIFO") parts.push(`FIFO 选择最早到达的 <b>${p}</b>，它将一直运行到完成。`);
+      else if (P === "SJF") parts.push(`SJF 在就绪作业中选总长度最短的 <b>${p}</b>（${fmt(result.per[ev.pick].length)}），并运行到完成。`);
+      else if (P === "STCF") parts.push(`STCF 在就绪作业中选剩余时间最短的 <b>${p}</b>（剩 ${rem(ev.pick)}）。`);
+      else parts.push(`RR 取队首的 <b>${p}</b>，运行一个时间片（${q}）或直到它完成。`);
+  }
+  return parts.join("");
+}
+function drawStep(i) {
+  if (!result) return;
+  const evs = result.events, fin = i >= evs.length;
+  const ev = fin ? null : evs[i];
+  const cursor = fin ? null : ev.t;
+  timeline(document.getElementById("sc-gantt"), [{ label: "CPU", segs: result.segs }], {
+    cursor, arrivals: jobs.map((j, k) => ({ t: j.arrival, label: letter(k) })).filter((a) => a.t > 0) });
+  const rq = document.getElementById("sc-rq");
+  if (fin) {
+    rq.replaceChildren(h("span", { class: "lbl" }, "全部完成"));
+    const P = polSel.value;
+    document.getElementById("sc-nar").innerHTML = `<b>结束</b>（t = ${fmt(result.end)}）。${polName[P]}${P === "RR" ? `(q=${qIn.value})` : ""} 的平均周转时间 <b>${fmt(result.avgT)}</b>，平均响应时间 <b>${fmt(result.avgR)}</b>。换一种策略对比一下，或看下方的对比视图。`;
+  } else {
+    rq.replaceChildren(h("span", { class: "lbl" }, "CPU："),
+      ev.pick >= 0 ? h("span", { class: "cell run", style: { background: color(ev.pick) } }, `${letter(ev.pick)} · 剩 ${fmt(ev.rem[ev.pick])}`) : h("span", { class: "cell" }, "空闲"),
+      h("span", { class: "lbl", style: { marginLeft: "14px" } }, "就绪队列："),
+      ...(ev.ready.length ? ev.ready.map((k) => h("span", { class: "cell on" }, `${letter(k)} · 剩 ${fmt(ev.rem[k])}`)) : [h("span", { class: "muted small" }, "（空）")]));
+    document.getElementById("sc-nar").innerHTML = narrate(ev);
+  }
+}
+function recompute() {
+  document.getElementById("sc-qwrap").style.display = polSel.value === "RR" ? "" : "none";
+  result = schedule(jobs, polSel.value, +qIn.value || 1, +csIn.value || 0);
+  const st = document.getElementById("sc-stats");
+  const stat = (v, l) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+  st.replaceChildren(stat(fmt(result.avgT), "平均周转时间"), stat(fmt(result.avgR), "平均响应时间"), stat(fmt(result.avgW), "平均等待时间"), stat(fmt(result.end), "全部完成时刻"));
+  const res = document.getElementById("sc-res");
+  res.replaceChildren(h("thead", {}, h("tr", {}, ["作业", "到达", "长度", "首次运行", "完成", "周转时间", "响应时间"].map((x, k) => h("th", { class: k ? "num" : "" }, x)))),
+    h("tbody", {}, result.per.map((p, i) => h("tr", {}, h("td", {}, h("span", { class: "sw", style: { display: "inline-block", width: "10px", height: "10px", borderRadius: "2px", background: color(i), marginRight: "6px" } }), letter(i)),
+      [p.arrival, p.length, p.first, p.done, p.turnaround, p.response].map((v) => h("td", { class: "num" }, fmt(v)))))));
+  stepper.reset();
+  drawCompare();
+}
+const stepper = OSTEP.stepper(document.getElementById("sc-step"), { steps: () => (result ? result.events.length + 1 : 1), render: drawStep, autoplayMs: 1000 });
+
+// ---------- 对比视图 ----------
+function barChart(host, groups, o) {
+  const W = 420, H = 250, L = 44, B = 40, T = 16, innerH = H - B - T;
+  const max = Math.max(1, ...groups.flatMap((g) => g.vals)) * 1.12;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": o.aria });
+  const gw = (W - L - 10) / groups.length;
+  for (let k = 0; k <= 4; k++) {
+    const v = (max / 4) * k, y = T + innerH - (v / max) * innerH;
+    svg.append(s("line", { x1: L, x2: W - 6, y1: y, y2: y, style: "stroke:var(--border)" }));
+    svg.append(s("text", { x: L - 6, y: y + 4, "text-anchor": "end", "font-size": 10.5, class: "t-muted mono", text: v >= 100 ? Math.round(v) : v.toFixed(1) }));
+  }
+  groups.forEach((g, gi) => {
+    const x0 = L + gi * gw + gw * 0.15, bw = (gw * 0.7) / g.vals.length;
+    g.vals.forEach((v, k) => {
+      const hgt = (v / max) * innerH, x = x0 + k * bw, y = T + innerH - hgt;
+      svg.append(s("rect", { x: x + 1, y, width: bw - 2, height: Math.max(0.5, hgt), rx: 2, style: `fill:${color(k)}` }));
+      svg.append(s("text", { x: x + bw / 2, y: y - 4, "text-anchor": "middle", "font-size": 10.5, text: fmt(Math.round(v * 100) / 100) }));
+    });
+    svg.append(s("text", { x: L + gi * gw + gw / 2, y: H - B + 18, "text-anchor": "middle", "font-size": 12, text: g.name }));
+  });
+  svg.append(s("text", { x: W / 2, y: H - 4, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", text: o.title }));
+  host.replaceChildren(svg);
+}
+function lineChart(host, xs, series, o) {
+  const W = 420, H = 250, L = 44, B = 40, T = 16, R = 10, innerW = W - L - R, innerH = H - B - T;
+  const max = Math.max(1, ...series.flatMap((sr) => sr.vals)) * 1.08;
+  const x0 = xs[0], x1 = xs[xs.length - 1];
+  const X = (i) => L + (x1 === x0 ? 0 : ((xs[i] - x0) / (x1 - x0)) * innerW), Y = (v) => T + innerH - (v / max) * innerH;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": o.aria });
+  for (let k = 0; k <= 4; k++) {
+    const v = (max / 4) * k;
+    svg.append(s("line", { x1: L, x2: W - R, y1: Y(v), y2: Y(v), style: "stroke:var(--border)" }));
+    svg.append(s("text", { x: L - 6, y: Y(v) + 4, "text-anchor": "end", "font-size": 10.5, class: "t-muted mono", text: v >= 100 ? Math.round(v) : v.toFixed(1) }));
+  }
+  const u = niceUnit(x1 - x0 || 1), XV = (v) => L + (x1 === x0 ? 0 : ((v - x0) / (x1 - x0)) * innerW);
+  for (let v = Math.ceil(x0 / u) * u; v <= x1; v += u) svg.append(s("text", { x: XV(v), y: H - B + 16, "text-anchor": "middle", "font-size": 10.5, class: "t-muted mono", text: v }));
+  if (x0 % u) svg.append(s("text", { x: XV(x0), y: H - B + 16, "text-anchor": "middle", "font-size": 10.5, class: "t-muted mono", text: x0 }));
+  series.forEach((sr, k) => {
+    svg.append(s("path", { d: sr.vals.map((v, i) => (i ? "L" : "M") + X(i).toFixed(1) + " " + Y(v).toFixed(1)).join(""), style: `fill:none;stroke:${color(k)};stroke-width:2.2` }));
+    sr.vals.forEach((v, i) => svg.append(s("circle", { cx: X(i), cy: Y(v), r: 2.6, style: `fill:${color(k)}` })));
+  });
+  if (o.mark != null) { const i = xs.indexOf(o.mark); if (i >= 0) svg.append(s("line", { x1: X(i), x2: X(i), y1: T, y2: T + innerH, style: "stroke:var(--accent)", "stroke-dasharray": "4 3" })); }
+  svg.append(s("text", { x: W / 2, y: H - 4, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", text: o.title }));
+  host.replaceChildren(svg);
+}
+function drawCompare() {
+  const q = +qIn.value || 1, cs = +csIn.value || 0;
+  const pols = ["FIFO", "SJF", "STCF", "RR"];
+  const rs = pols.map((p) => schedule(jobs, p, q, cs));
+  barChart(document.getElementById("cmp-bars"), rs.map((r, i) => ({ name: pols[i] === "RR" ? `RR(q=${q})` : pols[i], vals: [r.avgT, r.avgR] })),
+    { title: "各策略的平均周转时间 / 平均响应时间", aria: "策略对比柱状图" });
+  const maxLen = Math.max(...jobs.map((j) => j.length));
+  const qs = []; const stepQ = Math.max(1, Math.round(maxLen / 24));
+  for (let x = 1; x <= maxLen; x += stepQ) qs.push(x);
+  if (qs[qs.length - 1] !== maxLen) qs.push(maxLen);
+  const sw = qs.map((x) => schedule(jobs, "RR", x, cs));
+  lineChart(document.getElementById("cmp-sweep"), qs, [{ vals: sw.map((r) => r.avgT) }, { vals: sw.map((r) => r.avgR) }],
+    { title: "RR：时间片（横轴）对两个指标的影响", aria: "RR 时间片扫描折线图", mark: q });
+  const bestT = pols[rs.reduce((b, r, i) => (r.avgT < rs[b].avgT - 1e-9 ? i : b), 0)];
+  const bestR = pols[rs.reduce((b, r, i) => (r.avgR < rs[b].avgR - 1e-9 ? i : b), 0)];
+  document.getElementById("cmp-nar").innerHTML = `这组作业里，平均周转时间最好的是 <b>${bestT}</b>，平均响应时间最好的是 <b>${bestR}</b>。` +
+    `右图：时间片增大时，RR 的平均响应时间通常上升；当时间片 ≥ 最长作业（${maxLen}）时，RR 退化为 FIFO。` +
+    (cs > 0 ? `（当前切换开销 ${cs}：时间片太小时，周转时间会因频繁切换明显变差。）` : "把切换开销设为非零，再看右图左端的变化。");
+}
+
+// ---------- I/O 重叠模拟器 ----------
+const ioIn = ["io-mode", "io-n", "io-b", "io-t", "io-bl"].map((id) => document.getElementById(id));
+let ioRes = null;
+function ioRecompute() {
+  const [m, n, b, t, bl] = ioIn;
+  ioRes = ioSim(Math.max(1, +n.value | 0), Math.max(1, +b.value | 0), Math.max(1, +t.value | 0), Math.max(1, +bl.value | 0), m.value);
+  const stat = (v, l) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+  document.getElementById("io-stats").replaceChildren(stat(ioRes.aDone, "A 完成时刻"), stat(ioRes.bDone, "B 完成时刻"),
+    stat((ioRes.util * 100).toFixed(1) + "%", "CPU 利用率"), stat(fmt((ioRes.aDone + ioRes.bDone) / 2), "平均周转时间"));
+  ioStepper.reset();
+}
+function ioDraw(i) {
+  if (!ioRes) return;
+  const fin = i >= ioRes.end;
+  timeline(document.getElementById("io-chart"), [{ label: "CPU", segs: ioRes.cpu }, { label: "磁盘", segs: ioRes.disk }], { cursor: fin ? null : i, end: Math.max(ioRes.end, 20) });
+  const nar = document.getElementById("io-nar");
+  if (fin) { nar.innerHTML = `<b>结束</b>：A 在 ${ioRes.aDone} 完成，B 在 ${ioRes.bDone} 完成，CPU 利用率 ${(ioRes.util * 100).toFixed(1)}%。${ioIn[0].value === "whole" ? "A 做 I/O 时 CPU 只能空等——试试切换到“重叠”方式。" : "CPU 在 A 做 I/O 时运行 B，两边同时忙。"}`; return; }
+  const st = ioRes.steps[i];
+  const who = st.who === 0 ? "A" : st.who === 1 ? "B" : "（空闲）";
+  let why;
+  if (ioIn[0].value === "whole") why = st.who === 0 ? "调度器把 A 当作一个整体，A 没做完之前不考虑 B。" : st.who === 1 ? "A 已全部完成，轮到 B。" : "A 正在等 I/O，但调度器仍认为 A 这个作业没结束，不运行 B：CPU 空闲。";
+  else if (st.aReady) why = `A 的当前子作业剩 ${st.aCur}，B 剩 ${st.bRem}：STCF 选更短的 ${st.who === 0 ? "A" : "B"}。`;
+  else why = st.who === 1 ? `A 在做 I/O（阻塞），只有 B 就绪，B 运行（剩 ${st.bRem}）。` : "没有就绪作业。";
+  nar.innerHTML = `<b>t = ${i}</b>：CPU 运行 <b>${who}</b>。${why}`;
+}
+const ioStepper = OSTEP.stepper(document.getElementById("io-step"), { steps: () => (ioRes ? ioRes.end + 1 : 1), render: ioDraw, autoplayMs: 250 });
+ioIn.forEach((el) => (el.oninput = ioRecompute));
+document.getElementById("io-book").onclick = () => { ioIn[1].value = 5; ioIn[2].value = 10; ioIn[3].value = 10; ioIn[4].value = 50; ioRecompute(); };
+
+drawTable();
+recompute();
+ioRecompute();
+})();
+</script>
+</body></html>

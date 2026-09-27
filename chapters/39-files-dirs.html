@@ -1,0 +1,1130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 39 章 · 插叙：文件和目录</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+.presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.presets button { font-size: 13px; padding: 4px 10px; }
+.presets button.on { border-color: var(--accent); background: var(--accent-soft); }
+.booktab { font-family: var(--mono); font-size: 13px; }
+.booktab td, .booktab th { padding: 4px 10px; white-space: nowrap; }
+.booktab tr.cur td { background: var(--warn-soft); }
+.booktab tr.future td { color: transparent; }
+.booktab tr.future td:first-child { color: var(--faint); }
+.booktab tr.bad td { color: var(--bad); }
+.permgrid { display: inline-grid; grid-template-columns: auto repeat(3, 56px); gap: 4px 6px; align-items: center; font-size: 14px; margin: 6px 0; }
+.permgrid .h { font-size: 12.5px; color: var(--muted); text-align: center; }
+.permgrid label { justify-content: center; display: flex; }
+.permstr { font: 22px var(--mono); letter-spacing: .08em; }
+.permstr span { padding: 0 1px; border-radius: 3px; }
+.permstr .u { background: color-mix(in srgb, var(--c1) 22%, transparent); }
+.permstr .g { background: color-mix(in srgb, var(--c3) 22%, transparent); }
+.permstr .o { background: color-mix(in srgb, var(--c2) 22%, transparent); }
+.cmdline { font-family: var(--mono); font-size: 13px; }
+textarea#fd-script { min-height: 150px; font-size: 13px; }
+</style>
+</head>
+<body data-chapter="39">
+<main>
+
+<h2 id="why">本章要解决什么</h2>
+<div class="crux">
+<p><strong>操作系统应该如何管理持久存储设备？</strong>都有哪些 API？实现上有哪些要点？</p>
+<p class="muted small">How should the OS manage a persistent device? What are the APIs? What are the important aspects of the implementation?</p>
+</div>
+<p>进程虚拟化了 CPU，地址空间虚拟化了内存；这一章给虚拟化拼图加上最后一块：<strong>持久存储</strong>。硬盘、SSD 上的数据断电也不会丢，用户最在乎的东西都放在这里，所以操作系统必须格外小心。</p>
+<p>本章是一篇"插叙"：先不谈实现，只站在程序员的角度，把 UNIX 文件系统的接口过一遍——<code>open</code>、<code>read</code>、<code>write</code>、<code>lseek</code>、<code>fsync</code>、<code>rename</code>、<code>stat</code>、<code>link</code>、<code>unlink</code>、<code>mkdir</code>、<code>mount</code>……读完你会明白为什么删除文件的系统调用叫 <code>unlink</code>。下一章（第 40 章）再打开盖子，看这些接口在磁盘上是怎样实现的。</p>
+
+<h2 id="cards">核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>文件（file）</h4><p>一个线性的字节数组，可读可写。它的低级名字是 <strong>inode 号</strong>（i-number）。</p></div>
+  <div class="card"><h4>目录（directory）</h4><p>也有 inode 号，内容是一串 (用户可读的名字, inode 号) 对；目录套目录形成目录树。</p></div>
+  <div class="card"><h4>文件描述符（fd）</h4><p>open() 返回的小整数，每个进程私有，是访问文件的"能力"（capability）。</p></div>
+  <div class="card"><h4>打开文件表（open file table）</h4><p>系统级的表，每项记录：指向哪个 inode、<strong>当前偏移</strong>、读写权限、引用计数。</p></div>
+  <div class="card"><h4>fsync()</h4><p>write() 只是把数据交给文件系统"以后再写"；fsync() 强制把脏数据写到磁盘后才返回。</p></div>
+  <div class="card"><h4>rename() 的原子性</h4><p>崩溃时文件要么是旧名、要么是新名，没有中间态——原子更新文件的关键工具。</p></div>
+  <div class="card"><h4>硬链接 vs 符号链接</h4><p>硬链接是同一 inode 的另一个名字（link count +1）；符号链接是一个存着路径名的独立小文件。</p></div>
+  <div class="card"><h4>mkfs 与 mount</h4><p>mkfs 在分区上建一个空文件系统；mount 把它"粘"到目录树的某个挂载点上。</p></div>
+</div>
+
+<h2 id="files-dirs">文件和目录</h2>
+<p>存储虚拟化里发展出了两个关键抽象。</p>
+<p><strong>文件（file）</strong>就是一个线性的字节数组，每个字节都能读写。每个文件有一个<strong>低级名字（low-level name）</strong>，通常是个数字，用户往往意识不到它；由于历史原因，它叫做 <strong>inode 号（inode number / i-number）</strong>。操作系统一般不关心文件的内部结构（图片？文本？C 代码？）——文件系统只负责把数据持久地存好，你下次要的时候原样还给你。这件事并没有听起来那么简单！</p>
+<p><strong>目录（directory）</strong>也有 inode 号，但内容很特定：一串 <strong>(用户可读的名字, 低级名字)</strong> 对。比如某文件的低级名字是 10，用户叫它 foo，那么它所在的目录里就有一项 ("foo", "10")。目录项可以指向文件，也可以指向别的目录，于是就能搭出任意的<strong>目录树（directory tree / directory hierarchy）</strong>。</p>
+<figure class="fig">
+<svg viewBox="0 0 560 250" width="560" role="img" aria-label="目录树示例">
+  <g class="arrow">
+    <path d="M280 40 L160 90"/><path d="M280 40 L400 90"/>
+    <path d="M160 116 L160 168"/>
+    <path d="M400 116 L330 168"/><path d="M400 116 L470 168"/>
+    <path d="M470 194 L470 214"/>
+  </g>
+  <g font-size="14">
+    <rect x="255" y="16" width="50" height="26" rx="13" class="accent-soft"/><text x="280" y="34" text-anchor="middle" class="mono">/</text>
+    <rect x="130" y="90" width="60" height="26" rx="13" class="accent-soft"/><text x="160" y="108" text-anchor="middle" class="mono">foo</text>
+    <rect x="370" y="90" width="60" height="26" rx="13" class="accent-soft"/><text x="400" y="108" text-anchor="middle" class="mono">bar</text>
+    <rect x="120" y="168" width="80" height="26" rx="4" class="ok-soft"/><text x="160" y="186" text-anchor="middle" class="mono">bar.txt</text>
+    <rect x="300" y="168" width="60" height="26" rx="13" class="accent-soft"/><text x="330" y="186" text-anchor="middle" class="mono">bar</text>
+    <rect x="440" y="168" width="60" height="26" rx="13" class="accent-soft"/><text x="470" y="186" text-anchor="middle" class="mono">foo</text>
+    <rect x="430" y="214" width="80" height="26" rx="4" class="ok-soft"/><text x="470" y="232" text-anchor="middle" class="mono">bar.txt</text>
+  </g>
+  <text x="10" y="236" font-size="12" class="t-muted">圆角 = 目录，方角 = 文件</text>
+</svg>
+<figcaption>原书 Figure 39.1：合法目录有 /、/foo、/bar、/bar/bar、/bar/foo；合法文件有 /foo/bar.txt 和 /bar/foo/bar.txt</figcaption>
+</figure>
+<p>目录树从<strong>根目录（root directory）</strong> <code>/</code> 开始，用分隔符逐级命名子目录，直到指定目标，这就是<strong>绝对路径名（absolute pathname）</strong>，比如 <code>/foo/bar.txt</code>。同名文件只要在树的不同位置就不冲突（图里有两个 bar.txt）。文件名里的 <code>.txt</code>、<code>.c</code> 通常只是<strong>约定</strong>，没人强制 <code>main.c</code> 里一定是 C 代码。</p>
+<div class="aside" data-title="提示 · 认真考虑命名">
+<p>命名是计算机系统的重要一环。在 UNIX 里，几乎一切都通过文件系统命名：文件、设备、管道，甚至进程（<code>/proc</code>）。这种统一让概念模型更简单、系统更模块化。访问任何资源的第一步，就是能叫出它的名字。</p>
+</div>
+
+<h2 id="create">创建文件：open() 与文件描述符</h2>
+<p>用 <code>open()</code> 并传入 <code>O_CREAT</code> 标志即可创建文件：</p>
+<pre><code>int fd = open("foo", O_CREAT|O_WRONLY|O_TRUNC, S_IRUSR|S_IWUSR);</code></pre>
+<ul>
+<li><code>O_CREAT</code>：文件不存在就创建；<code>O_WRONLY</code>：只能写；<code>O_TRUNC</code>：如果已存在，把它截断为 0 字节（清空旧内容）。</li>
+<li>第三个参数是权限：<code>S_IRUSR|S_IWUSR</code> 让属主可读可写。</li>
+</ul>
+<div class="aside" data-title="旁注 · creat() 系统调用">
+<p>老办法是 <code>int fd = creat("foo");</code>，相当于 <code>open()</code> 加上 <code>O_CREAT|O_WRONLY|O_TRUNC</code>。既然 open 能建文件，creat 就不太用了（完全可以实现成调用 open 的库函数）。它在 UNIX 传说里却有特殊地位：有人问 Ken Thompson 重新设计 UNIX 会改什么，他说："我会把 creat 拼成带 e 的。"</p>
+</div>
+<p><code>open()</code> 的返回值是<strong>文件描述符（file descriptor）</strong>：一个整数，<strong>每个进程私有</strong>，之后用它来读写文件（前提是你有权限）。可以把它看成一种<strong>能力（capability）</strong>——一个不透明的句柄，持有它就有权做某些操作；也可以把它看成指向"文件对象"的指针，有了对象就能调用 <code>read()</code>、<code>write()</code> 这些"方法"。</p>
+<p>文件描述符由操作系统按进程管理。xv6 内核里，<code>struct proc</code> 有一个数组：</p>
+<pre><code>struct proc {
+    ...
+    struct file *ofile[NOFILE];  // Open files：下标就是 fd
+    ...
+};</code></pre>
+<p>数组下标就是文件描述符，每个元素是指向 <code>struct file</code> 的指针，后者记录被读写文件的信息。三层关系如下图——这是整章最重要的一张图，后面的 fork、dup、lseek 全靠它解释：</p>
+<figure class="fig">
+<svg viewBox="0 0 700 250" width="700" role="img" aria-label="fd 表 → 打开文件表 → inode">
+  <defs><marker id="ah39" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="20" y="22" font-size="13" font-weight="600">进程私有：fd 表</text>
+  <text x="250" y="22" font-size="13" font-weight="600">系统共享：打开文件表</text>
+  <text x="520" y="22" font-size="13" font-weight="600">文件系统：inode</text>
+  <g font-size="12" class="mono">
+    <rect x="20" y="34" width="170" height="190" rx="8" class="box"/>
+    <text x="30" y="54">struct proc (pid 100)</text>
+    <rect x="30" y="64" width="150" height="24" rx="3" class="box-strong"/><text x="38" y="81">0: 标准输入 → tty</text>
+    <rect x="30" y="92" width="150" height="24" rx="3" class="box-strong"/><text x="38" y="109">1: 标准输出 → tty</text>
+    <rect x="30" y="120" width="150" height="24" rx="3" class="box-strong"/><text x="38" y="137">2: 标准错误 → tty</text>
+    <rect x="30" y="148" width="150" height="24" rx="3" class="accent-soft"/><text x="38" y="165">3: ofile[3] ●</text>
+    <rect x="30" y="176" width="150" height="24" rx="3" class="accent-soft"/><text x="38" y="193">4: ofile[4] ●</text>
+    <rect x="250" y="70" width="200" height="72" rx="6" class="accent-soft"/>
+    <text x="260" y="88">struct file (OFT[10])</text><text x="260" y="106">ref: 1  readable: 1</text><text x="260" y="124">off: 100   ip: ●</text>
+    <rect x="250" y="156" width="200" height="72" rx="6" class="accent-soft"/>
+    <text x="260" y="174">struct file (OFT[11])</text><text x="260" y="192">ref: 1  writable: 1</text><text x="260" y="210">off: 0     ip: ●</text>
+    <rect x="520" y="90" width="160" height="96" rx="6" class="ok-soft"/>
+    <text x="530" y="110">inode 1000</text><text x="530" y="128">size: 300</text><text x="530" y="146">nlink: 1</text><text x="530" y="164">数据块指针…</text>
+  </g>
+  <path d="M170 160 C 210 160, 210 106, 248 106" class="arrow" marker-end="url(#ah39)"/>
+  <path d="M170 188 C 210 188, 210 192, 248 192" class="arrow" marker-end="url(#ah39)"/>
+  <path d="M430 124 C 480 124, 480 130, 518 130" class="arrow" marker-end="url(#ah39)"/>
+  <path d="M430 210 C 480 210, 480 150, 518 150" class="arrow" marker-end="url(#ah39)"/>
+</svg>
+<figcaption>同一进程把同一个文件打开两次：两个 fd → 两个独立的打开文件表项（各自的偏移）→ 同一个 inode</figcaption>
+</figure>
+
+<h2 id="rw">读写文件：用 strace 偷看 cat</h2>
+<p>先建一个文件，再用 <code>cat</code> 显示它：</p>
+<pre><code>prompt&gt; echo hello &gt; foo
+prompt&gt; cat foo
+hello</code></pre>
+<p><code>cat</code> 是怎样访问 foo 的？Linux 上的 <code>strace</code> 能跟踪一个程序执行的每一个系统调用、参数和返回值（Mac 上是 <code>dtruss</code>，老 UNIX 上是 <code>truss</code>）。原书的输出（删掉了无关调用）：</p>
+<pre><code>prompt&gt; strace cat foo
+...
+open("foo", O_RDONLY|O_LARGEFILE)       = 3
+read(3, "hello\n", 4096)                = 6
+write(1, "hello\n", 6)                  = 6
+hello
+read(3, "", 4096)                       = 0
+close(3)                                = 0
+...</code></pre>
+<ol>
+<li><strong>open</strong>：只读打开（<code>O_RDONLY</code>），使用 64 位偏移（<code>O_LARGEFILE</code>），成功返回 fd <strong>3</strong>。为什么是 3 而不是 0 或 1？因为每个进程启动时已经打开了三个文件：<strong>标准输入（0）、标准输出（1）、标准错误（2）</strong>。新打开的文件拿到最小的空闲编号，几乎总是 3。</li>
+<li><strong>read(3, …, 4096)</strong>：第一个参数是 fd，告诉文件系统读哪个文件（进程可能同时开着很多文件）；第二个是放结果的缓冲区（strace 把读到的内容 "hello" 显示在这里）；第三个是缓冲区大小 4KB。返回 6：5 个字母加一个换行符。</li>
+<li><strong>write(1, …, 6)</strong>：把内容写到 fd 1，也就是标准输出，于是屏幕上出现 hello。cat 可能直接调用 write，也可能调用 <code>printf()</code>，由库函数整理格式后最终调用 write。</li>
+<li><strong>再 read</strong>：返回 <strong>0</strong>，表示已经读到文件末尾，程序据此知道文件读完了。</li>
+<li><strong>close(3)</strong>：告诉系统不再使用这个 fd。</li>
+</ol>
+<p>写文件也是类似的步骤：open 打开写 → 可能多次 write → close。可以用 strace 跟踪你自己的程序，或 <code>dd if=foo of=bar</code>。</p>
+<div class="tip">
+<p><strong>使用 strace（以及类似工具）。</strong>常用参数：<code>-f</code> 连 fork 出的子进程一起跟踪；<code>-t</code> 显示每次调用的时间；<code>-e trace=open,close,read,write</code> 只跟踪这几种调用。在 WSL / Ubuntu 上安装：<code>sudo apt install strace</code>，然后 <code>strace -e trace=openat,read,write,close cat foo</code>（新版 glibc 用 <code>openat</code> 代替 <code>open</code>）。本章实验里的 <code>mycat</code> 在没装 strace 时也能打印出同样的调用序列。</p>
+</div>
+<div class="aside" data-title="数据结构 · 打开文件表">
+<p>每个进程维护一个文件描述符数组，每个描述符指向<strong>系统级打开文件表（open file table）</strong>中的一项。这一项记录：描述符对应哪个底层文件、<strong>当前偏移</strong>，以及文件是否可读、可写等细节。</p>
+</div>
+
+<h2 id="lseek">不按顺序读写：lseek() 与当前偏移</h2>
+<p>到目前为止的访问都是<strong>顺序的</strong>：从头读到尾。但有时需要从文件的某个偏移处读写，比如在文本文档上建了索引，查一个词时就要跳到随机位置去读。这就用 <code>lseek()</code>：</p>
+<pre><code>off_t lseek(int fildes, off_t offset, int whence);</code></pre>
+<ul>
+<li><code>SEEK_SET</code>：偏移设为 <code>offset</code>；</li>
+<li><code>SEEK_CUR</code>：偏移设为当前位置 + <code>offset</code>；</li>
+<li><code>SEEK_END</code>：偏移设为文件大小 + <code>offset</code>。</li>
+</ul>
+<p>对进程打开的每个文件，操作系统都跟踪一个<strong>当前偏移（current offset）</strong>，决定下一次读写从哪里开始。它有两种更新方式：① 读或写 N 字节，偏移自动 +N；② 用 lseek 显式修改。偏移存在 <code>struct file</code> 里（xv6 的简化版）：</p>
+<pre><code>struct file {
+    int   ref;        // 引用计数：有几个 fd（可能跨进程）指向这里
+    char  readable;
+    char  writable;
+    struct inode *ip; // 指向底层文件的 inode
+    uint  off;        // 当前偏移
+};</code></pre>
+<p>所有这些 <code>struct file</code> 合起来就是<strong>打开文件表</strong>。xv6 把它们放在一个数组里，整张表用一把锁保护：</p>
+<pre><code>struct {
+    struct spinlock lock;
+    struct file file[NFILE];
+} ftable;</code></pre>
+<div class="aside" data-title="旁注 · 调用 lseek() 不会执行磁盘寻道">
+<p>名字起得不好的 <code>lseek()</code> 让很多学生把它和磁盘寻道混为一谈。千万别！<code>lseek()</code> 只是修改操作系统内存里的一个变量，记录这个进程下一次读写从哪开始。<strong>磁盘寻道</strong>是指发往磁盘的读写请求和上一次不在同一磁道，磁头必须移动。更容易混淆的是：用 lseek 跳到文件各处再读写，确实会导致更多磁盘寻道——但 lseek 本身绝不会产生任何磁盘 I/O。</p>
+</div>
+<p>原书用三张表追踪偏移的变化。下面的模拟器可以逐行重放它们（预设 ①②③），这里先把结论列出来：</p>
+<div class="table-wrap"><table class="booktab">
+<thead><tr><th>① 顺序读 300 字节的文件</th><th class="num">返回值</th><th class="num">当前偏移</th></tr></thead>
+<tbody>
+<tr><td>fd = open("file", O_RDONLY);</td><td class="num">3</td><td class="num">0</td></tr>
+<tr><td>read(fd, buffer, 100);</td><td class="num">100</td><td class="num">100</td></tr>
+<tr><td>read(fd, buffer, 100);</td><td class="num">100</td><td class="num">200</td></tr>
+<tr><td>read(fd, buffer, 100);</td><td class="num">100</td><td class="num">300</td></tr>
+<tr><td>read(fd, buffer, 100);</td><td class="num">0</td><td class="num">300</td></tr>
+<tr><td>close(fd);</td><td class="num">0</td><td class="num">–</td></tr>
+</tbody></table></div>
+<p>偏移在 open 时初始化为 0，每次 read 增加；读到文件末尾之后再 read 返回 0，表示读完了。</p>
+<div class="table-wrap"><table class="booktab">
+<thead><tr><th>② 同一文件打开两次</th><th class="num">返回值</th><th class="num">OFT[10] 偏移</th><th class="num">OFT[11] 偏移</th></tr></thead>
+<tbody>
+<tr><td>fd1 = open("file", O_RDONLY);</td><td class="num">3</td><td class="num">0</td><td class="num">–</td></tr>
+<tr><td>fd2 = open("file", O_RDONLY);</td><td class="num">4</td><td class="num">0</td><td class="num">0</td></tr>
+<tr><td>read(fd1, buffer1, 100);</td><td class="num">100</td><td class="num">100</td><td class="num">0</td></tr>
+<tr><td>read(fd2, buffer2, 100);</td><td class="num">100</td><td class="num">100</td><td class="num">100</td></tr>
+<tr><td>close(fd1);</td><td class="num">0</td><td class="num">–</td><td class="num">100</td></tr>
+<tr><td>close(fd2);</td><td class="num">0</td><td class="num">–</td><td class="num">–</td></tr>
+</tbody></table></div>
+<p>两个 fd（3 和 4）各指向打开文件表里<strong>不同</strong>的表项（OFT = Open File Table，这里是第 10、11 项），偏移互不影响。</p>
+<div class="table-wrap"><table class="booktab">
+<thead><tr><th>③ 先 lseek 再读</th><th class="num">返回值</th><th class="num">当前偏移</th></tr></thead>
+<tbody>
+<tr><td>fd = open("file", O_RDONLY);</td><td class="num">3</td><td class="num">0</td></tr>
+<tr><td>lseek(fd, 200, SEEK_SET);</td><td class="num">200</td><td class="num">200</td></tr>
+<tr><td>read(fd, buffer, 50);</td><td class="num">50</td><td class="num">250</td></tr>
+<tr><td>close(fd);</td><td class="num">0</td><td class="num">–</td></tr>
+</tbody></table></div>
+
+<h2 id="share">共享打开文件表项：fork() 与 dup()</h2>
+<p>多数情况下 fd 与打开文件表项是一对一的：即使另一个进程同时读同一个文件，它也有自己的表项和偏移。但有两种重要的例外会<strong>共享表项</strong>。</p>
+<h3>fork()</h3>
+<p>父进程打开文件后 fork，子进程用 lseek 改偏移然后退出，父进程等子进程结束后查看偏移（原书 Figure 39.2，fork-seek.c）：</p>
+<pre><code>int main(int argc, char *argv[]) {
+    int fd = open("file.txt", O_RDONLY);
+    assert(fd &gt;= 0);
+    int rc = fork();
+    if (rc == 0) {                        // 子进程
+        rc = lseek(fd, 10, SEEK_SET);
+        printf("child: offset %d\n", rc);
+    } else if (rc &gt; 0) {                  // 父进程
+        (void) wait(NULL);
+        printf("parent: offset %d\n", (int) lseek(fd, 0, SEEK_CUR));
+    }
+    return 0;
+}</code></pre>
+<pre><code>prompt&gt; ./fork-seek
+child: offset 10
+parent: offset 10</code></pre>
+<p>父进程看到的偏移也是 10！因为 fork 复制的是 <strong>fd 数组</strong>，数组里的指针仍指向<strong>同一个</strong>打开文件表项，于是该表项的引用计数 <code>ref</code> 变成 2。只有两个进程都关闭了文件（或退出），表项才被删除：</p>
+<figure class="fig">
+<svg viewBox="0 0 620 200" width="620" role="img" aria-label="父子进程共享打开文件表项">
+  <defs><marker id="ah39b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker></defs>
+  <g font-size="12">
+    <rect x="20" y="20" width="140" height="70" rx="8" class="box"/><text x="30" y="40" font-weight="600">Parent</text><text x="30" y="56" class="t-muted">File Descriptors</text>
+    <rect x="30" y="62" width="120" height="20" rx="3" class="accent-soft"/><text x="38" y="77" class="mono">3: ●</text>
+    <rect x="20" y="110" width="140" height="70" rx="8" class="box"/><text x="30" y="130" font-weight="600">Child</text><text x="30" y="146" class="t-muted">File Descriptors</text>
+    <rect x="30" y="152" width="120" height="20" rx="3" class="accent-soft"/><text x="38" y="167" class="mono">3: ●</text>
+    <rect x="240" y="60" width="160" height="84" rx="8" class="accent-soft"/>
+    <text x="252" y="80" font-weight="600">Open File Table</text>
+    <text x="252" y="100" class="mono">refcnt: 2</text><text x="252" y="118" class="mono">off: 10</text><text x="252" y="136" class="mono">inode: ●</text>
+    <rect x="470" y="70" width="130" height="60" rx="8" class="ok-soft"/>
+    <text x="535" y="96" text-anchor="middle" font-weight="600">Inode 1000</text><text x="535" y="116" text-anchor="middle" class="mono">(file.txt)</text>
+  </g>
+  <path d="M140 72 C 190 72, 200 100, 238 100" style="stroke:var(--accent);fill:none;stroke-width:1.6" marker-end="url(#ah39b)"/>
+  <path d="M140 162 C 190 162, 200 110, 238 110" style="stroke:var(--accent);fill:none;stroke-width:1.6" marker-end="url(#ah39b)"/>
+  <path d="M380 131 C 420 131, 430 100, 468 100" style="stroke:var(--accent);fill:none;stroke-width:1.6" marker-end="url(#ah39b)"/>
+</svg>
+<figcaption>原书 Figure 39.3：父子进程共享同一个打开文件表项（refcnt 2，off 10）</figcaption>
+</figure>
+<p>共享偏移有时很有用：多个协作进程往同一个输出文件写，不需要额外协调就不会互相覆盖。</p>
+<h3>dup()、dup2()</h3>
+<p><code>dup()</code> 让进程新建一个 fd，指向与已有 fd <strong>相同</strong>的打开文件（原书 Figure 39.4）：</p>
+<pre><code>int fd = open("README", O_RDONLY);
+assert(fd &gt;= 0);
+int fd2 = dup(fd);
+// 现在 fd 和 fd2 可以互换使用</code></pre>
+<p><code>dup2(oldfd, newfd)</code> 则让<strong>指定</strong>的 newfd 指向 oldfd 的表项（必要时先关闭 newfd）。这正是 shell 实现输出重定向的方法：<code>ls &gt; out.txt</code> 时，shell 在 fork 出的子进程里先 <code>open("out.txt")</code> 得到 fd 3，再 <code>dup2(3, 1)</code> 让标准输出指向文件，然后 exec 程序——程序照常往 fd 1 写，却写进了文件。</p>
+
+<h2 id="fd-sim">模拟器：fd 表 → 打开文件表 → inode</h2>
+<p>在下面的模拟器里，每一行是一次系统调用，可以用 <code>fd = open("file", O_RDONLY)</code> 这样的写法把返回值存进变量；行首写 <code>child:</code> 表示由子进程执行（fork 之后），不写默认是父进程。支持 <code>open / read / write / lseek / dup / fork / close / exit / wait / link / unlink / fsync</code>。</p>
+
+<section class="sim" id="sim-fd">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>文件描述符表可视化</h3>
+    <div class="desc">单步执行系统调用，观察每个进程的 fd 表、系统打开文件表（编号从 10 开始，与原书一致；含偏移、refcnt、读写模式）和 inode（link count、被打开次数）如何变化。底部自动生成原书格式的"系统调用 | 返回值 | 当前偏移"表。</div></div>
+  <div class="sim-body">
+    <div class="presets" id="fd-presets">
+      <button data-p="seq">① 顺序读 4 次</button>
+      <button data-p="two">② 两次 open</button>
+      <button data-p="seek">③ lseek 后读</button>
+      <button data-p="fork">④ fork 共享偏移</button>
+      <button data-p="dup">⑤ dup 共享偏移</button>
+      <button data-p="links">⑥ 硬链接与 unlink</button>
+    </div>
+    <div class="controls">
+      <label>初始文件（名字:大小@inode号） <input type="text" id="fd-files" style="width:16em"></label>
+    </div>
+    <textarea id="fd-script" spellcheck="false" aria-label="系统调用序列"></textarea>
+    <div class="controls" style="margin-top:8px">
+      <button class="primary" id="fd-load">载入这段脚本</button>
+      <span class="muted small">改完脚本后点这里重新运行</span>
+    </div>
+    <div id="fd-step"></div>
+    <div class="stage" id="fd-stage"></div>
+    <div class="narrate" id="fd-narr"></div>
+    <div class="stats" id="fd-stats"></div>
+    <div class="table-wrap"><table class="booktab" id="fd-table"></table></div>
+  </div>
+</section>
+
+<h2 id="fsync">立即写入：fsync()</h2>
+<p>大多数时候，程序调用 <code>write()</code> 只是告诉文件系统："请在<strong>将来某个时候</strong>把这些数据写到持久存储上。"出于性能考虑，文件系统会把写操作在内存里<strong>缓冲</strong>一段时间（比如 5 秒或 30 秒），之后才真正发给存储设备。从应用看，写完成得很快；只有在极少数情况下（write 之后、落盘之前机器崩溃）数据才会丢失。</p>
+<p>但有些应用需要更强的保证。比如数据库管理系统（DBMS），正确的恢复协议要求能在某些时刻<strong>强制</strong>把数据写到磁盘。UNIX 提供 <code>fsync(int fd)</code>：文件系统把这个 fd 对应文件的所有<strong>脏数据（dirty data，尚未写入的数据）</strong>强制写到磁盘，全部完成后 fsync 才返回。</p>
+<pre><code>int fd = open("foo", O_CREAT|O_WRONLY|O_TRUNC, S_IRUSR|S_IWUSR);
+assert(fd &gt; -1);
+int rc = write(fd, buffer, size);
+assert(rc == size);
+rc = fsync(fd);       // 返回时，数据已经持久化（如果 fsync 实现正确的话）
+assert(rc == 0);</code></pre>
+<p>有意思的是，这还不够！如果 foo 是<strong>新建</strong>的，你还需要对它<strong>所在的目录</strong>也调用 fsync，才能保证"目录里有 foo 这个名字"也持久化了。这种细节经常被忽略，导致大量应用层 bug。</p>
+
+<h2 id="rename">重命名：rename() 的原子性</h2>
+<p>命令行上 <code>mv foo bar</code> 用的是 <code>rename(char *old, char *new)</code> 系统调用。它提供了一个有趣的保证：对系统崩溃而言通常是<strong>原子的（atomic）</strong>——如果重命名过程中系统崩溃，文件要么还叫旧名、要么已叫新名，不会出现奇怪的中间状态。这使 rename 成为<strong>原子地更新文件</strong>的关键。</p>
+<p>设想编辑器要在 foo.txt 中间插入一行，并保证文件要么是完整的旧版、要么是完整的新版：</p>
+<pre><code>int fd = open("foo.txt.tmp", O_WRONLY|O_CREAT|O_TRUNC, S_IRUSR|S_IWUSR);
+write(fd, buffer, size);   // ① 把新版本完整地写到临时文件
+fsync(fd);                 // ② 强制落盘
+close(fd);
+rename("foo.txt.tmp", "foo.txt");   // ③ 原子地替换，旧版本同时被删除</code></pre>
+<figure class="fig">
+<svg viewBox="0 0 660 170" width="660" role="img" aria-label="原子更新文件的时间线">
+  <defs><marker id="ah39c" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <line x1="20" y1="60" x2="640" y2="60" class="arrow" marker-end="url(#ah39c)"/>
+  <g font-size="12">
+    <rect x="30" y="30" width="130" height="24" rx="4" class="accent-soft"/><text x="95" y="47" text-anchor="middle">write(tmp)</text>
+    <rect x="170" y="30" width="110" height="24" rx="4" class="accent-soft"/><text x="225" y="47" text-anchor="middle">fsync(tmp)</text>
+    <rect x="290" y="30" width="70" height="24" rx="4" class="box"/><text x="325" y="47" text-anchor="middle">close</text>
+    <rect x="370" y="30" width="130" height="24" rx="4" class="warn-soft"/><text x="435" y="47" text-anchor="middle">rename(tmp, foo)</text>
+    <rect x="510" y="30" width="120" height="24" rx="4" class="box"/><text x="570" y="47" text-anchor="middle">fsync(目录)</text>
+    <text x="20" y="90" font-weight="600">若在此区间崩溃，重启后看到：</text>
+    <rect x="30" y="100" width="330" height="26" rx="4" class="ok-soft"/><text x="195" y="118" text-anchor="middle">foo.txt = 完整的旧版本（tmp 可能残缺，没关系）</text>
+    <rect x="370" y="100" width="260" height="26" rx="4" class="ok-soft"/><text x="500" y="118" text-anchor="middle">foo.txt = 完整的新版本</text>
+    <text x="330" y="150" text-anchor="middle" class="t-muted">任何时刻都不会看到"半新半旧"的 foo.txt</text>
+  </g>
+</svg>
+<figcaption>write 临时文件 + fsync + rename：原子文件更新的标准套路</figcaption>
+</figure>
+
+<div class="aside" data-title="旁注 · mmap() 与持久内存（客座旁注：Terence Kelly）">
+<p><code>mmap()</code> 是访问文件中持久数据的另一种方式：它在文件的字节偏移与进程的虚拟地址之间建立对应——前者叫<strong>后备文件（backing file）</strong>，后者叫它的<strong>内存映像（in-memory image）</strong>。之后进程直接用 load/store 指令访问内存映像就能读写文件。</p>
+<p>把文件的持久性和内存的访问方式结合起来，就得到<strong>持久内存（persistent memory）</strong>这种编程风格，省去了内存格式与存储格式之间的来回转换。原书示例 <code>pstack.c</code> 把一个栈存在文件 ps.img 里：<code>p = mmap(NULL, file_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)</code> 之后，用 <code>p-&gt;n</code>、<code>p-&gt;stack[]</code> 就能直接操作，这次 push 的数据下次运行还能 pop 出来。不过若在 push 的"递增 n"和"赋值"之间崩溃，栈会不一致——应用需要相对于故障原子地更新持久内存的机制。</p>
+</div>
+
+<h2 id="stat">获取文件信息：stat()</h2>
+<p>除了访问文件内容，文件系统还保存了关于每个文件的大量信息，统称<strong>元数据（metadata）</strong>。用 <code>stat()</code> 或 <code>fstat()</code>（传路径名或 fd）可以取出来，填进一个 <code>struct stat</code>：</p>
+<pre><code>struct stat {
+    dev_t     st_dev;     // 文件所在设备的 ID
+    ino_t     st_ino;     // inode 号
+    mode_t    st_mode;    // 类型与权限
+    nlink_t   st_nlink;   // 硬链接个数
+    uid_t     st_uid;     // 属主的用户 ID
+    gid_t     st_gid;     // 属组 ID
+    dev_t     st_rdev;    // 设备 ID（如果是特殊文件）
+    off_t     st_size;    // 总大小（字节）
+    blksize_t st_blksize; // 文件系统 I/O 的块大小
+    blkcnt_t  st_blocks;  // 分配的块数（以 512 字节为单位）
+    time_t    st_atime;   // 最后访问时间
+    time_t    st_mtime;   // 最后修改时间
+    time_t    st_ctime;   // 最后状态改变时间
+};</code></pre>
+<pre><code>prompt&gt; echo hello &gt; file
+prompt&gt; stat file
+  File: 'file'
+  Size: 6         Blocks: 8          IO Block: 4096   regular file
+Device: 811h/2065d   Inode: 67158084     Links: 1
+Access: (0640/-rw-r-----)  Uid: (30686/ remzi)   Gid: (30686/ remzi)
+Access: 2011-05-03 15:50:20.157594748 -0500
+Modify: 2011-05-03 15:50:20.157594748 -0500
+Change: 2011-05-03 15:50:20.157594748 -0500</code></pre>
+<p>注意 Size 是 6 字节，Blocks 却是 8（8 × 512B = 4KB）：文件系统按块分配空间。文件系统通常把这些信息存在一个叫 <strong>inode</strong> 的结构里。所有 inode 都在磁盘上，活跃的 inode 通常在内存中有缓存副本。下一章会细讲 inode。</p>
+
+<h2 id="unlink">删除文件：神秘的 unlink()</h2>
+<p>在 UNIX 上删除文件用 <code>rm</code>。但 rm 调用的是哪个系统调用？</p>
+<pre><code>prompt&gt; strace rm foo
+...
+unlink("foo")                           = 0
+...</code></pre>
+<p>只有一个名字古怪的 <code>unlink()</code>：接受要删除的文件名，成功返回 0。为什么叫"取消链接"而不是 remove 或 delete？要回答这个问题，得先弄懂目录和链接。</p>
+
+<h2 id="dirs">目录：创建、读取、删除</h2>
+<p><strong>你永远不能直接写目录。</strong>目录的格式属于文件系统元数据，文件系统要对它的完整性负责，所以只能通过创建文件、目录等操作<strong>间接</strong>地更新目录。</p>
+<p>创建目录用 <code>mkdir()</code>：</p>
+<pre><code>prompt&gt; strace mkdir foo
+...
+mkdir("foo", 0777)                      = 0
+...</code></pre>
+<p>新目录被认为是"空"的，但其实有两项：<code>.</code>（dot）指向自己，<code>..</code>（dot-dot）指向父目录。<code>ls -a</code> 能看到它们。</p>
+<p>读目录不能像读文件一样 open/read，而是用 <code>opendir()</code>、<code>readdir()</code>、<code>closedir()</code>。下面是一个迷你 ls，打印每一项的 inode 号和名字：</p>
+<pre><code>int main(int argc, char *argv[]) {
+    DIR *dp = opendir(".");
+    assert(dp != NULL);
+    struct dirent *d;
+    while ((d = readdir(dp)) != NULL) {        // 一次读一个目录项
+        printf("%lu %s\n", (unsigned long) d-&gt;d_ino, d-&gt;d_name);
+    }
+    closedir(dp);
+    return 0;
+}</code></pre>
+<pre><code>struct dirent {
+    char           d_name[256]; // 文件名
+    ino_t          d_ino;       // inode 号
+    off_t          d_off;       // 到下一个 dirent 的偏移
+    unsigned short d_reclen;    // 本记录长度
+    unsigned char  d_type;      // 文件类型
+};</code></pre>
+<p>目录里的信息很少（基本就是名字 → inode 号），所以 <code>ls -l</code> 要对每个文件再调用一次 <code>stat()</code> 取得长度等详细信息——用 strace 对比 <code>ls</code> 和 <code>ls -l</code> 就能看到。</p>
+<p>删除目录用 <code>rmdir()</code>。因为一条命令可能删掉大量数据，rmdir 要求目录<strong>必须为空</strong>（只有 . 和 ..），否则直接失败。</p>
+<div class="tip">
+<p><strong>小心强大的命令。</strong><code>rm *</code> 删除当前目录所有文件，<code>rm -rf *</code> 还会递归删除子目录及其内容。要是不小心在文件系统的根目录下执行……用很少的按键就能完成大量工作，也能迅速造成巨大破坏。</p>
+</div>
+
+<h2 id="hardlink">硬链接：link() 与引用计数</h2>
+<p>现在回到 unlink 之谜。<code>link(old, new)</code> 系统调用（命令行 <code>ln</code>）为已有文件创建另一个名字：</p>
+<pre><code>prompt&gt; echo hello &gt; file
+prompt&gt; ln file file2
+prompt&gt; cat file2
+hello
+prompt&gt; ls -i file file2
+67158084 file
+67158084 file2</code></pre>
+<p>link 只是在目录里再建一个名字，指向<strong>同一个 inode 号</strong>，文件本身完全没有被复制。所以创建文件其实做了两件事：① 建立一个 inode 结构，记录文件的几乎一切（大小、数据块位置……）；② 把一个人类可读的名字<strong>链接</strong>到这个 inode，放进某个目录。建好硬链接后，文件系统看 file 和 file2 毫无区别，它们都只是指向 inode 67158084 的链接。</p>
+<p>所以删除文件就是 <code>unlink()</code>：删掉名字与 inode 之间的这条"链接"，并把 inode 里的<strong>引用计数（reference count，也叫 link count）</strong>减 1。<strong>只有计数降到 0</strong>，文件系统才释放 inode 和相关数据块，真正"删除"文件。原书的实验：</p>
+<figure class="fig">
+<svg viewBox="0 0 700 210" width="700" role="img" aria-label="link count 随 ln 和 rm 变化">
+  <g font-size="12">
+    <g id="lc-steps"></g>
+  </g>
+</svg>
+<figcaption>三个硬链接的建立与删除：Links 1 → 2 → 3 → 2 → 1 → 0（为 0 时 inode 与数据块被释放）</figcaption>
+</figure>
+<p class="small muted">补充一个细节：计数为 0 的文件如果还被某个进程打开着，文件系统会等它关闭后才真正回收——这就是为什么删掉一个正在写的日志文件，磁盘空间不会立刻释放。模拟器的预设 ⑥ 演示了这一点。</p>
+
+<h2 id="symlink">符号链接</h2>
+<p>硬链接有局限：不能给<strong>目录</strong>建硬链接（怕在目录树里造成环）；不能链接到<strong>其他分区</strong>的文件（inode 号只在一个文件系统内唯一）。于是有了<strong>符号链接（symbolic link）</strong>，也叫<strong>软链接（soft link）</strong>，用 <code>ln -s</code> 创建：</p>
+<pre><code>prompt&gt; echo hello &gt; file
+prompt&gt; ln -s file file2
+prompt&gt; cat file2
+hello</code></pre>
+<p>表面上差不多，本质完全不同：符号链接<strong>本身是一个文件</strong>，是除普通文件、目录之外文件系统认识的第三种类型。<code>stat</code> 会显示 "symbolic link"，<code>ls -l</code> 首字符是 <code>l</code>。它的<strong>数据就是目标的路径名</strong>，所以 file2 的大小是 4 字节（"file"），链接到 <code>alongerfilename</code> 的 file3 大小是 15 字节。</p>
+<figure class="fig">
+<svg viewBox="0 0 700 250" width="700" role="img" aria-label="硬链接与符号链接对比">
+  <defs><marker id="ah39d" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <g font-size="12">
+    <text x="20" y="22" font-weight="600">硬链接：ln file file2</text>
+    <rect x="20" y="34" width="150" height="70" rx="6" class="box"/>
+    <text x="30" y="54" class="t-muted">目录</text>
+    <text x="30" y="74" class="mono">file  → 67158084</text><text x="30" y="94" class="mono">file2 → 67158084</text>
+    <rect x="220" y="40" width="120" height="58" rx="6" class="ok-soft"/>
+    <text x="280" y="62" text-anchor="middle" class="mono">inode 67158084</text><text x="280" y="82" text-anchor="middle" class="mono">Links: 2</text>
+    <path d="M150 70 L218 64" class="arrow" marker-end="url(#ah39d)"/><path d="M150 90 L218 78" class="arrow" marker-end="url(#ah39d)"/>
+    <text x="20" y="128" class="t-muted">两个名字地位完全平等，删掉任何一个文件都还在</text>
+
+    <text x="370" y="22" font-weight="600">符号链接：ln -s file file2</text>
+    <rect x="370" y="34" width="150" height="70" rx="6" class="box"/>
+    <text x="380" y="54" class="t-muted">目录</text>
+    <text x="380" y="74" class="mono">file  → 67158084</text><text x="380" y="94" class="mono">file2 → 67158090</text>
+    <rect x="560" y="120" width="130" height="72" rx="6" class="warn-soft"/>
+    <text x="625" y="140" text-anchor="middle" class="mono">inode 67158090</text><text x="625" y="158" text-anchor="middle" class="mono">类型 l，size 4</text><text x="625" y="176" text-anchor="middle" class="mono">数据: "file"</text>
+    <rect x="560" y="34" width="130" height="58" rx="6" class="ok-soft"/>
+    <text x="625" y="56" text-anchor="middle" class="mono">inode 67158084</text><text x="625" y="76" text-anchor="middle" class="mono">Links: 1</text>
+    <path d="M500 70 L558 62" class="arrow" marker-end="url(#ah39d)"/>
+    <path d="M500 90 C 530 100, 530 150, 558 152" class="arrow" marker-end="url(#ah39d)"/>
+    <path d="M560 165 C 340 205, 330 95, 367 72" style="stroke:var(--warn);fill:none;stroke-dasharray:4 3" marker-end="url(#ah39d)"/>
+    <text x="370" y="220" class="t-muted">打开 file2 时，文件系统读出路径 "file"，</text>
+    <text x="370" y="238" class="t-muted">再按名字重新查找——file 被删了就成了悬空引用</text>
+  </g>
+</svg>
+<figcaption>硬链接共享同一个 inode（link count 计数）；符号链接是一个独立的 inode，数据里存的是路径名</figcaption>
+</figure>
+<p>正因为只存路径名，符号链接可能出现<strong>悬空引用（dangling reference）</strong>：</p>
+<pre><code>prompt&gt; echo hello &gt; file
+prompt&gt; ln -s file file2
+prompt&gt; rm file
+prompt&gt; cat file2
+cat: file2: No such file or directory</code></pre>
+
+<h2 id="perm">权限位与访问控制列表</h2>
+<p>文件系统也提供了磁盘的虚拟视图，但和 CPU、内存的虚拟化不同，文件通常<strong>在不同用户和进程之间共享</strong>，所以需要一套控制共享程度的机制。最经典的是 UNIX 的<strong>权限位（permission bits）</strong>：</p>
+<pre><code>prompt&gt; ls -l foo.txt
+-rw-r--r-- 1 remzi wheel 0 Aug 24 16:29 foo.txt</code></pre>
+<p>第一个字符是类型（<code>-</code> 普通文件、<code>d</code> 目录、<code>l</code> 符号链接），与权限基本无关。后面 9 个字符分三组：<strong>属主（owner）</strong>、<strong>组（group）</strong>、<strong>其他人（other）</strong>，每组是读 r、写 w、执行 x。上例表示属主可读写，wheel 组成员和其他人只读。属主可以用 <code>chmod</code>（change mode）修改，比如 <code>chmod 600 foo.txt</code>：每一组用一个八进制数字表示，r=4、w=2、x=1，属主 4|2=6，组和其他人都是 0，结果是 <code>rw-------</code>。</p>
+
+<section class="sim" id="sim-perm">
+  <div class="sim-head"><span class="tag">小工具</span><h3>chmod 计算器：八进制 ⇄ rwx</h3>
+    <div class="desc">输入八进制模式或勾选各个位，看 ls -l 显示什么、每类用户能做什么。切换"目录"看看 x 位的含义如何变化。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>chmod <input type="text" id="pm-oct" value="644" style="width:4.5em"></label>
+      <label><input type="checkbox" id="pm-dir"> 这是目录</label>
+      <button data-m="600">600</button><button data-m="644">644</button><button data-m="640">640</button><button data-m="755">755</button><button data-m="711">711</button><button data-m="777">777</button>
+    </div>
+    <div class="permgrid" id="pm-grid"></div>
+    <div class="permstr" id="pm-str"></div>
+    <div class="narrate" id="pm-narr"></div>
+  </div>
+</section>
+
+<p><strong>执行位</strong>对普通文件决定能否运行它：<code>chmod 600 hello.csh</code> 之后 <code>./hello.csh</code> 会报 Permission denied。对<strong>目录</strong>含义不同：x 允许用户（或组、所有人）进入该目录（<code>cd</code>）、访问其中的名字；与 w 结合才能在里面创建文件。</p>
+<p>比权限位更强大的是<strong>访问控制列表（access control list，ACL）</strong>。分布式文件系统 AFS 给每个目录一个 ACL，可以精确列出谁能、谁不能访问：</p>
+<pre><code>prompt&gt; fs listacl private
+Access list for private is
+Normal rights:
+  system:administrators rlidwka
+  remzi rlidwka</code></pre>
+<p>rlidwka 分别是 read、lookup、insert、delete、write、lock、administer。要让另一位作者读这个目录：<code>fs setacl private/ andrea rl</code>。</p>
+<div class="aside" data-title="旁注 · 文件系统的超级用户">
+<p>谁有权执行特权操作，比如删除一个不活跃用户的文件来腾空间？本地文件系统通常有一个<strong>超级用户（superuser，即 root）</strong>，无视权限访问一切文件；AFS 里是 <code>system:administrators</code> 组。这些受信任的用户本身就是安全隐患：攻击者一旦冒充成功，就能访问系统中的全部信息。</p>
+</div>
+<div class="tip">
+<p><strong>警惕 TOCTTOU。</strong>检查时间到使用时间（Time Of Check To Time Of Use）问题：在"有效性检查"与"相关操作"之间存在时间窗口，这期间被检查的对象可能被恶意改变。例：以 root 运行的邮件服务先用 <code>lstat()</code> 确认收件箱是属于目标用户的普通文件，再往里追加邮件；攻击者恰好在检查之后、写入之前用 <code>rename()</code> 把收件箱换成指向 <code>/etc/passwd</code> 的东西，服务就把邮件内容写进了密码文件。没有简单完美的解法：减少需要 root 的服务；<code>O_NOFOLLOW</code> 让 open 在目标是符号链接时失败；事务性文件系统能根治但很少部署。所以老生常谈：写高权限代码要小心！</p>
+</div>
+
+<h2 id="mount">创建和挂载文件系统：mkfs 与 mount</h2>
+<p>最后一个问题：怎样用许多底层文件系统拼出一棵完整的目录树？先<strong>创建</strong>文件系统，再<strong>挂载</strong>它。</p>
+<p><strong>mkfs</strong>（"make fs"）：给它一个设备（比如磁盘分区 <code>/dev/sda1</code>）和文件系统类型（比如 ext3），它就在分区上写入一个空文件系统，从一个根目录开始。</p>
+<p><strong>mount</strong>（底层是 <code>mount()</code> 系统调用）：取一个已有目录作为<strong>挂载点（mount point）</strong>，把新文件系统"粘贴"到目录树的这个位置。</p>
+<figure class="fig">
+<svg viewBox="0 0 700 260" width="700" role="img" aria-label="mount 把文件系统粘到目录树上">
+  <defs><marker id="ah39e" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker></defs>
+  <g font-size="12" class="mono">
+    <text x="20" y="20" font-weight="600" style="font-family:var(--font)">现有目录树（根文件系统）</text>
+    <g class="arrow"><path d="M80 50 L50 90"/><path d="M80 50 L120 90"/><path d="M120 116 L120 150"/></g>
+    <rect x="60" y="30" width="40" height="22" rx="11" class="accent-soft"/><text x="80" y="45" text-anchor="middle">/</text>
+    <rect x="25" y="90" width="50" height="24" rx="12" class="accent-soft"/><text x="50" y="106" text-anchor="middle">etc</text>
+    <rect x="95" y="90" width="50" height="24" rx="12" class="accent-soft"/><text x="120" y="106" text-anchor="middle">home</text>
+    <rect x="88" y="150" width="64" height="24" rx="12" class="warn-soft"/><text x="120" y="166" text-anchor="middle">users</text>
+    <text x="120" y="194" text-anchor="middle" class="t-muted" style="font-family:var(--font)">挂载点（空目录）</text>
+
+    <text x="260" y="20" font-weight="600" style="font-family:var(--font)">/dev/sda1 上的 ext3（未挂载）</text>
+    <g class="arrow"><path d="M330 50 L300 90"/><path d="M330 50 L370 90"/><path d="M300 116 L300 150"/><path d="M370 116 L370 150"/></g>
+    <rect x="310" y="30" width="40" height="22" rx="11" class="ok-soft"/><text x="330" y="45" text-anchor="middle">/</text>
+    <rect x="280" y="90" width="40" height="24" rx="12" class="ok-soft"/><text x="300" y="106" text-anchor="middle">a</text>
+    <rect x="350" y="90" width="40" height="24" rx="12" class="ok-soft"/><text x="370" y="106" text-anchor="middle">b</text>
+    <rect x="280" y="150" width="40" height="24" rx="3" class="ok-soft"/><text x="300" y="166" text-anchor="middle">foo</text>
+    <rect x="350" y="150" width="40" height="24" rx="3" class="ok-soft"/><text x="370" y="166" text-anchor="middle">foo</text>
+
+    <text x="480" y="20" font-weight="600" style="font-family:var(--font)">mount 之后</text>
+    <g class="arrow"><path d="M540 50 L540 70"/><path d="M540 94 L540 110"/><path d="M540 134 L510 170"/><path d="M540 134 L580 170"/><path d="M510 194 L510 214"/><path d="M580 194 L580 214"/></g>
+    <rect x="520" y="30" width="40" height="22" rx="11" class="accent-soft"/><text x="540" y="45" text-anchor="middle">/</text>
+    <rect x="515" y="70" width="50" height="24" rx="12" class="accent-soft"/><text x="540" y="86" text-anchor="middle">home</text>
+    <rect x="508" y="110" width="64" height="24" rx="12" class="ok-soft" style="stroke-width:2"/><text x="540" y="126" text-anchor="middle">users</text>
+    <rect x="490" y="170" width="40" height="24" rx="12" class="ok-soft"/><text x="510" y="186" text-anchor="middle">a</text>
+    <rect x="560" y="170" width="40" height="24" rx="12" class="ok-soft"/><text x="580" y="186" text-anchor="middle">b</text>
+    <rect x="490" y="214" width="40" height="24" rx="3" class="ok-soft"/><text x="510" y="230" text-anchor="middle">foo</text>
+    <rect x="560" y="214" width="40" height="24" rx="3" class="ok-soft"/><text x="580" y="230" text-anchor="middle">foo</text>
+  </g>
+  <path d="M400 110 C 440 110, 460 120, 500 122" style="stroke:var(--accent);fill:none;stroke-width:1.6" marker-end="url(#ah39e)"/>
+  <text x="400" y="250" font-size="11.5" class="mono">mount -t ext3 /dev/sda1 /home/users</text>
+</svg>
+<figcaption>挂载后，/home/users 就是新文件系统的根：/home/users/a/foo、/home/users/b/foo</figcaption>
+</figure>
+<pre><code>prompt&gt; mount -t ext3 /dev/sda1 /home/users
+prompt&gt; ls /home/users/
+a b</code></pre>
+<p>这就是 mount 的美妙之处：不再是一堆零散的文件系统，而是统一成一棵树，命名一致又方便。运行不带参数的 <code>mount</code> 能看到系统上挂了什么：</p>
+<pre><code>/dev/sda1 on / type ext3 (rw)
+proc on /proc type proc (rw)
+sysfs on /sys type sysfs (rw)
+/dev/sda5 on /tmp type ext3 (rw)
+/dev/sda7 on /var/vice/cache type ext3 (rw)
+tmpfs on /dev/shm type tmpfs (rw)
+AFS on /afs type afs (rw)</code></pre>
+<p>ext3（标准磁盘文件系统）、proc（访问进程信息的伪文件系统）、tmpfs（只放临时文件的内存文件系统）、AFS（分布式文件系统）……五花八门，全被粘在同一棵树上。也正因为不同分区是不同的文件系统，inode 号只在各自内部唯一，硬链接才不能跨越挂载点。</p>
+
+<h2 id="predict">先预测，再验证</h2>
+
+<div class="exercise"><div class="q">在模拟器里写：<code>fd = open("file", O_RDONLY)</code>、<code>read(fd, b, 50)</code>、<code>rc = fork()</code>、<code>child: read(fd, b, 100)</code>、<code>child: exit()</code>、<code>read(fd, b, 100)</code>（file 大小 300）。父进程最后这次 read 从哪个偏移开始？返回多少？结束时偏移是多少？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>父子共享同一个表项。父读 50 → 偏移 50；子读 100 → 偏移 150；子退出，refcnt 从 2 降回 1；父再读从 <strong>150</strong> 开始，返回 <strong>100</strong>，偏移变为 <strong>250</strong>。如果子进程是自己重新 open 的文件，父进程就会从 50 开始读。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q"><code>fd2 = dup(fd)</code> 之后 <code>close(fd)</code>，fd2 还能用吗？打开文件表项的 refcnt 依次是多少？用预设 ⑤ 验证。</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>能用。dup 后 refcnt = 2，close(fd) 后 refcnt = 1，表项仍在，偏移也保留（预设里第三次读从 200 开始）。直到 close(fd2) 让 refcnt 变 0，表项才被释放。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">执行 <code>echo hello &gt; file; ln file file2; ln file file3; rm file2</code> 后，<code>stat file3</code> 显示 Links 是几？如果此时有进程打开着 file3，再执行 <code>rm file file3</code>，这个进程还能读到 hello 吗？磁盘空间什么时候释放？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>Links = <strong>2</strong>（file 和 file3）。全部 rm 之后 link count 为 0，但 inode 仍被打开文件表引用，进程<strong>照样能读到 hello</strong>；等最后一个 fd 关闭，inode 和数据块才被释放。用预设 ⑥ 单步看"links=0 但仍被打开"那一步。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（原书作业 1 的延伸）一个目录里有 5 个普通文件和 3 个子目录，它的 link count 是多少？再往里建一个符号链接和一个硬链接呢？先预测，再运行实验里的 <code>./mystat</code> 观察。</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>目录的 link count = 2 + 子目录数：父目录里指向它的名字 1 个、自己的 "." 1 个、每个子目录的 ".." 各 1 个，所以是 <strong>5</strong>。普通文件、符号链接、硬链接都只影响<strong>文件自己</strong>的 link count，不影响目录的，仍是 5。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">用 chmod 计算器：一个目录的模式是 <code>711</code>（<code>drwx--x--x</code>）。组里的用户能 <code>ls</code> 它吗？能 <code>cat</code> 里面一个已知名字、权限为 644 的文件吗？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>不能 ls（没有 r，读不了目录项列表）；但能 cat 已知名字的文件（目录有 x，可以按名字查找；文件本身对组可读）。很多系统上的用户主目录就用这种"能穿过、不能列出"的设置。</p>
+</div></details></div>
+
+<h2 id="lab">动手实验</h2>
+<div class="lab">
+<p>代码在 <code>labs/39-files-dirs/</code>，五个小程序对应本章的五个主题：</p>
+<pre><code class="cmd">cd labs/39-files-dirs &amp;&amp; make &amp;&amp; ./mycat &amp;&amp; ./links &amp;&amp; ./mystat &amp;&amp; ./fork-seek &amp;&amp; ./atomic-write</code></pre>
+<p><strong>关于 strace：</strong>本机没有安装 strace。WSL / Ubuntu / Debian 上安装：<code>sudo apt install strace</code>；然后试 <code>strace cat foo</code>、<code>strace -e trace=openat,read,write,close cat foo</code>、<code>strace rm foo</code>、<code>strace mv foo bar</code>、<code>strace -f ./fork-seek</code>。没有 strace 时，<code>mycat</code> 自己执行 cat 的系统调用序列，并按 strace 的格式把每一步打印到标准错误。</p>
+<p class="small muted">以下都是示例输出（WSL2 · ext4 · gcc 14），你的机器上 inode 号、时间等数字会不同。</p>
+<p><strong>1. mycat</strong>——和原书的 strace 输出对照（中间那行 hello 是真正写到标准输出的内容）：</p>
+<pre><code>openat(AT_FDCWD, "foo", O_RDONLY) = 3
+read(3, "hello\n", 4096) = 6
+hello
+write(1, "hello\n", 6) = 6
+read(3, "", 4096) = 0
+close(3) = 0</code></pre>
+<p><strong>2. links</strong>——复刻原书的硬链接 / 符号链接实验：</p>
+<pre><code>== 硬链接：link() 只是在目录里再加一个名字，指向同一个 inode ==
+echo hello &gt; file
+  file               inode=1034694   links=1 size=6   regular file
+ln file file2
+  file               inode=1034694   links=2 size=6   regular file
+  file2              inode=1034694   links=2 size=6   regular file
+ln file2 file3
+  file               inode=1034694   links=3 size=6   regular file
+rm file
+  file2              inode=1034694   links=2 size=6   regular file
+rm file2
+  file3              inode=1034694   links=1 size=6   regular file
+  cat file3: hello
+rm file3   （link count 降到 0，inode 和数据块才真正被释放）
+
+== 符号链接：一个独立的小文件，内容是目标的路径名 ==
+ln -s file file2
+  file               inode=1034694   links=1 size=6   regular file
+  file2              inode=1034695   links=1 size=4   symbolic link -&gt; file
+  cat file2: hello
+ln -s alongerfilename file3
+  file3              inode=1034697   links=1 size=15  symbolic link -&gt; alongerfilename
+rm file   （符号链接不增加 link count，也拦不住删除）
+  file2              inode=1034695   links=1 size=4   symbolic link -&gt; file
+  cat file2: 打开失败（No such file or directory）
+  → file2 成了悬空引用（dangling reference）</code></pre>
+<p><strong>3. mystat</strong>——自己实现的 stat，外加目录 link count 的观察：</p>
+<pre><code>$ echo hello &gt; file; ./mystat file
+  File: file
+  Size: 6          Blocks: 8      IO Block: 4096   regular file
+Device: 8,80  Inode: 1034694    Links: 1
+Access: (0640/-rw-r-----)  Uid: 1000  Gid: 1000
+Access: 2026-09-24 23:03:14.634124807
+Modify: 2026-09-24 23:03:14.634124807
+Change: 2026-09-24 23:03:14.634124807
+
+== 目录的 link count = 2 + 子目录个数 ==
+mkdir d            -&gt; d 的 links = 2 （父目录里的 "d" + 自己的 "."）
+touch d/f          -&gt; d 的 links = 2 （普通文件不影响）
+mkdir d/sub1       -&gt; d 的 links = 3 （sub1/.. 指向 d）
+mkdir d/sub2       -&gt; d 的 links = 4 （sub2/.. 指向 d）
+mkdir d/sub3       -&gt; d 的 links = 5 （sub3/.. 指向 d）
+rmdir d            -&gt; 成功（此时只剩 . 和 ..）</code></pre>
+<p><strong>4. fork-seek</strong>——Figure 39.2 原样复现，再对比 dup、两次 open 与 dup2 重定向：</p>
+<pre><code>== 1. fork()：父子进程共享同一个打开文件表项 ==
+child: offset 10
+parent: offset 10
+
+== 2. dup()：两个 fd，同一个表项，偏移一起动 ==
+fd=3 fd2=4
+read(fd, 100)  = 100  -&gt; fd 偏移 100, fd2 偏移 100
+read(fd2, 100) = 100  -&gt; fd 偏移 200, fd2 偏移 200
+
+== 3. 两次 open()：两个独立的表项，偏移各管各的 ==
+fd1=3 fd2=4
+read(fd1, 100) = 100  -&gt; fd1 偏移 100, fd2 偏移 0
+read(fd2, 100) = 100  -&gt; fd1 偏移 100, fd2 偏移 100
+
+== 4. dup2() 做输出重定向（shell 的 &gt; 就是这么实现的）==
+out.txt 的内容：这行字写进了 out.txt，而不是屏幕</code></pre>
+<p><strong>5. atomic-write</strong>——write 临时文件 + fsync + rename + fsync 目录：</p>
+<pre><code>初始状态：
+    foo.txt: "line 1\nline 3\n"
+
+1. open("foo.txt.tmp", O_WRONLY|O_CREAT|O_TRUNC)
+   = 3
+2. write(fd, 新内容, 32) = 32
+   此刻崩溃：foo.txt 仍是完整的旧版本，tmp 文件可能残缺——但没人会读它
+    foo.txt: "line 1\nline 3\n"
+3. fsync(fd) = 0   （新内容真正落盘后才继续）
+4. close(fd) = 0
+5. rename("foo.txt.tmp", "foo.txt") = 0   （原子地把新文件换上，旧文件同时消失）
+6. fsync(目录 ".") = 0   （让"改名"这一目录修改本身也持久化）
+
+最终状态（任何时刻崩溃，foo.txt 要么是旧版、要么是新版）：
+    foo.txt: "line 1\nline 2 (inserted)\nline 3\n"
+    foo.txt.tmp: (不存在)</code></pre>
+<p>怎么解读：mycat 的 fd 是 3（0/1/2 已被占）；links 里硬链接让 inode 号相同、Links 递增，符号链接则有自己的 inode、大小等于路径长度（4 和 15）、删掉目标就悬空；mystat 显示 6 字节文件占 8 个 512B 块，目录每多一个子目录 Links 就加 1；fork-seek 说明 fork 和 dup 共享偏移而两次 open 不共享；atomic-write 在每一步都保证 foo.txt 是完整的一个版本。注意：fsync 的效果无法在不断电的情况下直接"看到"，程序只能展示调用顺序，真正的意义要到崩溃时才体现（第 42 章会细讲）。</p>
+</div>
+
+<h2 id="quiz">自测题</h2>
+<p class="quiz-score"></p>
+
+<div class="mcq" data-answer="3"><div class="q">1. 一个新启动的进程第一次调用 open() 成功，返回值通常是多少？</div>
+<div class="opts"><button>A. 1</button><button>B. 0</button><button>C. 文件的 inode 号</button><button>D. 3</button></div>
+<div class="explain">0、1、2 分别是标准输入、标准输出、标准错误，已经打开。open 返回最小的空闲描述符，所以通常是 3。fd 不是 inode 号，它只是进程私有数组的下标。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">2. 调用 <code>lseek(fd, 1000000, SEEK_SET)</code> 会发生什么？</div>
+<div class="opts"><button>A. 立即把该位置的数据读进缓存</button><button>B. 只修改内存中打开文件表项的偏移，不产生任何磁盘 I/O</button><button>C. 磁盘磁头移动到文件第 1000000 字节所在的磁道</button><button>D. 如果文件不够大就返回错误</button></div>
+<div class="explain">lseek 只是改一个变量，和磁盘寻道无关（之后的读写可能导致寻道）。偏移可以超过文件末尾，之后再写会形成"洞"。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">3. 进程打开文件得到 fd 3 后 fork。子进程 read(3, buf, 100)。之后父进程 read(3, buf, 100) 从哪里读起？</div>
+<div class="opts"><button>A. 偏移 0，因为子进程的 fd 是复制出来的新表项</button><button>B. 偏移 0，因为父子进程的偏移相互独立</button><button>C. 偏移 100，因为父子共享同一个打开文件表项</button><button>D. 不确定，fork 之后 fd 不能再用</button></div>
+<div class="explain">fork 复制的是 fd 数组（指针），指向同一个打开文件表项，refcnt 变为 2，偏移共享。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">4. 下面哪种情况下，两个 fd 各自拥有<strong>独立</strong>的当前偏移？</div>
+<div class="opts"><button>A. 同一进程对同一文件调用两次 open()</button><button>B. <code>dup2(fd1, fd2)</code></button><button>C. <code>fd2 = dup(fd1)</code></button><button>D. fork 之后父子进程中的同一个 fd</button></div>
+<div class="explain">每次 open 都会在打开文件表里新建一项，偏移独立（原书的 OFT[10]/OFT[11] 表）。dup、dup2、fork 都是共享表项。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">5. <code>write()</code> 成功返回之后，数据的状态是：</div>
+<div class="opts"><button>A. 一定已经写到磁盘上</button><button>B. 一定还没写到磁盘上</button><button>C. 已交给文件系统，通常先缓冲在内存里，过一会儿才落盘；要确保持久需要 fsync</button><button>D. 要等 close() 才会写到磁盘</button></div>
+<div class="explain">文件系统出于性能会缓冲写 5~30 秒；fsync 强制刷盘。close 并不保证落盘。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">6. 文件 file 有 3 个硬链接（file、file2、file3）。执行 <code>rm file</code> 后：</div>
+<div class="opts"><button>A. 文件数据被删除，file2 和 file3 变成悬空链接</button><button>B. 三个名字全部被删除</button><button>C. rm 会失败，因为还有其他链接</button><button>D. 只是删掉名字 file，link count 从 3 变为 2，数据完好</button></div>
+<div class="explain">rm 调用 unlink，只删一个名字并把引用计数减 1；只有计数为 0（且没有进程打开）才真正释放 inode 和数据块。悬空引用是符号链接才有的问题。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">7. 关于符号链接，下列说法<strong>错误</strong>的是：</div>
+<div class="opts"><button>A. 创建它会让目标文件的 link count 加 1</button><button>B. 它本身是一个独立的文件，类型为 l</button><button>C. 它的大小等于所存路径名的长度</button><button>D. 它可以指向目录，也可以跨越不同的文件系统</button></div>
+<div class="explain">符号链接只存路径名，不影响目标 inode 的引用计数——所以目标被删后它会悬空。硬链接才会让 link count 加 1。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">8. 编辑器想原子地更新 foo.txt，下列哪个顺序是正确的？</div>
+<div class="opts"><button>A. 写 foo.txt.tmp → fsync(tmp) → close → rename(tmp, foo.txt)</button><button>B. rename(foo.txt, foo.txt.bak) → 写 foo.txt → unlink(bak)</button><button>C. 写 foo.txt.tmp → rename(tmp, foo.txt) → fsync(tmp)</button><button>D. 以 O_TRUNC 打开 foo.txt → 写新内容 → fsync</button></div>
+<div class="explain">D 在截断后、写完前崩溃会得到残缺文件；B 中间会有 foo.txt 不存在的时刻；C 在 fsync 之前 rename，崩溃后 foo.txt 可能指向尚未落盘（空或残缺）的数据。A 是原书的做法（再 fsync 一下目录更稳妥）。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">9. 为什么不能在 /home（ext4 分区）上为 /mnt/usb（另一个文件系统）里的文件创建硬链接？</div>
+<div class="opts"><button>A. 因为 mount 会复制文件</button><button>B. 因为 inode 号只在各自的文件系统内唯一，目录项无法指向另一个文件系统的 inode</button><button>C. 因为 USB 设备是只读的</button><button>D. 因为硬链接只能指向目录</button></div>
+<div class="explain">目录项只存 (名字, inode 号)，而 inode 号离开所属文件系统就没有意义。跨文件系统要用符号链接（存路径名）。</div></div>
+
+<h2 id="summary">常见误区与小结</h2>
+<div class="warn">
+<ul>
+<li><strong>lseek = 磁盘寻道？</strong>不是。lseek 只改内存里的偏移变量，不产生 I/O。</li>
+<li><strong>rm 就是删除数据？</strong>rm 调用 unlink，只删一个名字；还有别的硬链接或还有进程开着它时，数据都还在。</li>
+<li><strong>write 返回就安全了？</strong>数据可能还在内存缓冲里；需要持久性要调用 fsync（新建文件还要 fsync 目录）。</li>
+<li><strong>fd 就是 inode 号？</strong>fd 是每进程私有的小整数，经过打开文件表才指向 inode。</li>
+<li><strong>fork 后父子各有一份偏移？</strong>不，共享同一个打开文件表项；只有各自重新 open 才独立。</li>
+<li><strong>符号链接和硬链接差不多？</strong>硬链接是同一 inode 的另一个名字，不能指向目录、不能跨文件系统；符号链接是存路径名的独立文件，可以跨文件系统、指向目录，但可能悬空。</li>
+<li><strong>可以直接写目录？</strong>不行，目录只能通过创建 / 删除 / 改名等操作间接修改。</li>
+</ul>
+</div>
+<div class="key">
+<p><strong>本章要点（原书"关键文件系统术语"）</strong></p>
+<ul>
+<li><strong>文件</strong>是可创建、读、写、删除的字节数组，有唯一的低级名字（i-number）。</li>
+<li><strong>目录</strong>是 (人类可读名字, 低级名字) 元组的集合，本身也有 i-number，总有 <code>.</code> 和 <code>..</code> 两项；目录树从根开始组织所有文件和目录。</li>
+<li>访问文件先用 <code>open()</code> 向操作系统申请，得到<strong>文件描述符</strong>；它是每进程私有的，指向<strong>打开文件表</strong>中记录文件、当前偏移等信息的表项。</li>
+<li><code>read()</code>、<code>write()</code> 自动更新偏移，<code>lseek()</code> 显式修改，从而支持随机访问。</li>
+<li>强制持久化要用 <code>fsync()</code> 等调用；既正确又高效地使用它并不容易。</li>
+<li>让多个名字指向同一个文件，用<strong>硬链接</strong>或<strong>符号链接</strong>；删除文件就是对它做最后一次 <code>unlink()</code>。</li>
+<li>权限位提供基本的共享控制，ACL 更精细；mkfs + mount 把多个文件系统拼成一棵树。</li>
+</ul>
+</div>
+<p><strong>和后续章节的联系：</strong>本章只看了接口。下一章（第 40 章 文件系统实现）会用极简的 vsfs 打开盖子：inode 在磁盘上长什么样、目录项怎样存储、<code>open("/foo/bar")</code> 要逐级读哪些块、创建文件为什么要写位图——你会看到 link count、unlink、fsync 在磁盘结构上对应的是什么。之后的崩溃一致性（第 42 章）会解释为什么 rename 能做到原子、为什么 fsync 如此重要。</p>
+
+</main>
+<script>
+(function () {
+"use strict";
+// ===== CORE BEGIN：文件描述符 / 打开文件表 / inode 的状态机（纯函数，node 可测） =====
+function fsInit(files, nextInum) {
+  const st = { procs: [{ name: "parent", pid: 100, fds: ["tty", "tty", "tty"], vars: {} }], oft: {}, inodes: {}, dir: {}, nextInum: nextInum || 2000, used: [] };
+  for (const f of files) {
+    st.inodes[f.inum] = { inum: f.inum, size: f.size, links: 1, opens: 0 };
+    st.dir[f.name] = f.inum;
+    st.nextInum = Math.max(st.nextInum, f.inum + 1);
+  }
+  return st;
+}
+const fsClone = (st) => JSON.parse(JSON.stringify(st));
+function fsParseFiles(text) {
+  const out = [];
+  let inum = 1000;
+  for (const part of text.split(/[,，\s]+/).filter(Boolean)) {
+    const m = part.match(/^([^:=]+)[:=](\d+)(?:@(\d+))?$/);
+    if (!m) continue;
+    out.push({ name: m[1], size: +m[2], inum: m[3] ? +m[3] : inum });
+    inum = (m[3] ? +m[3] : inum) + 1;
+  }
+  return out;
+}
+function namesOf(st, inum) { return Object.keys(st.dir).filter((n) => st.dir[n] === inum); }
+// 执行一行，返回 {ok, ret, msg, proc}；会修改 st
+function fsExec(st, line) {
+  let s = line.trim().replace(/;$/, "");
+  let pname = "parent";
+  const pm = s.match(/^(parent|child\d*)\s*:\s*/);
+  if (pm) { pname = pm[1]; s = s.slice(pm[0].length); }
+  const proc = st.procs.find((p) => p.name === pname && !p.dead);
+  if (!proc) return { ok: false, ret: "—", msg: `进程 ${pname} 不存在（或已退出）`, proc: pname };
+  let lhs = null;
+  const am = s.match(/^(\w+)\s*=\s*/);
+  if (am) { lhs = am[1]; s = s.slice(am[0].length); }
+  const cm = s.match(/^(\w+)\s*\((.*)\)$/);
+  if (!cm) return { ok: false, ret: "—", msg: "看不懂这一行：" + line, proc: pname };
+  const fn = cm[1];
+  const args = cm[2].trim() ? cm[2].split(",").map((a) => a.trim().replace(/^"(.*)"$/, "$1")) : [];
+  const fdOf = (a) => (a in proc.vars ? proc.vars[a] : /^-?\d+$/.test(a) ? +a : NaN);
+  const entryOf = (fd) => (Number.isInteger(fd) && fd >= 0 && fd < proc.fds.length ? proc.fds[fd] : null);
+  const err = (ret, msg) => ({ ok: false, ret, msg, proc: pname });
+  const done = (ret, msg) => { if (lhs) proc.vars[lhs] = ret; return { ok: true, ret, msg, proc: pname }; };
+  const allocFd = (val) => { let i = proc.fds.findIndex((x) => x == null); if (i < 0) { i = proc.fds.length; proc.fds.push(null); } proc.fds[i] = val; return i; };
+  const release = (id) => {  // OFT 表项引用计数 -1
+    const e = st.oft[id]; e.ref -= 1;
+    let note = `OFT[${id}] 的 refcnt 变为 ${e.ref}`;
+    if (e.ref === 0) {
+      delete st.oft[id];
+      const ino = st.inodes[e.ino]; ino.opens -= 1;
+      note += `，表项被释放`;
+      if (ino.opens === 0 && ino.links === 0) { delete st.inodes[e.ino]; note += `；inode ${e.ino} 已没有任何名字也没人打开，<b>此刻才真正释放</b>（数据块归还）`; }
+    }
+    return note;
+  };
+  const tty = (fd) => ["标准输入", "标准输出", "标准错误"][fd] || "终端";
+  switch (fn) {
+    case "open": case "creat": {
+      const name = args[0];
+      const flags = fn === "creat" ? "O_CREAT|O_WRONLY|O_TRUNC" : (args[1] || "O_RDONLY");
+      const has = (f) => flags.includes(f);
+      let inum = st.dir[name];
+      let created = false;
+      if (inum == null) {
+        if (!has("O_CREAT")) return err(-1, `open 失败（ENOENT）：当前目录里没有名为 "${name}" 的文件`);
+        inum = st.nextInum++;
+        st.inodes[inum] = { inum, size: 0, links: 1, opens: 0 };
+        st.dir[name] = inum;
+        created = true;
+      }
+      const ino = st.inodes[inum];
+      if (has("O_TRUNC") && (has("O_WRONLY") || has("O_RDWR"))) ino.size = 0;
+      let id = 10; while (st.oft[id]) id++;
+      st.oft[id] = { id, ino: inum, off: 0, ref: 1, r: !has("O_WRONLY"), w: has("O_WRONLY") || has("O_RDWR"), app: has("O_APPEND") };
+      st.used.push(id);
+      ino.opens += 1;
+      const fd = allocFd(id);
+      return done(fd, `${created ? `目录里没有 "${name}"，O_CREAT 让文件系统新建 inode ${inum} 并加入目录项；` : `在目录里查到 "${name}" → inode ${inum}；`}在系统打开文件表里分配新表项 OFT[${id}]（偏移 0，refcnt 1），再把进程 fd 表里最小的空位 <b>${fd}</b> 指向它。返回 ${fd}。`);
+    }
+    case "read": case "write": {
+      const fd = fdOf(args[0]), id = entryOf(fd);
+      const n = Math.max(0, parseInt(args[2], 10) || 0);
+      if (id == null) return err(-1, `EBADF：fd ${args[0]} 没有打开`);
+      if (id === "tty") return done(n, `fd ${fd} 是${tty(fd)}（终端），${fn === "read" ? "从键盘读" : "输出到屏幕"}，不涉及打开文件表里的普通文件。`);
+      const e = st.oft[id], ino = st.inodes[e.ino];
+      if (fn === "read") {
+        if (!e.r) return err(-1, `EBADF：OFT[${id}] 是只写打开的，不能 read`);
+        const got = Math.max(0, Math.min(n, ino.size - e.off));
+        const from = e.off; e.off += got;
+        return done(got, got === 0 ? `偏移 ${from} 已到文件末尾（大小 ${ino.size}），read 返回 0 —— 程序据此知道"读完了"。` : `从 OFT[${id}] 记录的偏移 ${from} 开始读 ${got} 字节，偏移自动推进到 <b>${e.off}</b>。`);
+      }
+      if (!e.w) return err(-1, `EBADF：OFT[${id}] 是只读打开的，不能 write`);
+      if (e.app) e.off = ino.size;
+      const from = e.off; e.off += n; ino.size = Math.max(ino.size, e.off);
+      return done(n, `从偏移 ${from} 写入 ${n} 字节，偏移推进到 <b>${e.off}</b>，文件大小 ${ino.size}。（数据先进入内存缓冲，稍后才落盘；要立即持久化需 fsync）`);
+    }
+    case "lseek": {
+      const fd = fdOf(args[0]), id = entryOf(fd);
+      if (id == null || id === "tty") return err(-1, `EBADF/ESPIPE：fd ${args[0]} 不能 lseek`);
+      const e = st.oft[id], ino = st.inodes[e.ino], off = parseInt(args[1], 10) || 0, wh = args[2] || "SEEK_SET";
+      const base = wh === "SEEK_CUR" ? e.off : wh === "SEEK_END" ? ino.size : 0;
+      if (base + off < 0) return err(-1, "EINVAL：偏移不能为负");
+      e.off = base + off;
+      return done(e.off, `${wh}：新偏移 = ${wh === "SEEK_SET" ? "" : `${base} + ${off} = `}<b>${e.off}</b>。只改了内存里 OFT[${id}] 的一个变量，<b>没有任何磁盘 I/O</b>（更不是磁盘寻道）。`);
+    }
+    case "dup": {
+      const fd = fdOf(args[0]), id = entryOf(fd);
+      if (id == null) return err(-1, `EBADF：fd ${args[0]} 没有打开`);
+      const nfd = allocFd(id);
+      if (id !== "tty") st.oft[id].ref += 1;
+      return done(nfd, `新 fd <b>${nfd}</b> 指向与 fd ${fd} <b>同一个</b>表项${id === "tty" ? "（终端）" : ` OFT[${id}]，refcnt 变为 ${st.oft[id].ref}`}。两者共享偏移，可以互换使用。`);
+    }
+    case "fork": {
+      const k = st.procs.filter((p) => p.name.startsWith("child")).length;
+      const child = { name: k ? "child" + (k + 1) : "child", pid: 100 + st.procs.length, fds: proc.fds.slice(), vars: { ...proc.vars } };
+      const shared = [];
+      for (const id of child.fds) if (id != null && id !== "tty") { st.oft[id].ref += 1; shared.push(id); }
+      st.procs.push(child);
+      if (lhs) child.vars[lhs] = 0;
+      return done(child.pid, `创建子进程 ${child.name}（pid ${child.pid}）：复制父进程的 fd 数组，但<b>不复制</b>打开文件表项——${shared.length ? [...new Set(shared)].map((id) => `OFT[${id}] 的 refcnt 变为 ${st.oft[id].ref}`).join("，") : "没有打开的普通文件"}。父进程得到返回值 ${child.pid}，子进程得到 0。`);
+    }
+    case "close": {
+      const fd = fdOf(args[0]), id = entryOf(fd);
+      if (id == null) return err(-1, `EBADF：fd ${args[0]} 没有打开`);
+      proc.fds[fd] = null;
+      if (id === "tty") return done(0, `关闭 fd ${fd}（${tty(fd)}）。`);
+      return done(0, `释放 fd ${fd}；${release(id)}。`);
+    }
+    case "exit": {
+      const notes = [];
+      proc.fds.forEach((id, fd) => { if (id != null && id !== "tty") notes.push(release(id)); proc.fds[fd] = null; });
+      proc.dead = true;
+      return { ok: true, ret: "—", msg: `进程 ${pname} 退出，内核替它关闭所有 fd${notes.length ? "：" + notes.join("；") : ""}。`, proc: pname };
+    }
+    case "wait":
+      return done(st.procs.find((p) => p.name !== pname && p.dead)?.pid ?? -1, "等待子进程结束（这里只是个同步点）。");
+    case "link": {
+      const [a, b] = args;
+      if (st.dir[a] == null) return err(-1, `ENOENT：没有 "${a}"`);
+      if (st.dir[b] != null) return err(-1, `EEXIST："${b}" 已存在`);
+      const inum = st.dir[a]; st.dir[b] = inum; st.inodes[inum].links += 1;
+      return done(0, `在目录里加一项 ("${b}", ${inum})，指向和 "${a}" 相同的 inode；link count 变为 <b>${st.inodes[inum].links}</b>。没有复制任何数据。`);
+    }
+    case "unlink": {
+      const [a] = args;
+      if (st.dir[a] == null) return err(-1, `ENOENT：没有 "${a}"`);
+      const inum = st.dir[a], ino = st.inodes[inum];
+      delete st.dir[a]; ino.links -= 1;
+      let msg = `删掉目录项 "${a}"，inode ${inum} 的 link count 变为 <b>${ino.links}</b>`;
+      if (ino.links === 0 && ino.opens === 0) { delete st.inodes[inum]; msg += "；既没有名字也没人打开，inode 和数据块被释放。"; }
+      else if (ino.links === 0) msg += `；已经没有名字了，但还有 ${ino.opens} 个打开文件表项引用它，所以<b>暂不释放</b>，已打开的 fd 照样能读写。`;
+      else msg += "；还有别的名字指向它，文件完好。";
+      return done(0, msg);
+    }
+    case "fsync":
+      return done(0, "把这个文件的脏数据强制写到磁盘，写完才返回。");
+  }
+  return err("—", "不支持的调用：" + fn);
+}
+// 运行整段脚本，得到每一步的快照
+function fsRun(files, script, nextInum) {
+  let st = fsInit(files, nextInum);
+  const steps = [{ st: fsClone(st), line: null, res: null }];
+  for (const line of script.split("\n")) {
+    const t = line.trim();
+    if (!t || t.startsWith("#") || t.startsWith("//")) continue;
+    const res = fsExec(st, t);
+    steps.push({ st: fsClone(st), line: t, res });
+  }
+  return steps;
+}
+// 生成原书风格的表格：系统调用 | 返回值 | 每个 OFT 表项的当前偏移
+function fsTable(steps) {
+  const ids = [...new Set(steps[steps.length - 1].st.used)];
+  const rows = steps.slice(1).map((x) => ({ call: x.line, ret: x.res.ret, offs: ids.map((id) => (x.st.oft[id] ? x.st.oft[id].off : "–")) }));
+  return { ids, rows };
+}
+// ===== CORE END =====
+
+// ===== 页面交互部分 =====
+const { h, s } = OSTEP;
+const $ = (id) => document.getElementById(id);
+
+// ---------- 图：link count 随 ln / rm 变化 ----------
+(function linkCountFig() {
+  const g = $("lc-steps");
+  const steps = [["echo hello > file", ["file"], 1], ["ln file file2", ["file", "file2"], 2], ["ln file2 file3", ["file", "file2", "file3"], 3], ["rm file", ["file2", "file3"], 2], ["rm file2", ["file3"], 1], ["rm file3", [], 0]];
+  steps.forEach(([cmd, names, n], k) => {
+    const x = 8 + k * 115, cx = x + 52;
+    g.append(s("text", { x: cx, y: 18, "text-anchor": "middle", class: "mono", "font-size": 11, text: cmd }));
+    g.append(s("rect", { x, y: 28, width: 104, height: 92, rx: 6, class: "box" }));
+    g.append(s("text", { x: x + 6, y: 44, "font-size": 10.5, class: "t-muted", text: "目录项" }));
+    names.forEach((nm, j) => {
+      const y = 52 + j * 22;
+      g.append(s("rect", { x: x + 8, y, width: 88, height: 18, rx: 3, class: "box-strong" }));
+      g.append(s("text", { x: x + 14, y: y + 13, class: "mono", "font-size": 11, text: nm }));
+      g.append(s("path", { d: `M ${x + 52} ${y + 18} L ${cx} 150`, class: "arrow", style: "stroke-width:1" }));
+    });
+    if (!names.length) g.append(s("text", { x: cx, y: 80, "text-anchor": "middle", "font-size": 11, class: "t-muted", text: "（空）" }));
+    const dead = n === 0;
+    g.append(s("rect", { x: x + 4, y: 150, width: 96, height: 46, rx: 6, class: dead ? "bad-soft" : "ok-soft", style: dead ? "stroke-dasharray:4 3" : "" }));
+    g.append(s("text", { x: cx, y: 168, "text-anchor": "middle", class: "mono", "font-size": 10.5, text: "inode 67158084" }));
+    g.append(s("text", { x: cx, y: 187, "text-anchor": "middle", "font-size": 12, "font-weight": 700, text: dead ? "Links 0 → 释放" : "Links: " + n }));
+  });
+})();
+
+// ---------- 模拟器：fd 表 / 打开文件表 / inode ----------
+(function fdSim() {
+  const PRESETS = {
+    seq: { files: "file:300@1000", script: 'fd = open("file", O_RDONLY)\nread(fd, buffer, 100)\nread(fd, buffer, 100)\nread(fd, buffer, 100)\nread(fd, buffer, 100)\nclose(fd)' },
+    two: { files: "file:300@1000", script: 'fd1 = open("file", O_RDONLY)\nfd2 = open("file", O_RDONLY)\nread(fd1, buffer1, 100)\nread(fd2, buffer2, 100)\nclose(fd1)\nclose(fd2)' },
+    seek: { files: "file:300@1000", script: 'fd = open("file", O_RDONLY)\nlseek(fd, 200, SEEK_SET)\nread(fd, buffer, 50)\nclose(fd)' },
+    fork: { files: "file.txt:300@1000", script: 'fd = open("file.txt", O_RDONLY)\nrc = fork()\nchild: lseek(fd, 10, SEEK_SET)\nchild: exit()\nparent: wait()\nparent: lseek(fd, 0, SEEK_CUR)\nclose(fd)' },
+    dup: { files: "README:1200@1000", script: 'fd = open("README", O_RDONLY)\nfd2 = dup(fd)\nread(fd, buf, 100)\nread(fd2, buf, 100)\nclose(fd)\nread(fd2, buf, 100)\nclose(fd2)' },
+    links: { files: "", next: 67158084, script: 'fd = open("file", O_CREAT|O_WRONLY|O_TRUNC)\nwrite(fd, buf, 6)\nclose(fd)\nlink("file", "file2")\nlink("file2", "file3")\nunlink("file")\nunlink("file2")\nfd = open("file3", O_RDONLY)\nunlink("file3")\nread(fd, buf, 6)\nclose(fd)' },
+  };
+  const INTRO = {
+    seq: "原书第一张表：打开 300 字节的文件，每次读 100 字节。盯住 OFT[10] 的 off。",
+    two: "原书第二张表：同一个文件打开两次，得到两个独立的表项 OFT[10] 和 OFT[11]。",
+    seek: "原书第三张表：先 lseek 到 200，再读 50 字节。",
+    fork: "原书 Figure 39.2/39.3：fork 之后父子进程共享同一个表项（refcnt 2）。",
+    dup: "原书 Figure 39.4：dup 出来的 fd 和原 fd 共享表项和偏移。",
+    links: "原书 39.14 节的硬链接实验，外加\"unlink 一个仍被打开的文件\"。盯住 inode 的 links 和\"被打开\"。",
+  };
+  let steps = [], table = null, cur = "seq", nextInum = 2000;
+  const ta = $("fd-script"), files = $("fd-files");
+  function load() {
+    steps = fsRun(fsParseFiles(files.value), ta.value, nextInum);
+    table = fsTable(steps);
+    stepper.reset();
+  }
+  function usePreset(k) {
+    cur = k;
+    const p = PRESETS[k];
+    files.value = p.files; ta.value = p.script; nextInum = p.next || 2000;
+    [...$("fd-presets").children].forEach((b) => b.classList.toggle("on", b.dataset.p === k));
+    load();
+  }
+  function draw(st, active) {
+    const RH = 22;
+    const procs = st.procs;
+    let y = 30;
+    const fdPos = [];   // [x, y, oftId]
+    const parts = [];
+    for (const p of procs) {
+      const n = Math.max(3, p.fds.length);
+      const hh = 30 + n * RH + 6;
+      const isAct = p.name === active;
+      parts.push(s("rect", { x: 10, y, width: 200, height: hh, rx: 8, style: `fill:var(--surface-2);stroke:${isAct ? "var(--accent)" : "var(--border)"};stroke-width:${isAct ? 2 : 1}${p.dead ? ";opacity:.45" : ""}` }));
+      parts.push(s("text", { x: 20, y: y + 19, "font-size": 12.5, "font-weight": 700, text: `${p.name}（pid ${p.pid}）${p.dead ? " 已退出" : ""}` }));
+      for (let fd = 0; fd < n; fd++) {
+        const v = p.fds[fd], ry = y + 28 + fd * RH;
+        const isFile = v != null && v !== "tty";
+        parts.push(s("rect", { x: 20, y: ry, width: 180, height: RH - 3, rx: 3, style: isFile ? `fill:var(--surface);stroke:${OSTEP.color(v - 10)}` : "fill:var(--surface);stroke:var(--border)" }));
+        const label = v == null ? "—（空闲）" : v === "tty" ? ["标准输入 → 终端", "标准输出 → 终端", "标准错误 → 终端"][fd] || "终端" : `→ OFT[${v}]`;
+        parts.push(s("text", { x: 28, y: ry + 14, "font-size": 11.5, class: "mono" + (isFile ? "" : " t-muted"), text: `fd ${fd}: ${label}` }));
+        if (isFile && !p.dead) fdPos.push([200, ry + (RH - 3) / 2, v]);
+      }
+      y += hh + 14;
+    }
+    const hProcs = y;
+    // 打开文件表
+    const oftIds = Object.keys(st.oft).map(Number).sort((a, b) => a - b);
+    const oftY = {};
+    let y2 = 30;
+    parts.push(s("text", { x: 270, y: 18, "font-size": 12.5, "font-weight": 700, text: "系统打开文件表" }));
+    parts.push(s("text", { x: 10, y: 18, "font-size": 12.5, "font-weight": 700, text: "每个进程的 fd 表" }));
+    parts.push(s("text", { x: 530, y: 18, "font-size": 12.5, "font-weight": 700, text: "inode（文件系统）" }));
+    if (!oftIds.length) parts.push(s("text", { x: 270, y: 50, "font-size": 12, class: "t-muted", text: "（没有打开的普通文件）" }));
+    for (const id of oftIds) {
+      const e = st.oft[id], c = OSTEP.color(id - 10);
+      parts.push(s("rect", { x: 270, y: y2, width: 200, height: 74, rx: 8, style: `fill:var(--surface);stroke:${c};stroke-width:2` }));
+      parts.push(s("rect", { x: 270, y: y2, width: 8, height: 74, rx: 3, style: `fill:${c}` }));
+      parts.push(s("text", { x: 286, y: y2 + 18, "font-size": 12.5, "font-weight": 700, text: `OFT[${id}]` }));
+      parts.push(s("text", { x: 286, y: y2 + 36, "font-size": 12, class: "mono", text: `off: ${e.off}    refcnt: ${e.ref}` }));
+      parts.push(s("text", { x: 286, y: y2 + 53, "font-size": 12, class: "mono", text: `模式: ${e.r && e.w ? "读写" : e.w ? "只写" : "只读"}${e.app ? " +追加" : ""}` }));
+      parts.push(s("text", { x: 286, y: y2 + 68, "font-size": 11, class: "mono t-muted", text: `inode → #${e.ino}` }));
+      oftY[id] = y2 + 37;
+      y2 += 88;
+    }
+    // inode
+    const inos = Object.values(st.inodes).sort((a, b) => a.inum - b.inum);
+    const inoY = {};
+    let y3 = 30;
+    for (const ino of inos) {
+      const names = namesOf(st, ino.inum);
+      const orphan = ino.links === 0;
+      parts.push(s("rect", { x: 530, y: y3, width: 180, height: 88, rx: 8, class: orphan ? "warn-soft" : "ok-soft" }));
+      parts.push(s("text", { x: 540, y: y3 + 18, "font-size": 12.5, "font-weight": 700, class: "mono", text: `inode #${ino.inum}` }));
+      parts.push(s("text", { x: 540, y: y3 + 36, "font-size": 11.5, class: "mono", text: names.length ? "名字: " + names.join(", ") : "（已无名字）" }));
+      parts.push(s("text", { x: 540, y: y3 + 53, "font-size": 11.5, class: "mono", text: `size: ${ino.size}   links: ${ino.links}` }));
+      parts.push(s("text", { x: 540, y: y3 + 70, "font-size": 11.5, class: "mono", text: `被打开: ${ino.opens} 次` }));
+      if (orphan) parts.push(s("text", { x: 540, y: y3 + 84, "font-size": 10, class: "t-muted", text: "仍被打开，关闭后才释放" }));
+      inoY[ino.inum] = y3 + 44;
+      y3 += 100;
+    }
+    const H = Math.max(hProcs, y2, y3, 120) + 6;
+    const svg = s("svg", { viewBox: `0 0 720 ${H}`, width: 720, height: H, style: "max-width:none;display:block", role: "img", "aria-label": "fd 表、打开文件表与 inode" });
+    svg.append(...parts);
+    for (const [x, yy, id] of fdPos) if (oftY[id] != null) svg.append(s("path", { d: `M ${x} ${yy} C ${x + 35} ${yy}, ${235} ${oftY[id]}, 268 ${oftY[id]}`, style: `stroke:${OSTEP.color(id - 10)};fill:none;stroke-width:1.8` }));
+    for (const id of oftIds) { const ino = st.oft[id].ino; if (inoY[ino] != null) svg.append(s("path", { d: `M 470 ${oftY[id]} C 500 ${oftY[id]}, 500 ${inoY[ino]}, 528 ${inoY[ino]}`, style: `stroke:${OSTEP.color(id - 10)};fill:none;stroke-width:1.8;stroke-dasharray:5 3` })); }
+    $("fd-stage").replaceChildren(svg);
+  }
+  function render(i) {
+    const x = steps[i];
+    draw(x.st, x.res ? x.res.proc : null);
+    if (i === 0) $("fd-narr").innerHTML = (INTRO[cur] && files.value === PRESETS[cur].files && ta.value === PRESETS[cur].script ? INTRO[cur] + " " : "") + "初始状态：进程 parent 的 fd 0/1/2 已经指向终端。点\"下一步\"执行第一行。";
+    else $("fd-narr").innerHTML = `<code>${x.res.proc}: ${x.line.replace(/^(parent|child\d*)\s*:\s*/, "")}</code> → 返回 <b>${x.res.ret}</b>。` + (x.res.ok ? x.res.msg : `<span style="color:var(--bad)">${x.res.msg}</span>`);
+    const st = x.st;
+    $("fd-stats").replaceChildren(...[[st.procs.filter((p) => !p.dead).length, "存活进程"], [Object.keys(st.oft).length, "打开文件表项"], [Object.keys(st.inodes).length, "inode 数"], [i ? x.res.ret : "—", "本步返回值"]].map(([v, l]) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l))));
+    // 原书格式的表
+    const ids = table.ids;
+    const head = h("tr", {}, h("th", {}, "系统调用"), h("th", { class: "num" }, "返回值"), ...(ids.length === 1 ? [h("th", { class: "num" }, "当前偏移")] : ids.map((id) => h("th", { class: "num" }, `OFT[${id}] 偏移`))));
+    const rows = table.rows.map((r, j) => h("tr", { class: j + 1 === i ? "cur" : j + 1 > i ? "future" : steps[j + 1].res.ok ? "" : "bad" }, h("td", {}, r.call + ";"), h("td", { class: "num" }, r.ret), ...r.offs.map((o) => h("td", { class: "num" }, o))));
+    $("fd-table").replaceChildren(h("thead", {}, head), h("tbody", {}, rows));
+  }
+  const stepper = OSTEP.stepper($("fd-step"), { steps: () => Math.max(1, steps.length), render: (i) => steps.length && render(i), autoplayMs: 1300 });
+  $("fd-presets").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) usePreset(b.dataset.p); });
+  $("fd-load").onclick = () => { nextInum = cur === "links" ? 67158084 : 2000; load(); };
+  const p = PRESETS.seq;
+  files.value = p.files; ta.value = p.script;
+  $("fd-presets").children[0].classList.add("on");
+  steps = fsRun(fsParseFiles(p.files), p.script, 2000);
+  table = fsTable(steps);
+})();
+
+// ---------- 小工具：chmod 计算器 ----------
+(function permTool() {
+  const grid = $("pm-grid"), oct = $("pm-oct"), isDir = $("pm-dir");
+  const who = ["属主 (u)", "组 (g)", "其他人 (o)"], bits = ["r", "w", "x"];
+  const boxes = [];
+  grid.append(h("span"), ...bits.map((b) => h("span", { class: "h" }, b + " (" + { r: 4, w: 2, x: 1 }[b] + ")")));
+  who.forEach((w, i) => {
+    grid.append(h("span", { class: "small" }, w));
+    bits.forEach((b, j) => { const cb = h("input", { type: "checkbox", "aria-label": w + " " + b }); cb.onchange = fromBoxes; boxes.push(cb); grid.append(h("label", {}, cb)); });
+  });
+  function fromBoxes() {
+    let v = "";
+    for (let i = 0; i < 3; i++) v += (boxes[i * 3].checked ? 4 : 0) + (boxes[i * 3 + 1].checked ? 2 : 0) + (boxes[i * 3 + 2].checked ? 1 : 0);
+    oct.value = v; paint();
+  }
+  function fromOct() {
+    const m = oct.value.trim().match(/^[0-7]{3}$/);
+    if (!m) { $("pm-narr").textContent = "请输入三位八进制数字，例如 644。"; return; }
+    for (let i = 0; i < 3; i++) { const d = +oct.value[i]; boxes[i * 3].checked = !!(d & 4); boxes[i * 3 + 1].checked = !!(d & 2); boxes[i * 3 + 2].checked = !!(d & 1); }
+    paint();
+  }
+  function paint() {
+    const dir = isDir.checked;
+    const str = boxes.map((b, k) => (b.checked ? bits[k % 3] : "-"));
+    const cls = ["u", "g", "o"];
+    $("pm-str").replaceChildren(h("span", {}, dir ? "d" : "-"), ...[0, 1, 2].map((i) => h("span", { class: cls[i] }, str.slice(i * 3, i * 3 + 3).join(""))));
+    const can = (i) => {
+      const [r, w, x] = [0, 1, 2].map((j) => boxes[i * 3 + j].checked);
+      const out = [];
+      if (dir) {
+        if (r) out.push(x ? "能 ls 列出名字" : "能列出名字，但因为没有 x，拿不到各项的详细信息");
+        if (x) out.push("能 cd 进入、按名字访问里面的文件");
+        if (w && x) out.push("能在里面创建 / 删除 / 改名");
+        if (w && !x) out.push("有 w 却没有 x：实际上仍不能创建或删除");
+      } else {
+        if (r) out.push("能读内容");
+        if (w) out.push("能修改内容");
+        if (x) out.push("能作为程序执行");
+      }
+      return out.length ? out.join("；") : "什么都不能做";
+    };
+    $("pm-narr").innerHTML = [0, 1, 2].map((i) => `<b>${who[i]}</b>（${oct.value[i]} = ${str.slice(i * 3, i * 3 + 3).join("")}）：${can(i)}。`).join("<br>") + `<br><span class="muted small">命令：<code>chmod ${oct.value} ${dir ? "somedir" : "foo.txt"}</code>；ls -l 显示 <code>${dir ? "d" : "-"}${str.join("")}</code>。root 不受这些限制。</span>`;
+  }
+  oct.addEventListener("input", fromOct);
+  isDir.onchange = paint;
+  document.querySelectorAll("#sim-perm button[data-m]").forEach((b) => (b.onclick = () => { oct.value = b.dataset.m; fromOct(); }));
+  fromOct();
+})();
+
+})();
+</script>
+</body>
+</html>
+

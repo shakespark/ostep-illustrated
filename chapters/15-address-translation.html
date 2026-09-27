@@ -1,0 +1,643 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 15 章 · 机制：地址转换</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+  .trace { font: 13px var(--mono); }
+  .trace td, .trace th { padding: 5px 10px; white-space: nowrap; }
+  .trace tr.cur td { background: var(--warn-soft); }
+  .trace td.ok { color: var(--ok); } .trace td.bad { color: var(--bad); } .trace td.q { color: var(--faint); }
+  .lde { font-size: 13.5px; }
+  .lde td { width: 33%; vertical-align: top; padding: 6px 10px; }
+  .lde tr.phase td { background: var(--surface-2); font-weight: 600; font-size: 12.5px; color: var(--muted); }
+  .lde tr.cur td.act { background: var(--warn-soft); }
+  .lde tr.future { display: none; }
+  .lde td.act { border-left: 3px solid var(--accent); }
+  .lde ul { margin: 2px 0 0; padding-left: 1.1em; }
+  .lde li { margin: 0; }
+  .regs { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-top: 10px; }
+  .reg { background: var(--surface-2); border-radius: 8px; padding: 6px 10px; font-size: 13px; border: 1px solid transparent; transition: border-color .2s, background .2s; }
+  .reg b { display: block; font-size: 11.5px; color: var(--muted); font-weight: 600; }
+  .reg span { font-family: var(--mono); font-size: 14px; }
+  .reg.chg { border-color: var(--warn); background: var(--warn-soft); }
+  .req td:first-child { font-weight: 600; white-space: nowrap; }
+</style>
+</head>
+<body data-chapter="15">
+<main>
+
+<h2><span class="num">1</span>一句话 + 关键问题</h2>
+<div class="crux">
+  <p><strong>如何高效、灵活地虚拟化内存？</strong>怎样才能高效地实现内存虚拟化？怎样提供应用程序需要的灵活性？怎样保持控制——决定一个应用能访问哪些内存位置，保证它的访问被正确限制？而且这一切都要高效。</p>
+  <p class="small muted">原文：How can we build an efficient virtualization of memory? How do we provide the flexibility needed by applications? How do we maintain control over which memory locations an application can access, and thus ensure that application memory accesses are properly restricted? How do we do all of this efficiently?</p>
+</div>
+<p>虚拟化 CPU 时我们用了<strong>受限直接执行（limited direct execution, LDE）</strong>：大部分时间让程序直接在硬件上跑，只在系统调用、时钟中断等关键时刻让 OS 介入。虚拟化内存沿用同样的思路，追求<strong>效率</strong>和<strong>控制</strong>，再加上<strong>灵活性</strong>。本章给出的通用技术叫<strong>基于硬件的地址转换（hardware-based address translation）</strong>，简称<strong>地址转换</strong>：硬件在<strong>每一次</strong>内存访问（取指、load、store）时把虚拟地址换成物理地址。</p>
+<p>第 13 章提出了"每个进程一个私有地址空间"的目标，这一章给出第一种、也是最简单的实现：<strong>基址 + 界限（base and bounds）</strong>，又叫<strong>动态重定位（dynamic relocation）</strong>。它的缺点（内部碎片）将直接引出第 16 章的分段。</p>
+
+<h2><span class="num">2</span>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>地址转换（address translation）</h4><p>硬件把指令给出的虚拟地址变成数据真正所在的物理地址，每次访问都做。</p></div>
+  <div class="card"><h4>硬件 + OS 分工</h4><p>硬件提供快速转换的底层机制；OS 在关键时刻设置硬件、管理哪些内存空闲/在用。</p></div>
+  <div class="card"><h4>基址寄存器（base register）</h4><p>物理地址 = 虚拟地址 + base。OS 把进程放在哪，就把 base 设成哪。</p></div>
+  <div class="card"><h4>界限寄存器（bounds / limit）</h4><p>检查虚拟地址是否 &lt; bounds（且非负）；越界就抛异常，实现保护。</p></div>
+  <div class="card"><h4>MMU（内存管理单元）</h4><p>处理器中负责地址转换的那部分电路；每个 CPU 一对 base/bounds。</p></div>
+  <div class="card"><h4>动态 vs. 静态重定位</h4><p>静态：装载程序（loader）改写指令里的地址，没有保护，也难再移动。动态：运行时由硬件加 base。</p></div>
+  <div class="card"><h4>特权指令与异常</h4><p>只有内核态能改 base/bounds；越界访问或用户态改寄存器都会触发异常，交给 OS 处理。</p></div>
+  <div class="card"><h4>内部碎片（internal fragmentation）</h4><p>整个地址空间连续放进物理内存，堆和栈之间没用的空间也被占着，浪费在"分配单元内部"。</p></div>
+</div>
+
+<h2><span class="num">3</span>图解：从一条指令说起</h2>
+
+<h3>3.1 先做几个（可笑的）简单假设</h3>
+<ul>
+  <li>用户的地址空间必须<strong>连续地</strong>放在物理内存中；</li>
+  <li>地址空间不太大，<strong>小于物理内存</strong>；</li>
+  <li>每个地址空间<strong>大小完全相同</strong>。</li>
+</ul>
+<p>这些假设不现实，后面会逐一放宽。</p>
+
+<h3>3.2 一个例子：x = x + 3</h3>
+<pre><code>void func() {
+    int x = 3000;   // thanks, Perry.
+    x = x + 3;      // 我们关心的这一行
+    ...</code></pre>
+<p>编译成 x86 汇编（Linux 上可用 <code>objdump</code> 反汇编）：</p>
+<pre><code>128: movl 0x0(%ebx), %eax   ; 把地址 0+ebx 处的值读到 eax
+132: addl $0x03, %eax       ; eax 加 3
+135: movl %eax, 0x0(%ebx)   ; 把 eax 写回同一地址</code></pre>
+<p>假设 x 的地址已放在 <code>ebx</code> 中。三条指令位于地址空间代码区的 128 处，变量 x 在栈上的 15KB 处，初值 3000。从进程的视角，这三条指令执行时发生了这些内存访问：</p>
+<div class="as-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;align-items:center">
+<ol>
+  <li>取地址 128 处的指令</li>
+  <li>执行它（从地址 15KB <strong>load</strong>）</li>
+  <li>取地址 132 处的指令</li>
+  <li>执行它（没有内存访问）</li>
+  <li>取地址 135 处的指令</li>
+  <li>执行它（向地址 15KB <strong>store</strong>）</li>
+</ol>
+<figure class="fig" style="margin:0">
+<svg viewBox="0 0 330 300" width="330" role="img" aria-label="进程的 16KB 地址空间">
+  <g font-size="10.5" class="t-muted mono" text-anchor="end">
+    <text x="48" y="18">0KB</text><text x="48" y="54">2KB</text><text x="48" y="90">4KB</text><text x="48" y="252">14KB</text><text x="48" y="270">15KB</text><text x="48" y="292">16KB</text>
+  </g>
+  <rect x="54" y="14" width="150" height="36" rx="2" style="fill:var(--c4)"/>
+  <text x="129" y="36" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">Program Code</text>
+  <rect x="54" y="50" width="150" height="36" rx="2" style="fill:var(--c3)"/>
+  <text x="129" y="72" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">Heap</text>
+  <rect x="54" y="86" width="150" height="162" rx="2" class="box" style="stroke-dasharray:4 3"/>
+  <text x="129" y="170" text-anchor="middle" font-size="11.5" class="t-muted">(free)</text>
+  <rect x="54" y="248" width="150" height="40" rx="2" style="fill:var(--c2)"/>
+  <text x="129" y="262" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">Stack</text>
+  <rect x="100" y="268" width="60" height="16" rx="2" style="fill:var(--surface)"/>
+  <text x="130" y="280" text-anchor="middle" font-size="11" class="mono">3000</text>
+  <text x="212" y="24" font-size="10.5" class="mono">128 movl 0x0(%ebx),%eax</text>
+  <text x="212" y="36" font-size="10.5" class="mono">132 addl $0x03,%eax</text>
+  <text x="212" y="48" font-size="10.5" class="mono">135 movl %eax,0x0(%ebx)</text>
+  <text x="212" y="280" font-size="10.5">← x（15KB）</text>
+</svg>
+<figcaption>图 15.1 进程及其地址空间</figcaption>
+</figure>
+</div>
+<div class="aside" data-title="TIP · 插入（interposition）很强大">
+  <p>在虚拟化内存中，硬件会<strong>插入</strong>到每一次内存访问中间，把进程发出的虚拟地址翻译成物理地址。插入是一种通用技术：几乎任何定义良好的接口都可以被插入，以增加新功能或改进系统，而且通常不需要改动客户端——这又带来了<strong>透明</strong>。</p>
+</div>
+<p>从程序看，它的地址空间从 0 开始、最大 16KB。但 OS 想把它放到物理内存的别处，而不一定是 0。问题来了：<strong>怎样把这个进程重定位到内存中别的地方，同时对进程透明？</strong>下图是放置后的物理内存：OS 用第一个槽，进程被重定位到从物理地址 32KB 开始的槽，另外两个槽（16–32KB、48–64KB）空闲。</p>
+<figure class="fig">
+<svg viewBox="0 0 440 290" width="440" role="img" aria-label="物理内存中重定位的单个进程">
+  <g font-size="11" class="t-muted mono" text-anchor="end">
+    <text x="58" y="20">0KB</text><text x="58" y="84">16KB</text><text x="58" y="148">32KB</text><text x="58" y="212">48KB</text><text x="58" y="276">64KB</text>
+  </g>
+  <rect x="64" y="16" width="170" height="64" rx="3" style="fill:var(--c8)"/><text x="149" y="52" text-anchor="middle" font-size="12.5" style="fill:#fff;font-weight:600">Operating System</text>
+  <rect x="64" y="80" width="170" height="64" rx="3" class="box"/><text x="149" y="116" text-anchor="middle" font-size="12" class="t-muted">(not in use)</text>
+  <rect x="64" y="144" width="170" height="10" style="fill:var(--c4)"/>
+  <rect x="64" y="154" width="170" height="10" style="fill:var(--c3)"/>
+  <rect x="64" y="164" width="170" height="34" style="fill:var(--c1);opacity:.18"/>
+  <text x="149" y="185" text-anchor="middle" font-size="10.5">(allocated but not in use)</text>
+  <rect x="64" y="198" width="170" height="10" style="fill:var(--c2)"/>
+  <rect x="64" y="144" width="170" height="64" rx="3" style="fill:none;stroke:var(--c1);stroke-width:2"/>
+  <rect x="64" y="208" width="170" height="64" rx="3" class="box"/><text x="149" y="244" text-anchor="middle" font-size="12" class="t-muted">(not in use)</text>
+  <text x="244" y="152" font-size="11">← Code</text>
+  <text x="244" y="164" font-size="11">← Heap</text>
+  <text x="244" y="206" font-size="11">← Stack</text>
+  <text x="310" y="170" font-size="12" style="font-weight:600;fill:var(--c1)">Relocated</text>
+  <text x="310" y="186" font-size="12" style="font-weight:600;fill:var(--c1)">Process</text>
+</svg>
+<figcaption>图 15.2 物理内存中的单个重定位进程：base = 32KB</figcaption>
+</figure>
+
+<h3>3.3 动态（基于硬件的）重定位：基址 + 界限</h3>
+<p>20 世纪 50 年代末第一批时分共享机器引入了一个简单想法：每个 CPU 里放两个硬件寄存器，<strong>基址寄存器（base）</strong>和<strong>界限寄存器（bounds，也叫 limit）</strong>。程序按照"从地址 0 开始"编写和编译；程序开始运行时，OS 决定把它放在物理内存的哪里，并把 base 设为这个值（上例是 32KB）。之后进程产生的每个内存引用都由处理器这样翻译：</p>
+<div class="key"><p style="text-align:center;font-size:18px;margin:0"><strong>physical address = virtual address + base</strong>　　（前提：0 ≤ virtual address &lt; bounds）</p></div>
+<figure class="fig">
+<svg viewBox="0 0 700 250" width="700" role="img" aria-label="MMU 中的基址界限转换电路">
+  <defs><marker id="m15a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker>
+  <marker id="m15b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--bad)"/></marker></defs>
+  <rect x="10" y="80" width="110" height="56" rx="8" class="box-strong"/>
+  <text x="65" y="104" text-anchor="middle" font-size="12.5">CPU 发出</text><text x="65" y="122" text-anchor="middle" font-size="12.5">虚拟地址 VA</text>
+  <rect x="150" y="20" width="400" height="190" rx="12" class="accent-soft" style="opacity:.9"/>
+  <text x="350" y="40" text-anchor="middle" font-size="13" style="font-weight:600">MMU（每个 CPU 一份）</text>
+  <path d="M120 108 L182 108" class="arrow" marker-end="url(#m15a)"/>
+  <polygon points="250,70 320,108 250,146 180,108" class="box-strong"/>
+  <text x="250" y="104" text-anchor="middle" font-size="12">VA &lt; bounds</text><text x="250" y="120" text-anchor="middle" font-size="12">且 VA ≥ 0 ?</text>
+  <rect x="200" y="160" width="100" height="36" rx="6" class="box"/><text x="250" y="183" text-anchor="middle" font-size="12" class="mono">bounds</text>
+  <path d="M250 160 L250 148" class="arrow" marker-end="url(#m15a)"/>
+  <path d="M320 108 L382 108" class="arrow" marker-end="url(#m15a)"/>
+  <text x="350" y="100" text-anchor="middle" font-size="11" style="fill:var(--ok)">是</text>
+  <circle cx="410" cy="108" r="26" class="box-strong"/><text x="410" y="114" text-anchor="middle" font-size="18">+</text>
+  <rect x="360" y="160" width="100" height="36" rx="6" class="box"/><text x="410" y="183" text-anchor="middle" font-size="12" class="mono">base</text>
+  <path d="M410 160 L410 136" class="arrow" marker-end="url(#m15a)"/>
+  <path d="M436 108 L582 108" class="arrow" marker-end="url(#m15a)"/>
+  <rect x="586" y="80" width="104" height="56" rx="8" class="ok-soft"/>
+  <text x="638" y="104" text-anchor="middle" font-size="12.5">物理地址 PA</text><text x="638" y="122" text-anchor="middle" font-size="11" class="t-muted">→ 内存</text>
+  <path d="M250 70 L250 30 L586 30" style="fill:none;stroke:var(--bad);stroke-width:1.5" marker-end="url(#m15b)"/>
+  <text x="330" y="26" font-size="11" style="fill:var(--bad)" text-anchor="middle">否 → 引发异常</text>
+  <rect x="586" y="12" width="104" height="36" rx="8" class="bad-soft"/>
+  <text x="638" y="35" text-anchor="middle" font-size="11.5">越界异常 → OS</text>
+</svg>
+<figcaption>硬件做的事：先查界限、再加基址；两个寄存器都只能在内核态修改</figcaption>
+</figure>
+<p>跟踪一次指令执行：PC 为 128，硬件取指时先把它加上 base 32KB（32768），得到物理地址 <strong>32896</strong>，从那里取指令；执行时进程发出从虚拟地址 15KB 的 load，处理器再加上 base，得到物理地址 <strong>47KB</strong>，取出想要的内容。因为重定位发生在<strong>运行时</strong>，而且进程开始运行后还可以移动地址空间，所以叫<strong>动态重定位</strong>。</p>
+<p>界限寄存器用于<strong>保护</strong>：处理器先检查访问是否在界限内；上例中 bounds 总是 16KB。如果进程产生的虚拟地址<strong>大于或等于</strong>界限，或者是负数，CPU 抛出异常，进程很可能被终止。</p>
+<div class="aside" data-title="小注：界限寄存器的两种定义">
+  <p>方式一（本书默认）：bounds 存<strong>地址空间的大小</strong>，硬件先拿虚拟地址和它比较，再加 base。方式二：bounds 存<strong>地址空间末尾的物理地址</strong>，硬件先加 base，再检查物理地址是否在界内。两种方式逻辑等价。模拟器里可以切换这两种方式对比。</p>
+</div>
+<div class="aside" data-title="ASIDE · 软件重定位（静态重定位）">
+  <p>在有硬件支持之前，一些系统用纯软件做粗糙的重定位：<strong>装载程序（loader）</strong>在运行前把可执行文件里的地址改写成期望的物理偏移。比如指令 <code>movl 1000, %eax</code>，程序被装在 3000 处，loader 就把它改写成 <code>movl 4000, %eax</code>。问题：(1) <strong>没有保护</strong>，进程可以生成坏地址去访问别的进程或 OS 的内存；(2) 放好之后<strong>很难再移动</strong>地址空间。</p>
+</div>
+
+<h3>3.4 例子：4KB 地址空间装在 16KB</h3>
+<p>一个大小 4KB（不现实地小）的地址空间，装在物理地址 16KB 处（base = 16KB，bounds = 4KB）：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>虚拟地址</th><th>界限检查</th><th></th><th>物理地址</th></tr></thead>
+<tbody>
+<tr><td class="num">0</td><td>0 &lt; 4096 ✓</td><td>→</td><td class="num">16KB（16384）</td></tr>
+<tr><td class="num">1KB</td><td>1024 &lt; 4096 ✓</td><td>→</td><td class="num">17KB（17408）</td></tr>
+<tr><td class="num">3000</td><td>3000 &lt; 4096 ✓</td><td>→</td><td class="num">19384</td></tr>
+<tr><td class="num">4400</td><td>4400 ≥ 4096 ✗</td><td>→</td><td style="color:var(--bad)">Fault（越界）</td></tr>
+</tbody></table></div>
+<p>可以把虚拟地址看成地址空间内的<strong>偏移量</strong>，加上 base 就是物理地址。只有地址"太大"或为负时才会出错。</p>
+
+<h3>3.5 硬件支持小结（图 15.3）</h3>
+<div class="table-wrap"><table class="req">
+<thead><tr><th>硬件要求</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>特权模式（privileged mode）</td><td>防止用户态进程执行特权操作；一个模式位记录当前是内核态还是用户态</td></tr>
+<tr><td>base/bounds 寄存器</td><td>每个 CPU 一对，支持地址转换和界限检查（属于 MMU）</td></tr>
+<tr><td>转换虚拟地址并检查界限的能力</td><td>做转换和检查的电路；在这里非常简单</td></tr>
+<tr><td>更新 base/bounds 的特权指令</td><td>OS 必须能在让用户程序运行前设置它们</td></tr>
+<tr><td>注册异常处理程序的特权指令</td><td>OS 要告诉硬件发生异常时运行哪段代码</td></tr>
+<tr><td>引发异常的能力</td><td>进程试图执行特权指令或越界访问内存时</td></tr>
+</tbody></table></div>
+<p>想象一下，如果用户进程能随意修改 base 寄存器会造成怎样的浩劫（havoc）——所以修改它们的指令必须是<strong>特权指令</strong>。用户态下试图修改，CPU 会抛出"用户态执行特权操作"的异常。</p>
+
+<h3>3.6 操作系统要做的事（图 15.4）</h3>
+<figure class="fig">
+<svg viewBox="0 0 700 250" width="700" role="img" aria-label="OS 在四个时机需要介入">
+  <g font-size="12.5">
+    <rect x="10" y="10" width="160" height="230" rx="10" class="accent-soft"/>
+    <text x="90" y="34" text-anchor="middle" style="font-weight:600">① 进程创建</text>
+    <text x="22" y="60" font-size="11.5">在空闲链表（free list）</text><text x="22" y="78" font-size="11.5">中找一个槽放地址空间，</text><text x="22" y="96" font-size="11.5">标记为已用</text>
+    <rect x="30" y="120" width="120" height="22" class="box"/><text x="90" y="135" text-anchor="middle" font-size="10.5">OS</text>
+    <rect x="30" y="142" width="120" height="22" class="ok-soft"/><text x="90" y="157" text-anchor="middle" font-size="10.5">free</text>
+    <rect x="30" y="164" width="120" height="22" style="fill:var(--c1)"/><text x="90" y="179" text-anchor="middle" font-size="10.5" style="fill:#fff">新进程</text>
+    <rect x="30" y="186" width="120" height="22" class="ok-soft"/><text x="90" y="201" text-anchor="middle" font-size="10.5">free</text>
+    <rect x="185" y="10" width="160" height="230" rx="10" class="ok-soft"/>
+    <text x="265" y="34" text-anchor="middle" style="font-weight:600">② 进程终止</text>
+    <text x="197" y="60" font-size="11.5">正常退出或因行为不端</text><text x="197" y="78" font-size="11.5">被杀：把它的内存放回</text><text x="197" y="96" font-size="11.5">空闲链表，清理数据结构</text>
+    <rect x="360" y="10" width="160" height="230" rx="10" class="warn-soft"/>
+    <text x="440" y="34" text-anchor="middle" style="font-weight:600">③ 上下文切换</text>
+    <text x="372" y="60" font-size="11.5">每个 CPU 只有一对</text><text x="372" y="78" font-size="11.5">base/bounds：切出时存进</text><text x="372" y="96" font-size="11.5">PCB，切入时恢复</text>
+    <text x="372" y="126" font-size="11.5">进程停着时，OS 还可以</text><text x="372" y="144" font-size="11.5">把它整个搬到别处：</text><text x="372" y="162" font-size="11.5">拷贝地址空间，</text><text x="372" y="180" font-size="11.5">更新 PCB 里保存的 base</text>
+    <rect x="535" y="10" width="160" height="230" rx="10" class="bad-soft"/>
+    <text x="615" y="34" text-anchor="middle" style="font-weight:600">④ 异常处理</text>
+    <text x="547" y="60" font-size="11.5">启动时用特权指令</text><text x="547" y="78" font-size="11.5">安装异常处理程序；</text><text x="547" y="96" font-size="11.5">进程越界时，OS 的</text><text x="547" y="114" font-size="11.5">反应通常很"敌意"：</text><text x="547" y="132" font-size="11.5">终止这个进程</text>
+  </g>
+</svg>
+<figcaption>OS 在四个关键时刻介入；其余时间让进程直接在 CPU 上跑，转换全由硬件完成</figcaption>
+</figure>
+<div class="aside" data-title="ASIDE · 数据结构：空闲链表（free list）">
+  <p>OS 必须记录物理内存中哪些部分没被使用，才能分配给进程。最简单的结构是<strong>空闲链表</strong>：一个列出当前未用物理内存范围的列表。在图 15.2 中，空闲链表应当有两项：16KB–32KB 和 48KB–64KB。第 17 章会专门讨论空闲空间管理。</p>
+</div>
+<p>这些交互按时间线画出来就是原书图 15.5 和 15.6（受限直接执行 + 动态重定位）：OS 在启动时准备好机器，然后让进程 A 运行；A 的地址转换全部由硬件完成，OS 不介入；时钟中断后 OS 切到进程 B，B 执行了一次越界的 load，OS 介入，杀掉 B 并释放它的内存。第 4 节的第二个模拟器把这张表逐行"放映"出来。</p>
+
+<h3>3.7 基址/界限的问题：内部碎片</h3>
+<p>基址/界限很<strong>高效</strong>（只多了一点加法和比较的硬件逻辑），也提供了<strong>保护</strong>。但它有低效之处：看图 15.2，重定位的进程占用 32KB–48KB，可栈和堆都不大，<strong>它们之间的空间全都浪费了</strong>。这种浪费叫<strong>内部碎片（internal fragmentation）</strong>——分配单元<strong>内部</strong>的空间没用上。按目前的方案，即使物理内存还够放更多进程，我们也只能把地址空间放进固定大小的槽里。</p>
+<figure class="fig">
+<svg viewBox="0 0 560 150" width="560" role="img" aria-label="内部碎片示意">
+  <text x="10" y="20" font-size="12.5" style="font-weight:600">一个 16KB 的槽（32KB–48KB）里实际在用的部分：</text>
+  <rect x="10" y="34" width="35" height="44" style="fill:var(--c4)"/>
+  <rect x="45" y="34" width="35" height="44" style="fill:var(--c3)"/>
+  <rect x="80" y="34" width="420" height="44" class="bad-soft" style="stroke-dasharray:5 3"/>
+  <text x="290" y="61" text-anchor="middle" font-size="12.5" style="fill:var(--bad)">已分配但没用（allocated but not in use）：约 10KB</text>
+  <rect x="500" y="34" width="50" height="44" style="fill:var(--c2)"/>
+  <text x="27" y="96" text-anchor="middle" font-size="10.5">代码</text><text x="62" y="96" text-anchor="middle" font-size="10.5">堆</text><text x="525" y="96" text-anchor="middle" font-size="10.5">栈</text>
+  <text x="10" y="126" font-size="12">下一步：不再把整个地址空间当一个整体，而是给代码、堆、栈<tspan style="font-weight:600">各配一对</tspan> base/bounds</text>
+  <text x="10" y="144" font-size="12">——这就是第 16 章的<tspan style="font-weight:600">分段（segmentation）</tspan>。</text>
+</svg>
+<figcaption>基址/界限要求整个地址空间连续驻留：堆与栈之间的空洞白白占着物理内存</figcaption>
+</figure>
+
+<h2><span class="num">4</span>模拟器</h2>
+
+<section class="sim" id="sim-reloc">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>基址 + 界限地址转换（仿 relocation.py）</h3>
+    <div class="desc">设置地址空间大小、物理内存大小、base 和 bounds，随机生成（与 relocation.py 完全相同的随机数：同一个种子，同一道题）或手动输入虚拟地址，逐步观察"检查界限 → 加基址 → 得到物理地址 / 触发越界异常"。下方表格未执行到的行显示 ?，先自己算再点下一步。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>种子 -s <input type="number" id="rl-seed" value="0" min="0"></label>
+      <label>地址空间 -a <input type="text" id="rl-asize" value="1k" style="width:5em"></label>
+      <label>物理内存 -p <input type="text" id="rl-psize" value="16k" style="width:5em"></label>
+      <label>地址个数 -n <input type="number" id="rl-num" value="5" min="1" max="40"></label>
+      <label>base -b <input type="text" id="rl-base" value="-1" style="width:6em"></label>
+      <label>bounds -l <input type="text" id="rl-limit" value="-1" style="width:6em"></label>
+    </div>
+    <div class="controls">
+      <label>手动虚拟地址 <input type="text" id="rl-vas" placeholder="留空则随机，例：0, 1K, 3000, 4400" style="width:19em"></label>
+      <label>界限寄存器存的是 <select id="rl-mode"><option value="size">地址空间大小（先查后加）</option><option value="end">物理结束地址（先加后查）</option></select></label>
+      <button id="rl-gen" class="primary">生成</button>
+    </div>
+    <div class="controls">
+      <span class="muted">原书示例：</span>
+      <button id="rl-p1">x = x + 3（base 32KB）</button>
+      <button id="rl-p2">4KB 地址空间 @16KB</button>
+      <span class="sep"></span>
+      <span class="muted">作业：</span>
+      <button data-seed="1">-s 1</button><button data-seed="2">-s 2</button><button data-seed="3">-s 3</button>
+      <button id="rl-q2">-s 0 -n 10</button>
+    </div>
+    <div id="rl-step"></div>
+    <div class="stage"><div id="rl-svg"></div></div>
+    <div class="narrate" id="rl-narrate"></div>
+    <div class="table-wrap"><table class="trace" id="rl-table"></table></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="rl-s1">–</div><div class="l">base（十进制）</div></div>
+      <div class="stat"><div class="v" id="rl-s2">–</div><div class="l">bounds</div></div>
+      <div class="stat"><div class="v" id="rl-s3">–</div><div class="l">已翻译：合法 / 越界</div></div>
+      <div class="stat"><div class="v" id="rl-s4">–</div><div class="l">全部地址中合法的比例</div></div>
+    </div>
+  </div>
+</section>
+
+<section class="sim" id="sim-lde">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>受限直接执行 + 动态重定位：启动与运行时的时间线（图 15.5 / 15.6）</h3>
+    <div class="desc">逐行放映 OS、硬件、程序三方的动作。注意 CPU 模式、base/bounds 寄存器什么时候变（黄色高亮），以及进程 A 运行时 OS 完全不参与地址转换。</div></div>
+  <div class="sim-body">
+    <div id="ld-step"></div>
+    <div class="regs" id="ld-regs"></div>
+    <div class="stage" style="margin-top:10px"><div id="ld-mem"></div></div>
+    <div class="narrate" id="ld-narrate"></div>
+    <div class="table-wrap"><table class="lde" id="ld-table"></table></div>
+  </div>
+</section>
+
+<h2><span class="num">5</span>先预测，再验证</h2>
+<div class="exercise"><div class="q">（原书作业 1）用种子 1、2、3 生成题目（点"作业：-s 1/2/3"），对每个虚拟地址先判断是否越界、合法的算出物理地址，再单步验证。以 -s 1 为例：base = 13884，bounds = 290，第一个地址 782 呢？</div>
+<details class="reveal"><summary>看答案</summary><div>-s 1：base 13884、bounds 290；地址 782、261、507、460、667 中只有 <strong>261</strong> 合法 → 13884 + 261 = <strong>14145</strong>，其余都 ≥ 290，越界。-s 2：base 15529、bounds 500；57 → 15586、86 → 15615，855、753、685 越界。-s 3：base 8916、bounds 316；378、618、640 越界，67 → 8983、13 → 8929。（这些数字和 relocation.py -c 的输出一致。）</div></details></div>
+<div class="exercise"><div class="q">（原书作业 2）<code>-s 0 -n 10</code>：bounds（-l）至少设成多少，才能让生成的 10 个虚拟地址全部合法？</div>
+<details class="reveal"><summary>看答案</summary><div>10 个地址是 430、265、523、414、802、310、488、597、929、516，最大是 929。合法条件是 VA &lt; bounds，所以 bounds 至少为 <strong>930</strong>。在模拟器里把 bounds 填 930 验证（注意：手动指定 -l 后，随机数不再用于生成 limit，地址序列会变！relocation.py 也是这样。想保持同一组地址，就把上面 10 个数填进"手动虚拟地址"）。</div></details></div>
+<div class="exercise"><div class="q">（原书作业 3）<code>-s 1 -n 10 -l 100</code>，物理内存默认 16KB。base 最大能设成多少，地址空间仍能整个放进物理内存？</div>
+<details class="reveal"><summary>看答案</summary><div>地址空间占用 [base, base + 100)，要求 base + 100 ≤ 16384，所以 base 最大为 <strong>16284</strong>。在模拟器里填 base = 16284 可以生成；填 16285 会提示放不下。</div></details></div>
+<div class="exercise"><div class="q">（原书作业 5）随机生成的虚拟地址中，合法的比例和 bounds 是什么关系？先猜，再在 -a 1k、-n 40 下把 bounds 设成 256、512、768 看"合法比例"。</div>
+<details class="reveal"><summary>看答案</summary><div>虚拟地址在 [0, asize) 上均匀随机，合法当且仅当 VA &lt; bounds，所以合法比例 ≈ <strong>bounds / asize</strong>，是一条从 0 到 1 的直线（bounds ≥ asize 时为 100%）。样本少时会有波动，n 越大越接近。</div></details></div>
+<div class="exercise"><div class="q">在"时间线"模拟器中，进程 A 取指和 load 时 OS 有没有参与？哪几步 CPU 处在内核态？</div>
+<details class="reveal"><summary>看答案</summary><div>A 运行期间的取指、load/store 转换<strong>全部由硬件完成</strong>，OS 不参与——这正是效率的来源。内核态出现在：启动阶段全部、创建 A 直到 return-from-trap、时钟中断到 return-from-trap（切换到 B）、B 越界触发异常之后。return-from-trap 把 CPU 切回用户态。</div></details></div>
+
+<h2><span class="num">6</span>动手实验：用 C 写一个 MMU，并亲眼看看越界异常</h2>
+<div class="lab">
+  <p>实验目录 <code>labs/15-address-translation/</code>：</p>
+  <ul>
+    <li><code>translate.c</code>：把 MMU 的"查界限 + 加基址"写成 C 函数，复现原书两组例子；也可以自己传参：<code>./translate &lt;base&gt; &lt;bounds&gt; &lt;va&gt;...</code>。</li>
+    <li><code>segv.c</code>：在真实 Linux 进程里访问"界外"地址，捕获 SIGSEGV 并打印硬件报告的出错地址。</li>
+  </ul>
+<pre><code><span class="cmd">cd labs/15-address-translation &amp;&amp; make</span>
+<span class="cmd">./translate</span>
+<span class="cmd">./translate 16K 4K 0 1K 3000 4400</span>
+<span class="cmd">./segv</span></code></pre>
+</div>
+<p>本机输出（<code>translate</code> 的数字是确定的，与原书完全一致）：</p>
+<pre><code>Example 1 (Fig 15.2): 16KB address space at PA 32KB, base=32768 bounds=16384
+fetch movl 0x0(%ebx),%eax   VA    128 (0x00080) --> PA  32896 (0x08080) = 128 + 32768
+load  x (15KB)              VA  15360 (0x03c00) --> PA  48128 (0x0bc00) = 15360 + 32768
+fetch addl $0x03,%eax       VA    132 (0x00084) --> PA  32900 (0x08084) = 132 + 32768
+fetch movl %eax,0x0(%ebx)   VA    135 (0x00087) --> PA  32903 (0x08087) = 135 + 32768
+store x (15KB)              VA  15360 (0x03c00) --> PA  48128 (0x0bc00) = 15360 + 32768
+
+Example 2: 4KB address space at PA 16KB, base=16384 bounds=4096
+  VA      0 (0x00000) --> PA  16384 (0x04000) = 0 + 16384
+  VA   1024 (0x00400) --> PA  17408 (0x04400) = 1024 + 16384
+  VA   3000 (0x00bb8) --> PA  19384 (0x04bb8) = 3000 + 16384
+  VA   4400 (0x01130) --> SEGMENTATION VIOLATION (va >= bounds 4096)</code></pre>
+<p><code>segv</code> 的输出（示例输出，你的机器上地址会不同）：</p>
+<pre><code>region[0]          (legal)             0x73ba99800000  OK (read 0)
+region[pg-1]       (last legal byte)   0x73ba99800fff  OK (read 7)
+region[pg]         (1 byte past end)   0x73ba99801000  SIGSEGV! fault address = 0x73ba99801000
+(char*)16          (page 0 unmapped)   0x10  SIGSEGV! fault address = 0x10
+0xffff800000000000 (kernel address)    0xffff800000000000  SIGSEGV! fault address = 0xffff800000000000
+page size = 4096 bytes</code></pre>
+<p>现代 Linux 用的是分页而不是基址/界限，但流程和图 15.6 最后几行一模一样：越界访问 → <strong>硬件引发异常、切到内核态</strong> → OS 的异常处理程序接手 → 默认结局是向进程发 SIGSEGV 并终止它（"Bye bye, misbehaving process"）。<code>segv.c</code> 安装了信号处理函数，所以能打印出错地址后继续运行。注意"合法的最后一字节"和"越过 1 字节"之间的分界，正是 <code>VA &lt; bounds</code> 那个严格小于号。</p>
+
+<h2><span class="num">7</span>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="1"><div class="q">base = 32KB，bounds = 16KB。进程取地址 128 处的指令，硬件访问的物理地址是？</div>
+  <div class="opts"><button>A. 128</button><button>B. 32896</button><button>C. 16512</button><button>D. 49280</button></div>
+  <div class="explain">32768 + 128 = 32896，原书原话。</div></div>
+<div class="mcq" data-answer="0"><div class="q">4KB 地址空间装在 16KB（base = 16384，bounds = 4096）。虚拟地址 4400 会怎样？</div>
+  <div class="opts"><button>A. 越界异常，因为 4400 ≥ 4096</button><button>B. 截断成 4400 mod 4096 = 304 再加 base</button><button>C. 物理地址 4400</button><button>D. 物理地址 20784</button></div>
+  <div class="explain">合法条件是 0 ≤ VA &lt; bounds。4400 ≥ 4096，CPU 引发异常，交给 OS。</div></div>
+<div class="mcq" data-answer="2"><div class="q">为什么修改 base/bounds 的指令必须是特权指令？</div>
+  <div class="opts"><button>A. 因为只有 OS 能执行加法</button><button>B. 为了让地址转换更快</button><button>C. 否则用户进程可以随意改 base/bounds，访问任何物理内存，保护就失效了</button><button>D. 因为用户程序不知道自己的 base</button></div>
+  <div class="explain">原书："Imagine the havoc a user process could wreak if it could arbitrarily change the base register while running."</div></div>
+<div class="mcq" data-answer="1"><div class="q">上下文切换时，OS 对 base/bounds 做什么？</div>
+  <div class="opts"><button>A. 什么也不做，每个进程都有自己的一对硬件寄存器</button><button>B. 把当前进程的 base/bounds 存到它的 PCB，再从下一个进程的 PCB 恢复</button><button>C. 把整个地址空间拷贝到物理地址 0</button><button>D. 把它们清零，让下一个进程从物理地址 0 开始</button></div>
+  <div class="explain">每个 CPU 只有一对 base/bounds，而每个进程的值不同，所以必须保存/恢复（图 15.6 中 switch() 的 "including base/bounds"）。</div></div>
+<div class="mcq" data-answer="3"><div class="q">相比静态重定位（loader 改写地址），动态重定位的关键优势是？</div>
+  <div class="opts"><button>A. 不需要任何硬件</button><button>B. 程序可以超过物理内存大小</button><button>C. 可以消除内部碎片</button><button>D. 有界限检查提供保护，而且进程开始运行后仍能移动地址空间</button></div>
+  <div class="explain">静态重定位的两大问题：没有保护、难以再移动。动态重定位由硬件在运行时加 base、查 bounds，两个问题都解决了。它并不能消除内部碎片。</div></div>
+<div class="mcq" data-answer="2"><div class="q">进程被停下（不在运行）时，OS 想把它的地址空间搬到别处，需要哪些步骤？</div>
+  <div class="opts"><button>A. 必须先终止进程再重新创建</button><button>B. 修改进程代码中所有的地址</button><button>C. 把地址空间拷到新位置，更新 PCB 中保存的 base；进程恢复运行时浑然不觉</button><button>D. 只要改 bounds 就行</button></div>
+  <div class="explain">原书 15.5：deschedule → copy → update saved base。进程恢复时新的 base 被载入，它对搬家毫无察觉。</div></div>
+<div class="mcq" data-answer="3"><div class="q">基址/界限方案中的"内部碎片"指的是？</div>
+  <div class="opts"><button>A. OS 自身占用的内存</button><button>B. 物理内存里各个进程之间的空隙</button><button>C. 界限寄存器位数不够造成的浪费</button><button>D. 分配给进程的连续区域里，堆和栈之间没被使用、却占着物理内存的空间</button></div>
+  <div class="explain">浪费发生在"已分配单元的内部"，所以叫内部碎片。B 描述的是外部碎片（第 16、17 章）。</div></div>
+<div class="mcq" data-answer="0"><div class="q">下列哪一项<strong>不</strong>是原书列出的动态重定位硬件要求？</div>
+  <div class="opts"><button>A. 页表基址寄存器</button><button>B. 引发异常的能力</button><button>C. 注册异常处理程序的特权指令</button><button>D. 特权模式</button></div>
+  <div class="explain">页表是分页（第 18 章）的东西。图 15.3 列出的是：特权模式、base/bounds 寄存器、转换与检查电路、更新 base/bounds 的特权指令、注册异常处理程序的特权指令、引发异常的能力。</div></div>
+
+<h2><span class="num">8</span>常见误区与小结</h2>
+<div class="warn">
+  <p><strong>误区 1："地址转换由 OS 软件逐条完成。"</strong>不对。每次访问的转换由<strong>硬件（MMU）</strong>完成；OS 只在创建、切换、终止、异常这些时刻介入。如果每次都要 OS 参与，就太慢了。</p>
+  <p><strong>误区 2："bounds 是最后一个合法地址。"</strong>按本书的约定，bounds 是地址空间<strong>大小</strong>，合法范围是 0 ≤ VA &lt; bounds，VA = bounds 已经越界。</p>
+  <p><strong>误区 3："每个进程都有自己的 base/bounds 硬件寄存器。"</strong>每个 <strong>CPU</strong> 只有一对；每个进程的值保存在它的 PCB 里，切换时装入。</p>
+  <p><strong>误区 4："基址/界限能省内存。"</strong>它要求整个地址空间连续驻留，堆栈之间的空洞也要占物理内存（内部碎片）。</p>
+</div>
+<div class="key">
+  <p><strong>本章小结</strong></p>
+  <ul>
+    <li>地址转换扩展了受限直接执行：OS 设置好硬件，进程直接运行，硬件在每次访问时把虚拟地址转成物理地址，并确保访问不出界。</li>
+    <li>基址/界限（动态重定位）：<strong>PA = VA + base</strong>，要求 <strong>0 ≤ VA &lt; bounds</strong>；越界引发异常。硬件简单、快速，并提供保护，对进程完全透明。</li>
+    <li>硬件要提供：特权模式、base/bounds 寄存器、转换与检查电路、修改它们和注册异常处理程序的特权指令、引发异常的能力。</li>
+    <li>OS 要做：创建时找空闲槽（free list）、终止时回收、切换时保存/恢复 base/bounds、安装并处理异常。</li>
+    <li>缺点：内部碎片。下一章的<strong>分段</strong>为代码、堆、栈各配一对 base/bounds 来解决它。</li>
+  </ul>
+</div>
+
+</main>
+<script>
+(function () {
+  "use strict";
+  const { h, s, stepper } = OSTEP;
+  // Python random 兼容：MT19937 + init_by_array + genrand_res53
+  function PyRandom(seed) {
+    const N = 624, M = 397;
+    const mt = new Uint32Array(N); let mti = N + 1;
+    function initGen(s) { mt[0] = s >>> 0; for (mti = 1; mti < N; mti++) { const p = mt[mti - 1] ^ (mt[mti - 1] >>> 30); mt[mti] = (Math.imul(1812433253, p) + mti) >>> 0; } }
+    function initByArray(key) {
+      initGen(19650218);
+      let i = 1, j = 0, k = Math.max(N, key.length);
+      for (; k; k--) { const p = mt[i - 1] ^ (mt[i - 1] >>> 30); mt[i] = ((mt[i] ^ Math.imul(p, 1664525)) + key[j] + j) >>> 0; i++; j++; if (i >= N) { mt[0] = mt[N - 1]; i = 1; } if (j >= key.length) j = 0; }
+      for (k = N - 1; k; k--) { const p = mt[i - 1] ^ (mt[i - 1] >>> 30); mt[i] = ((mt[i] ^ Math.imul(p, 1566083941)) - i) >>> 0; i++; if (i >= N) { mt[0] = mt[N - 1]; i = 1; } }
+      mt[0] = 0x80000000;
+    }
+    function genrand() {
+      let y; const mag = [0, 0x9908b0df];
+      if (mti >= N) {
+        let kk = 0;
+        for (; kk < N - M; kk++) { y = (mt[kk] & 0x80000000) | (mt[kk + 1] & 0x7fffffff); mt[kk] = mt[kk + M] ^ (y >>> 1) ^ mag[y & 1]; }
+        for (; kk < N - 1; kk++) { y = (mt[kk] & 0x80000000) | (mt[kk + 1] & 0x7fffffff); mt[kk] = mt[kk + (M - N)] ^ (y >>> 1) ^ mag[y & 1]; }
+        y = (mt[N - 1] & 0x80000000) | (mt[0] & 0x7fffffff); mt[N - 1] = mt[M - 1] ^ (y >>> 1) ^ mag[y & 1];
+        mti = 0;
+      }
+      y = mt[mti++];
+      y ^= y >>> 11; y ^= (y << 7) & 0x9d2c5680; y ^= (y << 15) & 0xefc60000; y ^= y >>> 18;
+      return y >>> 0;
+    }
+    let n = Math.abs(Math.floor(seed)); const key = [];
+    do { key.push(n % 4294967296); n = Math.floor(n / 4294967296); } while (n > 0);
+    initByArray(key);
+    return () => { const a = genrand() >>> 5, b = genrand() >>> 6; return (a * 67108864 + b) / 9007199254740992; };
+  }
+  // ==CORE-BEGIN==
+  // 仿 relocation.py：随机数与 Python random 完全一致（PyRandom），同样的种子得到同样的题目。
+  function relocGen(o) {
+    const r = PyRandom(o.seed || 0);
+    let limit = o.limit, base = o.base;
+    const asize = o.asize, psize = o.psize;
+    if (limit === -1) limit = Math.floor(asize / 4.0 + (asize / 4.0) * r());
+    if (base === -1) { let guard = 0; do { base = Math.floor(psize * r()); } while (!(base + limit < psize) && ++guard < 100000); }
+    const vas = [];
+    for (let i = 0; i < o.num; i++) vas.push(Math.floor(asize * r()));
+    let err = "";
+    if (asize > psize) err = "地址空间必须小于物理内存（relocation.py 的假设）";
+    else if (base + limit > psize) err = "地址空间放不进物理内存：base + bounds > 物理内存大小";
+    return { base, limit, vas, err };
+  }
+  // 基址/界限地址转换。mode "size"：界限 = 地址空间大小，先检查 VA 再加 base；
+  // mode "end"：界限 = 物理结束地址（base + size），先加 base 再检查 PA。两种方式逻辑等价。
+  function relocTranslate(va, base, bounds, mode) {
+    if (mode === "end") {
+      const pa = va + base;
+      const ok = va >= 0 && pa < base + bounds;
+      return { ok, pa: ok ? pa : null, raw: pa, check: `${pa} < ${base + bounds}` };
+    }
+    const ok = va >= 0 && va < bounds;
+    return { ok, pa: ok ? va + base : null, raw: va + base, check: `0 ≤ ${va} < ${bounds}` };
+  }
+  // ==CORE-END==
+
+  const $ = (id) => document.getElementById(id);
+  function parseSize(str) {
+    const t = String(str).trim().toLowerCase();
+    let m = t.match(/^(-?\d+(?:\.\d+)?)\s*([kmg])?b?$/);
+    if (m) return Math.round(parseFloat(m[1]) * (m[2] === "k" ? 1024 : m[2] === "m" ? 1048576 : m[2] === "g" ? 1073741824 : 1));
+    if (/^0x[0-9a-f]+$/.test(t)) return parseInt(t, 16);
+    return NaN;
+  }
+  const fmt = (n) => (n >= 1024 && n % 1024 === 0 ? n / 1024 + "KB" : String(n));
+  const hx = (n) => "0x" + n.toString(16).padStart(8, "0");
+
+  // ---------------- 模拟器 1：relocation ----------------
+  let P = null;          // {asize, psize, base, limit, vas, labels, mode}
+  const SUB = 3;
+  function generate(opts) {
+    const asize = parseSize($("rl-asize").value), psize = parseSize($("rl-psize").value);
+    const base = parseSize($("rl-base").value), limit = parseSize($("rl-limit").value);
+    const num = Math.max(1, Math.min(40, +$("rl-num").value || 5));
+    if ([asize, psize, base, limit].some(Number.isNaN) || asize <= 0 || psize <= 0) { $("rl-narrate").innerHTML = "参数无法解析：大小可写 1k、16k、0x4000 或纯数字。"; return; }
+    const g = relocGen({ seed: +$("rl-seed").value || 0, asize, psize, num, base, limit });
+    let vas = g.vas, labels = (opts && opts.labels) || null;
+    const manual = $("rl-vas").value.trim();
+    if (manual) {
+      vas = manual.split(/[,\s]+/).filter(Boolean).map(parseSize);
+      if (vas.some(Number.isNaN)) { $("rl-narrate").innerHTML = "手动虚拟地址无法解析。"; return; }
+      if (!labels || labels.length !== vas.length) labels = null;
+    }
+    P = { asize, psize, base: g.base, limit: g.limit, vas, labels, mode: $("rl-mode").value, err: g.err };
+    rlStep.reset();
+  }
+  function drawReloc(k) {
+    const W = 720, Hh = 270;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${Hh}`, width: W, role: "img", "aria-label": "地址转换过程" });
+    const defs = s("defs", {}, s("marker", { id: "m15r", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto" }, s("path", { d: "M0,0 L10,5 L0,10 z", style: "fill:var(--muted)" })));
+    svg.append(defs);
+    const i = Math.floor(k / SUB), sub = k % SUB;
+    const va = P.vas[i];
+    const r = relocTranslate(va, P.base, P.limit, P.mode);
+    // 流水线
+    const box = (x, y, w, hh, cls, t1, t2, on) => {
+      svg.append(s("rect", { x, y, width: w, height: hh, rx: 8, class: cls, style: on ? "stroke-width:2.5" : "opacity:.55" }));
+      svg.append(s("text", { x: x + w / 2, y: y + (t2 ? 22 : 30), "text-anchor": "middle", "font-size": 12.5, text: t1 }));
+      if (t2) svg.append(s("text", { x: x + w / 2, y: y + 40, "text-anchor": "middle", "font-size": 12, class: "mono", text: t2 }));
+    };
+    box(10, 14, 150, 52, "box-strong", "① 虚拟地址 VA", `${va}（${"0x" + va.toString(16)}）`, true);
+    const endMode = P.mode === "end";
+    const checkTxt = endMode ? `${r.raw} < ${P.base + P.limit}?` : `VA < ${P.limit}?`;
+    const xC = endMode ? 370 : 200, xA = endMode ? 200 : 440;
+    box(xC, 14, endMode ? 200 : 200, 52, sub >= 1 ? (r.ok ? "ok-soft" : "bad-soft") : "box", endMode ? "③ 物理地址 < 结束地址?" : "② 界限检查", sub >= 1 ? checkTxt + (r.ok ? " ✓" : " ✗") : checkTxt, sub >= 1);
+    const addOn = endMode ? sub >= 1 : sub >= 2 && r.ok;
+    box(xA, 14, endMode ? 140 : 130, 52, addOn ? "accent-soft" : "box", endMode ? "② 先加 base" : "③ + base", `+ ${P.base}`, addOn);
+    const final = sub >= 2;
+    box(600, 14, 110, 52, final ? (r.ok ? "ok-soft" : "bad-soft") : "box", final ? (r.ok ? "④ 物理地址" : "④ 越界异常") : "④ 结果", final ? (r.ok ? String(r.pa) : "→ OS 处理") : "?", final);
+    for (const [x1, x2] of (endMode ? [[160, 198], [340, 368], [570, 598]] : [[160, 198], [400, 438], [570, 598]])) svg.append(s("line", { x1, x2, y1: 40, y2: 40, class: "arrow", "marker-end": "url(#m15r)" }));
+    // 虚拟地址空间条
+    const bx = 110, bw = 590;
+    const bar = (y, total, label, regs, marker, mcol) => {
+      svg.append(s("text", { x: 10, y: y + 20, "font-size": 12, style: "font-weight:600", text: label }));
+      svg.append(s("rect", { x: bx, y, width: bw, height: 30, rx: 3, class: "box" }));
+      for (const g of regs) {
+        if (!(g.b > g.a)) continue;
+        const x = bx + Math.max(0, g.a) / total * bw, w = Math.max(1, (Math.min(total, g.b) - Math.max(0, g.a)) / total * bw);
+        svg.append(s("rect", { x, y, width: w, height: 30, class: g.cls, style: g.style || "" }));
+        if (g.t && w > 60) svg.append(s("text", { x: x + w / 2, y: y + 19, "text-anchor": "middle", "font-size": 11, text: g.t }));
+      }
+      svg.append(s("text", { x: bx, y: y + 44, "font-size": 10.5, class: "t-muted mono", text: "0" }));
+      svg.append(s("text", { x: bx + bw, y: y + 44, "font-size": 10.5, class: "t-muted mono", "text-anchor": "end", text: fmt(total) }));
+      if (marker != null) {
+        const mx = bx + Math.min(total, Math.max(0, marker)) / total * bw;
+        svg.append(s("line", { x1: mx, x2: mx, y1: y - 6, y2: y + 36, style: `stroke:${mcol};stroke-width:3` }));
+        svg.append(s("path", { d: `M${mx - 5} ${y - 12} L${mx + 5} ${y - 12} L${mx} ${y - 5} Z`, style: `fill:${mcol}` }));
+      }
+    };
+    bar(110, P.asize, "虚拟地址空间", [
+      { a: 0, b: Math.min(P.limit, P.asize), cls: "ok-soft", t: `合法：0 ~ ${Math.min(P.limit, P.asize) - 1}` },
+      { a: P.limit, b: P.asize, cls: "bad-soft", t: P.limit < P.asize ? "≥ bounds：越界" : "" },
+    ], va, "var(--warn)");
+    svg.append(s("text", { x: bx + Math.min(P.asize, va) / P.asize * bw, y: 102, "text-anchor": "middle", "font-size": 11, class: "mono", text: "VA " + va }));
+    const regs = [{ a: 0, b: P.psize, cls: "box" }, { a: P.base, b: P.base + P.limit, cls: "accent-soft", t: `[${P.base}, ${P.base + P.limit})` }];
+    const pm = final ? r.raw : null;
+    bar(200, P.psize, "物理内存", regs, pm, r.ok ? "var(--ok)" : "var(--bad)");
+    if (final) svg.append(s("text", { x: bx + Math.min(P.psize, Math.max(0, r.raw)) / P.psize * bw, y: 192, "text-anchor": "middle", "font-size": 11, class: "mono", style: r.ok ? "" : "fill:var(--bad)", text: r.ok ? "PA " + r.pa : `（若不检查：${r.raw}）` }));
+    svg.append(s("text", { x: bx + P.base / P.psize * bw, y: 256, "font-size": 10.5, class: "mono", style: "fill:var(--accent)", text: "↑ base " + P.base }));
+    $("rl-svg").replaceChildren(svg);
+    // 讲解
+    const lab = P.labels ? `（${P.labels[i]}）` : "";
+    let t = "";
+    if (sub === 0) t = `<b>地址 ${i + 1}/${P.vas.length}${lab}：</b>进程发出虚拟地址 <code>${va}</code>（${hx(va)}）。进程以为自己的内存从 0 开始、大小 ${fmt(P.asize)}，它并不知道 base 是多少。`;
+    else if (sub === 1) t = P.mode === "end"
+      ? `<b>方式二：</b>硬件先加 base：${va} + ${P.base} = ${r.raw}，再检查它是否 &lt; 物理结束地址 ${P.base + P.limit}：${r.ok ? "是，合法。" : "否，<b style='color:var(--bad)'>越界！</b>"}`
+      : `<b>界限检查：</b>0 ≤ ${va} &lt; ${P.limit} ？ ${r.ok ? "成立，合法。" : `不成立（${va} ≥ ${P.limit}），<b style='color:var(--bad)'>越界！</b>硬件不会去碰内存。`}`;
+    else t = r.ok
+      ? `<b>结果：</b>物理地址 = ${va} + ${P.base} = <b>${r.pa}</b>（${hx(r.pa)}）。这个地址被送到内存系统。整个过程 OS 没有参与。`
+      : `<b>结果：SEGMENTATION VIOLATION。</b>CPU 引发异常、切到内核态，跳到 OS 启动时安装的"非法内存访问"处理程序，OS 通常会终止这个进程。${r.raw < P.psize ? `如果没有界限检查，它会访问物理地址 ${r.raw}——那可能是别的进程或 OS 的内存。` : ""}`;
+    if (P.err) t = `<b style="color:var(--bad)">注意：${P.err}</b><br>` + t;
+    $("rl-narrate").innerHTML = t;
+    // 表格
+    const tb = $("rl-table"); tb.replaceChildren();
+    tb.append(h("tr", {}, h("th", {}, "#"), P.labels ? h("th", {}, "访问") : null, h("th", {}, "VA（十六进制）"), h("th", {}, "VA（十进制）"), h("th", {}, "结果（relocation.py -c 的格式）")));
+    let okc = 0, badc = 0, allOk = 0;
+    P.vas.forEach((v, j) => {
+      const rr = relocTranslate(v, P.base, P.limit, P.mode);
+      if (rr.ok) allOk++;
+      const shown = j < i || (j === i && sub === 2);
+      if (shown) rr.ok ? okc++ : badc++;
+      tb.append(h("tr", { class: j === i ? "cur" : "" }, h("td", {}, "VA " + String(j).padStart(2)), P.labels ? h("td", {}, P.labels[j]) : null, h("td", {}, hx(v)), h("td", {}, String(v)),
+        shown ? h("td", { class: rr.ok ? "ok" : "bad" }, rr.ok ? `VALID: ${hx(rr.pa)} (decimal: ${rr.pa})` : "SEGMENTATION VIOLATION") : h("td", { class: "q" }, "PA or segmentation violation?")));
+    });
+    $("rl-s1").textContent = P.base; $("rl-s2").textContent = P.limit;
+    $("rl-s3").textContent = `${okc} / ${badc}`;
+    $("rl-s4").textContent = Math.round(allOk / P.vas.length * 100) + "%";
+  }
+  const rlStep = stepper($("rl-step"), { steps: () => (P ? P.vas.length * SUB : 1), autoplayMs: 800, render(k) { if (P) drawReloc(k); } });
+  $("rl-gen").onclick = () => generate();
+  $("rl-mode").onchange = () => { if (P) { P.mode = $("rl-mode").value; rlStep.refresh(); } };
+  function preset(v) { for (const [k, x] of Object.entries(v)) $("rl-" + k).value = x; }
+  $("rl-p1").onclick = () => { preset({ asize: "16k", psize: "64k", base: "32k", limit: "16k", num: 5, vas: "128, 15K, 132, 135, 15K", seed: 0 }); generate({ labels: ["取指 128：movl 0x0(%ebx),%eax", "load x（15KB）", "取指 132：addl $0x03,%eax", "取指 135：movl %eax,0x0(%ebx)", "store x（15KB）"] }); };
+  $("rl-p2").onclick = () => { preset({ asize: "4k", psize: "64k", base: "16k", limit: "4k", num: 4, vas: "0, 1K, 3000, 4400", seed: 0 }); generate(); };
+  document.querySelectorAll("#sim-reloc button[data-seed]").forEach((b) => (b.onclick = () => { preset({ asize: "1k", psize: "16k", base: "-1", limit: "-1", num: 5, vas: "", seed: b.dataset.seed }); generate(); }));
+  $("rl-q2").onclick = () => { preset({ asize: "1k", psize: "16k", base: "-1", limit: "-1", num: 10, vas: "", seed: 0 }); generate(); };
+  $("rl-p1").click();
+
+  // ---------------- 模拟器 2：LDE 时间线 ----------------
+  const K = 1024;
+  const ROWS = [
+    { ph: "OS @ boot（内核态）　|　Hardware　|　（还没有程序）" },
+    { who: 0, t: "初始化陷阱表（initialize trap table）", set: { mode: "内核态" }, n: "机器启动，OS 以内核态运行，首先准备陷阱表。" },
+    { who: 1, t: "记住以下处理程序的地址：", ul: ["system call handler", "timer handler", "illegal mem-access handler", "illegal instruction handler"], set: { trap: "4 个处理程序已登记" }, n: "硬件记下各个处理程序的地址；以后越界访问会跳到 illegal mem-access handler。" },
+    { who: 0, t: "启动中断时钟（start interrupt timer）", n: "OS 用特权指令启动时钟，保证以后能夺回 CPU。" },
+    { who: 1, t: "启动时钟；每 X ms 中断一次", set: { timer: "运行中" }, n: "时钟开始计时。" },
+    { who: 0, t: "初始化进程表（initialize process table）", set: { ptable: "（空）" }, n: "准备记录进程的数据结构。" },
+    { who: 0, t: "初始化空闲链表（initialize free list）", set: { free: "16–32KB, 32–48KB" }, mem: { B: 1 }, n: "OS 占 0–16KB。为了演示，假设进程 B 之前已按同样步骤被创建，放在 48–64KB；空闲链表记录剩下的 16–32KB 和 32–48KB。" },
+    { ph: "OS @ run（内核态）　|　Hardware　|　Program（用户态）" },
+    { who: 0, t: "启动进程 A：在进程表中分配表项", set: { ptable: "A（新建）, B（就绪, base 48KB）" }, n: "为 A 分配 PCB。" },
+    { who: 0, t: "为进程分配内存（alloc memory for process）", set: { free: "16–32KB" }, mem: { A: 1, B: 1 }, n: "OS 在空闲链表里找到 32–48KB 这个槽给 A（和图 15.2 一样）。" },
+    { who: 0, t: "设置 base/bounds 寄存器", set: { base: "32768（32KB）", bounds: "16384（16KB）" }, n: "用特权指令把 base 设为 32KB、bounds 设为 16KB。只有内核态能做这件事。" },
+    { who: 0, t: "return-from-trap（进入 A）", n: "OS 执行从陷阱返回，准备交出 CPU。" },
+    { who: 1, t: "恢复 A 的寄存器；切到用户态；跳到 A 的（初始）PC", set: { mode: "用户态", pc: "A: 128", run: "A" }, n: "CPU 切到用户态，从 A 的 PC 开始执行。此后 OS 退居幕后。" },
+    { who: 2, t: "进程 A 运行：取指令", n: "A 要取 PC = 128 处的指令。" },
+    { who: 1, t: "转换虚拟地址并执行取指", ul: ["VA 128 < 16384 ✓", "PA = 128 + 32768 = 32896"], hl: 32896, n: "硬件独立完成转换：检查界限、加 base，取物理地址 32896 处的指令。<b>OS 没有参与</b>。" },
+    { who: 2, t: "执行指令（movl 0x0(%ebx), %eax）", n: "这条指令要从虚拟地址 15KB load。" },
+    { who: 1, t: "显式 load/store：确认地址合法；转换；执行 load", ul: ["VA 15360 < 16384 ✓", "PA = 15360 + 32768 = 48128（47KB）"], hl: 48128, n: "又一次纯硬件转换：load 物理地址 47KB 处的 x（值 3000）。" },
+    { who: 2, t: "（A 继续运行……）", set: { pc: "A: 135 …" }, n: "A 全速运行，每次访问都由 MMU 转换。" },
+    { who: 1, t: "时钟中断：切到内核态；跳到中断处理程序", set: { mode: "内核态" }, n: "时钟到期，硬件把 CPU 切回内核态，OS 重新获得控制权。" },
+    { who: 0, t: "处理时钟中断；决定：停 A，运行 B", n: "调度器决定切换到 B。" },
+    { who: 0, t: "调用 switch()：", ul: ["保存 A 的寄存器到 proc-struct(A)（包括 base/bounds）", "从 proc-struct(B) 恢复 B 的寄存器（包括 base/bounds）"], set: { base: "49152（48KB）", bounds: "16384（16KB）", ptable: "A（就绪, 已存 base 32KB）, B（运行）" }, n: "关键：只有一对 base/bounds，所以 A 的值存进它的 PCB，B 的值装进寄存器。" },
+    { who: 0, t: "return-from-trap（进入 B）" , n: "返回用户态，进入 B。" },
+    { who: 1, t: "恢复 B 的寄存器；切到用户态；跳到 B 的 PC", set: { mode: "用户态", pc: "B: …", run: "B" }, n: "B 开始运行。同样的虚拟地址，现在会被加上 48KB。" },
+    { who: 2, t: "进程 B 运行：执行一条坏的 load", ul: ["load 虚拟地址 20KB（20480）"], n: "B 试图访问虚拟地址 20KB，超出了它 16KB 的地址空间。" },
+    { who: 1, t: "load 越界；切到内核态；跳到陷阱处理程序", ul: ["VA 20480 ≥ 16384 ✗ → 异常"], set: { mode: "内核态" }, bad: 1, n: "硬件检查界限失败，<b>不访问内存</b>，而是引发异常，跳到 OS 的 illegal mem-access handler。" },
+    { who: 0, t: "处理陷阱：决定杀掉进程 B", ul: ["释放 B 的内存", "从进程表中删除 B 的表项"], set: { free: "16–32KB, 48–64KB", ptable: "A（就绪）", run: "—" }, mem: { A: 1 }, n: "OS 的反应很\"敌意\"：终止 B，把 48–64KB 放回空闲链表。Bye bye, misbehaving process。" },
+  ];
+  const INIT = { mode: "（未启动）", base: "—", bounds: "—", pc: "—", run: "—", trap: "未初始化", timer: "关闭", ptable: "—", free: "—" };
+  const REGNAMES = [["mode", "CPU 模式"], ["base", "base 寄存器"], ["bounds", "bounds 寄存器"], ["pc", "PC"], ["run", "正在运行"], ["trap", "陷阱表"], ["timer", "时钟"], ["ptable", "进程表"], ["free", "空闲链表"]];
+  const acts = ROWS.map((r, i) => (r.ph ? null : i)).filter((x) => x !== null);
+  function ldState(k) {
+    const st = { ...INIT }, prev = { ...INIT }; let mem = {};
+    for (let j = 0; j <= k; j++) { const r = ROWS[acts[j]]; if (j === k) Object.assign(prev, st); Object.assign(st, r.set || {}); if (r.mem) mem = r.mem; }
+    return { st, prev, mem };
+  }
+  function drawMem(mem, row) {
+    const W = 640, svg = s("svg", { viewBox: `0 0 ${W} 86`, width: W, role: "img", "aria-label": "物理内存" });
+    const x0 = 20, w = 600, seg = w / 4;
+    const lab = [["OS", "var(--c8)"], [null], [mem.A ? "进程 A" : null, "var(--c1)"], [mem.B ? "进程 B" : null, "var(--c2)"]];
+    lab.forEach(([t, c], i) => {
+      svg.append(s("rect", { x: x0 + i * seg, y: 10, width: seg - 2, height: 40, rx: 3, style: t ? `fill:${c}` : "fill:var(--surface-2);stroke:var(--border)" }));
+      svg.append(s("text", { x: x0 + i * seg + seg / 2, y: 35, "text-anchor": "middle", "font-size": 12.5, style: t ? "fill:#fff;font-weight:600" : "", class: t ? null : "t-muted", text: t || "(free)" }));
+      svg.append(s("text", { x: x0 + i * seg, y: 66, "font-size": 10.5, class: "t-muted mono", text: i * 16 + "KB" }));
+    });
+    svg.append(s("text", { x: x0 + w, y: 66, "font-size": 10.5, class: "t-muted mono", "text-anchor": "end", text: "64KB" }));
+    if (row.hl) { const x = x0 + row.hl / (64 * K) * w; svg.append(s("line", { x1: x, x2: x, y1: 4, y2: 56, style: "stroke:var(--warn);stroke-width:3" })); svg.append(s("text", { x, y: 82, "text-anchor": "middle", "font-size": 11, class: "mono", text: "PA " + row.hl })); }
+    if (row.bad) svg.append(s("text", { x: x0 + 3.5 * seg, y: 82, "text-anchor": "middle", "font-size": 11, style: "fill:var(--bad)", text: "B 想访问 48KB+20KB = 68KB：被界限挡住" }));
+    $("ld-mem").replaceChildren(svg);
+  }
+  const ldStep = stepper($("ld-step"), { steps: acts.length, autoplayMs: 1500, render(k) {
+    const { st, prev, mem } = ldState(k), row = ROWS[acts[k]];
+    const box = $("ld-regs"); box.replaceChildren();
+    for (const [key, name] of REGNAMES) box.append(h("div", { class: "reg" + (st[key] !== prev[key] ? " chg" : "") }, h("b", {}, name), h("span", {}, st[key])));
+    drawMem(mem, row);
+    $("ld-narrate").innerHTML = `<b>${["OS", "硬件", "程序"][row.who]}：</b>${row.n}`;
+    const tb = $("ld-table"); tb.replaceChildren();
+    tb.append(h("tr", {}, h("th", {}, "OS（内核态）"), h("th", {}, "Hardware"), h("th", {}, "Program（用户态）")));
+    ROWS.forEach((r, i) => {
+      const pos = acts.indexOf(i);
+      const future = r.ph ? i > acts[k] : pos > k;
+      if (r.ph) { tb.append(h("tr", { class: "phase" + (future ? " future" : "") }, h("td", { colspan: 3 }, r.ph))); return; }
+      const cells = [0, 1, 2].map((c) => c === r.who ? h("td", { class: "act" }, r.t, r.ul ? h("ul", {}, r.ul.map((x) => h("li", {}, x))) : null) : h("td", {}));
+      tb.append(h("tr", { class: (pos === k ? "cur" : "") + (future ? " future" : "") }, cells));
+    });
+  } });
+})();
+</script>
+</body></html>

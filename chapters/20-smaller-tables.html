@@ -1,0 +1,911 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 20 章 · 分页：较小的表</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+.bits { display: flex; flex-wrap: nowrap; gap: 4px; align-items: flex-end; margin: 4px 0; }
+.bitgrp { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.bitgrp .cells { display: flex; gap: 2px; }
+.bitgrp .cap { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+.bit { width: 22px; height: 28px; display: inline-flex; align-items: center; justify-content: center; font: 600 13.5px var(--mono); border: 1.5px solid var(--border); border-radius: 5px; background: var(--surface); }
+.bit.pd { border-color: var(--c4); background: color-mix(in srgb, var(--c4) 16%, var(--surface)); }
+.bit.pt { border-color: var(--c1); background: color-mix(in srgb, var(--c1) 16%, var(--surface)); }
+.bit.off { border-color: var(--c3); background: color-mix(in srgb, var(--c3) 16%, var(--surface)); }
+.bit.pfn { border-color: var(--c2); background: color-mix(in srgb, var(--c2) 18%, var(--surface)); }
+.addr-row { display: flex; gap: 10px; align-items: center; }
+.rowlab { font-size: 13px; color: var(--muted); min-width: 64px; }
+.tpd { font-family: var(--mono); color: var(--c4); font-weight: 650; }
+.tpt { font-family: var(--mono); color: var(--c1); font-weight: 650; }
+.to { font-family: var(--mono); color: var(--c3); font-weight: 650; }
+.tp { font-family: var(--mono); color: var(--c2); font-weight: 650; }
+.tables3 { display: grid; grid-template-columns: repeat(3, minmax(150px, 1fr)); gap: 10px; margin-top: 12px; }
+@media (max-width: 640px) { .tables3 { grid-template-columns: 1fr; } }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; min-width: 0; }
+.panel h5 { margin: 0 0 6px; font-size: 13px; color: var(--muted); font-weight: 600; }
+.etab { font: 12px/1.45 var(--mono); width: 100%; }
+.etab td, .etab th { padding: 1px 6px; border-bottom: 1px solid var(--border); }
+.etab tr.inv td { color: var(--faint); }
+.etab tr.act td { background: var(--accent-soft); font-weight: 700; }
+.etab tr.act.bad td { background: var(--bad-soft); }
+.panel.dim { opacity: .45; }
+.memdump { font: 11.5px/1.5 var(--mono); max-height: 320px; overflow: auto; background: var(--code-bg); border-radius: 8px; padding: 6px 8px; margin-top: 10px; }
+.memdump .row { white-space: nowrap; }
+.memdump .row .pn { color: var(--muted); }
+.memdump .row.pdp { background: color-mix(in srgb, var(--c4) 16%, transparent); }
+.memdump .row.ptp { background: color-mix(in srgb, var(--c1) 16%, transparent); }
+.memdump .row.dp { background: color-mix(in srgb, var(--c2) 14%, transparent); }
+.memdump .b.hl { outline: 2px solid var(--fg); border-radius: 2px; font-weight: 700; }
+.pills { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; }
+.pills button { font: 12.5px var(--mono); padding: 3px 8px; }
+.pills button.cur { border-color: var(--accent); background: var(--accent-soft); }
+.pills button.okv { border-left: 4px solid var(--ok); }
+.pills button.badv { border-left: 4px solid var(--bad); }
+.err { color: var(--bad); font-weight: 600; }
+.lvbar { display: flex; flex-wrap: nowrap; gap: 3px; margin: 8px 0; min-width: 420px; }
+.lvbar div { text-align: center; font: 12px var(--mono); padding: 6px 2px; border-radius: 5px; color: #fff; font-weight: 600; min-width: 0; overflow: hidden; white-space: nowrap; }
+.tree { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.tree .lv { display: grid; grid-template-columns: 110px 1fr; gap: 8px; align-items: center; font-size: 13px; }
+.tree .boxes { display: flex; flex-wrap: wrap; gap: 2px; align-items: center; }
+.tree .boxes span { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+.calc { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; font-size: 14px; }
+.calc label { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); }
+.ipt { font: 12.5px var(--mono); }
+.ipt td, .ipt th { padding: 2px 8px; }
+.ipt tr.act td { background: var(--accent-soft); }
+.ipt tr.hit td { background: var(--ok-soft); font-weight: 700; }
+</style>
+</head>
+<body data-chapter="20">
+<main>
+
+<h2 id="crux">一句话 + 关键问题</h2>
+<p><strong>一句话：</strong>线性页表为地址空间里<em>每一个</em>虚拟页都留一项，哪怕绝大部分是无效的；
+<strong>多级页表</strong>把页表切成页大小的块，整块都无效就干脆不分配，再用一个<strong>页目录</strong>记录哪些块存在——
+页表占用从"与地址空间大小成正比"变成"与实际使用的地址空间成正比"，代价是 TLB 未命中时要多访问几次内存。</p>
+<div class="crux">
+<p><strong>如何让页表更小？</strong>简单的基于数组的页表（通常称为线性页表）太大，在典型系统上占用太多内存。如何让页表更小？关键的思路是什么？这些新的数据结构会带来哪些低效？</p>
+<p class="small muted">Simple array-based page tables (usually called linear page tables) are too big, taking up far too much memory on typical systems. How can we make page tables smaller? What are the key ideas? What inefficiencies arise as a result of these new data structures?</p>
+</div>
+<p>第 18 章指出分页的两个问题，第 19 章用 TLB 解决了"慢"，本章解决第二个问题：页表<strong>太大</strong>。再算一遍：32 位地址空间（2<sup>32</sup> 字节）、4KB（2<sup>12</sup> 字节）页、4 字节 PTE，
+约一百万个虚拟页（2<sup>32</sup>/2<sup>12</sup>），页表 4MB。通常每个进程一张页表，一百个活动进程（在现代系统上很常见）就要几百 MB 内存来存页表！
+本章依次考察更大的页、段页混合、多级页表、反向页表，以及把页表换出到磁盘。</p>
+
+<h2 id="concepts">核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>更大的页</h4><p>页大 4 倍，页表小 4 倍。但会造成页内浪费——<strong>内部碎片（internal fragmentation）</strong>。</p></div>
+  <div class="card"><h4>段页混合（hybrid）</h4><p>每个逻辑段（代码、堆、栈）一张页表，段的基址寄存器指向页表，界限寄存器记录页表有几项。</p></div>
+  <div class="card"><h4>多级页表（multi-level page table）</h4><p>把页表切成页大小的块，全无效的块不分配，像一棵树。x86 等现代系统都在用。</p></div>
+  <div class="card"><h4>页目录（page directory）</h4><p>每个页表页对应一个页目录项（PDE）：有效位 + 该页表页所在的 PFN。</p></div>
+  <div class="card"><h4>时间-空间权衡</h4><p>多级页表更省空间，但 TLB 未命中时要多次访存（两级就是 2 次）；结构也更复杂。</p></div>
+  <div class="card"><h4>反向页表（inverted page table）</h4><p>整个系统一张表，每个<strong>物理页</strong>一项，记录谁在用它；用哈希表加速查找（PowerPC）。</p></div>
+  <div class="card"><h4>页表放进虚拟内存</h4><p>有的系统把页表放在内核虚拟内存里，内存紧张时可以把页表本身换出到磁盘（VAX/VMS）。</p></div>
+</div>
+
+<h2 id="bigger">简单方案：更大的页</h2>
+<p>仍然是 32 位地址空间，但页大小改为 <strong>16KB</strong>：VPN 18 位、偏移 14 位。PTE 仍是 4 字节，线性页表就是 2<sup>18</sup> 项、<strong>1MB</strong>——缩小到 1/4，
+恰好对应页大小扩大的 4 倍。</p>
+<p>主要问题是<strong>内部碎片</strong>：浪费发生在分配单元的内部。应用程序分配了一整页却只用其中一点点，内存很快就被这些过大的页填满。
+所以大多数系统在常见情况下使用较小的页：x86 用 4KB，SPARCv9 用 8KB。问题没法这么简单地解决。</p>
+<div class="aside" data-title="多种页大小">
+<p>许多体系结构（如 MIPS、SPARC、x86-64）现在支持多种页大小。通常使用小页（4KB 或 8KB）；但如果某个"聪明的"应用请求，也可以为地址空间的某一部分使用一个大页（比如 4MB），
+把频繁使用的大型数据结构放在里面，只占<strong>一个 TLB 项</strong>。数据库管理系统和其他高端商业应用常这么做。
+多种页大小的主要目的<strong>不是节省页表空间</strong>，而是减轻 TLB 的压力，让程序访问更多的地址空间而不遭受过多的 TLB 未命中。
+不过研究表明，支持多种页大小会让 OS 的虚拟内存管理明显更复杂，所以大页有时最容易的用法就是给应用提供一个直接请求大页的新接口。</p>
+</div>
+
+<h2 id="hybrid">混合方案：分页和分段</h2>
+<p>当你有两种合理但不同的方法时，应该考虑把两者结合起来，看能否两全其美——就像把巧克力和花生酱结合成 Reese 花生酱杯。
+多年前，Multics 的创造者（特别是 Jack Dennis）在构建 Multics 虚拟内存系统时想到了结合分页和分段、以减少页表内存开销的主意。</p>
+<p>看一个典型的线性页表：16KB 地址空间、1KB 页，堆和栈的已用部分都很小。代码 VPN 0 映射到 PFN 10，堆 VPN 4 映射到 PFN 23，栈的两页 VPN 14、15 映射到 PFN 28 和 4：</p>
+
+<figure class="fig">
+<svg viewBox="0 0 700 420" width="700" role="img" aria-label="16KB 地址空间及其线性页表">
+  <text x="90" y="20" text-anchor="middle" font-size="13" font-weight="600">虚拟地址空间（16 页）</text>
+  <g id="f201-as"></g>
+  <text x="440" y="20" text-anchor="middle" font-size="13" font-weight="600">线性页表（16 项，只有 4 项有效）</text>
+  <g id="f201-pt" font-size="12" class="mono"></g>
+</svg>
+<figcaption>图 20.1 + 20.2：16KB 地址空间（1KB 页）与它的页表。16 项里 12 项无效——而这还只是 16KB 的地址空间；32 位地址空间里浪费的空间多到不敢想象。</figcaption>
+</figure>
+
+<p>混合方案：不再为整个地址空间准备一张页表，而是<strong>每个逻辑段一张</strong>——代码、堆、栈各一张。MMU 里仍有分段时的基址/界限寄存器，
+但<strong>基址寄存器不再指向段本身，而是存放该段页表的物理地址</strong>；界限寄存器表示页表的结尾（有多少个有效页）。</p>
+<p>例子：32 位虚拟地址、4KB 页，地址空间分成 4 个段，只用其中 3 个。用地址的最高两位选择段：00 未用，01 代码，10 堆，11 栈：</p>
+
+<figure class="fig">
+<svg viewBox="0 0 700 250" width="700" role="img" aria-label="混合方案的地址格式与页表查找">
+  <defs><marker id="a20" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <g font-size="10" class="mono t-muted" text-anchor="middle"><text x="36" y="16" class="t-muted">31</text><text x="58" y="16" class="t-muted">30</text><text x="80" y="16" class="t-muted">29</text><text x="444" y="16" class="t-muted">12</text><text x="466" y="16" class="t-muted">11</text><text x="684" y="16" class="t-muted">0</text></g>
+  <rect x="25" y="22" width="44" height="34" rx="3" style="fill:color-mix(in srgb, var(--c4) 22%, var(--surface));stroke:var(--c4)"/><text x="47" y="44" text-anchor="middle" font-size="13" font-weight="600">Seg</text>
+  <rect x="69" y="22" width="386" height="34" rx="3" style="fill:color-mix(in srgb, var(--c1) 20%, var(--surface));stroke:var(--c1)"/><text x="262" y="44" text-anchor="middle" font-size="13" font-weight="600">VPN（18 位）</text>
+  <rect x="455" y="22" width="240" height="34" rx="3" style="fill:color-mix(in srgb, var(--c3) 20%, var(--surface));stroke:var(--c3)"/><text x="575" y="44" text-anchor="middle" font-size="13" font-weight="600">Offset（12 位）</text>
+  <g font-size="12">
+    <rect x="25" y="96" width="210" height="104" rx="8" class="box"/>
+    <text x="130" y="116" text-anchor="middle" font-weight="600">MMU：每段一对寄存器</text>
+    <text x="38" y="138" class="mono">01 代码 base │ bounds=3</text>
+    <text x="38" y="160" class="mono">10 堆   base │ bounds</text>
+    <text x="38" y="182" class="mono">11 栈   base │ bounds</text>
+  </g>
+  <path d="M47,58 L47,94" class="arrow" marker-end="url(#a20)"/>
+  <text x="54" y="80" font-size="11" class="t-muted">选择哪一对</text>
+  <g font-size="12">
+    <rect x="330" y="96" width="120" height="30" rx="4" class="accent-soft"/><text x="390" y="116" text-anchor="middle">代码段页表（3 项）</text>
+    <rect x="330" y="134" width="120" height="30" rx="4" class="accent-soft"/><text x="390" y="154" text-anchor="middle">堆的页表</text>
+    <rect x="330" y="172" width="120" height="30" rx="4" class="accent-soft"/><text x="390" y="192" text-anchor="middle">栈的页表</text>
+  </g>
+  <path d="M236,134 C290,134 290,111 328,111" class="arrow" marker-end="url(#a20)"/>
+  <path d="M236,156 C290,156 290,149 328,149" class="arrow" marker-end="url(#a20)"/>
+  <path d="M236,178 C290,178 290,187 328,187" class="arrow" marker-end="url(#a20)"/>
+  <text x="470" y="112" font-size="12">页表只有段实际用到的那么长，</text>
+  <text x="470" y="130" font-size="12">堆和栈之间未分配的页不再占页表项。</text>
+  <text x="470" y="160" font-size="12" class="t-muted">VPN ≥ bounds → 异常（越界）</text>
+  <text x="25" y="232" font-size="12" class="mono">AddressOfPTE = Base[SN] + (VPN * sizeof(PTE))   // 和线性页表几乎一样，只是换成了段的基址</text>
+</svg>
+<figcaption>段页混合：地址最高 2 位选段，每段一对基址/界限寄存器，基址指向该段的线性页表。上下文切换时这些寄存器都要换成新进程的值。</figcaption>
+</figure>
+
+<p>TLB 未命中时（假设硬件管理 TLB），硬件用段号（SN）决定用哪一对基址/界限，再把基址与 VPN 组合成 PTE 地址：</p>
+<pre><code>SN           = (VirtualAddress &amp; SEG_MASK) &gt;&gt; SN_SHIFT
+VPN          = (VirtualAddress &amp; VPN_MASK) &gt;&gt; VPN_SHIFT
+AddressOfPTE = Base[SN] + (VPN * sizeof(PTE))</code></pre>
+<p>关键区别在于每段的<strong>界限寄存器</strong>保存该段最大的有效页：如果代码段使用前 3 页（0、1、2），代码段页表就只分配 3 项、界限设为 3；超出段末尾的访问产生异常。
+这样，堆和栈之间未分配的页不再占用页表空间。但混合方案也有问题：</p>
+<ul>
+  <li>它仍然依赖分段，而分段不够灵活，假定了地址空间的某种使用模式；比如一个很大但稀疏使用的堆，仍然会浪费大量页表空间。</li>
+  <li>它让<strong>外部碎片</strong>重新出现：内存大部分按页管理，页表却可以是任意大小（PTE 的整数倍），在内存中给它们找空闲空间更复杂。</li>
+</ul>
+<div class="aside" data-title="提示：使用混合">
+<p>当你有两个好的、看似对立的想法时，总应该看看能否把它们结合成两全其美的混合体。杂交玉米比任何天然品种都更强健。当然，不是所有杂交都是好主意——看看斑马和驴的杂交后代"斑驴"（Zeedonk）。</p>
+</div>
+
+<h2 id="multilevel">多级页表</h2>
+<p>另一种方法不依赖分段，却攻击同一个问题：如何去掉页表中所有无效的区域，而不是把它们都留在内存里？这就是<strong>多级页表</strong>，它把线性页表变成类似树的结构。
+这种方法非常有效，许多现代系统都在使用（例如 x86）。</p>
+<p>基本思想很简单：先把页表切成页大小的单元；如果一整页的 PTE 都无效，就<strong>完全不分配</strong>这一页页表。为了追踪页表的某一页是否有效（以及有效时它在内存中的位置），
+使用一个新结构——<strong>页目录（page directory）</strong>：它要么告诉你页表的某一页在哪里，要么告诉你这一整页页表里没有有效的页。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 760 450" width="760" role="img" aria-label="线性页表与多级页表">
+  <defs><marker id="a20b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker></defs>
+  <text x="130" y="18" text-anchor="middle" font-size="13.5" font-weight="600">线性页表</text>
+  <g id="f203-lin"></g>
+  <text x="540" y="18" text-anchor="middle" font-size="13.5" font-weight="600">多级页表</text>
+  <g id="f203-ml"></g>
+</svg>
+<figcaption>图 20.3：左边是线性页表（占 4 页：PFN 201～204），尽管中间两页全是无效项也必须分配；右边是多级页表：页目录（PFN 200）只标记第一页和最后一页有效，中间两页页表<strong>根本不存在</strong>，那两个页帧可以另作他用。</figcaption>
+</figure>
+
+<p>在简单的两级页表中，页目录的每一项对应页表的一页，称为<strong>页目录项（PDE）</strong>。PDE（至少）有一个有效位和一个 PFN，和 PTE 类似；
+但有效位的含义略有不同：PDE 有效表示它指向的那一页页表中<strong>至少有一个</strong> PTE 有效。PDE 无效时，PDE 的其余部分没有定义。</p>
+<p>多级页表的优点：</p>
+<ul>
+  <li>只按<strong>实际使用的地址空间</strong>的比例分配页表空间，通常很紧凑，并且支持稀疏的地址空间。</li>
+  <li>精心构造时，页表的每一部分都正好放进一页，内存管理更容易：OS 需要分配或增长页表时，取下一个空闲页即可。
+  相比之下，线性页表（未分页的）必须在物理内存中<strong>连续</strong>存放，为一个 4MB 的页表找到连续的空闲物理内存可能相当困难。
+  多级结构通过页目录增加了一层<strong>间接（indirection）</strong>，让页表页可以放在物理内存的任何地方。</li>
+</ul>
+<p>代价也很明显：</p>
+<ul>
+  <li><strong>时间</strong>：TLB 未命中时需要从内存加载两次（一次页目录、一次 PTE）才能得到转换，而线性页表只要一次。这是一个小小的<strong>时间-空间权衡</strong>：
+  我们得到了更小的表，但不是免费的；在常见情况（TLB 命中）下性能完全一样，TLB 未命中则更昂贵。</li>
+  <li><strong>复杂性</strong>：无论由硬件还是 OS 处理查找，都比简单的线性页表查找更复杂。我们常常愿意增加复杂性来提高性能或降低开销；在这里，是让页表查找更复杂来节省宝贵的内存。</li>
+</ul>
+<div class="aside" data-title="提示：理解时间-空间权衡">
+<p>构建数据结构时，总要考虑时间和空间的权衡。通常，如果想让访问某个数据结构更快，就要为它付出空间上的代价。</p>
+</div>
+
+<h2 id="example">详细的多级页表例子</h2>
+<p>地址空间 <strong>16KB</strong>，页 <strong>64 字节</strong>：虚拟地址 14 位，VPN 8 位、偏移 6 位。线性页表有 2<sup>8</sup> = 256 项，即使只用了地址空间的一小部分。
+这个例子里，VPN 0、1 是代码，VPN 4、5 是堆，VPN 254、255 是栈，其余全都未用。</p>
+<p>每个 PTE 4 字节，整个页表 256 × 4 = 1KB；按 64 字节一页切开，共 <strong>16 页</strong>，每页装 16 个 PTE。页目录需要为页表的每一页准备一项，所以有 16 项，
+需要 VPN 的 <strong>高 4 位</strong>作为页目录索引（PDIndex）；剩下的低 4 位作为页表索引（PTIndex）：</p>
+<figure class="fig">
+<svg viewBox="0 0 560 110" width="560" role="img" aria-label="14 位虚拟地址的拆分">
+  <g id="f-split14"></g>
+</svg>
+<figcaption>14 位虚拟地址：<span class="tpd">PDIndex（4 位）</span> | <span class="tpt">PTIndex（4 位）</span> | <span class="to">偏移（6 位）</span>。</figcaption>
+</figure>
+<pre><code>PDEAddr = PageDirBase + (PDIndex * sizeof(PDE))        // 先找页目录项
+PTEAddr = (PDE.PFN &lt;&lt; SHIFT) + (PTIndex * sizeof(PTE)) // PDE 给出页表页的 PFN，左移后再加上页内的下标
+PhysAddr = (PTE.PFN &lt;&lt; SHIFT) + offset</code></pre>
+<p>注意 PDE 中的 PFN 必须先<strong>左移</strong>到位，才能和页表索引组合成 PTE 的地址。页目录如下：页表的第 0 页在 PFN 100，最后一页在 PFN 101，其余 14 页都不存在。
+这样只需分配 <strong>3 页</strong>（1 页页目录 + 2 页页表），而不是线性页表的全部 16 页；对 32 位或 64 位的大地址空间，节省会大得多。</p>
+
+<section class="sim" id="sim-ml">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>两级页表地址转换（仿 paging-multilevel-translate.py）</h3>
+    <div class="desc">两种模式：①原书图 20.5 的例子，逐步走 PDE → 页表页 → PTE → 物理地址；②作业模拟器：随机种子生成 4KB 物理内存（128 页 × 32 字节）、页目录和页表，15 位虚拟地址 = 5 | 5 | 5 位。随机数与 Python 一致，<strong>同一种子的内存内容、PDBR 和地址与官方脚本完全相同</strong>。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>模式 <select id="ml-mode"><option value="book">原书例子（16KB 空间，64 字节页）</option><option value="hw">作业模拟器（-s 种子）</option></select></label>
+      <span id="ml-hwctl" hidden><label>种子 -s <input type="number" id="ml-seed" value="0" min="0"></label>
+      <label>已分配页 -a <input type="number" id="ml-alloc" value="64" min="1" max="90"></label>
+      <label>地址数 -n <input type="number" id="ml-num" value="10" min="1" max="30"></label>
+      <button class="primary" id="ml-gen">生成</button></span>
+    </div>
+    <div class="controls">
+      <label>虚拟地址 <input type="text" id="ml-va" value="0x3F80" size="9"></label>
+      <button id="ml-go">翻译</button>
+      <span class="muted small">十六进制加 0x，例如 0x3F80</span>
+    </div>
+    <div class="pills" id="ml-pills"></div>
+    <div id="ml-step" style="margin-top:10px"></div>
+    <div class="stage">
+      <div id="ml-bits"></div>
+      <div id="ml-tables"></div>
+    </div>
+    <div class="narrate" id="ml-nar"></div>
+    <div class="stats" id="ml-stats"></div>
+  </div>
+</section>
+
+<p>用原书的数字核对一遍：虚拟地址 <code>0x3F80</code>（二进制 <code>11 1111 1000 0000</code>）是 VPN 254 的第 0 个字节。VPN 的高 4 位 <span class="tpd">1111</span> 选择页目录的最后一项（第 15 项），
+它指向位于 PFN 101 的有效页表页；再用 VPN 的低 4 位 <span class="tpt">1110</span> 选中这页里倒数第二项（第 14 项），得知虚拟页 254 映射到物理页 55。
+PFN 55（0x37）与偏移 000000 拼接：<code>PhysAddr = (PTE.PFN &lt;&lt; SHIFT) + offset = 00 1101 1100 0000 = 0x0DC0</code>。</p>
+
+<h2 id="deeper">超过两级</h2>
+<p>有时两级还不够。例子：<strong>30 位</strong>虚拟地址空间，<strong>512 字节</strong>的小页：VPN 21 位、偏移 9 位。</p>
+<p>构造多级页表的目标是<strong>让页表的每一部分都放进一页</strong>。一页 512 字节、PTE 4 字节，所以一页能放 128 个 PTE，页表索引需要 VPN 的最低 7 位（log<sub>2</sub>128）。
+剩下 14 位给页目录——但 2<sup>14</sup> 个 PDE（每个 4 字节）占 128 页而不是 1 页，"每部分都放进一页"的目标落空了。
+解决办法：再加一层，把页目录本身也切成页，在上面放一个顶层页目录指向这些页目录页：</p>
+<figure class="fig">
+<svg viewBox="0 0 720 150" width="720" role="img" aria-label="三级页表的地址拆分">
+  <g id="f-split30"></g>
+</svg>
+<figcaption>30 位虚拟地址、512 字节页：<span class="tpd">PD Index 0（7 位）</span> | <span class="tpd">PD Index 1（7 位）</span> | <span class="tpt">页表索引（7 位）</span> | <span class="to">偏移（9 位）</span>。每一级正好是 128 项 × 4 字节 = 一页。</figcaption>
+</figure>
+<p>查找时先用最高的 PD Index 0 在顶层页目录中取 PDE；若有效，把它的 PFN 与 PD Index 1 组合，查第二级页目录；若仍有效，再用页表索引和第二级 PDE 给出的地址找到 PTE。
+唷！为了在多级表里查点东西，工作量可不小。下面的计算器可以对任意地址空间算出需要几级。</p>
+
+<section class="sim" id="sim-calc">
+  <div class="sim-head"><span class="tag">计算器</span><h3>需要几级？比线性页表省多少？</h3>
+    <div class="desc">给定地址位数、页大小、PTE 大小，按"每一级正好放进一页"的原则算出级数和位的拆分；再给出进程实际使用的 VPN 区间，统计多级页表每一级要分配多少页，与线性页表对比。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>虚拟地址位数 <input type="number" id="cc-bits" value="30" min="8" max="64"></label>
+      <label>页大小 <select id="cc-ps"><option value="64">64B</option><option value="512" selected>512B</option><option value="1024">1KB</option><option value="4096">4KB</option><option value="16384">16KB</option><option value="65536">64KB</option></select></label>
+      <label>PTE 大小 <select id="cc-pte"><option value="1">1 字节</option><option value="4" selected>4 字节</option><option value="8">8 字节</option></select></label>
+    </div>
+    <div class="controls" style="width:100%"><label style="flex:1;min-width:260px">使用中的 VPN 区间（如 <code>0-99, 2000-2009</code>；<code>a-b:s</code> 表示从 a 到 b 每隔 s 取一页）<input type="text" id="cc-rng" value="0-99, 2097100-2097151" style="width:100%"></label></div>
+    <div class="controls">
+      <button data-cc="30,512,4,0-99, 2097100-2097151">原书：30 位 / 512B 页</button>
+      <button data-cc="14,64,4,0-1, 4-5, 254-255">原书图 20.5：14 位 / 64B 页</button>
+      <button data-cc="32,4096,4,0x8048-0x8100, 0x9000-0x9100, 0xBFF00-0xBFFFF">32 位 x86 / 4KB（两级）</button>
+      <button data-cc="32,4096,8,0x8048-0x8100, 0xBFF00-0xBFFFF">32 位 PAE（8 字节 PTE，三级）</button>
+      <button data-cc="48,4096,8,0x555555554-0x5555555FF, 0x7FFFFFFDE-0x7FFFFFFFF">48 位 x86-64（四级）</button>
+      <button data-cc="48,4096,8,0-261632:512">实验：512 页，相隔 2MB</button>
+      <button data-cc="57,4096,8,0-99">57 位（五级）</button>
+    </div>
+    <div class="stage" id="cc-stage"></div>
+    <div class="narrate" id="cc-nar"></div>
+    <div class="stats" id="cc-stats"></div>
+  </div>
+</section>
+
+<h2 id="flow">转换过程：别忘了 TLB</h2>
+<p>把两级页表的整个地址转换过程写成算法（原书图 20.6，硬件管理的 TLB）：每次内存引用都<strong>先查 TLB</strong>，命中就直接得到物理地址，完全不碰页表；
+只有未命中时才做完整的多级查找——这条路径上，传统的两级页表要额外访问<strong>两次</strong>内存。</p>
+<pre><code> 1  VPN = (VirtualAddress &amp; VPN_MASK) &gt;&gt; SHIFT
+ 2  (Success, TlbEntry) = TLB_Lookup(VPN)
+ 3  if (Success == True)    // TLB 命中
+ 4      if (CanAccess(TlbEntry.ProtectBits) == True)
+ 5          Offset   = VirtualAddress &amp; OFFSET_MASK
+ 6          PhysAddr = (TlbEntry.PFN &lt;&lt; SHIFT) | Offset
+ 7          Register = AccessMemory(PhysAddr)
+ 8      else
+ 9          RaiseException(PROTECTION_FAULT)
+10  else                    // TLB 未命中
+11      // 先取页目录项
+12      PDIndex = (VPN &amp; PD_MASK) &gt;&gt; PD_SHIFT
+13      PDEAddr = PDBR + (PDIndex * sizeof(PDE))
+14      PDE     = AccessMemory(PDEAddr)                  // 第 1 次额外访存
+15      if (PDE.Valid == False)
+16          RaiseException(SEGMENTATION_FAULT)
+17      else
+18          // PDE 有效：再从页表页中取 PTE
+19          PTIndex = (VPN &amp; PT_MASK) &gt;&gt; PT_SHIFT
+20          PTEAddr = (PDE.PFN &lt;&lt; SHIFT) + (PTIndex * sizeof(PTE))
+21          PTE     = AccessMemory(PTEAddr)              // 第 2 次额外访存
+22          if (PTE.Valid == False)
+23              RaiseException(SEGMENTATION_FAULT)
+24          else if (CanAccess(PTE.ProtectBits) == False)
+25              RaiseException(PROTECTION_FAULT)
+26          else
+27              TLB_Insert(VPN, PTE.PFN, PTE.ProtectBits)
+28              RetryInstruction()</code></pre>
+<ul>
+  <li><strong>第 12～16 行</strong>：页目录这一级。PDE 无效说明整块地址（一整页 PTE 覆盖的范围）都没分配，直接报错——连页表页都不用读。</li>
+  <li><strong>第 20 行</strong>：PDE 里的 PFN 左移后才是页表页的物理地址，再加上页内下标 × PTE 大小。</li>
+  <li>k 级页表在未命中时要额外访问 k 次内存；所以 TLB 的高命中率对多级页表更加关键。</li>
+</ul>
+
+<h2 id="inverted">反向页表</h2>
+<p>更极端的空间节省来自<strong>反向页表</strong>：不再是每个进程一张页表，而是整个系统<strong>只有一张</strong>，每个<strong>物理页</strong>对应一项，记录哪个进程在使用这一页、以及该进程的哪个虚拟页映射到这里。</p>
+<p>要找到正确的项就得搜索这个数据结构。线性扫描太昂贵，所以通常在基本结构之上建一个<strong>哈希表</strong>来加速查找。PowerPC 是这种体系结构的一个例子。</p>
+
+<section class="sim" id="sim-ipt">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>反向页表查找</h3>
+    <div class="desc">8 个物理页帧，每帧一项（进程号，VPN）。查找 (PID, VPN) 时先算哈希、找到桶，沿着链逐项比较；找到的那一项的<strong>下标就是 PFN</strong>。表的大小只和物理内存有关，与进程数、地址空间大小都无关。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>进程 PID <input type="number" id="ip-pid" value="2" min="1" max="9"></label>
+      <label>VPN <input type="number" id="ip-vpn" value="5" min="0" max="99"></label>
+      <span class="muted small">哈希函数：h = (PID × 7 + VPN) mod 4</span>
+    </div>
+    <div id="ip-step"></div>
+    <div class="stage" id="ip-stage"></div>
+    <div class="narrate" id="ip-nar"></div>
+  </div>
+</section>
+<p>反向页表再次印证了本书从一开始就在说的：<strong>页表只是数据结构</strong>。你可以对数据结构做很多疯狂的事情：让它们更小或更大，更慢或更快。多级页表和反向页表只是其中两个例子。</p>
+
+<h2 id="swap">把页表交换到磁盘</h2>
+<p>最后放宽一个假设：到目前为止我们都假设页表驻留在内核拥有的物理内存中。即使用了各种技巧来缩小页表，它们仍可能大到无法一次全部放进内存。
+因此有些系统把页表放在<strong>内核虚拟内存</strong>中，这样内存吃紧时系统可以把一部分页表换出到磁盘。等我们更详细地理解了如何在内存和磁盘之间移动页之后，
+会在后面关于 VAX/VMS 的案例研究（第 23 章）中再谈这个问题。</p>
+
+<h2 id="tradeoff">时间-空间权衡一览</h2>
+<div class="table-wrap"><table>
+<tr><th>结构</th><th>页表占用（每进程）</th><th>TLB 未命中时的额外访存</th><th>主要问题</th></tr>
+<tr><td>线性页表</td><td>与<strong>地址空间大小</strong>成正比（32 位 / 4KB：4MB）</td><td class="num">1</td><td>太大；要求大块连续物理内存</td></tr>
+<tr><td>更大的页</td><td>缩小为 1/k（页大 k 倍）</td><td class="num">1</td><td>内部碎片</td></tr>
+<tr><td>段页混合</td><td>与每段<strong>已用范围</strong>成正比</td><td class="num">1</td><td>稀疏的大堆仍然浪费；页表大小不一，外部碎片重现</td></tr>
+<tr><td>两级页表</td><td>与<strong>实际使用</strong>的地址空间成正比（以页为单位）</td><td class="num">2</td><td>未命中更慢；更复杂</td></tr>
+<tr><td>k 级页表（x86-64 为 4 级）</td><td>同上，适用于 48/57 位的巨大地址空间</td><td class="num">k</td><td>未命中代价随级数增长</td></tr>
+<tr><td>反向页表</td><td>全系统一张，与<strong>物理内存</strong>成正比</td><td class="num">哈希查找（≥ 1）</td><td>查找要搜索；共享页不好处理</td></tr>
+</table></div>
+<p>总之，表越大，TLB 未命中处理得越快；反之亦然。正确的选择强烈依赖于环境的约束：内存受限的系统（像许多老系统）适合小结构；
+内存较充裕、工作负载主动使用大量页的系统，用一个能加速 TLB 未命中处理的较大页表可能更合适。有了软件管理的 TLB，
+整个数据结构的空间都向操作系统创新者敞开了（提示：就是你）。</p>
+<div class="aside" data-title="提示：警惕复杂性">
+<p>系统设计者应该警惕在系统中加入复杂性。好的系统构建者会实现能完成任务的<strong>最不复杂</strong>的系统：如果磁盘空间充足，就不该设计一个拼命节省字节的文件系统；
+如果处理器很快，写一个干净易懂的 OS 模块就比写 CPU 优化到极致的手工汇编更好。正如 Antoine de Saint-Exupéry 所说："完美不是无可增加，而是无可删减。"</p>
+</div>
+
+<h2 id="lab">动手实验：看看真实进程的页表有多大</h2>
+<div class="lab">
+<p>Linux 在 <code>/proc/self/status</code> 里用 <code>VmPTE</code> 报告当前进程页表占用的内存。<code>ptcost.c</code> 三次写入同样多的数据（512 页 = 2MB），
+只是分布的稀疏程度不同，观察页表各增加多少。x86-64 是 4 级页表：每个页表页 4KB，装 512 个 8 字节项，一个最底层页表页管 2MB 虚拟地址，一个第三级页管 1GB。</p>
+<pre><code><span class="cmd">cd labs/20-smaller-tables &amp;&amp; make &amp;&amp; ./ptcost</span></code></pre>
+<p class="small muted">示例输出（WSL2，gcc 14），你的机器上数字会略有不同：</p>
+<pre><code id="pt-out">页大小 4096 字节；开始时本进程页表占用 VmPTE = 52 kB
+
+数据  2048 KB   页表 +   12 KB =    3 个页表页   1) 连续 512 页（2MB）
+数据  2048 KB   页表 + 2052 KB =  513 个页表页   2) 512 页，每页相隔 2MB（跨 1GB）
+数据  2048 KB   页表 + 4100 KB = 1025 个页表页   3) 512 页，每页相隔 1GB（跨 512GB）
+
+同样是 2MB 数据：页表开销 12 KB → 2052 KB → 4100 KB。
+多级页表只为"用到的区域"分配页表页：越稀疏，每个有效页分摊的页表越多。
+对比：48 位地址空间的线性页表需要 2^36 项 × 8 字节 = 512 GB，而 VmPTE 只有几 MB。</code></pre>
+<p>解读：① 连续的 2MB 只需要 1 个最底层页表页（另外 2 页是这块新区域用到的上层页表页）；
+② 每页相隔 2MB，每一页都要一个<strong>独占的</strong> 4KB 页表页——为 4KB 数据花 4KB 页表；③ 每页相隔 1GB，连第三级也要各分配一页，页表开销再翻倍。
+上面的计算器"实验：512 页，相隔 2MB"预设算出的也是 512 个最底层页 + 上层各 1 页，和内核报告的一致。
+多级页表省空间的前提是<strong>地址空间的使用是成片的</strong>；而即便是最坏的情况 ③，也比 48 位线性页表所需的 512GB 小五个数量级。</p>
+</div>
+
+<h2 id="predict">先预测再验证</h2>
+<div class="exercise"><div class="q">（作业第 1 题）线性页表需要一个寄存器（页表基址）来定位页表。两级页表需要几个寄存器？三级呢？</div>
+<details class="reveal"><summary>看答案</summary><div>都只需要<strong>一个</strong>：指向顶层页目录的寄存器（PDBR；x86 上是 CR3）。下一级的位置都存放在上一级的表项（PDE 的 PFN）里，不需要额外的寄存器。</div></details></div>
+<div class="exercise"><div class="q">（作业第 2 题）在模拟器的"作业模式"里用种子 0、1、2 做地址转换，先手算再单步验证。每次查找需要多少次内存访问？</div>
+<details class="reveal"><summary>看答案</summary><div>每次成功的转换要 <strong>3 次</strong>访存：读 PDE、读 PTE、读数据本身（这里假设没有 TLB）；PDE 无效时只读了 1 次就报错，PTE 无效时读了 2 次。
+例如种子 0：PDBR = 108，第一个地址 0x611c → PDE 下标 24，内容 0xa1（有效，PFN 33）→ PTE 下标 8，内容 0xb5（有效，PFN 53）→ 物理地址 0x6bc，值 0x08。</div></details></div>
+<div class="exercise"><div class="q">（作业第 3 题）根据你对缓存的理解，对页表的内存访问在 CPU 缓存里会表现如何？命中多还是未命中多？</div>
+<details class="reveal"><summary>看答案</summary><div>页目录很小，而且每次 TLB 未命中都要访问，通常会一直留在缓存里，命中率很高；页表页的访问取决于程序的局部性：顺序访问时同一页表页的相邻 PTE 在同一缓存行里（64 字节行可放 16 个 4 字节 PTE），也容易命中；
+随机访问大范围地址时，PTE 很可能缓存未命中，TLB 未命中的代价就更大——第 19 章实验中页数超过 L2 TLB 后耗时陡增，部分原因正是如此。</div></details></div>
+<div class="exercise"><div class="q">用计算器：32 位地址空间、4KB 页，PTE 从 4 字节改成 8 字节，级数怎么变？</div>
+<details class="reveal"><summary>看答案</summary><div>4 字节 PTE：一页放 1024 项（10 位），VPN 20 位 → 两级（10 + 10），这就是经典 32 位 x86。8 字节 PTE：一页只放 512 项（9 位），20 位 VPN 需要三级（2 + 9 + 9），这就是 x86 的 PAE 模式，顶层只有 4 项。</div></details></div>
+<div class="exercise"><div class="q">原书例子中，翻译 0x0080 和 0x1000 会发生什么？各访问了几次内存？</div>
+<details class="reveal"><summary>看答案</summary><div>0x0080 = VPN 2：PDIndex 0 有效（PFN 100），但 PTIndex 2 的 PTE 无效 → 段错误，访问了 2 次内存（PDE、PTE）。0x1000 = VPN 64：PDIndex 4 的 PDE 无效 → 段错误，只访问了 1 次（页表页都不存在）。</div></details></div>
+<div class="exercise"><div class="q">48 位地址空间、4KB 页、8 字节 PTE：如果进程只用了 1 页，多级页表至少占多少内存？线性页表呢？</div>
+<details class="reveal"><summary>看答案</summary><div>四级，每级 1 页：4 × 4KB = 16KB。线性页表：2<sup>36</sup> × 8 字节 = 512GB。</div></details></div>
+
+<h2 id="quiz">自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="1"><div class="q">1. 32 位地址空间、4 字节 PTE，页大小从 4KB 改为 16KB，线性页表大小如何变化？</div>
+<div class="opts"><button>A. 不变</button><button>B. 从 4MB 变为 1MB</button><button>C. 从 4MB 变为 256KB</button><button>D. 从 4MB 变为 2MB</button></div>
+<div class="explain">VPN 从 20 位变为 18 位，项数减为 1/4：2<sup>18</sup> × 4 = 1MB。</div></div>
+<div class="mcq" data-answer="2"><div class="q">2. 为什么不能简单地靠增大页来解决页表太大的问题？</div>
+<div class="opts"><button>A. 硬件不支持大页</button><button>B. 大页会产生外部碎片</button><button>C. 大页造成内部碎片，内存很快被用不满的大页占满</button><button>D. 大页让 TLB 命中率下降</button></div>
+<div class="explain">分配单位越大，单元内部没用上的浪费就越多，这是内部碎片。大页反而能提高 TLB 覆盖范围。</div></div>
+<div class="mcq" data-answer="1"><div class="q">3. 在段页混合方案中，段的基址寄存器存放的是什么？</div>
+<div class="opts"><button>A. 段的大小</button><button>B. 该段页表的物理地址</button><button>C. 段中最大的有效 VPN</button><button>D. 段在物理内存中的起始地址</button></div>
+<div class="explain">混合方案里基址不再指向段本身，而是指向该段的线性页表；界限寄存器表示页表的结尾。</div></div>
+<div class="mcq" data-answer="0"><div class="q">4. 两级页表中，PDE 有效意味着什么？</div>
+<div class="opts"><button>A. 它指向的页表页中至少有一个 PTE 有效</button><button>B. 对应的虚拟页被访问过</button><button>C. 对应的数据页在内存中</button><button>D. 它指向的页表页中所有 PTE 都有效</button></div>
+<div class="explain">只要那一页页表里有一个有效的 PTE，就需要分配这一页页表，PDE 就有效。</div></div>
+<div class="mcq" data-answer="3"><div class="q">5. 原书例子（14 位地址，64 字节页，4 位 PDIndex + 4 位 PTIndex），虚拟地址 0x3F80 的 PDIndex 和 PTIndex 分别是？</div>
+<div class="opts"><button>A. 15 和 15</button><button>B. 14 和 15</button><button>C. 3 和 15</button><button>D. 15 和 14</button></div>
+<div class="explain">0x3F80 = 11 1111 1000 0000，VPN = 1111 1110 = 254；高 4 位 1111 = 15，低 4 位 1110 = 14。</div></div>
+<div class="mcq" data-answer="3"><div class="q">6. 与线性页表相比，两级页表在 TLB 命中时的开销是？</div>
+<div class="opts"><button>A. 多 2 次访存</button><button>B. 多 1 次访存</button><button>C. 取决于页目录的大小</button><button>D. 完全一样</button></div>
+<div class="explain">命中时根本不查页表。只有 TLB 未命中时两级页表才多一次访存（2 次对 1 次）。</div></div>
+<div class="mcq" data-answer="2"><div class="q">7. 30 位虚拟地址、512 字节页、4 字节 PTE，要让每一级都放进一页，需要几级？</div>
+<div class="opts"><button>A. 1 级</button><button>B. 4 级</button><button>C. 3 级</button><button>D. 2 级</button></div>
+<div class="explain">偏移 9 位，VPN 21 位；一页装 128 项（7 位），21 / 7 = 3 级。两级的话页目录有 2<sup>14</sup> 项，要占 128 页。</div></div>
+<div class="mcq" data-answer="0"><div class="q">8. 反向页表的大小主要取决于什么？</div>
+<div class="opts"><button>A. 物理内存的页数</button><button>B. 虚拟地址空间大小</button><button>C. TLB 大小</button><button>D. 进程个数</button></div>
+<div class="explain">每个物理页一项，全系统一张表，与进程数和地址空间大小无关。代价是查找需要搜索（通常借助哈希表）。</div></div>
+<div class="mcq" data-answer="0"><div class="q">9. 多级页表"每一部分都正好放进一页"有什么好处？</div>
+<div class="opts"><button>A. 页表页可以放在任意空闲物理页中，不需要大块连续内存</button><button>B. 让 TLB 命中率更高</button><button>C. 减少 TLB 未命中时的访存次数</button><button>D. 不再需要有效位</button></div>
+<div class="explain">通过页目录这层间接，页表页可以像普通页一样分配；线性页表则要求整张表在物理内存中连续。</div></div>
+
+<h2 id="summary">常见误区与本章小结</h2>
+<div class="warn">
+<ul>
+  <li><strong>"多级页表总是更小"</strong>——如果地址空间几乎全被使用，多级页表比线性页表还多出页目录的开销；它的优势在于<strong>稀疏</strong>的地址空间。</li>
+  <li><strong>"多级页表让每次访存都变慢"</strong>——只有 TLB 未命中时才变慢；命中时和线性页表完全一样。</li>
+  <li><strong>"多级页表需要为每一级准备一个寄存器"</strong>——只需要指向顶层的一个寄存器。</li>
+  <li><strong>"PDE 里存的是页表页的虚拟地址"</strong>——PDE 存的是页表页的 PFN（物理帧号），使用前要左移。</li>
+  <li><strong>"大页主要是为了省页表"</strong>——多种页大小的主要目的是减轻 TLB 压力。</li>
+</ul>
+</div>
+<div class="key">
+<ul>
+  <li>线性页表与地址空间大小成正比，32 位就是每进程 4MB，64 位完全不可行。</li>
+  <li>更大的页：页表按比例缩小，但内部碎片严重。段页混合：每段一张页表，省掉堆栈之间的空洞，但不够灵活且引入外部碎片。</li>
+  <li><strong>多级页表</strong>：页表切成页大小的块，页目录记录哪些块存在；只为用到的部分分配，页表页可放在任意物理页中。代价是 TLB 未命中时每级一次访存、更复杂。</li>
+  <li>级数由"每级放进一页"决定：每级索引位数 = log<sub>2</sub>(页大小 / PTE 大小)，级数 = ⌈VPN 位数 / 每级位数⌉。x86-64：48 位、4KB、8 字节 → 4 级。</li>
+  <li>反向页表：全系统一张、每物理页一项，靠哈希查找。页表还可以放进内核虚拟内存并换出到磁盘。</li>
+  <li>这些都是<strong>时间-空间权衡</strong>。接下来第 21、22 章放宽"所有页都在内存中"的假设，研究交换（swapping）的机制与策略。</li>
+</ul>
+</div>
+
+</main>
+
+<script id="core">
+// ======================= 核心算法（纯函数，无 DOM；自检脚本会单独抽出来用 node 运行） =======================
+// Python random 的精确复刻：MT19937 + random.seed(int) + random.random()
+function PyRandom(seed) {
+  const N = 624, M = 397, mt = new Uint32Array(N);
+  let mti = N + 1;
+  function initGenrand(s) {
+    mt[0] = s >>> 0;
+    for (mti = 1; mti < N; mti++) { const p = mt[mti - 1] ^ (mt[mti - 1] >>> 30); mt[mti] = (Math.imul(1812433253, p) + mti) >>> 0; }
+  }
+  function initByArray(key) {
+    initGenrand(19650218);
+    let i = 1, j = 0, k = Math.max(N, key.length);
+    for (; k; k--) {
+      const p = mt[i - 1] ^ (mt[i - 1] >>> 30);
+      mt[i] = ((mt[i] ^ Math.imul(p, 1664525)) + key[j] + j) >>> 0; i++; j++;
+      if (i >= N) { mt[0] = mt[N - 1]; i = 1; }
+      if (j >= key.length) j = 0;
+    }
+    for (k = N - 1; k; k--) {
+      const p = mt[i - 1] ^ (mt[i - 1] >>> 30);
+      mt[i] = ((mt[i] ^ Math.imul(p, 1566083941)) - i) >>> 0; i++;
+      if (i >= N) { mt[0] = mt[N - 1]; i = 1; }
+    }
+    mt[0] = 0x80000000;
+  }
+  function genrand() {
+    let y;
+    if (mti >= N) {
+      let kk;
+      for (kk = 0; kk < N - M; kk++) { y = (mt[kk] & 0x80000000) | (mt[kk + 1] & 0x7fffffff); mt[kk] = mt[kk + M] ^ (y >>> 1) ^ (y & 1 ? 0x9908b0df : 0); }
+      for (; kk < N - 1; kk++) { y = (mt[kk] & 0x80000000) | (mt[kk + 1] & 0x7fffffff); mt[kk] = mt[kk + (M - N)] ^ (y >>> 1) ^ (y & 1 ? 0x9908b0df : 0); }
+      y = (mt[N - 1] & 0x80000000) | (mt[0] & 0x7fffffff); mt[N - 1] = mt[M - 1] ^ (y >>> 1) ^ (y & 1 ? 0x9908b0df : 0);
+      mti = 0;
+    }
+    y = mt[mti++];
+    y ^= y >>> 11; y = (y ^ ((y << 7) & 0x9d2c5680)) >>> 0; y = (y ^ ((y << 15) & 0xefc60000)) >>> 0; y ^= y >>> 18;
+    return y >>> 0;
+  }
+  let n = Math.abs(Math.trunc(Number(seed) || 0)); const key = [];
+  if (n === 0) key.push(0); else while (n > 0) { key.push(n % 4294967296); n = Math.floor(n / 4294967296); }
+  initByArray(key);
+  return function random() { const a = genrand() >>> 5, b = genrand() >>> 6; return (a * 67108864 + b) / 9007199254740992; };
+}
+// 复刻 paging-multilevel-translate.py：32 字节页、128 个物理页（4KB）、15 位虚拟地址、1 字节 PDE/PTE
+function mlGen(seed, allocated, num) {
+  const random = PyRandom(seed);
+  const pageSize = 32, physPages = 128, vaPages = 1024, pageBits = 5;
+  const mem = new Uint8Array(pageSize * physPages), usedPages = new Uint8Array(physPages);
+  let usedCount = 0;
+  function findFree() {
+    if (usedCount >= physPages) throw new Error("物理内存用完了");
+    let look = Math.floor(random() * physPages);
+    while (usedPages[look] === 1) look = Math.floor(random() * physPages);
+    usedCount++; usedPages[look] = 1; return look;
+  }
+  const initPage = (p) => { for (let i = p << pageBits; i < (p << pageBits) + pageSize; i++) mem[i] = 0x7f; };
+  const pdbr = findFree(); initPage(pdbr);
+  const used = new Uint8Array(vaPages), vps = [], ptPages = [], dataPages = [];
+  for (let n = 0; n < allocated; n++) {
+    let vp = Math.floor(random() * vaPages);
+    while (used[vp] === 1) vp = Math.floor(random() * vaPages);
+    used[vp] = 1; vps.push(vp);
+    const pp = findFree(); dataPages.push(pp);
+    const va = vp << pageBits;
+    const pdeAddr = (pdbr << pageBits) | ((va & 0x7c00) >> 10);
+    let ptePage;
+    if (((mem[pdeAddr] & 0x80) >> 7) === 0) { ptePage = findFree(); mem[pdeAddr] = 0x80 | ptePage; initPage(ptePage); ptPages.push(ptePage); }
+    else ptePage = mem[pdeAddr] & 0x7f;
+    mem[(ptePage << pageBits) | ((va & 0x03e0) >> 5)] = 0x80 | pp;
+    for (let j = 0; j < pageSize; j++) mem[pp * pageSize + j] = Math.floor(random() * 31);
+  }
+  const addrs = [];
+  for (let i = 0; i < num; i++) {
+    let vaddr;
+    if (random() * 100 > 50.0 || i >= vps.length) vaddr = Math.floor(random() * 1024 * 32);
+    else vaddr = (vps[i] << 5) | Math.floor(random() * 32);
+    addrs.push(vaddr);
+  }
+  return { mem, pdbr, vps, ptPages, dataPages, addrs };
+}
+function mlTranslate(sim, va) {
+  const pdIndex = (va & 0x7c00) >> 10, ptIndex = (va & 0x03e0) >> 5, offset = va & 0x1f;
+  const pdeAddr = (sim.pdbr << 5) | pdIndex, pde = sim.mem[pdeAddr];
+  const r = { va, pdIndex, ptIndex, offset, pdeAddr, pde, pdeValid: (pde & 0x80) >> 7, ptPage: pde & 0x7f };
+  if (!r.pdeValid) { r.fault = "pde"; return r; }
+  r.pteAddr = (r.ptPage << 5) | ptIndex; r.pte = sim.mem[r.pteAddr];
+  r.pteValid = (r.pte & 0x80) >> 7; r.pfn = r.pte & 0x7f;
+  if (!r.pteValid) { r.fault = "pte"; return r; }
+  r.pa = (r.pfn << 5) | offset; r.value = sim.mem[r.pa];
+  return r;
+}
+// 原书图 20.5：16KB 地址空间，64 字节页，4 字节 PTE，16 项页目录（页目录位置原书未给出，这里假设在 PFN 200）
+const BOOK20 = {
+  vaBits: 14, pageBits: 6, ptBits: 4, pdbr: 200,
+  pd: [100, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 101],
+  pt: {
+    100: [[10, "r-x"], [23, "r-x"], null, null, [80, "rw-"], [59, "rw-"], null, null, null, null, null, null, null, null, null, null],
+    101: [null, null, null, null, null, null, null, null, null, null, null, null, null, null, [55, "rw-"], [45, "rw-"]],
+  },
+};
+function bookTranslate(va) {
+  const B = BOOK20, vpn = va >> B.pageBits, offset = va & ((1 << B.pageBits) - 1);
+  const pdIndex = vpn >> B.ptBits, ptIndex = vpn & ((1 << B.ptBits) - 1);
+  const r = { va, vpn, offset, pdIndex, ptIndex, pdeAddr: (B.pdbr << B.pageBits) + pdIndex * 4 };
+  if (!(va >= 0 && va < 2 ** B.vaBits)) { r.out = true; return r; }
+  r.pdePfn = B.pd[pdIndex]; r.pdeValid = r.pdePfn >= 0;
+  if (!r.pdeValid) { r.fault = "pde"; return r; }
+  r.pteAddr = (r.pdePfn << B.pageBits) + ptIndex * 4;
+  const e = B.pt[r.pdePfn][ptIndex];
+  r.pteValid = !!e; if (!e) { r.fault = "pte"; return r; }
+  r.pfn = e[0]; r.prot = e[1]; r.pa = (r.pfn << B.pageBits) | offset;
+  return r;
+}
+// 需要几级？每级索引位数 = log2(页大小 / PTE 大小)；顶层可能不满
+function levelsFor(vaBits, pageSize, pteSize) {
+  const off = Math.log2(pageSize), per = Math.log2(pageSize / pteSize), vpn = vaBits - off;
+  const levels = Math.max(1, Math.ceil(vpn / per));
+  const split = []; let rest = vpn;
+  for (let i = 0; i < levels; i++) { const b = Math.min(per, rest - per * (levels - 1 - i)); split.push(b); rest -= b; }
+  return { off, per, vpn, levels, split }; // split[0] 是最顶层
+}
+// 线性 vs 多级：给定有效 VPN 区间，统计每层要分配几个页表页（顶层固定 1 页）
+function tableCost(vaBits, pageSize, pteSize, ranges) {
+  const L = levelsFor(vaBits, pageSize, pteSize), maxV = 2 ** L.vpn;
+  const linearBytes = maxV * pteSize;
+  const rs = ranges.map((r) => [Math.min(r[0], r[1]), Math.max(r[0], r[1])]).filter((r) => r[0] >= 0 && r[1] < maxV).sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const r of rs) { if (merged.length && r[0] <= merged[merged.length - 1][1] + 1) merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], r[1]); else merged.push(r.slice()); }
+  let validPages = 0; for (const r of merged) validPages += r[1] - r[0] + 1;
+  const perLevel = []; let shift = 0;
+  for (let lv = L.levels - 1; lv >= 0; lv--) {
+    shift += L.split[lv];
+    const div = 2 ** shift; let cnt = 0, last = -1;
+    for (const r of merged) { const a = Math.floor(r[0] / div), b = Math.floor(r[1] / div); const s = Math.max(a, last + 1); if (b >= s) cnt += b - s + 1; last = Math.max(last, b); }
+    perLevel.unshift(lv === 0 ? 1 : cnt);
+  }
+  const pagesTotal = perLevel.reduce((a, b) => a + b, 0);
+  return { ...L, linearBytes, perLevel, pagesTotal, multiBytes: pagesTotal * pageSize, validPages, ranges: merged };
+}
+// "0-99, 0x100-0x1ff, 5, 0-4096:512" → 区间数组
+function parseRanges(text) {
+  const out = [];
+  for (let tok of String(text).split(/[,，;\s]+/)) {
+    tok = tok.trim(); if (!tok) continue;
+    const m = /^(0x[0-9a-f]+|\d+)(?:-(0x[0-9a-f]+|\d+)(?::(0x[0-9a-f]+|\d+))?)?$/i.exec(tok);
+    if (!m) return { error: "无法解析：" + tok };
+    const a = Number(m[1]), b = m[2] != null ? Number(m[2]) : a, st = m[3] != null ? Number(m[3]) : 0;
+    if (st > 0) { if ((b - a) / st > 200000) return { error: "步长区间展开后太多：" + tok }; for (let v = a; v <= b; v += st) out.push([v, v]); }
+    else out.push([a, b]);
+  }
+  return { ranges: out };
+}
+// 反向页表：8 个物理帧，每帧 (pid, vpn)；哈希 h = (pid*7 + vpn) mod 4，桶里是按插入顺序串起来的 PFN 链
+const IPT = { frames: [[1, 0], [2, 5], [1, 3], [3, 1], [2, 9], [1, 7], [3, 5], [2, 1]], buckets: 4 };
+function iptHash(pid, vpn) { return (pid * 7 + vpn) % IPT.buckets; }
+function iptLookup(pid, vpn) {
+  const b = iptHash(pid, vpn), chain = [];
+  IPT.frames.forEach((f, pfn) => { if (iptHash(f[0], f[1]) === b) chain.push(pfn); });
+  const probes = [];
+  for (const pfn of chain) { probes.push(pfn); if (IPT.frames[pfn][0] === pid && IPT.frames[pfn][1] === vpn) return { bucket: b, chain, probes, pfn }; }
+  return { bucket: b, chain, probes, pfn: -1 };
+}
+</script>
+<script>
+(function () {
+  "use strict";
+  const { h, s, hex, bin } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  const parseNum = (t) => { t = String(t).trim().toLowerCase(); if (/^0x[0-9a-f]+$/.test(t)) return parseInt(t.slice(2), 16); if (/^0b[01]+$/.test(t)) return parseInt(t.slice(2), 2); if (/^\d+$/.test(t)) return parseInt(t, 10); return NaN; };
+  const stat = (box, v, l) => box.append(h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l)));
+  const fmtBytes = (n) => { const u = ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB"]; let k = 0; while (n >= 1024 && k < u.length - 1) { n /= 1024; k++; } return (Math.round(n * 100) / 100) + " " + u[k]; };
+  const hex2 = (n, w) => n.toString(16).padStart(w, "0");
+
+  // ---------------- 静态图：图 20.1/20.2 ----------------
+  (function () {
+    const as = $("f201-as"), pt = $("f201-pt");
+    const map = { 0: [10, "r-x", "1", "0", "code"], 4: [23, "rw-", "1", "1", "heap"], 14: [28, "rw-", "1", "1", "stack"], 15: [4, "rw-", "1", "1", "stack"] };
+    const col = { code: "var(--c1)", heap: "var(--c3)", stack: "var(--c2)" };
+    pt.append(s("text", { x: 300, y: 42, class: "t-muted", text: "VPN" }), s("text", { x: 350, y: 42, class: "t-muted", text: "PFN" }), s("text", { x: 400, y: 42, class: "t-muted", text: "valid" }), s("text", { x: 455, y: 42, class: "t-muted", text: "prot" }), s("text", { x: 505, y: 42, class: "t-muted", text: "present" }), s("text", { x: 570, y: 42, class: "t-muted", text: "dirty" }));
+    for (let v = 0; v < 16; v++) {
+      const y = 30 + (15 - v) * 23, e = map[v];
+      as.append(s("rect", { x: 40, y, width: 100, height: 21, rx: 3, style: e ? `fill:${col[e[4]]}` : "fill:var(--surface-2);stroke:var(--border)" }));
+      if (e) as.append(s("text", { x: 90, y: y + 15, "text-anchor": "middle", "font-size": 12, style: "fill:#fff;font-weight:600", text: e[4] }));
+      as.append(s("text", { x: 32, y: y + 15, "text-anchor": "end", "font-size": 11, class: "mono t-muted", text: v }));
+      const py = 52 + v * 22.5;
+      pt.append(s("rect", { x: 290, y: py - 14, width: 330, height: 20, rx: 3, class: e ? "ok-soft" : "box" }));
+      const cells = e ? [v, e[0], e[2], e[1], e[2], e[3]] : [v, "-", "0", "—", "-", "-"];
+      [300, 350, 410, 455, 520, 580].forEach((x, k) => pt.append(s("text", { x, y: py, class: e ? "" : "t-muted", text: cells[k] })));
+    }
+  })();
+
+  // ---------------- 静态图：图 20.3 ----------------
+  (function () {
+    const lin = $("f203-lin"), ml = $("f203-ml");
+    const E = [[1, "rx", 12], [1, "rx", 13], [0], [1, "rw", 100], [0], [0], [0], [0], [0], [0], [0], [0], [0], [0], [1, "rw", 86], [1, "rw", 15]];
+    const row = (g, x, y, e) => {
+      g.append(s("rect", { x, y, width: 150, height: 19, class: e[0] ? "ok-soft" : "box" }));
+      g.append(s("text", { x: x + 12, y: y + 14, "font-size": 11.5, class: "mono" + (e[0] ? "" : " t-muted"), text: e[0] }));
+      g.append(s("text", { x: x + 55, y: y + 14, "font-size": 11.5, class: "mono" + (e[0] ? "" : " t-muted"), text: e[0] ? e[1] : "-" }));
+      g.append(s("text", { x: x + 105, y: y + 14, "font-size": 11.5, class: "mono" + (e[0] ? "" : " t-muted"), text: e[0] ? e[2] : "-" }));
+    };
+    lin.append(s("text", { x: 70, y: 40, "font-size": 11, class: "t-muted", text: "valid  prot  PFN" }));
+    for (let k = 0; k < 16; k++) row(lin, 60, 46 + k * 21 + Math.floor(k / 4) * 6, E[k]);
+    for (let p = 0; p < 4; p++) { const y = 46 + p * 4 * 21 + p * 6; lin.append(s("rect", { x: 56, y: y - 2, width: 158, height: 4 * 21 + 2, rx: 4, style: "fill:none;stroke:var(--fg);stroke-width:1.2" })); lin.append(s("text", { x: 220, y: y + 44, "font-size": 11, class: "mono", text: "PFN " + (201 + p) })); }
+    lin.append(s("rect", { x: 0, y: 46, width: 46, height: 24, rx: 4, class: "accent-soft" })); lin.append(s("text", { x: 23, y: 62, "text-anchor": "middle", "font-size": 10.5, class: "mono", text: "PTBR" }));
+    lin.append(s("text", { x: 23, y: 84, "text-anchor": "middle", "font-size": 10.5, class: "mono", text: "201" }));
+    lin.append(s("path", { d: "M46,58 L54,58", style: "stroke:var(--accent);stroke-width:1.5", "marker-end": "url(#a20b)" }));
+    // 多级：页目录
+    ml.append(s("rect", { x: 330, y: 46, width: 50, height: 24, rx: 4, class: "accent-soft" })); ml.append(s("text", { x: 355, y: 62, "text-anchor": "middle", "font-size": 10.5, class: "mono", text: "PDBR" }));
+    ml.append(s("text", { x: 355, y: 84, "text-anchor": "middle", "font-size": 10.5, class: "mono", text: "200" }));
+    ml.append(s("text", { x: 400, y: 40, "font-size": 11, class: "t-muted", text: "valid  PFN" }));
+    const PD = [[1, 201], [0], [0], [1, 204]];
+    PD.forEach((d, k) => { const y = 46 + k * 21; ml.append(s("rect", { x: 390, y, width: 110, height: 19, class: d[0] ? "ok-soft" : "box" })); ml.append(s("text", { x: 402, y: y + 14, "font-size": 11.5, class: "mono", text: d[0] })); ml.append(s("text", { x: 448, y: y + 14, "font-size": 11.5, class: "mono" + (d[0] ? "" : " t-muted"), text: d[0] ? d[1] : "-" })); });
+    ml.append(s("rect", { x: 386, y: 44, width: 118, height: 86, rx: 4, style: "fill:none;stroke:var(--fg);stroke-width:1.2" }));
+    ml.append(s("text", { x: 445, y: 146, "text-anchor": "middle", "font-size": 11, class: "mono", text: "PFN 200：页目录" }));
+    ml.append(s("path", { d: "M380,58 L384,58", style: "stroke:var(--accent);stroke-width:1.5", "marker-end": "url(#a20b)" }));
+    // 两页页表
+    const pages = [{ y: 170, k0: 0, pfn: 201 }, { y: 300, k0: 12, pfn: 204 }];
+    for (const pg of pages) {
+      for (let k = 0; k < 4; k++) row(ml, 560, pg.y + k * 21, E[pg.k0 + k]);
+      ml.append(s("rect", { x: 556, y: pg.y - 2, width: 158, height: 86, rx: 4, style: "fill:none;stroke:var(--fg);stroke-width:1.2" }));
+      ml.append(s("text", { x: 635, y: pg.y + 100, "text-anchor": "middle", "font-size": 11, class: "mono", text: "PFN " + pg.pfn }));
+    }
+    ml.append(s("path", { d: "M500,56 C540,56 520,190 554,190", style: "stroke:var(--accent);stroke-width:1.5;fill:none", "marker-end": "url(#a20b)" }));
+    ml.append(s("path", { d: "M500,119 C540,119 520,320 554,320", style: "stroke:var(--accent);stroke-width:1.5;fill:none", "marker-end": "url(#a20b)" }));
+    ml.append(s("rect", { x: 380, y: 240, width: 150, height: 30, rx: 4, style: "fill:none;stroke:var(--border);stroke-dasharray:4 3" })); ml.append(s("text", { x: 455, y: 259, "text-anchor": "middle", "font-size": 11, class: "t-muted", text: "[页表第 1 页：未分配]" }));
+    ml.append(s("rect", { x: 380, y: 280, width: 150, height: 30, rx: 4, style: "fill:none;stroke:var(--border);stroke-dasharray:4 3" })); ml.append(s("text", { x: 455, y: 299, "text-anchor": "middle", "font-size": 11, class: "t-muted", text: "[页表第 2 页：未分配]" }));
+    ml.append(s("text", { x: 540, y: 436, "text-anchor": "middle", "font-size": 12, text: "共 3 页（1 页目录 + 2 页页表），线性页表要 4 页" }));
+  })();
+
+  // ---------------- 位拆分图 ----------------
+  function splitSvg(host, groups, total, W) {
+    const cw = Math.min(34, (W - 20) / total), x0 = (W - cw * total) / 2;
+    let x = x0, bitIdx = total - 1;
+    for (const g of groups) {
+      const w = g.n * cw;
+      host.append(s("rect", { x, y: 26, width: w - 2, height: 32, rx: 4, style: `fill:color-mix(in srgb, ${g.c} 20%, var(--surface));stroke:${g.c};stroke-width:1.5` }));
+      for (let k = 0; k < g.n; k++) host.append(s("text", { x: x + k * cw + cw / 2 - 1, y: 18, "text-anchor": "middle", "font-size": 10, class: "mono t-muted", text: bitIdx - k }));
+      host.append(s("text", { x: x + w / 2, y: 47, "text-anchor": "middle", "font-size": 12.5, "font-weight": 600, text: g.label }));
+      if (g.sub) host.append(s("text", { x: x + w / 2, y: 76, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", text: g.sub }));
+      x += w; bitIdx -= g.n;
+    }
+  }
+  splitSvg($("f-split14"), [{ n: 4, c: "var(--c4)", label: "PDIndex", sub: "选页目录项（16 项）" }, { n: 4, c: "var(--c1)", label: "PTIndex", sub: "选页内的 PTE（16 项）" }, { n: 6, c: "var(--c3)", label: "offset", sub: "页内偏移（64 字节）" }], 14, 560);
+  $("f-split14").append(s("text", { x: 280, y: 100, "text-anchor": "middle", "font-size": 12, text: "VPN = 高 8 位 = PDIndex | PTIndex" }));
+  splitSvg($("f-split30"), [{ n: 7, c: "var(--c4)", label: "PD Index 0", sub: "顶层页目录（128 项 = 1 页）" }, { n: 7, c: "var(--c5)", label: "PD Index 1", sub: "第二级页目录（1 页）" }, { n: 7, c: "var(--c1)", label: "PT Index", sub: "页表页（1 页）" }, { n: 9, c: "var(--c3)", label: "offset", sub: "512 字节页" }], 30, 720);
+  $("f-split30").append(s("text", { x: 360, y: 108, "text-anchor": "middle", "font-size": 12, text: "两级时：页目录索引有 14 位 → 2^14 个 PDE × 4 字节 = 64KB = 128 页，放不进一页" }));
+  $("f-split30").append(s("text", { x: 360, y: 130, "text-anchor": "middle", "font-size": 12, class: "t-muted", text: "所以把页目录再切成页，上面加一层顶层页目录" }));
+
+  // ---------------- 模拟器：两级页表 ----------------
+  let mode = "book", HW = null, cur = null;
+  function bitsGroup(value, width, cls, caption) {
+    const cells = h("div", { class: "cells" }), b = bin(value, width);
+    for (let k = 0; k < width; k++) cells.append(h("span", { class: "bit " + cls }, b[k]));
+    return h("div", { class: "bitgrp" }, cells, h("span", { class: "cap" }, caption));
+  }
+  function mlGenerate() {
+    try { HW = mlGen(Math.max(0, parseInt($("ml-seed").value, 10) || 0), Math.max(1, Math.min(90, parseInt($("ml-alloc").value, 10) || 64)), Math.max(1, Math.min(30, parseInt($("ml-num").value, 10) || 10))); }
+    catch (e) { HW = { error: e.message }; }
+  }
+  function translateCur() {
+    const va = parseNum($("ml-va").value);
+    if (isNaN(va)) { cur = { bad: true }; }
+    else if (mode === "book") cur = bookTranslate(va);
+    else cur = HW && !HW.error ? (va >= 0 && va < 32768 ? mlTranslate(HW, va) : { va, out: true }) : { bad: true };
+    renderPills(); mlStep.reset();
+  }
+  function renderPills() {
+    const box = $("ml-pills"); box.replaceChildren();
+    const list = mode === "book" ? [0x3f80, 0x0040, 0x0150, 0x3fc5, 0x0080, 0x1000] : HW && !HW.error ? HW.addrs : [];
+    box.append(h("span", { class: "muted small" }, mode === "book" ? "示例地址：" : "生成的地址（点击翻译）："));
+    list.forEach((va) => {
+      const r = mode === "book" ? bookTranslate(va) : mlTranslate(HW, va);
+      box.append(h("button", { class: (r.fault ? "badv" : "okv") + (cur && cur.va === va ? " cur" : ""), onclick: () => { $("ml-va").value = "0x" + va.toString(16).toUpperCase().padStart(4, "0"); translateCur(); } }, "0x" + va.toString(16).padStart(4, "0")));
+    });
+    if (mode === "hw" && HW && !HW.error) box.append(h("span", { class: "muted small" }, "　PDBR = " + HW.pdbr));
+  }
+  function mlSteps() { if (!cur || cur.bad || cur.out) return 1; if (cur.fault === "pde") return 4; if (cur.fault === "pte") return 6; return 7; }
+  function entryTable(title, rows, act, bad, dim) {
+    const t = h("table", { class: "etab" });
+    rows.forEach((r, k) => { const tr = h("tr", { class: (r.inv ? "inv" : "") + (k === act ? " act" + (bad ? " bad" : "") : "") }); r.cells.forEach((c) => tr.append(h(r.head ? "th" : "td", {}, c))); t.append(tr); });
+    return h("div", { class: "panel" + (dim ? " dim" : "") }, h("h5", {}, title), t);
+  }
+  function mlRender(i) {
+    const bitsBox = $("ml-bits"), tabs = $("ml-tables"), nar = $("ml-nar"), st = $("ml-stats");
+    bitsBox.replaceChildren(); tabs.replaceChildren(); st.replaceChildren();
+    if (mode === "hw" && HW && HW.error) { nar.innerHTML = '<span class="err">' + HW.error + "</span>"; return; }
+    if (!cur || cur.bad) { nar.innerHTML = '<span class="err">无法解析这个地址。</span>请输入十六进制（0x3F80）或十进制。'; return; }
+    const book = mode === "book", VA = book ? 14 : 15, OFF = book ? 6 : 5, PDB = book ? 4 : 5, PTB = book ? 4 : 5;
+    if (cur.out) { nar.innerHTML = `<span class="err">地址超出 ${VA} 位虚拟地址空间</span>（0 ～ ${hex(2 ** VA - 1)}）。`; return; }
+    // 位
+    const row = h("div", { class: "addr-row" }, h("span", { class: "rowlab" }, "虚拟地址"));
+    const b = h("div", { class: "bits" });
+    if (i === 0) b.append(bitsGroup(cur.va, VA, "", VA + " 位"));
+    else b.append(bitsGroup(cur.pdIndex, PDB, "pd", "PDIndex = " + cur.pdIndex), bitsGroup(cur.ptIndex, PTB, "pt", "PTIndex = " + cur.ptIndex), bitsGroup(cur.offset, OFF, "off", "offset = " + cur.offset));
+    row.append(b, h("span", { class: "mono small" }, "= " + hex(cur.va, 4) + " = " + cur.va));
+    bitsBox.append(row);
+    const done = !cur.fault && i >= 6;
+    if (done) {
+      const pr = h("div", { class: "addr-row", style: { marginTop: "6px" } }, h("span", { class: "rowlab" }, "物理地址"));
+      const pfnBits = book ? 8 : 7;
+      pr.append(h("div", { class: "bits" }, bitsGroup(cur.pfn, pfnBits, "pfn", "PFN = " + cur.pfn), bitsGroup(cur.offset, OFF, "off", "offset = " + cur.offset)), h("span", { class: "mono small" }, "= " + hex(cur.pa, book ? 4 : 3) + (book ? "" : "，值 = " + hex(cur.value, 2))));
+      bitsBox.append(pr);
+    }
+    // 表
+    const grid = h("div", { class: "tables3" });
+    const pdAct = i >= 2 ? cur.pdIndex : -1, pdBad = i >= 3 && cur.fault === "pde";
+    if (book) {
+      const B = BOOK20;
+      const pdRows = [{ head: true, cells: ["#", "valid", "PFN"] }].concat(B.pd.map((p, k) => ({ inv: p < 0, cells: [k, p >= 0 ? 1 : 0, p >= 0 ? p : "—"] })));
+      grid.append(entryTable("页目录 @ PFN " + B.pdbr + "（假设）", pdRows, pdAct >= 0 ? pdAct + 1 : -1, pdBad, false));
+      for (const pfn of [100, 101]) {
+        const active = i >= 4 && cur.pdeValid && cur.pdePfn === pfn;
+        const rows = [{ head: true, cells: ["#", "PFN", "valid", "prot"] }].concat(B.pt[pfn].map((e, k) => ({ inv: !e, cells: [k, e ? e[0] : "—", e ? 1 : 0, e ? e[1] : "—"] })));
+        grid.append(entryTable("页表页 @ PFN " + pfn, rows, active ? cur.ptIndex + 1 : -1, i >= 5 && cur.fault === "pte", i >= 3 && !active));
+      }
+      tabs.append(grid);
+    } else {
+      const mem = HW.mem, pd = HW.pdbr;
+      const pdRows = [{ head: true, cells: ["#", "内容", "V", "PFN"] }];
+      for (let k = 0; k < 32; k++) { const v = mem[pd * 32 + k]; pdRows.push({ inv: !(v & 0x80), cells: [k, hex2(v, 2), v >> 7, v & 0x7f] }); }
+      grid.append(entryTable("页目录 = 物理页 " + pd + "（PDBR）", pdRows, pdAct >= 0 ? pdAct + 1 : -1, pdBad, false));
+      if (i >= 4 && cur.pdeValid) {
+        const ptRows = [{ head: true, cells: ["#", "内容", "V", "PFN"] }];
+        for (let k = 0; k < 32; k++) { const v = mem[cur.ptPage * 32 + k]; ptRows.push({ inv: !(v & 0x80), cells: [k, hex2(v, 2), v >> 7, v & 0x7f] }); }
+        grid.append(entryTable("页表页 = 物理页 " + cur.ptPage, ptRows, cur.ptIndex + 1, i >= 5 && cur.fault === "pte", false));
+      } else grid.append(h("div", { class: "panel dim" }, h("h5", {}, "页表页"), h("div", { class: "small muted" }, "还没读到 PDE，不知道页表页在哪里")));
+      if (done) {
+        const dRows = [{ head: true, cells: ["偏移", "值"] }];
+        for (let k = 0; k < 32; k++) dRows.push({ cells: [k, hex2(mem[cur.pfn * 32 + k], 2)] });
+        grid.append(entryTable("数据页 = 物理页 " + cur.pfn, dRows, cur.offset + 1, false, false));
+      } else grid.append(h("div", { class: "panel dim" }, h("h5", {}, "数据页"), h("div", { class: "small muted" }, cur.fault ? "转换失败，不会访问数据" : "还没得到 PFN")));
+      tabs.append(grid);
+      // 内存转储
+      const dump = h("div", { class: "memdump" });
+      for (let p = 0; p < 128; p++) {
+        const cls = p === pd ? "pdp" : (i >= 4 && cur.pdeValid && p === cur.ptPage) ? "ptp" : (done && p === cur.pfn) ? "dp" : "";
+        const r = h("div", { class: "row " + cls }, h("span", { class: "pn" }, "page " + String(p).padStart(3, " ") + ": "));
+        for (let k = 0; k < 32; k++) {
+          const addr = p * 32 + k;
+          const hl = (i >= 2 && addr === cur.pdeAddr) || (i >= 4 && addr === cur.pteAddr) || (done && addr === cur.pa);
+          r.append(h("span", { class: "b" + (hl ? " hl" : "") }, hex2(mem[addr], 2)));
+        }
+        dump.append(r);
+      }
+      tabs.append(h("div", { class: "small muted", style: { marginTop: "8px" } }, "完整的物理内存转储（与脚本输出的格式相同）：紫色 = 页目录，蓝色 = 页表页，橙色 = 数据页，方框 = 本次读取的字节"), dump);
+      const focus = (done ? cur.pfn : i >= 4 && cur.pdeValid ? cur.ptPage : pd);
+      queueMicrotask(() => { const el = dump.children[focus]; if (el) dump.scrollTop = el.offsetTop - dump.clientHeight / 2; });
+    }
+    // 解说
+    const pdbrTxt = book ? `PDBR = ${BOOK20.pdbr}（原书没给出页目录的位置，这里假设在 PFN 200）` : `PDBR = ${HW.pdbr}`;
+    const pdeSize = book ? 4 : 1, shift = OFF;
+    const pdeVal = book ? (cur.pdeValid ? `valid = 1，PFN = ${cur.pdePfn}` : "valid = 0") : `内容 ${hex(cur.pde, 2)}：最高位 valid = ${cur.pdeValid}，低 7 位 PFN = ${cur.ptPage}`;
+    const ptePfn = book ? cur.pdePfn : cur.ptPage;
+    const msgs = [
+      `第 1 步：虚拟地址 <b>${hex(cur.va, 4)}</b> 写成 ${VA} 位二进制是 <code>${bin(cur.va, VA)}</code>。先假设 TLB 未命中，要走一遍页表。`,
+      `第 2 步：页大小 ${2 ** OFF} 字节 → 低 ${OFF} 位是<span class="to">偏移 ${cur.offset}</span>；VPN = ${cur.va >> OFF}。每个页表页装 ${2 ** PTB} 个 PTE，所以 VPN 的低 ${PTB} 位是 <span class="tpt">PTIndex = ${cur.ptIndex}</span>，高 ${PDB} 位是 <span class="tpd">PDIndex = ${cur.pdIndex}</span>。`,
+      `第 3 步：找页目录项：PDEAddr = (PDBR &lt;&lt; ${shift}) + PDIndex × ${pdeSize} = ${book ? BOOK20.pdbr : HW.pdbr} × ${2 ** shift} + ${cur.pdIndex} × ${pdeSize} = <b>${cur.pdeAddr}</b>（${hex(cur.pdeAddr)}）。${pdbrTxt}。<b>第 1 次访存</b>。`,
+      cur.pdeValid ? `第 4 步：读到 PDE：${pdeVal}。PDE 有效，说明它指向的页表页里至少有一个有效 PTE。`
+        : `第 4 步：读到 PDE：${pdeVal}。<b style="color:var(--bad)">PDE 无效</b>：这一整块地址（${2 ** PTB} 个虚拟页）根本没有页表页，转换失败，抛出 SEGMENTATION_FAULT。只访问了 1 次内存。${book ? "" : "（脚本输出：Fault (page directory entry not valid)）"}`,
+      `第 5 步：找 PTE：PTEAddr = (PDE.PFN &lt;&lt; ${shift}) + PTIndex × ${pdeSize} = ${ptePfn} × ${2 ** shift} + ${cur.ptIndex} × ${pdeSize} = <b>${cur.pteAddr}</b>（${hex(cur.pteAddr)}）。注意 PDE 里的 PFN 要先左移。<b>第 2 次访存</b>。`,
+      cur.pteValid ? `第 6 步：读到 PTE：${book ? `PFN = ${cur.pfn}，valid = 1，prot = ${cur.prot}` : `内容 ${hex(cur.pte, 2)}：valid = 1，PFN = ${cur.pfn}`}。转换有效。`
+        : `第 6 步：读到 PTE：${book ? "valid = 0" : `内容 ${hex(cur.pte, 2)}：valid = 0`}。<b style="color:var(--bad)">PTE 无效</b>：页表页存在，但这个虚拟页没有分配，抛出 SEGMENTATION_FAULT。访问了 2 次内存。${book ? "" : "（脚本输出：Fault (page table entry not valid)）"}`,
+      `第 7 步：物理地址 = (PTE.PFN &lt;&lt; ${shift}) | offset = (${cur.pfn} &lt;&lt; ${shift}) | ${cur.offset} = <b>${hex(cur.pa, book ? 4 : 3)}</b>（${cur.pa}）。${book ? (cur.va === 0x3f80 ? "与原书一致：0x3F80 → PFN 55 → 0x0DC0。" : "") : `读出的值是 <b>${hex(cur.value, 2)}</b>——这是<b>第 3 次访存</b>。与脚本 -c 输出一致：Translates to Physical Address ${hex(cur.pa, 3).toLowerCase().replace("0x", "0x")} --> Value: ${hex(cur.value, 2).toLowerCase()}`}`,
+    ];
+    nar.innerHTML = msgs[i];
+    const memRefs = [0, 0, 1, 1, 2, 2, 3][i] - (book && i === 6 ? 0 : 0);
+    stat(st, Math.min(memRefs, cur.fault === "pde" ? 1 : cur.fault === "pte" ? 2 : 3), "已访问内存次数");
+    if (book) { stat(st, "3 页 = 192 B", "多级页表实际占用（1 PD + 2 PT）"); stat(st, "16 页 = 1 KB", "线性页表（256 × 4 字节）"); }
+    else { stat(st, (1 + HW.ptPages.length) + " 页", "页表占用（1 PD + " + HW.ptPages.length + " PT）"); stat(st, "32 页 = 1 KB", "同样用 1 字节 PTE 的线性页表"); }
+  }
+  const mlStep = OSTEP.stepper($("ml-step"), { steps: mlSteps, render: mlRender, autoplayMs: 1400 });
+  $("ml-mode").onchange = () => {
+    mode = $("ml-mode").value; $("ml-hwctl").hidden = mode !== "hw";
+    if (mode === "hw") { mlGenerate(); if (HW && !HW.error) $("ml-va").value = "0x" + HW.addrs[0].toString(16).padStart(4, "0"); }
+    else $("ml-va").value = "0x3F80";
+    translateCur();
+  };
+  $("ml-gen").onclick = () => { mlGenerate(); if (HW && !HW.error) $("ml-va").value = "0x" + HW.addrs[0].toString(16).padStart(4, "0"); translateCur(); };
+  $("ml-go").onclick = translateCur;
+  $("ml-va").addEventListener("keydown", (e) => { if (e.key === "Enter") translateCur(); });
+  translateCur();
+
+  // ---------------- 计算器 ----------------
+  const LVCOL = ["var(--c4)", "var(--c5)", "var(--c6)", "var(--c7)", "var(--c8)", "var(--c1)"];
+  function cc() {
+    const bits = Math.max(8, Math.min(64, parseInt($("cc-bits").value, 10) || 32)), ps = +$("cc-ps").value, pte = +$("cc-pte").value;
+    const stage = $("cc-stage"), nar = $("cc-nar"), st = $("cc-stats");
+    stage.replaceChildren(); st.replaceChildren();
+    if (Math.log2(ps) >= bits) { nar.innerHTML = '<span class="err">页比地址空间还大。</span>'; return; }
+    const pr = parseRanges($("cc-rng").value);
+    const R = tableCost(bits, ps, pte, pr.ranges || []);
+    // 位拆分条
+    const bar = h("div", { class: "lvbar" });
+    R.split.forEach((b, k) => bar.append(h("div", { style: { flex: String(b), background: LVCOL[k % LVCOL.length] } }, (k === R.levels - 1 ? "PT" : "L" + (k + 1)) + " " + b)));
+    bar.append(h("div", { style: { flex: String(R.off), background: "var(--c3)" } }, "offset " + R.off));
+    stage.append(h("div", { class: "small muted" }, `${bits} 位虚拟地址 = ` + R.split.map((b, k) => (k === R.levels - 1 ? "页表索引 " : "第 " + (k + 1) + " 级目录 ") + b).join(" + ") + ` + 偏移 ${R.off}（位）`), bar);
+    // 树
+    const tree = h("div", { class: "tree" });
+    R.perLevel.forEach((c, k) => {
+      const boxes = h("div", { class: "boxes" });
+      for (let j = 0; j < Math.min(c, 120); j++) boxes.append(h("span", { style: { background: LVCOL[k % LVCOL.length] } }));
+      if (c > 120) boxes.append(h("span", { style: { width: "auto", height: "auto", fontSize: "12px" } }, " … 共 " + c.toLocaleString("en-US") + " 页"));
+      else boxes.append(h("span", { style: { width: "auto", height: "auto", fontSize: "12px", marginLeft: "6px" } }, c + " 页"));
+      tree.append(h("div", { class: "lv" }, h("span", { class: "muted" }, k === 0 ? "顶层目录" : k === R.levels - 1 ? "页表页（最底层）" : "第 " + (k + 1) + " 级目录"), boxes));
+    });
+    stage.append(h("div", { class: "small muted", style: { marginTop: "10px" } }, "多级页表每一级实际要分配的页（按上面的 VPN 区间计算）："), tree);
+    const tooBig = R.vpn > 52;
+    nar.innerHTML = (pr.error ? `<span class="err">${pr.error}</span><br>` : "") +
+      `每页 ${ps} 字节 / 每项 ${pte} 字节 = <b>${ps / pte}</b> 项 → 每级索引 <b>${R.per}</b> 位；VPN 共 ${R.vpn} 位 → 需要 ⌈${R.vpn} / ${R.per}⌉ = <b>${R.levels} 级</b>` +
+      (R.split[0] < R.per ? `（顶层只用了 ${R.split[0]} 位，只有 ${2 ** R.split[0]} 项，不满一页）` : "") + `。<br>` +
+      `线性页表：2<sup>${R.vpn}</sup> × ${pte} 字节 = <b>${fmtBytes(R.linearBytes)}</b>；多级页表：${R.pagesTotal.toLocaleString("en-US")} 页 × ${ps} 字节 = <b>${fmtBytes(R.multiBytes)}</b>` +
+      (R.validPages ? `，为 ${R.validPages.toLocaleString("en-US")} 个有效页（${fmtBytes(R.validPages * ps)} 数据）服务。` : "。（没有给出有效区间，只算顶层目录）") +
+      (tooBig ? "（地址空间太大，数值是近似的）" : "");
+    stat(st, R.levels, "级数");
+    stat(st, fmtBytes(R.linearBytes), "线性页表大小");
+    stat(st, fmtBytes(R.multiBytes), "多级页表实际占用");
+    stat(st, R.multiBytes ? (R.linearBytes / R.multiBytes >= 10 ? Math.round(R.linearBytes / R.multiBytes).toLocaleString("en-US") : (R.linearBytes / R.multiBytes).toFixed(2)) + " ×" : "—", "线性 ÷ 多级");
+  }
+  ["cc-bits", "cc-ps", "cc-pte", "cc-rng"].forEach((id) => $(id).addEventListener("input", cc));
+  document.querySelectorAll("[data-cc]").forEach((b) => b.onclick = () => { const [bi, ps, pte, ...rg] = b.dataset.cc.split(","); $("cc-bits").value = bi; $("cc-ps").value = ps; $("cc-pte").value = pte; $("cc-rng").value = rg.join(",").trim(); cc(); });
+  cc();
+
+  // ---------------- 反向页表 ----------------
+  let IR = null;
+  function ipBuild() { IR = iptLookup(Math.max(1, +$("ip-pid").value || 1), Math.max(0, +$("ip-vpn").value || 0)); ipStep.reset(); }
+  function ipSteps() { return 2 + IR.probes.length; }
+  function ipRender(i) {
+    const pid = Math.max(1, +$("ip-pid").value || 1), vpn = Math.max(0, +$("ip-vpn").value || 0);
+    const stage = $("ip-stage"); stage.replaceChildren();
+    const probed = IR.probes.slice(0, Math.max(0, i - 1));
+    const t = h("table", { class: "ipt" }, h("tr", {}, h("th", {}, "PFN（下标）"), h("th", {}, "PID"), h("th", {}, "VPN"), h("th", {}, "哈希桶")));
+    IPT.frames.forEach((f, pfn) => {
+      const inChain = i >= 1 && IR.chain.includes(pfn), isHit = probed.includes(pfn) && pfn === IR.pfn, isProbe = probed.includes(pfn);
+      t.append(h("tr", { class: isHit ? "hit" : isProbe ? "act" : "" }, h("td", {}, pfn), h("td", {}, f[0]), h("td", {}, f[1]), h("td", { style: inChain ? { fontWeight: 700 } : {} }, iptHash(f[0], f[1]))));
+    });
+    const chainTxt = IR.chain.length ? IR.chain.map((p) => "PFN " + p).join(" → ") : "（空）";
+    stage.append(h("div", { class: "table-wrap", style: { margin: 0 } }, t), h("div", { class: "small", style: { marginTop: "6px" } }, "哈希桶 " + IR.bucket + " 的链：" + chainTxt));
+    const nar = $("ip-nar");
+    if (i === 0) nar.innerHTML = `要查找 (PID ${pid}, VPN ${vpn})。反向页表按<b>物理页</b>组织，不能用 VPN 直接当下标，只能搜索。`;
+    else if (i === 1) nar.innerHTML = `计算哈希：h = (${pid} × 7 + ${vpn}) mod 4 = <b>${IR.bucket}</b>。桶 ${IR.bucket} 串着 ${IR.chain.length} 个物理页：${chainTxt}。`;
+    else {
+      const p = IR.probes[i - 2], f = IPT.frames[p], last = i - 2 === IR.probes.length - 1;
+      nar.innerHTML = `比较 PFN ${p} 的项 (PID ${f[0]}, VPN ${f[1]})：` + (p === IR.pfn ? `<b style="color:var(--ok)">匹配！</b>这一项的下标就是答案：PFN = <b>${p}</b>。共比较了 ${IR.probes.length} 次。`
+        : last ? `不匹配，链已走完：<b style="color:var(--bad)">找不到</b>，这个虚拟页不在物理内存中（缺页或非法访问，交给 OS）。` : "不匹配，沿链继续。");
+    }
+  }
+  const ipStep = OSTEP.stepper($("ip-step"), { steps: () => (IR ? ipSteps() : 1), render: ipRender, autoplayMs: 1100 });
+  ["ip-pid", "ip-vpn"].forEach((id) => $(id).addEventListener("change", ipBuild));
+  ipBuild();
+})();
+</script>
+</body></html>

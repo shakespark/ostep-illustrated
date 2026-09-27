@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 8 章 · 调度：多级反馈队列</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+svg.tl { max-width: none; }
+.jobtable input[type="number"] { width: 4.6em; }
+.jobtable td, .jobtable th { padding: 5px 8px; vertical-align: middle; }
+.sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 6px; }
+.presets { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+.presets button { font-size: 13px; padding: 4px 10px; }
+.presets .lbl { font-size: 13px; color: var(--muted); align-self: center; margin-right: 4px; }
+.rules { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 6px 14px; margin: 0 0 12px; font-size: 14px; }
+.rules label { display: flex; gap: 8px; align-items: flex-start; color: var(--fg); }
+.rules input[type="checkbox"] { margin-top: 5px; accent-color: var(--accent); }
+.rules small { color: var(--muted); }
+.qsnap { display: grid; gap: 6px; margin-top: 10px; font-size: 13.5px; }
+.qsnap .row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.qsnap .qn { font: 600 13px var(--mono); width: 3.2em; }
+.qsnap .qp { color: var(--muted); font-size: 12px; min-width: 9em; }
+.cell.run { color: #fff; border-color: transparent; font-weight: 600; }
+.cell small { color: var(--muted); margin-left: 4px; font-size: 11px; }
+.cell.run small { color: #fff; opacity: .85; }
+.levels-tbl input { width: 4.2em; }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px; color: var(--muted); margin-top: 8px; }
+.legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.rulebox li { margin: 6px 0; }
+.rulebox b { color: var(--accent); }
+</style>
+</head>
+<body data-chapter="8">
+<main>
+
+<h2>一句话 + 关键问题</h2>
+<div class="crux">
+  <p><strong>没有完备的先验知识，如何调度？</strong>如何设计一个调度器，既能让交互式作业的响应时间最小，又能在不知道作业长度的前提下让周转时间最小？</p>
+  <p class="muted small">THE CRUX: HOW TO SCHEDULE WITHOUT PERFECT KNOWLEDGE? — How can we design a scheduler that both minimizes response time for interactive jobs while also minimizing turnaround time without a priori knowledge of job length?</p>
+</div>
+<p>上一章留下了两难：SJF/STCF 周转时间好，但需要知道作业长度；RR 响应时间好，但周转时间差。<strong>多级反馈队列（Multi-level Feedback Queue, MLFQ）</strong>要同时解决这两件事，而且<strong>不需要</strong>任何先验知识：它一边运行，一边<strong>观察</strong>作业的行为，用<strong>过去预测未来</strong>。</p>
+<p>MLFQ 最早由 Corbató 等人于 1962 年在兼容分时系统（CTSS）中提出，这项工作连同后来的 Multics 让 Corbató 获得了图灵奖。BSD UNIX 的衍生系统、Solaris、Windows NT 及其后续版本都以某种形式的 MLFQ 作为基础调度器。本章按书中的节奏，从两条基本规则出发，每发现一个漏洞就加一条规则，最终得到 5 条规则。</p>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>多个队列 = 多个优先级</h4><p>每个队列有一个优先级；任一时刻，一个就绪作业只在一个队列里。</p></div>
+  <div class="card"><h4>规则 1、2</h4><p>优先级高的先运行；优先级相同的轮转（RR）。</p></div>
+  <div class="card"><h4>反馈（feedback）</h4><p>优先级不是固定的，而是根据作业<strong>观察到的行为</strong>调整：频繁让出 CPU 的保持高优先级，长期霸占 CPU 的逐步降级。</p></div>
+  <div class="card"><h4>时间配额（allotment）</h4><p>作业在某一优先级上可以使用的 CPU 时间总量，用完就降级。最简单时配额 = 一个时间片。</p></div>
+  <div class="card"><h4>近似 SJF</h4><p>新作业先假定"可能很短"放在最高优先级；真短就很快完成，真长就一路沉到底。</p></div>
+  <div class="card"><h4>饥饿与优先级提升</h4><p>交互作业太多时长作业会<strong>饥饿（starvation）</strong>；规则 5 每隔 S 把所有作业提升（boost）到最高队列。</p></div>
+  <div class="card"><h4>愚弄调度器（gaming）</h4><p>在配额用完前主动发起 I/O 就能永远留在高优先级。规则 4 的"完整计账"堵住这个漏洞。</p></div>
+  <div class="card"><h4>巫毒常量（voo-doo constants）</h4><p>队列数、时间片、配额、S 都很难设定，只能靠经验调优——Ousterhout 定律：尽量避免它们。</p></div>
+</div>
+
+<h2>图解讲解</h2>
+
+<h3>8.1 基本规则</h3>
+<p>MLFQ 有若干个不同的队列，每个队列一个优先级。任何时刻一个就绪作业只在一个队列中。MLFQ 用优先级决定运行谁；同一队列里可能有多个作业（优先级相同），它们之间用轮转。于是得到前两条规则：</p>
+<ul class="rulebox">
+  <li><b>规则 1</b>：如果 A 的优先级 &gt; B 的优先级，运行 A（不运行 B）。</li>
+  <li><b>规则 2</b>：如果 A 的优先级 = B 的优先级，A 和 B 轮转运行。</li>
+</ul>
+<figure class="fig">
+<svg viewBox="0 0 560 330" width="560" role="img" aria-label="MLFQ 示例：8 个队列，A、B 在最高优先级，C 在中间，D 在最低">
+  <text x="20" y="18" font-size="12" class="t-muted">[高优先级]</text>
+  <text x="20" y="322" font-size="12" class="t-muted">[低优先级]</text>
+  <g font-size="13">
+    <g><text x="30" y="46" class="mono">Q8</text><line class="stroke" x1="70" y1="41" x2="180" y2="41"/></g>
+    <g><text x="30" y="80" class="mono">Q7</text></g><g><text x="30" y="114" class="mono">Q6</text></g><g><text x="30" y="148" class="mono">Q5</text></g>
+    <g><text x="30" y="182" class="mono">Q4</text><line class="stroke" x1="70" y1="177" x2="180" y2="177"/></g>
+    <g><text x="30" y="216" class="mono">Q3</text></g><g><text x="30" y="250" class="mono">Q2</text></g>
+    <g><text x="30" y="284" class="mono">Q1</text><line class="stroke" x1="70" y1="279" x2="180" y2="279"/></g>
+  </g>
+  <g>
+    <circle cx="200" cy="41" r="15" style="fill:var(--c1)"/><text x="200" y="46" text-anchor="middle" style="fill:#fff;font-weight:700">A</text>
+    <line class="arrow" x1="215" y1="41" x2="243" y2="41"/>
+    <circle cx="258" cy="41" r="15" style="fill:var(--c2)"/><text x="258" y="46" text-anchor="middle" style="fill:#fff;font-weight:700">B</text>
+    <circle cx="200" cy="177" r="15" style="fill:var(--c3)"/><text x="200" y="182" text-anchor="middle" style="fill:#fff;font-weight:700">C</text>
+    <circle cx="200" cy="279" r="15" style="fill:var(--c4)"/><text x="200" y="284" text-anchor="middle" style="fill:#fff;font-weight:700">D</text>
+  </g>
+  <g font-size="13">
+    <rect class="accent-soft" x="300" y="22" width="245" height="40" rx="6"/><text x="312" y="47">A、B 优先级最高：两者轮转（规则 1、2）</text>
+    <rect class="bad-soft" x="300" y="196" width="245" height="84" rx="6"/>
+    <text x="312" y="222">C、D 永远轮不到？</text><text x="312" y="244" class="t-muted" font-size="12">只要 A、B 一直就绪，按目前的规则</text><text x="312" y="264" class="t-muted" font-size="12">C 和 D 就不会运行——岂有此理！</text>
+  </g>
+</svg>
+<figcaption>图 8.1　MLFQ 的一个静态快照。关键在于：优先级如何随时间变化？</figcaption>
+</figure>
+<p>MLFQ 调度的关键在于<strong>如何设置优先级</strong>。它不给作业固定优先级，而是根据<strong>观察到的行为</strong>改变优先级：如果一个作业反复在等待键盘输入时让出 CPU（交互式进程的典型行为），MLFQ 就保持它的高优先级；如果一个作业长时间密集使用 CPU，MLFQ 就降低它的优先级。</p>
+
+<h3>8.2 尝试 1：如何改变优先级</h3>
+<p>我们的工作负载是：一些运行时间短、频繁让出 CPU 的交互式作业，加上一些需要大量 CPU、不在乎响应时间的长时间"CPU 密集型"作业。先引入<strong>配额（allotment）</strong>：作业在某个优先级上能花的时间，用完就降级。先简单地假定配额 = 一个时间片。</p>
+<ul class="rulebox">
+  <li><b>规则 3</b>：作业进入系统时，放在最高优先级（最上层队列）。</li>
+  <li><b>规则 4a</b>：如果作业在运行中用完了它的配额，就降低它的优先级（移入下一层队列）。</li>
+  <li><b>规则 4b</b>：如果作业在配额用完之前主动放弃 CPU（例如发起 I/O），它保持在同一优先级（配额重置）。</li>
+</ul>
+<p>下面这些图都由本页模拟器按规则实时生成（时间片 10ms，配额 = 时间片，三个队列 Q2 &gt; Q1 &gt; Q0）。每个队列一行，行内每个作业占一条"泳道"；实心块 = 正在运行，细线 = 在该队列中等待。</p>
+<p><strong>例 1：一个长时间运行的作业。</strong>作业以最高优先级 Q2 进入；运行一个 10ms 时间片后降到 Q1；再运行一个时间片后降到最低的 Q0，并一直留在那里。</p>
+<figure class="fig"><div data-fig="p82"></div><figcaption>图 8.2　长时间运行的作业随时间的变化</figcaption></figure>
+<p><strong>例 2：来了一个短作业。</strong>A 是长时间运行的 CPU 密集型作业，已经跑了一段时间，沉在 Q0；B 在 T=100 到达，是一个只需 20ms 的短作业。B 被放入最高队列，两个时间片后（还没沉到底）就运行完毕，然后 A 以低优先级继续运行。</p>
+<figure class="fig"><div data-fig="p83l"></div><figcaption>图 8.3（左）　来了一个交互式短作业：B 在 100 到达，120 完成</figcaption></figure>
+<p>这就是 MLFQ 的主要目标之一：因为它不知道一个作业是短是长，就<strong>先假设它是短作业</strong>并给予高优先级。如果真的很短，它会很快完成；如果不是，它就会慢慢沉下去，证明自己是一个长时间运行的批处理型进程。MLFQ 以这种方式<strong>近似 SJF</strong>。</p>
+<p><strong>例 3：有 I/O 的情况。</strong>按规则 4b，交互式作业 B 每次只用 1ms CPU 就执行 I/O（这里 I/O 需要 5ms），在配额用完之前就让出 CPU，所以一直留在最高优先级；A 只能在 B 做 I/O 的空隙中运行。</p>
+<figure class="fig"><div data-fig="p83r"></div><figcaption>图 8.3（右）　交互式作业 B（每运行 1ms 做一次 I/O）与长作业 A 竞争</figcaption></figure>
+
+<h3>目前的 MLFQ 有什么问题？</h3>
+<p>看起来不错：长作业之间公平共享 CPU，短作业和 I/O 密集的交互作业能快速运行。但这个版本有严重缺陷（请尽可能"邪恶"地想一想）：</p>
+<div class="two" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px">
+  <div class="card"><h4>① 饥饿（starvation）</h4><p>系统中交互式作业"太多"时，它们合起来会吃掉所有 CPU，长作业一点 CPU 都得不到。</p></div>
+  <div class="card"><h4>② 愚弄调度器（game the scheduler）</h4><p>聪明的用户可以改写程序：在配额用完前发一个 I/O（比如对文件）主动让出 CPU，就能留在同一队列，获得更高比例的 CPU。做得好（如用掉配额的 99% 再让出），几乎可以垄断 CPU。</p></div>
+  <div class="card"><h4>③ 行为会变化</h4><p>一个程序可能先是 CPU 密集型，后来转为交互式。按目前的规则，它已经沉到底，不会再被当作交互式作业对待。</p></div>
+</div>
+<div class="tip"><p><strong>调度必须能抵御攻击。</strong>你可能觉得调度策略（无论在 OS 内部，还是在分布式存储系统的 I/O 请求处理中）不是安全问题，但在越来越多的场景下它恰恰是。现代数据中心里，来自世界各地的用户共享 CPU、内存、网络和存储；如果策略设计和执行不当，一个用户就可能损害他人并为自己谋利。</p></div>
+
+<h3>8.3 尝试 2：优先级提升</h3>
+<p>为了避免饥饿，最简单的办法是周期性地<strong>提升（boost）</strong>所有作业的优先级：</p>
+<ul class="rulebox"><li><b>规则 5</b>：经过一段时间 S 后，把系统中的所有作业都移到最高队列。</li></ul>
+<p>规则 5 一次解决两个问题：第一，进程不会饿死——在最高队列里，它会与其他高优先级作业轮转，最终得到服务；第二，如果一个 CPU 密集型作业变成了交互式的，提升之后调度器就会正确地对待它。</p>
+<p>下面的例子中，长作业 A 与两个交互式短作业 B、C 竞争（B、C 在 T=100 到达，每运行 2ms 就做一次 2ms 的 I/O）。左边没有优先级提升，B、C 到达后 A 就饿死了；右边每 100ms 提升一次（这个值可能太小了，但用于举例），A 至少能周期性地回到最高优先级运行一下。</p>
+<figure class="fig"><div data-fig="p84l"></div><figcaption>图 8.4（左）　没有优先级提升：A 在 100 之后再也得不到 CPU</figcaption></figure>
+<figure class="fig"><div data-fig="p84r"></div><figcaption>图 8.4（右）　S = 100ms 的优先级提升：A 每次被提升后在最高队列运行一个时间片，随即降到 Q1 再次等待，直到下一次提升</figcaption></figure>
+<p class="small muted">说明：原书图 8.4 是示意图（A 每 30ms 在 Q2 运行一次，与正文"每 100ms 提升一次"并不严格对应）。本页的图完全按规则 1–5 逐毫秒模拟，定性结论相同：没有提升时 A 饿死；有提升时 A 每个周期都能得到少量 CPU。你可以在下方模拟器里把 S 改成 30 或 50 对比。</p>
+<p>那 S 应该设成多少？John Ousterhout 把这类值称为<strong>巫毒常量（voo-doo constants）</strong>，因为它们似乎需要某种黑魔法才能设对。S 设得太大，长作业会饿死；太小，交互式作业又得不到合适的 CPU 份额。这通常留给系统管理员去调，或者在现代，越来越多地交给基于机器学习的自动方法。</p>
+<div class="tip"><p><strong>避免巫毒常量（Ousterhout 定律）。</strong>能避免就避免；可惜往往很难。常见结果是一个充满默认参数的配置文件，老练的管理员在出问题时去调整——而这些值通常没人动，我们只能祈祷默认值在实际中工作良好。</p></div>
+
+<h3>8.4 尝试 3：更好的计账</h3>
+<p>还剩一个问题：如何防止愚弄调度器？罪魁祸首是规则 4a 和 4b——它们允许作业在配额到期前让出 CPU 从而保住优先级。解决办法是对每一层的 CPU 使用做<strong>更好的计账（accounting）</strong>：作业做 I/O 时，调度器不再"忘记"它在本层已经用了多少配额，而是一直累计；用完就降级，不管是一次用完还是分很多次用完。于是把规则 4a、4b 合并重写为：</p>
+<ul class="rulebox"><li><b>规则 4</b>：一旦作业用完了它在某一层的时间配额（无论中间主动放弃了多少次 CPU），就降低它的优先级（移入下一层队列）。</li></ul>
+<p>下面的工作负载试图愚弄调度器：A 是长作业，B 在 T=100 到达，每运行 5ms 就发起一次 1ms 的 I/O（总是在 10ms 配额用完之前让出 CPU）。</p>
+<figure class="fig"><div data-fig="p85l"></div><figcaption>图 8.5（左）　旧规则 4a/4b：B 永远待在 Q2，在 100–219 之间拿走了约 84% 的 CPU（100/119）</figcaption></figure>
+<figure class="fig"><div data-fig="p85r"></div><figcaption>图 8.5（右）　新规则 4：B 在 Q2、Q1 各用完 10ms 配额后被降级，最终与 A 在 Q0 公平竞争</figcaption></figure>
+<p>细看右图有个有趣的细节：A 在 123–130 只运行了 7ms。这是因为 A 在 Q0 的这个时间片里之前已经被 B 抢占过 3 次、每次运行 1ms；被高优先级作业抢占不会重置 A 的时间片，所以 A 只剩 7ms。</p>
+
+<h3>8.5 调优 MLFQ 及其他问题</h3>
+<p>MLFQ 还有一个大问题：如何<strong>参数化</strong>？应该有多少个队列？每个队列的时间片多长？配额多大？多久提升一次优先级？这些问题没有简单答案，只有积累对工作负载的经验并据此调优。</p>
+<p>例如，大多数 MLFQ 变体允许不同队列有不同的时间片长度。高优先级队列通常时间片较短（例如 10ms 或更少），因为里面是交互式作业，快速切换合理；低优先级队列则是 CPU 密集型的长作业，较长的时间片（例如数百毫秒）效果更好。下图中，两个作业在最高队列运行 20ms（时间片 10ms），在中间队列运行 40ms（时间片 20ms），在最低队列时间片为 40ms：</p>
+<figure class="fig"><div data-fig="p86"></div><figcaption>图 8.6　优先级越低，时间片越长（Q2/Q1/Q0 的时间片分别为 10/20/40ms，Q2、Q1 的配额分别为 20/40ms）</figcaption></figure>
+<div class="table-wrap"><table>
+<thead><tr><th>实现</th><th>做法</th></tr></thead>
+<tbody>
+<tr><td>Solaris 分时调度类（TS）</td><td>特别容易配置：提供一组<strong>表</strong>，精确规定进程优先级在生命周期中如何变化、每个时间片多长、多久提升一次。默认 60 个队列，时间片从 20ms（最高优先级）缓慢增加到几百毫秒（最低），大约每 1 秒提升一次。管理员可以修改这张表来改变调度行为。</td></tr>
+<tr><td>FreeBSD（4.3 版）</td><td>不用表，而是用<strong>数学公式</strong>根据进程用了多少 CPU 计算优先级；使用量随时间<strong>衰减（decay）</strong>，以另一种方式实现了优先级提升。可参考 Epema 关于衰减使用（decay-usage）调度的论文。</td></tr>
+<tr><td>其他特性</td><td>一些调度器为操作系统工作保留最高的几个优先级，普通用户作业永远得不到；一些系统允许用户给出建议，例如用命令行工具 <code>nice</code> 提高或降低作业的优先级。</td></tr>
+</tbody></table></div>
+<div class="tip"><p><strong>尽可能使用建议（advice）。</strong>操作系统很少知道什么对每个进程最好，因此提供接口让用户或管理员给出一些提示通常很有用。这类提示称为建议：OS 不一定要理会，但可以参考它们做出更好的决定。调度器（<code>nice</code>）、内存管理器（<code>madvise</code>）、文件系统（informed prefetching and caching）都有这样的接口。</p></div>
+
+<h3>8.6 小结：完整的 MLFQ 规则</h3>
+<div class="key">
+<ul class="rulebox" style="margin:0">
+  <li><b>规则 1</b>：如果 A 的优先级 &gt; B 的优先级，运行 A（不运行 B）。</li>
+  <li><b>规则 2</b>：如果 A 的优先级 = B 的优先级，A 和 B 使用该队列的时间片以轮转方式运行。</li>
+  <li><b>规则 3</b>：作业进入系统时，放在最高优先级（最上层队列）。</li>
+  <li><b>规则 4</b>：一旦作业用完了它在某一层的时间配额（无论中间主动放弃了多少次 CPU），就降低其优先级（移入下一层队列）。</li>
+  <li><b>规则 5</b>：经过一段时间 S 后，把系统中的所有作业移到最高队列。</li>
+</ul>
+</div>
+<p>MLFQ 有意思的地方在于：它不要求对作业性质有先验知识，而是<strong>观察</strong>作业的执行并据此确定优先级。这样它能两全其美：对运行时间短的交互式作业，性能接近 SJF/STCF；对长时间运行的 CPU 密集型作业，也公平并能保证进展。</p>
+<div class="tip"><p><strong>从历史中学习。</strong>MLFQ 是用过去预测未来的一个绝佳例子。这类方法在操作系统中很常见（在计算机科学的其他领域也是，例如硬件分支预测器和缓存算法）。当作业有阶段性的行为、因而可预测时，这种方法就有效；但必须小心，预测可能出错，让系统做出比完全不知道时还糟糕的决定。</p></div>
+
+<h2>交互模拟器</h2>
+<section class="sim" id="sim-mlfq">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>MLFQ 调度器：规则逐条开关，逐毫秒单步</h3>
+    <div class="desc">每个队列一行、每个作业一条泳道，看作业如何在队列之间上下移动。可以逐条关闭/开启规则 1–5、改时间片和配额、给作业设置"每运行 X ms 就发起 I/O"（设成小于时间片即可"愚弄"调度器）。预设复刻原书图 8.2–8.6 和课后题。</div></div>
+  <div class="sim-body">
+    <div class="presets" id="ml-presets"><span class="lbl">载入示例：</span></div>
+    <div class="rules" id="ml-rules">
+      <label><input type="checkbox" data-r="r1" checked><span><b>规则 1</b> 优先级高者先运行<br><small>关闭：忽略优先级，所有就绪作业按排队先后轮转</small></span></label>
+      <label><input type="checkbox" data-r="r2" checked><span><b>规则 2</b> 同优先级轮转<br><small>关闭：时间片到了也不让位（同层内先来先服务）</small></span></label>
+      <label><input type="checkbox" data-r="r3" checked><span><b>规则 3</b> 新作业进入最高队列<br><small>关闭：新作业从最低队列开始</small></span></label>
+      <label><input type="checkbox" data-r="r4" checked><span><b>规则 4</b> 完整计账（防愚弄）<br><small>关闭：退回旧规则 4a/4b，做 I/O 会重置配额</small></span></label>
+      <label><input type="checkbox" data-r="r5"><span><b>规则 5</b> 每 <input type="number" id="ml-S" min="1" max="2000" value="100" style="width:4.5em"> ms 提升所有作业<br><small>关闭：从不提升（可能饥饿）</small></span></label>
+      <label><input type="checkbox" data-r="ioFront"><span><b>I/O 完成后插到队首</b><br><small>mlfq.py 的 -I 选项；默认插到队尾（课后题 6）</small></span></label>
+    </div>
+    <div class="controls">
+      <label>队列数 <input type="number" id="ml-nq" min="1" max="8" value="3"></label>
+      <label>显示到 t = <input type="number" id="ml-view" min="10" max="3000" value="200"></label>
+      <button id="ml-add">＋ 添加作业</button>
+    </div>
+    <div class="table-wrap"><table class="levels-tbl" id="ml-levels"></table></div>
+    <div class="table-wrap"><table class="jobtable"><thead><tr><th>作业</th><th>到达</th><th>运行时长</th><th title="0 表示不做 I/O">每运行几 ms 发 I/O</th><th>I/O 时长</th><th></th></tr></thead><tbody id="ml-jobs"></tbody></table></div>
+    <div id="ml-step"></div>
+    <div class="controls" style="margin-top:-6px"><button id="ml-prevev">⇤ 上一个事件</button><button id="ml-nextev">下一个事件 ⇥</button><span class="muted small">事件 = 到达、降级、提升、发起 I/O、完成等</span></div>
+    <div class="stage"><div id="ml-chart"></div><div class="qsnap" id="ml-snap"></div></div>
+    <div class="legend"><span><i style="background:var(--c1)"></i>实心块 = 在该队列中运行</span><span><i style="background:var(--c1);height:3px;opacity:.55"></i>细线 = 在该队列中等待</span><span>竖线 = 当前时刻；虚线 = 优先级提升</span></div>
+    <div class="narrate" id="ml-nar"></div>
+    <div class="stats" id="ml-stats"></div>
+    <div class="table-wrap"><table id="ml-res"></table></div>
+  </div>
+</section>
+
+<h2>先预测再验证</h2>
+<div class="exercise"><div class="q">（课后题 2）如何配置模拟器来复现书中的每个例子？先自己想参数，再点对应预设对照。例如图 8.5 需要哪些条件？</div>
+<details class="reveal"><summary>看答案</summary><div>图 8.5：3 个队列，时间片与配额都是 10ms；A 在 0 到达、长 200；B 在 100 到达、长 100、每运行 5ms 做一次 1ms 的 I/O。左图关闭规则 4（旧规则 4a/4b），右图开启规则 4。左图中 B 在 219 完成，A 在 300 完成；右图中 A 在 265 就完成了，因为 B 被降到 Q0 后只能与 A 轮流。</div></details></div>
+<div class="exercise"><div class="q">（课后题 3）如何配置参数，让 MLFQ 的行为和一个时间片为 10 的轮转（RR）调度器完全一样？</div>
+<details class="reveal"><summary>看答案</summary><div>只用 <strong>1 个队列</strong>，时间片 10（规则 2 开启）。只有一个优先级时，规则 1、3、4、5 都不起作用，剩下的就是纯轮转。（另一种思路：关闭规则 1，让所有作业不分优先级按排队先后轮转——但各层时间片不同时就不是严格的 RR 了。）</div></details></div>
+<div class="exercise"><div class="q">（课后题 4）构造两个作业和调度参数，让其中一个作业利用旧规则 4a/4b 在某段时间内拿到 99% 的 CPU。</div>
+<details class="reveal"><summary>看答案</summary><div>关闭规则 4，时间片（和配额）设为 100；A 为普通长作业，B 每运行 99ms 就发起一次 1ms 的 I/O。B 每次都在配额用完前让出 CPU，永远留在最高队列；它做 I/O 的那 1ms 里 A 才能运行。B 的份额 = 99/(99+1) = 99%。预设"课后题 4"就是这个配置，统计里能看到 B 的 CPU 份额。打开规则 4 再看看。</div></details></div>
+<div class="exercise"><div class="q">（课后题 5）最高队列时间片为 10ms。为了保证一个可能饥饿的长作业至少得到 5% 的 CPU，需要多久提升一次优先级？</div>
+<details class="reveal"><summary>看答案</summary><div>在最坏情况下（交互式作业占满高优先级队列），长作业每次被提升后只能在最高队列运行一个 10ms 时间片，随即被降级、再次饥饿。要求 10/S ≥ 5%，所以 <strong>S ≤ 200ms</strong>。预设"课后题 5"用 S = 200 跑 1000ms，A 的 CPU 份额约为 5%（提升时刻与作业到达的相位不同会有少许偏差）。</div></details></div>
+<div class="exercise"><div class="q">（课后题 6）I/O 完成后的作业应该放在队列的哪一端？打开"I/O 完成后插到队首"，在图 8.5（右）上观察变化。</div>
+<details class="reveal"><summary>看答案</summary><div>插到队首时，B 在 Q0 里每次 I/O 返回都排到 A 前面：A 的时间片一结束（或下一次调度决策时）B 就先运行，交互式作业的响应更快；但在同一队列中，频繁做 I/O 的作业会因此获得更多 CPU，又给了"愚弄"一定的空间。插到队尾则对同层作业更公平。这是一个典型的权衡。</div></details></div>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="0"><div class="q">1. MLFQ 如何在不知道作业长度的情况下近似 SJF？</div>
+  <div class="opts"><button>A. 新作业先放在最高优先级；如果它很短就很快完成，如果很长就逐步降级</button><button>B. 让用户在提交作业时声明运行时间</button><button>C. 统计历史平均长度，按平均值排序</button><button>D. 对所有作业使用最短的时间片</button></div>
+  <div class="explain">MLFQ 先假设每个新作业"可能是短作业"（规则 3），用行为反馈调整：用完配额就降级（规则 4）。</div></div>
+<div class="mcq" data-answer="1"><div class="q">2. 按旧规则 4a/4b，作业如何"愚弄"调度器？</div>
+  <div class="opts"><button>A. 调用 nice 提高优先级</button><button>B. 在配额用完之前发起 I/O 主动让出 CPU，从而一直留在高优先级</button><button>C. 创建大量子进程</button><button>D. 频繁地让出时间片给别的进程</button></div>
+  <div class="explain">规则 4b 在作业放弃 CPU 时重置配额，因此只要每次在配额用完前做一次 I/O（例如用掉 99% 再让出），就永远不会降级。</div></div>
+<div class="mcq" data-answer="1"><div class="q">3. 规则 5（优先级提升）一次解决了哪两个问题？</div>
+  <div class="opts"><button>A. 愚弄调度器；上下文切换开销</button><button>B. 长作业饥饿；作业从 CPU 密集型转为交互式后不能被正确对待</button><button>C. 响应时间；周转时间</button><button>D. 饥饿；愚弄调度器</button></div>
+  <div class="explain">提升保证所有作业定期回到最高队列与其他作业轮转（不饿死），也让变成交互式的作业重新获得高优先级。愚弄问题要靠规则 4 的完整计账来解决。</div></div>
+<div class="mcq" data-answer="3"><div class="q">4. 下列哪种配置下，MLFQ 的行为与时间片为 q 的 RR 完全相同？</div>
+  <div class="opts"><button>A. 开启规则 5 且 S = q</button><button>B. 8 个队列，每层时间片都是 q</button><button>C. 3 个队列，关闭规则 5</button><button>D. 只有 1 个队列，时间片为 q</button></div>
+  <div class="explain">只有一个队列时就只有一个优先级，规则 2 的轮转就是全部行为。多个队列时，作业仍会降级，行为不同于 RR。</div></div>
+<div class="mcq" data-answer="2"><div class="q">5. 关于提升周期 S，说法正确的是？</div>
+  <div class="opts"><button>A. S 必须等于最高队列的时间片</button><button>B. S 越小越好，因为长作业得到的 CPU 更多</button><button>C. S 太大长作业可能饥饿，太小交互式作业得不到合适的份额；它是典型的"巫毒常量"</button><button>D. 有了规则 4 就不需要 S 了</button></div>
+  <div class="explain">书中明确说 S 设大了会饥饿、设小了会损害交互作业。规则 4 防愚弄，不能防饥饿。</div></div>
+<div class="mcq" data-answer="2"><div class="q">6. 为什么大多数 MLFQ 让低优先级队列的时间片更长？</div>
+  <div class="opts"><button>A. 为了防止愚弄调度器</button><button>B. 为了让低优先级作业更快饥饿</button><button>C. 低优先级队列里多是 CPU 密集型长作业，长时间片减少切换开销；高优先级队列是交互作业，短时间片保证快速轮转</button><button>D. 因为低优先级队列作业更少</button></div>
+  <div class="explain">这就是图 8.6 的思路。Solaris TS 默认从 20ms 到几百毫秒。</div></div>
+<div class="mcq" data-answer="0"><div class="q">7. 在图 8.5（右）的例子中，A 在 Q0 被 B 抢占了 3 次（每次运行 1ms），之后 A 连续运行了多久才让出 CPU？</div>
+  <div class="opts"><button>A. 7ms，因为被高优先级作业抢占不会重置时间片</button><button>B. 10ms，因为被抢占后时间片重置</button><button>C. 1ms</button><button>D. 一直运行到 A 完成</button></div>
+  <div class="explain">A 在 123–130 运行 7ms，加上之前的 3×1ms 恰好用完 10ms 时间片，于是轮到同在 Q0 的 B。</div></div>
+
+<h2>常见误区</h2>
+<div class="warn">
+<ul>
+<li><strong>"MLFQ 需要知道作业长度。"</strong>恰恰相反，MLFQ 的全部意义在于不需要先验知识，而是从作业的运行历史中学习。</li>
+<li><strong>"有了优先级提升就不怕愚弄了。"</strong>提升解决的是饥饿；愚弄要靠规则 4 的完整计账。两者缺一不可。</li>
+<li><strong>"配额就是时间片。"</strong>本章开头为了简单令二者相等；一般来说配额是作业在某一层能用的 CPU 总量，可以是多个时间片（如图 8.6 中 Q2 的配额是 20ms、时间片是 10ms）。</li>
+<li><strong>"交互式作业在 MLFQ 里会一直保持高优先级。"</strong>在规则 4 下，即使频繁做 I/O，只要累计用完了配额也会降级；它能回到高优先级靠的是规则 5 的提升。</li>
+<li><strong>"被高优先级作业抢占后，时间片会重新开始。"</strong>在书中的模型（以及 mlfq.py）里不会：被抢占的作业仍在队首，只剩下未用完的那部分时间片。</li>
+</ul>
+</div>
+
+<h2>本章小结</h2>
+<ul>
+  <li>MLFQ 用多个优先级队列 + 基于行为的反馈，在不知道作业长度的情况下兼顾周转时间（近似 SJF）和响应时间（交互作业留在高优先级）。</li>
+  <li>五条规则：1 高优先级先运行；2 同级轮转；3 新作业进最高队列；4 用完本层配额就降级（完整计账，防愚弄）；5 每隔 S 全部提升（防饥饿、适应行为变化）。</li>
+  <li>参数（队列数、各层时间片、配额、S）难以设定，是"巫毒常量"；Solaris 用表配置，FreeBSD 用衰减公式，还可以借助 <code>nice</code> 等用户建议。</li>
+  <li>下一章换一个目标：不优化周转或响应时间，而是保证每个作业获得<strong>一定比例</strong>的 CPU——比例份额调度（彩票、步长、Linux CFS）。第 10 章再把这些思想推广到多处理器。</li>
+</ul>
+
+</main>
+<script>
+(function () {
+"use strict";
+const { h, s, color, letter } = OSTEP;
+
+/* CORE-BEGIN */
+// MLFQ 逐毫秒模拟（纯函数）。层级 0 = 最低优先级，nq-1 = 最高。
+// cfg = { nq, quantum:[..], allot:[..], S, rules:{r1,r2,r3,r4,r5,ioFront}, jobs:[{arrival,length,ioEvery,ioTime}], maxT }
+function mlfq(cfg) {
+  const nq = cfg.nq, R = cfg.rules, top = nq - 1, maxT = cfg.maxT || 3000;
+  const jobs = cfg.jobs.map((j, i) => ({ i, arr: +j.arrival, len: +j.length, ioEvery: +j.ioEvery || 0, ioTime: Math.max(1, +j.ioTime || 1),
+    rem: +j.length, level: -1, qUsed: 0, allotUsed: 0, sinceIO: 0, state: "new", ioDone: -1, first: null, done: null, cpu: 0 }));
+  const Q = Array.from({ length: nq }, () => []);
+  let seq = 0; const seqOf = {};
+  const enq = (j, front) => { if (front) { Q[j.level].unshift(j.i); seqOf[j.i] = -(++seq); } else { Q[j.level].push(j.i); seqOf[j.i] = ++seq; } j.state = "ready"; };
+  const deq = (j) => { const q = Q[j.level], k = q.indexOf(j.i); if (k >= 0) q.splice(k, 1); };
+  const ticks = []; // 每毫秒的记录
+  let finished = 0, t = 0;
+  for (; t < maxT && finished < jobs.length; t++) {
+    const ev = [];
+    for (const j of jobs) if (j.state === "io" && j.ioDone === t) { enq(j, R.ioFront); ev.push({ k: "ioret", j: j.i, lv: j.level }); }
+    for (const j of jobs) if (j.state === "new" && j.arr === t) { j.level = R.r3 ? top : 0; enq(j, false); ev.push({ k: "arrive", j: j.i, lv: j.level }); }
+    if (R.r5 && cfg.S > 0 && t > 0 && t % cfg.S === 0) {
+      const order = [];
+      for (let l = top; l >= 0; l--) { order.push(...Q[l]); Q[l] = []; }
+      for (const j of jobs) if (j.state === "ready" || j.state === "io") { j.level = top; j.allotUsed = 0; j.qUsed = 0; }
+      for (const id of order) { Q[top].push(id); seqOf[id] = ++seq; }
+      ev.push({ k: "boost" });
+    }
+    let run = -1;
+    if (R.r1) { for (let l = top; l >= 0; l--) if (Q[l].length) { run = Q[l][0]; break; } }
+    else { let best = Infinity; for (let l = 0; l < nq; l++) for (const id of Q[l]) if (seqOf[id] < best) { best = seqOf[id]; run = id; } }
+    const snap = { t, Q: Q.map((q) => q.slice()), io: jobs.filter((j) => j.state === "io").map((j) => ({ j: j.i, left: j.ioDone - t })),
+      lv: jobs.map((j) => (j.state === "ready" || j.state === "io" ? j.level : -1)), st: jobs.map((j) => j.state), run,
+      qUsed: jobs.map((j) => j.qUsed), allotUsed: jobs.map((j) => j.allotUsed), rem: jobs.map((j) => j.rem) };
+    if (run >= 0) {
+      const j = jobs[run], L = j.level;
+      if (j.first === null) j.first = t;
+      j.rem--; j.qUsed++; j.allotUsed++; j.sinceIO++; j.cpu++;
+      const after = [];
+      if (j.rem === 0) { deq(j); j.state = "done"; j.done = t + 1; finished++; after.push({ k: "done", j: run }); }
+      else {
+        if (j.allotUsed >= cfg.allot[L] && L > 0) {
+          deq(j); j.level = L - 1; j.allotUsed = 0; j.qUsed = 0; enq(j, false);
+          after.push({ k: "demote", j: run, from: L, to: L - 1 });
+        } else if (j.qUsed >= cfg.quantum[L] || (L === 0 && j.allotUsed >= cfg.allot[L])) {
+          j.qUsed = 0; if (L === 0) j.allotUsed = 0;
+          if (R.r2) { deq(j); enq(j, false); after.push({ k: "rotate", j: run, lv: L }); } else after.push({ k: "keep", j: run, lv: L });
+        }
+        if (j.ioEvery > 0 && j.sinceIO >= j.ioEvery) {
+          deq(j); j.state = "io"; j.ioDone = t + 1 + j.ioTime; j.sinceIO = 0; j.qUsed = 0;
+          const reset = !R.r4 && j.allotUsed > 0; if (!R.r4) j.allotUsed = 0;
+          after.push({ k: "io", j: run, lv: j.level, until: j.ioDone, reset });
+        }
+      }
+      snap.after = after;
+    } else snap.after = [];
+    snap.ev = ev; snap.runLevel = run >= 0 ? snap.lv[run] : -1;
+    ticks.push(snap);
+    if (finished === jobs.length) { t++; break; }
+    // 若无作业就绪且无未来事件，提前结束
+    if (!jobs.some((j) => j.state !== "done")) { t++; break; }
+  }
+  const per = jobs.map((j) => ({ arrival: j.arr, length: j.len, first: j.first, done: j.done, cpu: j.cpu,
+    response: j.first === null ? null : j.first - j.arr, turnaround: j.done === null ? null : j.done - j.arr }));
+  return { ticks, per, end: ticks.length };
+}
+/* CORE-END */
+
+// ---------- 图 ----------
+const NAMES = (n) => Array.from({ length: n }, (_, i) => letter(i));
+function niceUnit(end) { for (const u of [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000]) if (end / u <= 12) return u; return 2000; }
+// 按队列分行、行内按作业分泳道的多行甘特图（复刻原书图 8.2–8.6 的画法）
+function mlfqChart(host, res, cfg, o = {}) {
+  const nq = cfg.nq, nj = cfg.jobs.length, view = Math.min(o.view || res.end, res.end + 0) || 1;
+  const end = Math.max(view, 1);
+  const lane = nj > 3 ? 9 : 12, pad = 5, rowH = nj * lane + pad * 2, gap = 6, L = 40, top = 6;
+  const pxPer = o.pxPer || Math.max(1.5, Math.min(12, 700 / end));
+  const cpuRow = o.cpuRow !== false;
+  const H = top + nq * (rowH + gap) + (cpuRow ? 26 : 0) + 26, W = L + end * pxPer + 20;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, class: "tl", role: "img", "aria-label": "MLFQ 多级队列时间线" });
+  const X = (t) => L + t * pxPer;
+  const rowY = (lv) => top + (nq - 1 - lv) * (rowH + gap);
+  for (let lv = nq - 1; lv >= 0; lv--) {
+    const y = rowY(lv);
+    svg.append(s("rect", { x: X(0), y, width: end * pxPer, height: rowH, rx: 3, style: "fill:var(--surface);stroke:var(--border)" }));
+    svg.append(s("text", { x: L - 6, y: y + rowH / 2 + 4, "text-anchor": "end", "font-size": 12, class: "mono", text: "Q" + lv }));
+  }
+  const cursor = o.cursor;
+  const tk = res.ticks;
+  for (let j = 0; j < nj; j++) {
+    // 运行块与等待线：按 (状态, 层级) 合并连续区间
+    let cur = null;
+    const flush = () => {
+      if (!cur) return;
+      const y = rowY(cur.lv) + pad + j * lane;
+      const dim = cursor != null && cur.a >= cursor ? 0.18 : 1;
+      if (cur.kind === "run") svg.append(s("rect", { x: X(cur.a), y: y + 0.5, width: Math.max(0.8, (cur.b - cur.a) * pxPer), height: lane - 1, style: `fill:${color(j)}`, opacity: dim }));
+      else svg.append(s("rect", { x: X(cur.a), y: y + lane / 2 - 1, width: (cur.b - cur.a) * pxPer, height: 2, style: `fill:${color(j)}`, opacity: 0.5 * dim }));
+      cur = null;
+    };
+    for (let t = 0; t < Math.min(end, tk.length); t++) {
+      const k = tk[t];
+      let kind = null, lv = k.lv[j];
+      if (k.run === j) kind = "run"; else if (k.st[j] === "ready") kind = "wait";
+      if (kind && lv >= 0) {
+        if (cur && cur.kind === kind && cur.lv === lv && cur.b === t && (cursor == null || t !== cursor)) cur.b = t + 1;
+        else { flush(); cur = { kind, lv, a: t, b: t + 1 }; }
+      } else flush();
+    }
+    flush();
+    svg.append(s("text", { x: W - 16, y: rowY(nq - 1) + pad + j * lane + lane - 2, "font-size": 9.5, class: "t-muted", text: letter(j) }));
+  }
+  // 提升时刻
+  if (cfg.rules.r5 && cfg.S > 0) for (let t = cfg.S; t < end; t += cfg.S)
+    svg.append(s("line", { x1: X(t), x2: X(t), y1: top - 2, y2: top + nq * (rowH + gap) - gap + 2, style: "stroke:var(--warn);stroke-width:1.5", "stroke-dasharray": "4 3" }));
+  let axY = top + nq * (rowH + gap) - gap + 4;
+  if (cpuRow) {
+    const y = axY + 2;
+    svg.append(s("text", { x: L - 6, y: y + 13, "text-anchor": "end", "font-size": 11, class: "t-muted", text: "CPU" }));
+    let a = 0;
+    for (let t = 1; t <= Math.min(end, tk.length); t++) {
+      if (t === Math.min(end, tk.length) || tk[t].run !== tk[a].run || t === cursor) {
+        const who = tk[a].run;
+        const dim = cursor != null && a >= cursor ? 0.18 : 1;
+        svg.append(s("rect", { x: X(a), y, width: (t - a) * pxPer, height: 18, style: who < 0 ? "fill:var(--surface-2)" : `fill:${color(who)}`, opacity: dim }));
+        if ((t - a) * pxPer > 14 && who >= 0) svg.append(s("text", { x: X(a) + ((t - a) * pxPer) / 2, y: y + 13, "text-anchor": "middle", "font-size": 11, style: "fill:#fff;font-weight:600", opacity: dim, text: letter(who) }));
+        a = t;
+      }
+    }
+    axY += 24;
+  }
+  const unit = niceUnit(end);
+  for (let t = 0; t <= end; t += unit) {
+    svg.append(s("line", { x1: X(t), x2: X(t), y1: axY, y2: axY + 5, class: "stroke" }));
+    svg.append(s("text", { x: X(t), y: axY + 17, "text-anchor": "middle", "font-size": 11, class: "t-muted mono", text: t }));
+  }
+  if (cursor != null) svg.append(s("line", { x1: X(cursor), x2: X(cursor), y1: 0, y2: axY + 4, style: "stroke:var(--accent);stroke-width:2" }));
+  host.replaceChildren(svg);
+}
+
+// ---------- 预设（原书图 + 课后题） ----------
+const base = (o) => Object.assign({ nq: 3, quantum: [10, 10, 10], allot: [10, 10, 10], S: 100,
+  rules: { r1: true, r2: true, r3: true, r4: true, r5: false, ioFront: false }, view: 200 }, o);
+const J = (a, l, io = 0, iot = 1) => ({ arrival: a, length: l, ioEvery: io, ioTime: iot });
+const PRESETS = {
+  p82: { name: "图 8.2 单个长作业", cfg: base({ jobs: [J(0, 200)] }) },
+  p83l: { name: "图 8.3 左 短作业到来", cfg: base({ jobs: [J(0, 180), J(100, 20)] }) },
+  p83r: { name: "图 8.3 右 交互作业", cfg: base({ jobs: [J(0, 200), J(50, 25, 1, 5)], rules: { r1: true, r2: true, r3: true, r4: false, r5: false } }) },
+  p84l: { name: "图 8.4 左 无提升(饥饿)", cfg: base({ jobs: [J(0, 1000), J(100, 50, 2, 2), J(100, 50, 2, 2)], rules: { r1: true, r2: true, r3: true, r4: false, r5: false } }) },
+  p84r: { name: "图 8.4 右 每 100ms 提升", cfg: base({ jobs: [J(0, 1000), J(100, 100, 2, 2), J(100, 100, 2, 2)], rules: { r1: true, r2: true, r3: true, r4: false, r5: true }, S: 100, view: 300 }) },
+  p85l: { name: "图 8.5 左 被愚弄", cfg: base({ jobs: [J(0, 200), J(100, 100, 5, 1)], rules: { r1: true, r2: true, r3: true, r4: false, r5: false }, view: 300 }) },
+  p85r: { name: "图 8.5 右 完整计账", cfg: base({ jobs: [J(0, 200), J(100, 100, 5, 1)], view: 300 }) },
+  p86: { name: "图 8.6 低优先级长时间片", cfg: base({ quantum: [40, 20, 10], allot: [40, 40, 20], jobs: [J(0, 140), J(0, 140)], view: 300 }) },
+  hw4: { name: "课后题 4 愚弄 99%", cfg: base({ quantum: [100, 100, 100], allot: [100, 100, 100], jobs: [J(0, 1000), J(0, 1000, 99, 1)], rules: { r1: true, r2: true, r3: true, r4: false, r5: false }, view: 1000 }) },
+  hw5: { name: "课后题 5 S=200 保 5%", cfg: base({ jobs: [J(0, 3000), J(0, 3000, 2, 2), J(0, 3000, 2, 2)], rules: { r1: true, r2: true, r3: true, r4: false, r5: true }, S: 200, view: 1000 }) },
+};
+for (const [id, p] of Object.entries(PRESETS)) {
+  const host = document.querySelector(`[data-fig="${id}"]`);
+  if (!host) continue;
+  const cfg = JSON.parse(JSON.stringify(p.cfg));
+  const res = mlfq(Object.assign({}, cfg, { maxT: cfg.view }));
+  mlfqChart(host, res, cfg, { view: cfg.view, pxPer: cfg.view > 200 ? 2.2 : 3.2 });
+}
+
+// ---------- 交互模拟器 ----------
+let cfg = JSON.parse(JSON.stringify(PRESETS.p85r.cfg));
+let res = null;
+const $ = (id) => document.getElementById(id);
+const presetBox = $("ml-presets");
+for (const p of Object.values(PRESETS)) presetBox.append(h("button", { onclick: () => { cfg = JSON.parse(JSON.stringify(p.cfg)); cfg.rules = Object.assign({ r1: true, r2: true, r3: true, r4: true, r5: false, ioFront: false }, cfg.rules); syncUI(); recompute(); } }, p.name));
+document.querySelectorAll("#ml-rules input[type=checkbox]").forEach((cb) => (cb.onchange = () => { cfg.rules[cb.dataset.r] = cb.checked; recompute(); }));
+$("ml-S").oninput = (e) => { cfg.S = Math.max(1, +e.target.value | 0); recompute(); };
+$("ml-nq").oninput = (e) => {
+  const n = Math.max(1, Math.min(8, +e.target.value | 0));
+  while (cfg.quantum.length < n) { cfg.quantum.unshift(cfg.quantum[0]); cfg.allot.unshift(cfg.allot[0]); }
+  while (cfg.quantum.length > n) { cfg.quantum.shift(); cfg.allot.shift(); }
+  cfg.nq = n; drawLevels(); recompute();
+};
+$("ml-view").oninput = (e) => { cfg.view = Math.max(10, Math.min(3000, +e.target.value | 0)); recompute(); };
+$("ml-add").onclick = () => { if (cfg.jobs.length >= 6) return; cfg.jobs.push(J(0, 50)); drawJobs(); recompute(); };
+function drawLevels() {
+  const t = $("ml-levels");
+  const lvls = Array.from({ length: cfg.nq }, (_, k) => cfg.nq - 1 - k);
+  const inp = (arr, lv) => h("input", { type: "number", min: 1, max: 1000, value: arr[lv], oninput: (e) => { arr[lv] = Math.max(1, +e.target.value | 0); recompute(); } });
+  t.replaceChildren(
+    h("thead", {}, h("tr", {}, h("th", {}, "队列"), lvls.map((lv) => h("th", {}, "Q" + lv + (lv === cfg.nq - 1 ? "（最高）" : lv === 0 ? "（最低）" : ""))))),
+    h("tbody", {}, h("tr", {}, h("td", {}, "时间片 ms"), lvls.map((lv) => h("td", {}, inp(cfg.quantum, lv)))),
+      h("tr", {}, h("td", {}, "配额 ms"), lvls.map((lv) => h("td", {}, lv === 0 ? h("span", { class: "muted small" }, "（最低层不再降级）") : inp(cfg.allot, lv))))));
+}
+function drawJobs() {
+  $("ml-jobs").replaceChildren(...cfg.jobs.map((j, i) => {
+    const num = (k, min, max, label) => h("input", { type: "number", min, max, value: j[k], "aria-label": letter(i) + label, oninput: (e) => { j[k] = Math.max(min, Math.min(max, +e.target.value | 0)); recompute(); } });
+    return h("tr", {}, h("td", {}, h("span", { class: "sw", style: { background: color(i) } }), h("b", {}, letter(i))),
+      h("td", {}, num("arrival", 0, 2000, " 到达")), h("td", {}, num("length", 1, 5000, " 长度")),
+      h("td", {}, num("ioEvery", 0, 1000, " I/O 间隔")), h("td", {}, num("ioTime", 1, 200, " I/O 时长")),
+      h("td", {}, cfg.jobs.length > 1 ? h("button", { title: "删除", onclick: () => { cfg.jobs.splice(i, 1); drawJobs(); recompute(); } }, "✕") : ""));
+  }));
+}
+function syncUI() {
+  document.querySelectorAll("#ml-rules input[type=checkbox]").forEach((cb) => (cb.checked = !!cfg.rules[cb.dataset.r]));
+  $("ml-S").value = cfg.S; $("ml-nq").value = cfg.nq; $("ml-view").value = cfg.view;
+  drawLevels(); drawJobs();
+}
+function describe(k) {
+  const L = letter, parts = [`<b>t = ${k.t}</b>：`];
+  for (const e of k.ev) {
+    if (e.k === "arrive") parts.push(`${L(e.j)} 到达，放入 Q${e.lv}${cfg.rules.r3 ? "（规则 3：最高队列）" : "（规则 3 关闭：最低队列）"}。`);
+    if (e.k === "ioret") parts.push(`${L(e.j)} 的 I/O 完成，回到 Q${e.lv} 的${cfg.rules.ioFront ? "队首" : "队尾"}。`);
+    if (e.k === "boost") parts.push(`<b>优先级提升</b>（规则 5）：所有作业移到最高队列 Q${cfg.nq - 1}，配额清零。`);
+  }
+  if (k.run < 0) parts.push("没有就绪作业，CPU 空闲。");
+  else {
+    const lv = k.lv[k.run], others = [];
+    for (let l = cfg.nq - 1; l > lv; l--) if (k.Q[l].length) others.push(l);
+    const lower = k.Q.some((q, l) => l < lv && q.length);
+    let why;
+    if (!cfg.rules.r1) why = "（规则 1 关闭：选排队最早的就绪作业）";
+    else if (lower) why = `（规则 1：Q${lv} 是有就绪作业的最高队列，更低队列里的作业只能等）`;
+    else if (k.Q[lv].length > 1) why = `（规则 2：与同层作业轮转，它在队首）`;
+    else why = "";
+    parts.push(`运行 <b>${L(k.run)}</b>（Q${lv}，本时间片已用 ${k.qUsed[k.run]}/${cfg.quantum[lv]}，本层配额已用 ${k.allotUsed[k.run]}/${lv === 0 ? "∞" : cfg.allot[lv]}）${why}。`);
+  }
+  for (const a of k.after) {
+    if (a.k === "done") parts.push(`${L(a.j)} <b>完成</b>。`);
+    if (a.k === "demote") parts.push(`${L(a.j)} 用完了 Q${a.from} 的配额 → <b>降级</b>到 Q${a.to}（规则 ${cfg.rules.r4 ? "4" : "4a"}）。`);
+    if (a.k === "rotate") parts.push(`${L(a.j)} 的时间片用完，移到 Q${a.lv} 队尾（规则 2）。`);
+    if (a.k === "keep") parts.push(`${L(a.j)} 的时间片用完，但规则 2 关闭，它继续留在队首。`);
+    if (a.k === "io") parts.push(`${L(a.j)} <b>发起 I/O</b>，阻塞到 t = ${a.until}，留在 Q${a.lv}` + (cfg.rules.r4 ? "；规则 4：已用配额照样记账。" : a.reset ? "；旧规则 4b：配额被重置——这就是愚弄的入口。" : "。"));
+  }
+  return parts.join("");
+}
+function drawStep(i) {
+  if (!res) return;
+  const n = res.ticks.length, fin = i >= n;
+  mlfqChart($("ml-chart"), res, cfg, { view: n, cursor: fin ? null : i });
+  const snap = $("ml-snap");
+  if (fin) { snap.replaceChildren(h("div", { class: "muted small" }, "模拟结束")); $("ml-nar").innerHTML = summary(); return; }
+  const k = res.ticks[i];
+  const rows = [];
+  for (let l = cfg.nq - 1; l >= 0; l--) {
+    rows.push(h("div", { class: "row" }, h("span", { class: "qn" }, "Q" + l), h("span", { class: "qp" }, `片 ${cfg.quantum[l]} · 配额 ${l === 0 ? "∞" : cfg.allot[l]}`),
+      k.Q[l].length ? k.Q[l].map((j) => h("span", { class: "cell" + (j === k.run ? " run" : " on"), style: j === k.run ? { background: color(j) } : null }, letter(j), h("small", {}, `${k.allotUsed[j]}/${l === 0 ? "∞" : cfg.allot[l]}`))) : h("span", { class: "muted small" }, "（空）")));
+  }
+  rows.push(h("div", { class: "row" }, h("span", { class: "qn" }, "I/O"), h("span", { class: "qp" }, "阻塞中（剩余 ms）"),
+    k.io.length ? k.io.map((x) => h("span", { class: "cell" }, letter(x.j), h("small", {}, x.left))) : h("span", { class: "muted small" }, "（无）")));
+  snap.replaceChildren(...rows);
+  $("ml-nar").innerHTML = describe(k);
+}
+function summary() {
+  const P = res.per, tot = res.ticks.length;
+  const parts = [`<b>模拟结束</b>（共 ${tot} ms）。`];
+  P.forEach((p, i) => parts.push(`${letter(i)}：${p.done === null ? "未完成" : "在 " + p.done + " 完成"}，得到 CPU ${p.cpu} ms。`));
+  return parts.join(" ");
+}
+function recompute() {
+  res = mlfq(Object.assign({}, cfg, { maxT: Math.max(cfg.view, 10) }));
+  const n = res.ticks.length;
+  const stat = (v, l) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+  const busy = res.ticks.filter((k) => k.run >= 0).length;
+  const shares = res.per.map((p, i) => stat((busy ? (100 * p.cpu) / busy : 0).toFixed(1) + "%", `${letter(i)} 的 CPU 份额（0–${n}）`));
+  $("ml-stats").replaceChildren(...shares, stat(res.ticks.filter((k) => k.ev.some((e) => e.k === "boost")).length, "提升次数"));
+  $("ml-res").replaceChildren(h("thead", {}, h("tr", {}, ["作业", "到达", "长度", "首次运行", "完成", "响应时间", "周转时间", "已获 CPU"].map((x, k) => h("th", { class: k ? "num" : "" }, x)))),
+    h("tbody", {}, res.per.map((p, i) => h("tr", {}, h("td", {}, h("span", { class: "sw", style: { background: color(i) } }), letter(i)),
+      [p.arrival, p.length, p.first, p.done, p.response, p.turnaround, p.cpu].map((v) => h("td", { class: "num" }, v == null ? "—" : String(v)))))));
+  stepper.reset();
+}
+const stepper = OSTEP.stepper($("ml-step"), { steps: () => (res ? res.ticks.length + 1 : 1), render: drawStep, autoplayMs: 90 });
+const notable = (k) => k.ev.length > 0 || k.after.length > 0;
+$("ml-nextev").onclick = () => { stepper.stop(); for (let i = stepper.index + 1; i < res.ticks.length; i++) if (notable(res.ticks[i])) return stepper.go(i); stepper.go(res.ticks.length); };
+$("ml-prevev").onclick = () => { stepper.stop(); for (let i = stepper.index - 1; i >= 0; i--) if (notable(res.ticks[i])) return stepper.go(i); stepper.go(0); };
+syncUI();
+recompute();
+})();
+</script>
+</body></html>

@@ -1,0 +1,1343 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 30 章 · 条件变量</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+.tchip { display: inline-block; color: #fff; font: 600 12px/1.2 var(--mono); padding: 2px 7px; border-radius: 999px; margin: 1px 2px; white-space: nowrap; }
+.tchip.dim { opacity: .55; outline: 1px dashed var(--fg); outline-offset: 1px; }
+.runbar .tbtn { display: inline-flex; align-items: center; gap: 6px; border-width: 2px; font-weight: 600; }
+.runbar .tbtn .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.presets button { font-size: 13px; }
+.sim .controls label { max-width: 100%; flex-wrap: wrap; }
+.sim .controls select { max-width: 100%; min-width: 0; }
+.notice { margin: 10px 0; padding: 8px 12px; border-radius: 8px; background: var(--warn-soft); border-left: 4px solid var(--warn); font-size: 14px; }
+.codecols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; }
+.codebox { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 0; font: 12.5px/1.55 var(--mono); min-width: 0; overflow-x: auto; }
+.codebox .cb-title { font: 600 12.5px var(--font); color: var(--muted); padding: 0 10px 4px; }
+.cl { display: flex; align-items: center; min-height: 22px; padding: 0 8px 0 0; white-space: nowrap; }
+.cl .lb { width: 34px; flex: none; text-align: right; padding-right: 8px; color: var(--faint); font-size: 11.5px; }
+.cl .tx { white-space: pre; }
+.cl .mk { margin-left: 8px; display: inline-flex; flex-wrap: nowrap; }
+.cl.exec { background: color-mix(in srgb, var(--warn) 22%, transparent); }
+.cl.exec.bad { background: var(--bad-soft); box-shadow: inset 3px 0 0 var(--bad); }
+.cl.exec .lb { color: var(--fg); font-weight: 700; }
+.midrow { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; margin-top: 10px; }
+.thpanel, .shpanel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; min-width: 0; overflow-x: auto; }
+table.mini { font-size: 13px; background: none; }
+table.mini th, table.mini td { padding: 4px 6px; }
+table.mini tr.cur td { background: var(--accent-soft); }
+.st-sleep { color: var(--warn); font-weight: 600; }
+.st-lock { color: var(--bad); font-weight: 600; }
+.st-run { color: var(--ok); font-weight: 600; }
+.st-done { color: var(--faint); }
+.kv { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 4px 0; font-size: 13.5px; }
+.kv .k { color: var(--muted); min-width: 7.5em; font-size: 13px; }
+.slots { display: inline-flex; flex-wrap: wrap; gap: 2px; }
+.slot { display: inline-flex; flex-direction: column; align-items: center; }
+.slot .ptr { font: 10.5px var(--mono); color: var(--accent); min-height: 14px; }
+pre.term { margin: 0; padding: 6px 10px; font-size: 12.5px; min-width: 12em; }
+.trace-wrap { margin-top: 10px; max-height: 300px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+table.trace { font: 12.5px/1.4 var(--mono); border-radius: 0; overflow: visible; }
+table.trace th { position: sticky; top: 0; z-index: 1; font-family: var(--font); }
+table.trace td, table.trace th { padding: 3px 8px; white-space: nowrap; }
+table.trace td:last-child { white-space: normal; min-width: 18em; font-family: var(--font); }
+table.trace td.me { font-weight: 700; }
+table.trace tr.cur td { background: var(--accent-soft); }
+table.trace tr.future td { opacity: .38; }
+table.trace tr.k-warn td:last-child { color: var(--warn); }
+table.trace tr.k-bad td { background: var(--bad-soft); }
+.narrate.bad { background: var(--bad-soft); border-left: 4px solid var(--bad); }
+.narrate.ok { background: var(--ok-soft); border-left: 4px solid var(--ok); }
+.narrate.warn { background: var(--warn-soft); border-left: 4px solid var(--warn); }
+.narrate .halt { margin-top: 6px; font-weight: 650; }
+.cmp { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.cmp pre { margin: 6px 0; }
+.lbl-bad { color: var(--bad); font-weight: 700; }
+.lbl-ok { color: var(--ok); font-weight: 700; }
+.inline-btn { font-size: 13px; padding: 3px 10px; margin: 2px 0; }
+</style>
+</head>
+<body data-chapter="30">
+<main>
+
+<h2>本章要解决什么问题</h2>
+<div class="crux">
+<p><strong>如何等待一个条件？</strong>在多线程程序中，一个线程常常需要等某个条件成立（比如"子线程已经结束""缓冲区里有数据了"）之后才能继续执行。最简单的做法是自旋，一直检查直到条件成立。但这样极其低效，白白浪费 CPU 周期，某些情况下甚至是错的。那么，线程应该怎样等待一个条件？</p>
+<p class="muted small">原文：How should a thread wait for a condition?</p>
+</div>
+<p>上一章之前我们一直在研究锁（lock）。锁解决的是<strong>互斥</strong>：同一时刻只让一个线程进入临界区。但并发程序还有另一类同样常见的需求，就是<strong>等待与通知</strong>。比如父线程要等子线程结束（join），消费者要等缓冲区里有数据，生产者要等缓冲区有空位。这些需求都不能只靠锁来完成。</p>
+<p>本章引入第二个同步原语：<strong>条件变量（condition variable，CV）</strong>。它和锁搭配，能优雅地解决 join、生产者/消费者（有界缓冲区）以及内存分配器这类"覆盖条件"问题。本章的几个结论会反复用到：<strong>永远用 while 检查条件</strong>、<strong>调用 wait/signal 时持有锁</strong>、<strong>不同的等待者用不同的条件变量</strong>。下一章的信号量（semaphore）能同时充当锁和条件变量；第 32 章里的"顺序违反（order violation）"类 bug，修复方法正是本章的条件变量。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 680 190" width="680" role="img" aria-label="自旋等待与睡眠等待的 CPU 时间线对比">
+  <text x="10" y="20" font-size="13" font-weight="600">单 CPU 上父线程等子线程（Figure 30.2 vs 30.3）</text>
+  <text x="10" y="62" font-size="12.5">自旋 while(done==0);</text>
+  <rect x="150" y="45" width="50" height="28" rx="3" style="fill:var(--c1)"/><text x="175" y="64" font-size="11" text-anchor="middle" style="fill:#fff">父</text>
+  <rect x="200" y="45" width="170" height="28" rx="3" class="bad-soft"/><text x="285" y="64" font-size="11.5" text-anchor="middle">父：空转检查 done（浪费）</text>
+  <rect x="370" y="45" width="120" height="28" rx="3" style="fill:var(--c2)"/><text x="430" y="64" font-size="11" text-anchor="middle" style="fill:#fff">子：child; done=1</text>
+  <rect x="490" y="45" width="60" height="28" rx="3" style="fill:var(--c1)"/><text x="520" y="64" font-size="11" text-anchor="middle" style="fill:#fff">父：end</text>
+  <text x="10" y="122" font-size="12.5">条件变量 wait()</text>
+  <rect x="150" y="105" width="60" height="28" rx="3" style="fill:var(--c1)"/><text x="180" y="124" font-size="11" text-anchor="middle" style="fill:#fff">父：wait</text>
+  <rect x="210" y="105" width="130" height="28" rx="3" style="fill:var(--c2)"/><text x="275" y="124" font-size="11" text-anchor="middle" style="fill:#fff">子：child; signal</text>
+  <rect x="340" y="105" width="60" height="28" rx="3" style="fill:var(--c1)"/><text x="370" y="124" font-size="11" text-anchor="middle" style="fill:#fff">父：end</text>
+  <text x="410" y="124" font-size="11.5" class="t-muted">← 提前结束；父睡眠期间不占 CPU</text>
+  <line x1="150" y1="150" x2="660" y2="150" class="arrow"/>
+  <text x="150" y="168" font-size="11" class="t-muted">时间 →</text>
+  <text x="200" y="95" font-size="11" class="t-muted">父线程的整个时间片都在空转，子线程只能等它被抢占</text>
+</svg>
+<figcaption>自旋等待在单 CPU 上最糟：父线程烧掉整个时间片，而它等待的那个子线程恰恰因此无法运行。</figcaption>
+</figure>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>条件变量（condition variable）</h4><p>一个显式的等待队列：状态不如意时线程把自己挂上去睡觉，另一个线程改变状态后把它叫醒。</p></div>
+  <div class="card"><h4>wait(c, m)</h4><p>调用时必须持有锁 m；它<strong>原子地</strong>释放 m 并睡眠；被唤醒后，返回前会重新获取 m。</p></div>
+  <div class="card"><h4>signal(c)</h4><p>唤醒一个睡在 c 上的线程（如果有）。没人在等就什么也不做：<strong>信号不会被记住</strong>。</p></div>
+  <div class="card"><h4>状态变量（state variable）</h4><p>如 <code>done</code>、<code>count</code>。条件变量本身没有记忆，睡眠、唤醒和加锁都要围绕状态变量来做。</p></div>
+  <div class="card"><h4>Mesa 语义（Mesa semantics）</h4><p>signal 只是一个"提示"：被唤醒的线程真正运行时，状态可能已经又变了，所以要用 while 重新检查。</p></div>
+  <div class="card"><h4>生产者/消费者（bounded buffer）</h4><p>经典同步问题。最终解法是 while 加两个条件变量 empty/fill，再加多槽循环缓冲区。</p></div>
+  <div class="card"><h4>覆盖条件（covering condition）</h4><p>不知道该唤醒谁时，用 broadcast 把所有等待者都叫醒，各自重新检查。代价是一些线程白醒一场。</p></div>
+  <div class="card"><h4>伪唤醒（spurious wakeup）</h4><p>某些实现里一次 signal 可能唤醒两个线程。这又是一个必须用 while 的理由。</p></div>
+</div>
+
+<h2>定义与接口：wait() 和 signal()</h2>
+<p>条件变量最早可以追溯到 Dijkstra 的"私有信号量"，后来 Hoare 在管程（monitor）的工作里给了它"条件变量"这个名字。在 POSIX 里这样声明和使用：</p>
+<pre><code>pthread_cond_t c = PTHREAD_COND_INITIALIZER;   // 需要正确初始化
+pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m);
+pthread_cond_signal(pthread_cond_t *c);</code></pre>
+<p>注意 <code>wait()</code> 多带了一个互斥锁参数。它假定调用时 m <strong>已经被锁住</strong>，然后做两件事：①<strong>原子地</strong>释放锁并让调用者睡眠；②被别的线程 signal 唤醒后，在返回调用者之前<strong>重新获取锁</strong>。所以从调用者的角度看，wait() 前后自己都持有锁。之所以设计得这么复杂，是为了防止线程"准备去睡"的那一刻出现竞态条件，下面的 join 例子会讲清楚。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 700 272" width="700" role="img" aria-label="wait 与 signal 的三个阶段">
+  <defs><marker id="ah30" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <rect x="20" y="90" width="160" height="70" rx="8" class="accent-soft"/>
+  <text x="100" y="118" font-size="13" text-anchor="middle" font-weight="600">运行中的线程 T</text>
+  <text x="100" y="140" font-size="12" text-anchor="middle">持有锁 m，发现条件不满足</text>
+  <rect x="270" y="90" width="170" height="70" rx="8" class="warn-soft"/>
+  <text x="355" y="113" font-size="13" text-anchor="middle" font-weight="600">条件变量 c 的等待队列</text>
+  <rect x="290" y="124" width="40" height="24" rx="12" style="fill:var(--c2)"/><text x="310" y="141" font-size="11" text-anchor="middle" style="fill:#fff">T2</text>
+  <rect x="336" y="124" width="40" height="24" rx="12" style="fill:var(--c1)"/><text x="356" y="141" font-size="11" text-anchor="middle" style="fill:#fff">T</text>
+  <text x="400" y="141" font-size="11" class="t-muted">睡眠</text>
+  <rect x="520" y="90" width="160" height="70" rx="8" class="ok-soft"/>
+  <text x="600" y="118" font-size="13" text-anchor="middle" font-weight="600">就绪队列</text>
+  <text x="600" y="140" font-size="12" text-anchor="middle">可运行，但还没运行</text>
+  <path d="M180,112 L268,112" class="arrow" marker-end="url(#ah30)"/>
+  <text x="224" y="60" font-size="12" text-anchor="middle" font-weight="600">① wait(&amp;c, &amp;m)</text>
+  <text x="224" y="78" font-size="11" text-anchor="middle">原子地：释放 m + 入队睡眠</text>
+  <path d="M440,112 L518,112" class="arrow" marker-end="url(#ah30)"/>
+  <text x="480" y="60" font-size="12" text-anchor="middle" font-weight="600">② 别人 signal(&amp;c)</text>
+  <text x="480" y="78" font-size="11" text-anchor="middle">取出一个 → 就绪</text>
+  <path d="M600,160 C600,212 100,212 100,162" class="arrow" marker-end="url(#ah30)"/>
+  <text x="350" y="236" font-size="12" text-anchor="middle" font-weight="600">③ 被调度运行：先重新拿到锁 m，wait() 才返回</text>
+  <text x="350" y="256" font-size="11" text-anchor="middle" class="t-muted">②和③之间可能隔了很久，其他线程可能已经改变了状态（Mesa 语义）</text>
+</svg>
+<figcaption>wait() 的三个阶段。"释放锁"和"睡眠"必须是一个原子动作，否则在两者之间发生的 signal 会丢失。</figcaption>
+</figure>
+
+<h2>用条件变量实现 join</h2>
+<p>我们希望 Figure 30.1 的程序总是输出 <code>parent: begin</code> → <code>child</code> → <code>parent: end</code>。正确的写法（Figure 30.3）如下：</p>
+<pre><code>int done = 0;                                   // 状态变量
+pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  c = PTHREAD_COND_INITIALIZER;
+
+void thr_exit() {                  // 子线程结束时调用
+    Pthread_mutex_lock(&amp;m);
+    done = 1;                      // 先改状态……
+    Pthread_cond_signal(&amp;c);       // ……再通知
+    Pthread_mutex_unlock(&amp;m);
+}
+void thr_join() {                  // 父线程等待
+    Pthread_mutex_lock(&amp;m);
+    while (done == 0)              // 条件不满足才睡；用 while
+        Pthread_cond_wait(&amp;c, &amp;m);
+    Pthread_mutex_unlock(&amp;m);
+}</code></pre>
+<p>要考虑两种情况：</p>
+<ul>
+<li><strong>父线程先运行</strong>：它拿锁，发现 <code>done == 0</code>，调用 wait() 睡下，同时释放锁。子线程之后运行，打印 child，拿锁，把 done 置 1，signal 叫醒父线程。父线程从 wait() 返回时已持有锁，解锁后打印 parent: end。</li>
+<li><strong>子线程先运行完</strong>：它把 done 置 1 并 signal，但此时没人在等，signal 什么也不做。父线程之后调用 thr_join()，看到 <code>done == 1</code>，根本不睡，直接返回。</li>
+</ul>
+
+<figure class="fig">
+<svg viewBox="0 0 700 200" width="700" role="img" aria-label="join 的两种情况时间线">
+  <text x="10" y="18" font-size="13" font-weight="600">情况 1：父先运行</text>
+  <text x="10" y="48" font-size="12">父</text><text x="10" y="80" font-size="12">子</text>
+  <rect x="40" y="32" width="150" height="24" rx="3" style="fill:var(--c1)"/><text x="115" y="49" font-size="11" text-anchor="middle" style="fill:#fff">lock; done==0 → wait</text>
+  <rect x="190" y="32" width="190" height="24" rx="3" class="warn-soft"/><text x="285" y="49" font-size="11" text-anchor="middle">睡在 c 上（锁已释放）</text>
+  <rect x="190" y="64" width="190" height="24" rx="3" style="fill:var(--c2)"/><text x="285" y="81" font-size="11" text-anchor="middle" style="fill:#fff">child; lock; done=1; signal; unlock</text>
+  <rect x="380" y="32" width="200" height="24" rx="3" style="fill:var(--c1)"/><text x="480" y="49" font-size="11" text-anchor="middle" style="fill:#fff">wait 返回(持锁); done==1; unlock; end</text>
+  <text x="10" y="118" font-size="13" font-weight="600">情况 2：子先运行完</text>
+  <text x="10" y="148" font-size="12">父</text><text x="10" y="180" font-size="12">子</text>
+  <rect x="40" y="164" width="240" height="24" rx="3" style="fill:var(--c2)"/><text x="160" y="181" font-size="11" text-anchor="middle" style="fill:#fff">child; lock; done=1; signal（无人等）; unlock</text>
+  <rect x="280" y="132" width="250" height="24" rx="3" style="fill:var(--c1)"/><text x="405" y="149" font-size="11" text-anchor="middle" style="fill:#fff">lock; done==1 → 不睡; unlock; end</text>
+  <text x="545" y="149" font-size="11" class="t-muted">done 记住了"已结束"</text>
+</svg>
+<figcaption>两种情况都正确。关键是 <code>done</code>：signal 本身不会被记住，但 done 会。</figcaption>
+</figure>
+
+<h3>为什么需要状态变量 done？</h3>
+<p>去掉 done，只用锁和条件变量（Figure 30.4）：</p>
+<div class="cmp">
+<div><span class="lbl-bad">✗ 没有状态变量（Figure 30.4）</span>
+<pre><code>void thr_exit() {
+    Pthread_mutex_lock(&amp;m);
+    Pthread_cond_signal(&amp;c);
+    Pthread_mutex_unlock(&amp;m);
+}
+void thr_join() {
+    Pthread_mutex_lock(&amp;m);
+    Pthread_cond_wait(&amp;c, &amp;m);
+    Pthread_mutex_unlock(&amp;m);
+}</code></pre></div>
+<div><span class="lbl-bad">✗ 不持锁（Figure 30.5，假想的接口）</span>
+<pre><code>void thr_exit() {
+    done = 1;
+    Pthread_cond_signal(&amp;c);
+}
+void thr_join() {
+    if (done == 0)
+        Pthread_cond_wait(&amp;c);
+}</code></pre></div>
+</div>
+<p><strong>没有状态变量</strong>：如果子线程先运行，它 signal 的时候没人在等，这个信号就丢了。父线程随后调用 wait()，会永远睡下去，因为再也没有人会叫醒它。状态变量记录的正是线程们关心的那个事实；睡眠、唤醒和加锁都是围绕它建立的。</p>
+<p><strong>不持锁</strong>：这里有一个微妙的竞态。父线程检查 <code>done</code>，看到 0，正要调用 wait() 去睡，恰好在这一刻被中断。子线程运行，把 done 置 1 并 signal，可此时父线程还没进入等待队列，所以没有线程被唤醒。父线程恢复运行后照原计划去睡，从此永远睡下去。"检查条件"和"去睡"之间必须没有缝隙，而 wait() 在持锁状态下原子地"释放锁并入睡"，正是为了堵住这条缝。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 700 150" width="700" role="img" aria-label="不持锁时的信号丢失竞态">
+  <text x="10" y="18" font-size="13" font-weight="600">不持锁时的"丢失唤醒"（lost wakeup）</text>
+  <text x="10" y="58" font-size="12">父</text><text x="10" y="98" font-size="12">子</text>
+  <rect x="40" y="42" width="120" height="24" rx="3" style="fill:var(--c1)"/><text x="100" y="59" font-size="11" text-anchor="middle" style="fill:#fff">if (done == 0) ✓</text>
+  <text x="165" y="36" font-size="11" class="t-muted">← 在这里被中断！</text>
+  <rect x="160" y="82" width="200" height="24" rx="3" style="fill:var(--c2)"/><text x="260" y="99" font-size="11" text-anchor="middle" style="fill:#fff">done = 1; signal（队列空，丢失）</text>
+  <rect x="360" y="42" width="80" height="24" rx="3" style="fill:var(--c1)"/><text x="400" y="59" font-size="11" text-anchor="middle" style="fill:#fff">wait(&amp;c)</text>
+  <rect x="440" y="42" width="240" height="24" rx="3" class="bad-soft"/><text x="560" y="59" font-size="11" text-anchor="middle">永远睡眠：再也没有人 signal</text>
+  <text x="40" y="136" font-size="11.5" class="t-muted">持锁版本里，子线程在父线程释放锁（进入 wait 的同时）之前根本拿不到锁，这个窗口就不存在了。</text>
+</svg>
+<figcaption>检查条件和进入睡眠之间的缝隙，就是"丢失唤醒"的来源。</figcaption>
+</figure>
+
+<div class="tip"><p><strong>发信号时总是持有锁（Always hold the lock while signaling）。</strong>严格说并非所有情况都必须持锁，但持锁发信号最简单，也最不容易出错。而"调用 wait 时持有锁"不只是建议，它是 wait 语义强制要求的：wait 假定调用时持锁，睡眠时释放锁，返回前重新获取锁。所以把两条合起来记：<strong>调用 signal 或 wait 时都持有锁</strong>，就不会出问题。</p></div>
+
+<section class="sim" id="sim-join">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>join 的三种写法：交错执行器</h3>
+  <div class="desc">选一种实现，用线程按钮决定父、子线程的交错顺序。看看哪种写法在哪种交错下会让父线程"永远睡下去"。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>实现 <select data-p="variant">
+        <option value="ok">正确：done + 锁 + while（Fig 30.3）</option>
+        <option value="nostate">错误：没有状态变量（Fig 30.4）</option>
+        <option value="nolock">错误：不持锁（Fig 30.5）</option>
+      </select></label>
+    </div>
+    <div class="sim-mount"></div>
+  </div>
+</section>
+
+<h2>生产者/消费者（有界缓冲区）问题</h2>
+<p>生产者/消费者问题也叫有界缓冲区（bounded buffer）问题，由 Dijkstra 提出。正是为了解决它，Dijkstra 和同事发明了通用的信号量。设想有一个或多个<strong>生产者</strong>线程往缓冲区里放数据，一个或多个<strong>消费者</strong>线程从里面取数据。多线程 Web 服务器就是这样工作的：生产者把 HTTP 请求放进工作队列，消费者线程取出来处理。管道也一样：<code>grep foo file.txt | wc -l</code> 中，grep 是生产者，wc 是消费者，中间的 UNIX 管道就是内核里的有界缓冲区。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 700 200" width="700" role="img" aria-label="有界缓冲区示意">
+  <defs><marker id="ah30b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <rect x="20" y="30" width="120" height="34" rx="17" style="fill:var(--c3)"/><text x="80" y="52" font-size="12" text-anchor="middle" style="fill:#fff">生产者 Tp1</text>
+  <rect x="20" y="80" width="120" height="34" rx="17" style="fill:var(--c3)"/><text x="80" y="102" font-size="12" text-anchor="middle" style="fill:#fff">生产者 Tp2</text>
+  <path d="M140,47 L230,68" class="arrow" marker-end="url(#ah30b)"/><path d="M140,97 L230,78" class="arrow" marker-end="url(#ah30b)"/>
+  <text x="185" y="45" font-size="11" class="t-muted">put()</text>
+  <rect x="235" y="55" width="230" height="40" rx="6" class="box-strong"/>
+  <rect x="245" y="62" width="36" height="26" rx="4" style="fill:var(--c3)"/><rect x="287" y="62" width="36" height="26" rx="4" style="fill:var(--c3)"/>
+  <rect x="329" y="62" width="36" height="26" rx="4" class="box"/><rect x="371" y="62" width="36" height="26" rx="4" class="box"/><rect x="413" y="62" width="36" height="26" rx="4" class="box"/>
+  <text x="350" y="115" font-size="12" text-anchor="middle">共享缓冲区：MAX 个槽（count = 2）</text>
+  <path d="M465,68 L555,47" class="arrow" marker-end="url(#ah30b)"/><path d="M465,78 L555,97" class="arrow" marker-end="url(#ah30b)"/>
+  <text x="510" y="45" font-size="11" class="t-muted">get()</text>
+  <rect x="560" y="30" width="120" height="34" rx="17" style="fill:var(--c1)"/><text x="620" y="52" font-size="12" text-anchor="middle" style="fill:#fff">消费者 Tc1</text>
+  <rect x="560" y="80" width="120" height="34" rx="17" style="fill:var(--c1)"/><text x="620" y="102" font-size="12" text-anchor="middle" style="fill:#fff">消费者 Tc2</text>
+  <text x="80" y="150" font-size="11.5" text-anchor="middle" class="t-muted">满了就要等</text>
+  <text x="620" y="150" font-size="11.5" text-anchor="middle" class="t-muted">空了就要等</text>
+  <text x="350" y="160" font-size="12.5" text-anchor="middle" class="mono">grep foo file.txt  |  wc -l</text>
+  <text x="350" y="182" font-size="11" text-anchor="middle" class="t-muted">生产者（grep）→ 内核管道缓冲区 → 消费者（wc）</text>
+</svg>
+<figcaption>两种等待：生产者等"有空位"，消费者等"有数据"。缓冲区是共享资源，访问它必须同步。</figcaption>
+</figure>
+
+<p>先用最简单的单槽缓冲区（Figure 30.6）：<code>put()</code> 断言缓冲区为空，放入数据并令 <code>count = 1</code>；<code>get()</code> 断言缓冲区为满，令 <code>count = 0</code> 并返回数据。同步代码的职责很清楚：只在 <code>count == 0</code> 时 put，只在 <code>count == 1</code> 时 get。如果写错，断言就会触发。</p>
+<pre><code>int buffer;
+int count = 0;              // 一开始为空
+
+void put(int value) {
+    assert(count == 0);
+    count = 1;
+    buffer = value;
+}
+int get() {
+    assert(count == 1);
+    count = 0;
+    return buffer;
+}</code></pre>
+<p>put 和 get 显然含有临界区，但只加一把锁不够：消费者发现缓冲区为空时，拿着锁自旋是没用的。我们需要让它<strong>睡下去，等生产者叫醒它</strong>，这就用到了条件变量。</p>
+
+<h2>第一次尝试：if + 单个条件变量（Broken v1）</h2>
+<pre><code>cond_t  cond;
+mutex_t mutex;
+
+void *producer(void *arg) {
+    for (int i = 0; i &lt; loops; i++) {
+        Pthread_mutex_lock(&amp;mutex);            // p1
+        if (count == 1)                        // p2
+            Pthread_cond_wait(&amp;cond, &amp;mutex);  // p3
+        put(i);                                // p4
+        Pthread_cond_signal(&amp;cond);            // p5
+        Pthread_mutex_unlock(&amp;mutex);          // p6
+    }
+}
+void *consumer(void *arg) {
+    for (int i = 0; i &lt; loops; i++) {
+        Pthread_mutex_lock(&amp;mutex);            // c1
+        if (count == 0)                        // c2
+            Pthread_cond_wait(&amp;cond, &amp;mutex);  // c3
+        int tmp = get();                       // c4
+        Pthread_cond_signal(&amp;cond);            // c5
+        Pthread_mutex_unlock(&amp;mutex);          // c6
+        printf("%d\n", tmp);
+    }
+}</code></pre>
+<p>生产者在 p1–p3 等缓冲区变空，消费者在 c1–c3 等缓冲区变满，两边逻辑对称。<strong>只有一个生产者和一个消费者时，这段代码是对的</strong>。但只要有两个消费者（或两个生产者），就会暴露两个严重问题。先看第一个，它和 <code>if</code> 有关。</p>
+<p>设有两个消费者 Tc1、Tc2 和一个生产者 Tp（Figure 30.9）：</p>
+<ol>
+<li>Tc1 先运行：拿锁（c1），发现没数据（c2），wait 睡下（c3），同时释放了锁。</li>
+<li>Tp 运行：拿锁（p1），发现不满（p2），放入数据（p4），signal（p5）。这让 Tc1 从睡眠变为<strong>就绪</strong>，但它还没有运行。Tp 继续循环，发现缓冲区满了，于是睡下（p6, p1–p3）。</li>
+<li><strong>Tc2 插队</strong>：它恰好这时运行，走 c1、c2（有数据，不用等）、c4 把唯一的数据取走、c5、c6。</li>
+<li>Tc1 终于运行：从 wait() 返回前重新拿到锁，接着执行 c4 的 get()。但缓冲区已经空了，断言触发！</li>
+</ol>
+
+<figure class="fig">
+<svg viewBox="0 0 720 210" width="720" role="img" aria-label="Figure 30.9 的时间线">
+  <text x="10" y="18" font-size="13" font-weight="600">Figure 30.9 的关键窗口</text>
+  <text x="10" y="52" font-size="12" font-weight="600" style="fill:var(--c1)">Tc1</text>
+  <text x="10" y="92" font-size="12" font-weight="600" style="fill:var(--c2)">Tc2</text>
+  <text x="10" y="132" font-size="12" font-weight="600" style="fill:var(--c3)">Tp</text>
+  <text x="10" y="172" font-size="12">count</text>
+  <rect x="50" y="36" width="90" height="24" rx="3" style="fill:var(--c1)"/><text x="95" y="53" font-size="11" text-anchor="middle" style="fill:#fff">c1 c2 c3</text>
+  <rect x="140" y="36" width="115" height="24" rx="3" class="warn-soft"/><text x="197" y="53" font-size="11" text-anchor="middle">Sleep</text>
+  <rect x="255" y="36" width="330" height="24" rx="3" class="accent-soft"/><text x="420" y="53" font-size="11" text-anchor="middle">Ready（已被唤醒，但还没运行）</text>
+  <rect x="585" y="36" width="60" height="24" rx="3" style="fill:var(--bad)"/><text x="615" y="53" font-size="11" text-anchor="middle" style="fill:#fff">c4 ✗</text>
+  <rect x="140" y="116" width="115" height="24" rx="3" style="fill:var(--c3)"/><text x="197" y="133" font-size="11" text-anchor="middle" style="fill:#fff">p1 p2 p4 p5</text>
+  <rect x="255" y="116" width="130" height="24" rx="3" style="fill:var(--c3)"/><text x="320" y="133" font-size="11" text-anchor="middle" style="fill:#fff">p6 p1 p2 p3</text>
+  <rect x="385" y="116" width="200" height="24" rx="3" class="warn-soft"/><text x="485" y="133" font-size="11" text-anchor="middle">Sleep → c5 唤醒 → Ready</text>
+  <rect x="385" y="76" width="200" height="24" rx="3" style="fill:var(--c2)"/><text x="485" y="93" font-size="11" text-anchor="middle" style="fill:#fff">c1 c2 c4 c5 c6（取走数据）</text>
+  <text x="95" y="176" font-size="12" text-anchor="middle" class="mono">0</text>
+  <text x="320" y="176" font-size="12" text-anchor="middle" class="mono">1</text>
+  <text x="485" y="176" font-size="12" text-anchor="middle" class="mono">1 → 0</text>
+  <text x="615" y="176" font-size="12" text-anchor="middle" class="mono" style="fill:var(--bad)">0！</text>
+  <line x1="255" y1="28" x2="255" y2="190" style="stroke:var(--accent);stroke-dasharray:4 3"/>
+  <line x1="585" y1="28" x2="585" y2="190" style="stroke:var(--accent);stroke-dasharray:4 3"/>
+  <text x="420" y="202" font-size="11.5" text-anchor="middle" style="fill:var(--accent)">从"被唤醒"到"真正运行"之间，状态被 Tc2 改掉了</text>
+</svg>
+<figcaption>用 if 时，Tc1 醒来后不会重新检查 count，直接 get()。</figcaption>
+</figure>
+<p><button class="inline-btn" data-load="fig309">▶ 在下方模拟器中逐行复现 Figure 30.9</button> <button class="inline-btn" data-load="fig309v2">▶ 同一调度换成 while 会怎样？</button></p>
+
+<h2>Mesa 语义与 Hoare 语义</h2>
+<p>问题的根源很简单：生产者叫醒 Tc1 之后、Tc1 真正运行之前，缓冲区的状态被 Tc2 改变了。<strong>signal 只是把线程唤醒，它是一个提示（hint）</strong>：告诉对方"世界的状态变了"，但不保证对方运行时状态仍然如它所愿。对 signal 的这种解释叫 <strong>Mesa 语义（Mesa semantics）</strong>，得名于第一个这样实现条件变量的研究（Lampson 和 Redell 用 Mesa 语言做的 Pilot 系统）。与之相对的 <strong>Hoare 语义（Hoare semantics）</strong>提供更强的保证：被唤醒的线程会立即运行。Hoare 语义更难实现，<strong>几乎所有实际系统都采用 Mesa 语义</strong>。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 700 190" width="700" role="img" aria-label="Mesa 与 Hoare 语义对比">
+  <text x="10" y="20" font-size="13" font-weight="600">Mesa：signal 之后，谁先运行由调度器决定</text>
+  <rect x="20" y="32" width="130" height="26" rx="3" style="fill:var(--c3)"/><text x="85" y="50" font-size="11" text-anchor="middle" style="fill:#fff">Tp: put; signal</text>
+  <rect x="150" y="32" width="90" height="26" rx="3" style="fill:var(--c3)"/><text x="195" y="50" font-size="11" text-anchor="middle" style="fill:#fff">Tp: unlock…</text>
+  <rect x="240" y="32" width="160" height="26" rx="3" style="fill:var(--c2)"/><text x="320" y="50" font-size="11" text-anchor="middle" style="fill:#fff">任何别的线程都可能插进来</text>
+  <rect x="400" y="32" width="270" height="26" rx="3" style="fill:var(--c1)"/><text x="535" y="50" font-size="11" text-anchor="middle" style="fill:#fff">Tc1: 拿回锁，wait 返回 → 必须 while 重查</text>
+  <text x="10" y="100" font-size="13" font-weight="600">Hoare：signal 的同时把锁和 CPU 直接交给被唤醒者</text>
+  <rect x="20" y="112" width="130" height="26" rx="3" style="fill:var(--c3)"/><text x="85" y="130" font-size="11" text-anchor="middle" style="fill:#fff">Tp: put; signal</text>
+  <rect x="150" y="112" width="250" height="26" rx="3" style="fill:var(--c1)"/><text x="275" y="130" font-size="11" text-anchor="middle" style="fill:#fff">Tc1 立刻运行：状态一定还是"有数据"</text>
+  <rect x="400" y="112" width="160" height="26" rx="3" style="fill:var(--c3)"/><text x="480" y="130" font-size="11" text-anchor="middle" style="fill:#fff">Tp 重新拿锁后继续</text>
+  <text x="20" y="168" font-size="11.5" class="t-muted">Hoare 下 if 就够用，前提是 signal 只在"对方等的条件确实成立"时才发出，并且发给对的那一类线程。</text>
+</svg>
+<figcaption>Mesa 语义：被唤醒只代表"可能可以了"；Hoare 语义：被唤醒代表"现在一定可以"。</figcaption>
+</figure>
+
+<div class="aside" data-title="模拟器里的 Hoare 开关"><p>下方的交错执行器提供了一个 Hoare 语义开关：signal 时把锁直接交给被唤醒者，并强制它下一步运行。你会看到"if + 两个 CV"在 Hoare 下完全正确（对小规模配置穷举所有交错，一次都没出错），在 Mesa 下却会被插队；而"if + 单个 CV"即使在 Hoare 下也会出错，因为消费者可能叫醒另一个消费者，被叫醒的那个会立刻对空缓冲区 get()。这说明 Hoare 语义只解决"被插队"，不解决"叫错人"。</p></div>
+
+<h2>第二次尝试：while + 单个条件变量（Broken v2）</h2>
+<p>修复第一个问题很容易：把 <code>if</code> 换成 <code>while</code>（Figure 30.10）。这样 Tc1 醒来后（持有锁）会立即<strong>重新检查</strong>共享变量（c2），如果缓冲区是空的，就再睡回去（c3）。生产者里的 if 也同样换成 while（p2）。</p>
+<div class="cmp">
+<div><pre><code>    Pthread_mutex_lock(&amp;mutex);            // c1
+<span class="hl">    while (count == 0)                     // c2</span>
+        Pthread_cond_wait(&amp;cond, &amp;mutex);  // c3
+    int tmp = get();                       // c4</code></pre></div>
+</div>
+<p>由于 Mesa 语义，用条件变量时要记住一条简单规则：<strong>永远用 while 循环</strong>。有时不重新检查也没事，但重新检查总是安全的。</p>
+<p>可这段代码<strong>仍然有 bug</strong>，也就是前面说的第二个问题，它和"只有一个条件变量"有关（Figure 30.11）：</p>
+<ol>
+<li>Tc1、Tc2 先后运行，都发现没数据，都睡在 <code>cond</code> 上。</li>
+<li>Tp 放入一个数据，signal 唤醒<strong>一个</strong>消费者（假设是 Tc1），然后继续循环，发现缓冲区满了，于是也睡在 <code>cond</code> 上。现在 cond 的队列里有 Tc2 和 Tp。</li>
+<li>Tc1 醒来，重新检查（c2），发现有数据，于是取走（c4），然后 signal（c5），<strong>只叫醒一个</strong>。该叫谁？缓冲区刚被取空，显然应该叫生产者。可是如果叫醒的是 Tc2（完全可能，取决于等待队列的管理方式）……</li>
+<li>Tc2 醒来发现缓冲区是空的（c2），又睡回去（c3）。Tp 手里还有数据要放，却一直睡着。Tc1 也回到循环开头睡下。<strong>三个线程全部睡着了</strong>。</li>
+</ol>
+
+<figure class="fig">
+<svg viewBox="0 0 700 250" width="700" role="img" aria-label="单个条件变量与两个条件变量的队列对比">
+  <text x="10" y="20" font-size="13" font-weight="600">单个 CV：生产者和消费者挤在同一个队列里</text>
+  <rect x="20" y="34" width="300" height="46" rx="8" class="warn-soft"/>
+  <text x="30" y="52" font-size="11.5" class="t-muted">cond 队列（FIFO）</text>
+  <rect x="40" y="56" width="50" height="20" rx="10" style="fill:var(--c2)"/><text x="65" y="70" font-size="11" text-anchor="middle" style="fill:#fff">Tc2</text>
+  <rect x="96" y="56" width="50" height="20" rx="10" style="fill:var(--c3)"/><text x="121" y="70" font-size="11" text-anchor="middle" style="fill:#fff">Tp</text>
+  <text x="340" y="50" font-size="12">Tc1 取完数据后 signal(&amp;cond)：</text>
+  <text x="340" y="70" font-size="12" style="fill:var(--bad)">队首是 Tc2 → 消费者叫醒了消费者 ✗</text>
+  <text x="340" y="90" font-size="11.5" class="t-muted">Tc2 醒来发现空，又睡；Tp 永远没人叫</text>
+  <text x="10" y="130" font-size="13" font-weight="600">两个 CV：谁等什么，一目了然</text>
+  <rect x="20" y="144" width="300" height="42" rx="8" class="ok-soft"/>
+  <text x="30" y="160" font-size="11.5" class="t-muted">empty 队列：只有生产者在等</text>
+  <rect x="40" y="164" width="50" height="18" rx="9" style="fill:var(--c3)"/><text x="65" y="177" font-size="11" text-anchor="middle" style="fill:#fff">Tp</text>
+  <rect x="20" y="194" width="300" height="42" rx="8" class="accent-soft"/>
+  <text x="30" y="210" font-size="11.5" class="t-muted">fill 队列：只有消费者在等</text>
+  <rect x="40" y="214" width="50" height="18" rx="9" style="fill:var(--c2)"/><text x="65" y="227" font-size="11" text-anchor="middle" style="fill:#fff">Tc2</text>
+  <text x="340" y="170" font-size="12">消费者 get() 之后 signal(&amp;empty) → 只会叫醒生产者</text>
+  <text x="340" y="220" font-size="12">生产者 put() 之后 signal(&amp;fill) → 只会叫醒消费者</text>
+</svg>
+<figcaption>signal 必须"有方向"：消费者只叫生产者，生产者只叫消费者。</figcaption>
+</figure>
+<p><button class="inline-btn" data-load="fig3011">▶ 在下方模拟器中逐行复现 Figure 30.11</button> <button class="inline-btn" data-load="fig3011v3">▶ 同一调度换成最终版会怎样？</button></p>
+
+<h2>正确方案：两个条件变量 + 多槽缓冲区</h2>
+<p>解法同样很小：用<strong>两个</strong>条件变量，在状态变化时准确地通知该醒的那一类线程（Figure 30.12）。生产者在 <code>empty</code> 上等待、在 <code>fill</code> 上发信号；消费者正好相反，在 <code>fill</code> 上等待、在 <code>empty</code> 上发信号。这样从设计上就排除了第二个问题：消费者永远不会误叫醒消费者，生产者也不会误叫醒生产者。</p>
+<p>最后一步是提高并发度和效率：把单槽缓冲区换成 MAX 个槽的<strong>循环队列</strong>（Figure 30.13），让生产者能连续放入多个数据后才睡，消费者也能连续取多个数据。只有一个生产者和一个消费者时，这能减少上下文切换；有多个生产者或消费者时，还能让生产和消费并发进行。相应地，生产者只在<strong>所有槽都满</strong>时才睡（p2），消费者只在<strong>所有槽都空</strong>时才睡（c2）。</p>
+<div class="cmp">
+<div><pre><code>int buffer[MAX];
+int fill_ptr = 0;
+int use_ptr  = 0;
+int count    = 0;
+
+void put(int value) {
+    buffer[fill_ptr] = value;
+    fill_ptr = (fill_ptr + 1) % MAX;
+    count++;
+}
+int get() {
+    int tmp = buffer[use_ptr];
+    use_ptr = (use_ptr + 1) % MAX;
+    count--;
+    return tmp;
+}</code></pre></div>
+<div><pre><code>cond_t empty, fill;
+mutex_t mutex;
+
+void *producer(void *arg) {
+  for (int i = 0; i &lt; loops; i++) {
+    Pthread_mutex_lock(&amp;mutex);           // p1
+    while (count == MAX)                  // p2
+      Pthread_cond_wait(&amp;empty, &amp;mutex);  // p3
+    put(i);                               // p4
+    Pthread_cond_signal(&amp;fill);           // p5
+    Pthread_mutex_unlock(&amp;mutex);         // p6
+  }
+}
+void *consumer(void *arg) {
+  for (int i = 0; i &lt; loops; i++) {
+    Pthread_mutex_lock(&amp;mutex);           // c1
+    while (count == 0)                    // c2
+      Pthread_cond_wait(&amp;fill, &amp;mutex);   // c3
+    int tmp = get();                      // c4
+    Pthread_cond_signal(&amp;empty);          // c5
+    Pthread_mutex_unlock(&amp;mutex);         // c6
+    printf("%d\n", tmp);
+  }
+}</code></pre></div>
+</div>
+
+<figure class="fig">
+<svg viewBox="0 0 640 170" width="640" role="img" aria-label="循环缓冲区 fill_ptr 与 use_ptr">
+  <text x="10" y="20" font-size="13" font-weight="600">MAX = 6 的循环缓冲区（count = 3）</text>
+  <g font-size="12" text-anchor="middle">
+    <rect x="80" y="50" width="70" height="44" rx="6" class="box"/><text x="115" y="77" class="t-muted">空</text>
+    <rect x="160" y="50" width="70" height="44" rx="6" style="fill:var(--c3)"/><text x="195" y="77" style="fill:#fff">7</text>
+    <rect x="240" y="50" width="70" height="44" rx="6" style="fill:var(--c3)"/><text x="275" y="77" style="fill:#fff">8</text>
+    <rect x="320" y="50" width="70" height="44" rx="6" style="fill:var(--c3)"/><text x="355" y="77" style="fill:#fff">9</text>
+    <rect x="400" y="50" width="70" height="44" rx="6" class="box"/><text x="435" y="77" class="t-muted">空</text>
+    <rect x="480" y="50" width="70" height="44" rx="6" class="box"/><text x="515" y="77" class="t-muted">空</text>
+    <text x="195" y="120" style="fill:var(--c1)" font-weight="600">↑ use_ptr = 1</text>
+    <text x="195" y="138" class="t-muted" font-size="11">get() 从这里取</text>
+    <text x="435" y="120" style="fill:var(--c2)" font-weight="600">↑ fill_ptr = 4</text>
+    <text x="435" y="138" class="t-muted" font-size="11">put() 往这里放</text>
+  </g>
+  <path d="M550,72 C610,72 610,160 330,160 C50,160 40,72 78,72" style="stroke:var(--faint);fill:none;stroke-dasharray:4 3"/>
+  <text x="330" y="156" font-size="11" text-anchor="middle" class="t-muted">% MAX：走到末尾就绕回开头</text>
+</svg>
+<figcaption>两个指针各走各的，count 记录有多少个槽被占用。count == MAX 时生产者睡，count == 0 时消费者睡。</figcaption>
+</figure>
+
+<div class="tip"><p><strong>检查条件时用 while，不要用 if。</strong>在多线程程序里检查条件，用 while 循环总是正确的；用 if 只是<em>可能</em>正确，取决于信号的语义。另外，有些线程库由于实现细节，一次 signal 可能唤醒两个线程，这叫<strong>伪唤醒（spurious wakeup）</strong>。这是重新检查所等条件的又一个理由。</p></div>
+
+<h2>模拟器：生产者/消费者交错执行器</h2>
+<p>这是本章的核心模拟器。你扮演一个"恶意的调度器"：每一步选一个线程执行它的<strong>一行</strong>代码（p1–p6 / c1–c6，与原书标号一致）。模拟器会显示每个线程停在哪一行、处于什么状态（运行 / 就绪 / 睡在哪个条件变量上 / 等锁）、缓冲区内容、锁的持有者和每个条件变量的等待队列，并在下方按原书表格的格式记录轨迹。</p>
+
+<section class="sim" id="sim-pc">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>生产者/消费者：选版本、选线程、逐行交错</h3>
+  <div class="desc">先载入 Figure 30.9 / 30.11 看原书轨迹，再自己当调度器：能不能让 v1 断言失败、让 v2 全体睡着？最终版无论怎么调度都不会出错。唤醒顺序默认 FIFO，与原书一致。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>版本 <select data-p="ver">
+        <option value="1">v1：if + 单个 CV（Fig 30.8）</option>
+        <option value="2">v2：while + 单个 CV（Fig 30.10）</option>
+        <option value="4">if + 两个 CV（作业 main-two-cvs-if）</option>
+        <option value="3" selected>最终版：while + empty/fill（Fig 30.14）</option>
+      </select></label>
+      <label>生产者 <input type="number" data-p="np" value="1" min="1" max="3"></label>
+      <label>消费者 <input type="number" data-p="nc" value="2" min="1" max="3"></label>
+      <label>缓冲区 MAX <input type="number" data-p="max" value="1" min="1" max="6"></label>
+      <label>每个生产者生产 <input type="number" data-p="loops" value="5" min="1" max="20"> 个</label>
+      <label>语义 <select data-p="sem"><option value="mesa">Mesa（真实系统）</option><option value="hoare">Hoare</option></select></label>
+      <label>signal 唤醒 <select data-p="wake"><option value="fifo">队首（FIFO）</option><option value="lifo">队尾（LIFO）</option><option value="random">随机</option></select></label>
+    </div>
+    <div class="sim-mount"></div>
+  </div>
+</section>
+<p class="small muted">说明：为了简化，消费者像 Figure 30.7 那样无限循环（while (1)），所以生产者全部完成、缓冲区取空、消费者都睡着时算"正常结束"；如果有生产者还没完成而所有线程都睡着了，就是 Figure 30.11 那种 bug。一次 signal 只唤醒一个线程；被唤醒的线程下次被调度时，会先重新拿锁，再执行 wait 之后的那一行（if 版本是 c4/p4，while 版本是 c2/p2），这和原书表格一行的粒度一致。</p>
+
+<h2>覆盖条件（covering condition）</h2>
+<p>再看一个例子，它来自 Lampson 和 Redell 关于 Pilot 系统的论文，也就是最早实现 Mesa 语义的那群人。设想一个多线程内存分配库（Figure 30.15）：</p>
+<pre><code>int bytesLeft = MAX_HEAP_SIZE;   // 堆里还剩多少字节
+cond_t c;  mutex_t m;
+
+void *allocate(int size) {
+    Pthread_mutex_lock(&amp;m);
+    while (bytesLeft &lt; size)
+        Pthread_cond_wait(&amp;c, &amp;m);
+    void *ptr = ...;             // 从堆里拿内存
+    bytesLeft -= size;
+    Pthread_mutex_unlock(&amp;m);
+    return ptr;
+}
+void free(void *ptr, int size) {
+    Pthread_mutex_lock(&amp;m);
+    bytesLeft += size;
+    Pthread_cond_signal(&amp;c);     // 叫醒谁？？
+    Pthread_mutex_unlock(&amp;m);
+}</code></pre>
+<p>场景：堆里 0 字节空闲。Ta 调用 <code>allocate(100)</code>，接着 Tb 调用 <code>allocate(10)</code>，两者都不够，都睡下。然后 Tc 调用 <code>free(50)</code>。signal 只叫醒一个线程，可它不知道该叫谁。如果叫醒了 Ta，Ta 发现 50 &lt; 100，又睡回去；而本来能满足的 Tb（只要 10 字节）却继续睡着。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 700 180" width="700" role="img" aria-label="覆盖条件：signal 与 broadcast">
+  <rect x="20" y="30" width="200" height="60" rx="8" class="warn-soft"/>
+  <text x="120" y="50" font-size="12" text-anchor="middle">c 的队列（bytesLeft = 50）</text>
+  <rect x="40" y="60" width="74" height="22" rx="11" style="fill:var(--c1)"/><text x="77" y="75" font-size="11" text-anchor="middle" style="fill:#fff">Ta 要100</text>
+  <rect x="122" y="60" width="74" height="22" rx="11" style="fill:var(--c2)"/><text x="159" y="75" font-size="11" text-anchor="middle" style="fill:#fff">Tb 要10</text>
+  <text x="250" y="45" font-size="12.5" font-weight="600">signal：只叫醒一个</text>
+  <text x="250" y="65" font-size="12">叫醒 Ta → 50 &lt; 100，又睡了</text>
+  <text x="250" y="85" font-size="12" style="fill:var(--bad)">Tb 明明能满足，却继续睡 ✗</text>
+  <text x="250" y="120" font-size="12.5" font-weight="600">broadcast：全部叫醒，各自重查</text>
+  <text x="250" y="140" font-size="12" style="fill:var(--ok)">Tb：50 ≥ 10 → 分配成功 ✓</text>
+  <text x="250" y="160" font-size="12" class="t-muted">Ta：40 &lt; 100 → 白醒一次，回去睡（性能代价）</text>
+</svg>
+<figcaption>覆盖条件：用 broadcast 保守地"覆盖"所有可能需要醒来的线程。</figcaption>
+</figure>
+<p>Lampson 和 Redell 的解法很直接：把 <code>pthread_cond_signal()</code> 换成 <strong><code>pthread_cond_broadcast()</code></strong>，唤醒<strong>所有</strong>等待的线程，这就保证了该醒的线程一定会醒。缺点是可能有性能损失：一些本不该醒的线程被白白叫醒，它们醒来、重新检查条件、再去睡。这样的条件叫<strong>覆盖条件（covering condition）</strong>，因为它（保守地）覆盖了所有需要唤醒线程的情况。</p>
+<p>细心的读者会发现，前面单个条件变量的生产者/消费者也可以用 broadcast 修好。但那里有更好的解法（两个 CV），所以我们用了更好的。一般来说，<strong>如果你发现程序只有把 signal 改成 broadcast 才能工作（而你觉得本不需要），那多半是有 bug，去修它！</strong>不过对于上面这种内存分配器，broadcast 可能就是最直接的方案。</p>
+
+<section class="sim" id="sim-alloc">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>覆盖条件：内存分配器的 signal vs broadcast</h3>
+  <div class="desc">三个线程共用一个条件变量 c。比较 free() 用 signal 和用 broadcast 时，谁醒了、谁白醒、谁被遗忘。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>free() 用 <select data-p="how"><option value="signal">pthread_cond_signal</option><option value="broadcast">pthread_cond_broadcast</option></select></label>
+      <label>Ta 申请 <input type="number" data-p="a" value="100" min="1" max="500"></label>
+      <label>Tb 申请 <input type="number" data-p="b" value="10" min="1" max="500"></label>
+      <label>Tc 释放 <input type="number" data-p="f" value="50" min="1" max="500"></label>
+    </div>
+    <div class="sim-mount"></div>
+  </div>
+</section>
+
+<h2>先预测，再验证</h2>
+<div class="exercise"><div class="q">在生产者/消费者模拟器里选 v1（if + 单个 CV），1 个生产者、1 个消费者、MAX = 1。先预测：无论怎样调度，它会不会出错？然后点「批量随机 500 次」验证，再改成 2 个消费者重做一次。</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>1 生产者 1 消费者时<strong>不会出错</strong>，500 次全部正常结束（我们还用 node 穷举了 loops = 3 时的全部交错，同样没有一次出错）。原因是：能被唤醒的只可能是"另一类"线程，而同类线程只有自己一个，没有人能插队改掉状态。</p>
+<p>改成 2 个消费者后，大部分随机调度都会触发 get() 断言失败（本页用 node 跑出的结果是 500 次中 443 次）。这正是原书说的"只有一个生产者和一个消费者时 Figure 30.8 能工作"。</p></div></details></div>
+
+<div class="exercise"><div class="q">点「Figure 30.9 调度 × while」：还是原书那 17 步调度，只是版本换成了 v2（while）。先预测：最后一步 Tc1 会执行哪一行？结果如何？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>Tc1 从 wait() 返回后执行的是 <strong>c2</strong>（while 的重新检查），而不是 c4。它发现 count == 0，于是准备回到 c3 继续睡。模拟器会把这一步标成"白醒一次"。断言不再触发，这就是 while 修复的第一个问题。</p></div></details></div>
+
+<div class="exercise"><div class="q">载入「Figure 30.11 调度 × 最终版」（原书的调度用在两个 CV 的版本上）。预测：第 17 步 Tc1 执行 c5 时，会叫醒谁？之后原书的调度还能继续吗？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>c5 现在是 <code>signal(&amp;empty)</code>，empty 队列里只有 Tp，所以叫醒的是 <strong>Tp</strong>。Tc2 睡在 fill 上，不受影响。第 22 步原书要运行 Tc2，但 Tc2 在最终版里仍在睡眠，不能被调度，模拟器会提示轨迹从这里分叉。此时 Tp 已经就绪，继续运行它，一切正常。</p></div></details></div>
+
+<div class="exercise"><div class="q">（改编自作业第 8、9 题）v2 在"1 个生产者 + 1 个消费者 + MAX = 1"时能出问题吗？2 个消费者呢？用批量随机和手动调度分别试试。</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>1P1C 时 v2 不会出问题：队列里最多只有一个等待者，而且一定是对方那一类。2 个消费者时，Figure 30.11 那种"全体睡着"就可能出现（本页 node 批量结果：500 次随机调度里 233 次全体睡眠）。反过来，2 个生产者、1 个消费者时也会出现对称的问题：生产者叫醒了生产者。</p></div></details></div>
+
+<div class="exercise"><div class="q">点「Figure 30.11 调度 × LIFO 唤醒」：还是 v2 和原书的调度，只是 signal 改为唤醒队尾的线程。预测：第 17 步 Tc1 的 signal 叫醒了谁？这能说明 v2 是对的吗？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>LIFO 下，第 17 步 Tc1 的 signal 取的是队尾的 <strong>Tp</strong>，这一次碰巧避开了 bug。但这绝不能说明 v2 是对的：POSIX 并不保证 signal 唤醒哪一个等待者，正确性<strong>不能依赖唤醒顺序</strong>这种实现细节。原书的说法是"如果它唤醒了 Tc2（这完全可能，取决于等待队列的管理方式）"，这就足以判定代码有 bug。</p></div></details></div>
+
+<div class="exercise"><div class="q">载入「Figure 30.9 调度 × Hoare」。预测：生产者 p5 发信号之后，还能按原书调度接着运行 Tp 吗？手动继续运行，if 版本这次会出错吗？再把版本改成"if + 两个 CV"，用 Hoare 批量随机 500 次，和 Mesa 对比。</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>不能。Hoare 语义要求被唤醒的 Tc1 <strong>立刻</strong>运行，锁也直接交给它，所以原书的下一步（Tp 执行 p6）不被允许，模拟器提示分叉。手动运行 Tc1，它直接执行 c4，缓冲区里确实有数据，这一轮不会出错。</p>
+<p>"if + 两个 CV"在 Hoare 下批量 500 次全部正常，在 Mesa 下却经常断言失败（node 结果：1 生产者 2 消费者时 500 次中 271 次失败）。这说明 if 的正确性依赖 Hoare 那种"醒来即运行"的保证，而真实系统几乎都是 Mesa，所以要用 while。</p></div></details></div>
+
+<h2>动手实验：真实的 pthread 版本</h2>
+<div class="lab">
+<p>实验目录 <code>labs/30-condvar/</code> 里有三个程序：</p>
+<ul>
+<li><code>pc.c</code>：生产者/消费者，<code>-v 1/2/3</code> 分别对应 if + 单 CV、while + 单 CV、while + empty/fill，另有 <code>-p 生产者 -c 消费者 -m MAX -l 每个生产者的数量</code>。v1 会被断言抓住；v2 如果卡住，会被一个看门狗线程在 2 秒无进展后报告出来。</li>
+<li><code>join.c</code>：<code>./join 0</code> 是正确版，<code>1</code> 是无状态变量版，<code>2</code> 是不持锁版。错误版本用 <code>pthread_cond_timedwait</code> 最多等 2 秒，不会真的挂死。</li>
+<li><code>alloc.c</code>：覆盖条件，<code>./alloc signal</code> 对比 <code>./alloc broadcast</code>。</li>
+</ul>
+<pre><code><span class="cmd">cd labs/30-condvar &amp;&amp; make</span>
+<span class="cmd">./pc -v 1 -p 1 -c 2 -m 1 -l 100000</span>
+<span class="cmd">./pc -v 2 -p 1 -c 2 -m 1 -l 100000</span>
+<span class="cmd">./pc -v 3 -p 1 -c 2 -m 1 -l 100000</span>
+<span class="cmd">./pc -v 3 -p 1 -c 2 -m 10 -l 100000</span></code></pre>
+<p class="small muted">示例输出，你的机器上数字会不同（WSL2，16 核）：</p>
+<pre><code>v1: if + 单 CV，生产者 1，消费者 2，MAX=1，共 100000 个数据
+断言失败：get() 时缓冲区为空 —— 这就是 Figure 30.9 的错误！
+
+v2: while + 单 CV，生产者 1，消费者 2，MAX=1，共 100000 个数据
+看门狗：2 秒内没有任何 put/get！count=0，已消费 3/100000
+=&gt; 所有线程都睡着了（原书 Figure 30.11 的情形）
+   从 wait 返回 5 次，其中 1 次白醒（条件仍不满足）
+
+v3: while + empty/fill 两个 CV，生产者 1，消费者 2，MAX=1，共 100000 个数据
+完成：消费 100000 个，用时 3731.2 ms；从 wait 返回 185269 次，其中 65 次白醒
+
+v3: while + empty/fill 两个 CV，生产者 1，消费者 2，MAX=10，共 100000 个数据
+完成：消费 100000 个，用时 278.3 ms；从 wait 返回 27823 次，其中 5397 次白醒</code></pre>
+<p>值得注意的几点：</p>
+<ul>
+<li>在真实多核机器上，v1 和 v2 的 bug <strong>几乎每次都能复现</strong>，而且 v2 往往只消费了几个数据就全体睡着了。</li>
+<li>单生产者、单消费者时，v1 和 v2 都能跑完（<code>./pc -v 1 -p 1 -c 1</code>），这与原书的分析一致。</li>
+<li>即使是正确的 v3，也有"白醒"：被唤醒的消费者发现数据已被另一个消费者拿走。这就是 Mesa 语义在真实系统里的样子，while 的重新检查在默默发挥作用。</li>
+<li>MAX 从 1 增加到 10，同样的工作量快了一个数量级，因为生产者不必每放一个数据就睡一次。这对应原书说的"减少上下文切换"。</li>
+</ul>
+<pre><code><span class="cmd">./join 1</span>
+== 模式 1：错误版：没有状态变量 done ==
+parent: begin
+child
+child: 已 signal（此刻有没有人在等？）
+parent: 等了 2 秒没人叫醒 —— 信号丢失，真实程序会永远睡下去！
+parent: end
+
+<span class="cmd">./alloc signal</span>
+== free() 使用 pthread_cond_signal ==
+Ta: 需要 100，只剩 0 → wait
+Tb: 需要 10，只剩 0 → wait
+Tc: free(50)，剩余 50 → signal
+Ta: 被唤醒，重新检查（剩余 50）
+Ta: 需要 100，只剩 50 → wait
+Ta: 2 秒内没被叫醒（剩余 50 字节）（本来就不够，正常）
+Tb: 2 秒内没被叫醒（剩余 50 字节） ← 明明够了却没人叫醒我！
+
+<span class="cmd">./alloc broadcast</span>
+== free() 使用 pthread_cond_broadcast ==
+Ta: 需要 100，只剩 0 → wait
+Tb: 需要 10，只剩 0 → wait
+Tc: free(50)，剩余 50 → broadcast
+Tb: 被唤醒，重新检查（剩余 50）
+Tb: 分配 10 成功，剩余 40
+Ta: 被唤醒，重新检查（剩余 40）
+Ta: 需要 100，只剩 40 → wait
+Ta: 2 秒内没被叫醒（剩余 40 字节）（本来就不够，正常）</code></pre>
+<p class="small muted">注意：Linux 的 signal 到底唤醒哪个等待者并没有保证。上面这次 signal 恰好叫醒了先睡下的 Ta，在你的机器上也可能叫醒 Tb。正因为不确定，才需要 broadcast。</p>
+</div>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="1"><div class="q">关于 pthread_cond_wait(&amp;c, &amp;m)，下列说法正确的是：</div>
+<div class="opts"><button>A. 它睡眠时仍持有 m，以保护共享状态</button><button>B. 它原子地释放 m 并睡眠，被唤醒后在返回前重新获取 m</button><button>C. 调用前不需要持有 m，wait 内部会自己加锁</button><button>D. 被 signal 后立即返回，不需要再竞争锁</button></div>
+<div class="explain">wait 假定调用时已持锁；它把"释放锁 + 睡眠"做成一个原子动作，醒来后先重新拿到锁才返回。如果睡眠时仍持锁，其他线程就无法改变条件，也就永远不会有人来叫醒它。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">join 的实现里去掉状态变量 done（Figure 30.4），会在什么情况下出错？</div>
+<div class="opts"><button>A. 子线程先运行完时：它的 signal 没人接收就丢了，父线程随后 wait 会永远睡下去</button><button>B. 只有在多处理器上才会出错</button><button>C. 任何情况都不会出错，只是效率低</button><button>D. 父线程先运行时</button></div>
+<div class="explain">条件变量没有记忆。没人在等时，signal 什么也不做。done 的作用就是把"孩子已经结束"这件事记下来。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">"Mesa 语义"指的是：</div>
+<div class="opts"><button>A. signal 会唤醒所有等待者</button><button>B. 被唤醒的线程立即运行，并且保证条件成立</button><button>C. signal 只是提示；被唤醒的线程真正运行时，条件可能已经不再成立</button><button>D. wait 不需要锁</button></div>
+<div class="explain">Mesa 语义下，被唤醒只是从睡眠变为就绪，之后什么时候运行由调度器决定，中间别的线程可能已经改变了状态。B 描述的是 Hoare 语义。几乎所有真实系统都用 Mesa 语义，所以要用 while。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">v2（while + 单个条件变量）在 2 个消费者、1 个生产者时的 bug，根本原因是：</div>
+<div class="opts"><button>A. 只有一个条件变量，消费者的 signal 可能唤醒另一个消费者而不是生产者</button><button>B. 缓冲区只有一个槽</button><button>C. 用了 if 而不是 while</button><button>D. 没有持锁调用 signal</button></div>
+<div class="explain">v2 已经用了 while。问题在于生产者和消费者睡在同一个队列里，signal 没有方向。解法是两个条件变量：消费者只 signal(empty)，生产者只 signal(fill)。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">在最终的正确方案里，生产者在哪个条件变量上等待、在哪个上发信号？</div>
+<div class="opts"><button>A. 在 fill 上等待，在 empty 上发信号</button><button>B. 都用 fill</button><button>C. 在 empty 上等待，在 fill 上发信号</button><button>D. 都用 empty</button></div>
+<div class="explain">生产者等"有空槽"（empty），放完数据后通知"有数据了"（fill）；消费者正好相反。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">Figure 30.8（if + 单个 CV）在只有 1 个生产者和 1 个消费者时：</div>
+<div class="opts"><button>A. 能正确工作；问题要在同类线程不止一个时才出现</button><button>B. 会死锁</button><button>C. 必然出错</button><button>D. 在多核上会出错，单核不会</button></div>
+<div class="explain">原书明确说，单生产者单消费者时这段代码能工作。插队和叫错人都需要至少两个同类线程。模拟器的批量随机和穷举都能验证这一点。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">关于覆盖条件（covering condition），下列说法正确的是：</div>
+<div class="opts"><button>A. broadcast 之后被唤醒的线程不需要重新检查条件</button><button>B. 用 signal 精确唤醒最合适的线程</button><button>C. 它是生产者/消费者问题的最佳解法</button><button>D. 用 broadcast 唤醒所有等待者，保证该醒的都醒；代价是有些线程白醒</button></div>
+<div class="explain">覆盖条件保守地覆盖所有需要唤醒的情况。被唤醒的线程仍然必须用 while 重查，不满足就回去睡。对生产者/消费者，两个 CV 是更好的解法；要是程序"只有改成 broadcast 才能工作"，多半有 bug。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">除了 Mesa 语义之外，下列哪一项也是"用 while 而不用 if"的理由？</div>
+<div class="opts"><button>A. while 比 if 执行得更快</button><button>B. 伪唤醒（spurious wakeup）：某些实现中一次 signal 可能唤醒多个线程</button><button>C. while 能让 signal 被记住</button><button>D. while 能避免死锁</button></div>
+<div class="explain">原书的 TIP 提到，在某些线程库里，由于实现细节，一个 signal 可能唤醒两个线程。重新检查条件可以应对这种情况。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">单 CPU 上，父线程用 <code>while (done == 0) ;</code> 自旋等子线程（Figure 30.2），主要问题是：</div>
+<div class="opts"><button>A. 结果一定错误</button><button>B. done 必须是原子变量才能编译</button><button>C. 会导致死锁</button><button>D. 父线程白白消耗 CPU 时间片，而它等待的子线程恰恰需要 CPU 才能运行</button></div>
+<div class="explain">自旋"一般能工作"，但极其低效。原书的 CRUX 也说，自旋在某些情况下甚至可能不正确。条件变量让父线程睡下，把 CPU 让给子线程。</div></div>
+
+<h2>常见误区</h2>
+<div class="warn">
+<ul>
+<li><strong>把条件变量当成"事件标志"</strong>，以为先 signal、后 wait 也能收到。实际上 CV 没有记忆，必须配合状态变量（done、count、bytesLeft……）。</li>
+<li><strong>用 if 检查条件。</strong>Mesa 语义下，醒来时条件可能又不成立了，而且还有伪唤醒。永远用 while。</li>
+<li><strong>不持锁就检查条件或调用 wait/signal。</strong>"检查"和"入睡"之间的缝隙会造成丢失唤醒。</li>
+<li><strong>以为 signal 会唤醒"正确的"线程。</strong>一个 CV 上睡着两类等待者时，signal 可能叫错人。给不同的条件用不同的 CV。</li>
+<li><strong>把 broadcast 当万能药。</strong>它能掩盖设计错误，还会带来大量白醒。只在确实无法判断该叫谁时（覆盖条件）才用。</li>
+<li><strong>以为"被唤醒"就等于"马上运行"。</strong>被唤醒只是进入就绪队列，还要重新竞争锁。</li>
+</ul>
+</div>
+
+<h2>本章小结</h2>
+<div class="key">
+<ul>
+<li>条件变量是一个显式的等待队列。<code>wait(c, m)</code> 原子地释放锁并睡眠，返回前重新获取锁；<code>signal(c)</code> 唤醒一个等待者，没人等就什么也不做。</li>
+<li>条件变量没有记忆，必须配合<strong>状态变量</strong>，并在<strong>持锁</strong>时检查和修改它，否则会丢失唤醒（join 的两个错误版本）。</li>
+<li>Mesa 语义下 signal 只是提示，所以<strong>永远用 while</strong> 重新检查条件（修复 Figure 30.9）。</li>
+<li>不同的等待条件用<strong>不同的条件变量</strong>，让 signal 有方向（修复 Figure 30.11）。生产者/消费者的标准写法是 while + empty/fill + 循环缓冲区。</li>
+<li>不知道该叫醒谁时，用 <strong>broadcast</strong> 形成覆盖条件，以白醒为代价换取正确性。</li>
+<li>后续章节：第 31 章的信号量把"锁"和"条件变量"统一成一个原语，并会用它重新解决生产者/消费者问题；第 32 章里的顺序违反（order violation）bug，正是用本章的条件变量修复的；第 33 章则换一种思路，用事件循环在不使用线程的情况下实现并发。</li>
+</ul>
+</div>
+
+</main>
+<script>
+(function () {
+"use strict";
+// ==VM-BEGIN==
+// 一个极小的"线程虚拟机"：每个线程是一串带标号的指令（p1…p6 / c1…c6 等），
+// 每一步由调度者（你）选择一个线程执行它的下一行。锁、条件变量、Mesa/Hoare 语义都在这里实现。
+const clone = (o) => JSON.parse(JSON.stringify(o));
+function lcg(S) { S.rnd = (Math.imul(S.rnd, 1103515245) + 12345) >>> 0; return S.rnd >>> 8; }
+function labelIdx(prog, lb) {
+  if (lb === "END") return -1;
+  const k = prog.findIndex((x) => x.lb === lb);
+  if (k < 0) throw new Error("no label " + lb);
+  return k;
+}
+function vmInit(sc) {
+  return {
+    sh: clone(sc.shared),
+    th: sc.threads.map(() => ({ pc: 0, st: "ready", cv: null, need: null, woke: false, wpc: -1, i: 0, got: 0 })),
+    owner: {}, lockQ: {}, cvq: {}, forced: -1, err: null, halt: null,
+    rnd: (sc.seed >>> 0) || 7, steps: 0, switches: 0, wakeups: 0, wasted: 0, last: -1,
+  };
+}
+function vmCanRun(S, t) {
+  const st = S.th[t].st;
+  return (st === "ready" || st === "run") && (S.forced < 0 || S.forced === t);
+}
+function vmRunnable(S, t) { return !S.halt && vmCanRun(S, t); }
+function vmStep(sc, S0, t) {
+  if (!vmRunnable(S0, t)) return null;
+  const S = clone(S0), T = S.th[t], def = sc.threads[t], prog = def.prog;
+  const nm = (k) => sc.threads[k].name;
+  const notes = [];
+  let kind = "ok";
+  if (S.last >= 0 && S.last !== t) S.switches++;
+  S.last = t; S.steps++;
+  const wasForced = S.forced === t;
+  S.forced = -1;
+  S.th.forEach((x, k) => { if (k !== t && x.st === "run") x.st = "ready"; });
+  T.st = "run";
+  const isFree = (m) => S.owner[m] == null || S.owner[m] < 0;
+  const release = (m) => {
+    S.owner[m] = -1;
+    const q = S.lockQ[m] || [];
+    q.forEach((k) => { S.th[k].st = "ready"; });
+    S.lockQ[m] = [];
+    return q;
+  };
+  let lb = prog[Math.min(T.pc, prog.length - 1)].lb;
+  const finish = () => {
+    if (S.err) S.halt = { kind: "bad", msg: S.err };
+    else if (!S.th.some((_, k) => vmCanRun(S, k))) S.halt = sc.judge(S, sc);
+    return {
+      S,
+      row: {
+        t, lb, note: notes.join("；"),
+        kind: S.halt && S.halt.kind === "bad" ? "bad" : kind,
+        st: S.th.map((x) => x.st), cv: S.th.map((x) => x.cv), col: sc.col ? sc.col(S.sh) : "",
+      },
+    };
+  };
+  // 1) 从 wait() 返回（或 Hoare 下 signal 之后）要先重新拿锁
+  if (T.need) {
+    const m = T.need;
+    if (!isFree(m) && S.owner[m] !== t) {
+      T.st = "lock";
+      (S.lockQ[m] = S.lockQ[m] || []).push(t);
+      if (T.wpc >= 0) lb = prog[T.wpc].lb;
+      notes.push(`想从 wait() 返回，得先重新拿到 ${m}，但它被 ${nm(S.owner[m])} 持有 → 阻塞等锁`);
+      return finish();
+    }
+    S.owner[m] = t;
+    T.need = null;
+    notes.push(T.woke ? `从 wait() 返回（先重新拿到了 ${m}）` : `重新拿到 ${m}（Hoare：之前把锁让给了被唤醒者）`);
+  } else if (wasForced) {
+    notes.push("Hoare 语义：被唤醒后立刻运行，锁由 signal 者直接交接，状态保证没被别人改过");
+  }
+  const woke = T.woke;
+  T.woke = false; T.wpc = -1; T.justWoke = woke;
+  const ins = prog[T.pc];
+  lb = ins.lb;
+  let next = T.pc + 1, blocked = false;
+  switch (ins.op) {
+    case "lock":
+      if (isFree(ins.m)) { S.owner[ins.m] = t; notes.push(`拿到锁 ${ins.m}`); }
+      else {
+        T.st = "lock"; blocked = true; next = T.pc;
+        (S.lockQ[ins.m] = S.lockQ[ins.m] || []).push(t);
+        notes.push(`锁 ${ins.m} 被 ${nm(S.owner[ins.m])} 持有 → 阻塞等锁`);
+      }
+      break;
+    case "unlock": {
+      const q = release(ins.m);
+      notes.push(`释放锁 ${ins.m}` + (q.length ? `（${q.map(nm).join("、")} 可以再去抢锁）` : ""));
+      break;
+    }
+    case "test":
+      if (ins.cond(S.sh, T, t)) {
+        notes.push(ins.yes(S.sh, T));
+        if (woke) { S.wasted++; kind = "warn"; notes.push("刚被唤醒，条件却仍不满足——白醒一次"); }
+      } else {
+        notes.push(ins.no(S.sh, T));
+        next = labelIdx(prog, ins.f);
+      }
+      break;
+    case "wait":
+      if (ins.m) release(ins.m);
+      T.st = "sleep"; T.cv = ins.cv; T.wpc = T.pc; T.need = ins.m || null;
+      (S.cvq[ins.cv] = S.cvq[ins.cv] || []).push(t);
+      next = labelIdx(prog, ins.ret);
+      notes.push(ins.m ? `wait(&${ins.cv}, &${ins.m})：原子地释放 ${ins.m} 并睡在 ${ins.cv} 上` : `wait(&${ins.cv})：睡在 ${ins.cv} 上`);
+      break;
+    case "signal":
+    case "broadcast": {
+      const q = S.cvq[ins.cv] || [];
+      if (!q.length) { notes.push(`${ins.op}(&${ins.cv})：没有线程在 ${ins.cv} 上等待，什么也不做（信号不会被"记住"）`); break; }
+      let picked;
+      if (ins.op === "broadcast") picked = q.splice(0);
+      else {
+        const pol = sc.wake || "fifo";
+        const k = pol === "lifo" ? q.length - 1 : pol === "random" ? lcg(S) % q.length : 0;
+        picked = q.splice(k, 1);
+      }
+      picked.forEach((k) => { const w = S.th[k]; w.st = "ready"; w.cv = null; w.woke = true; S.wakeups++; });
+      notes.push(`${ins.op}(&${ins.cv})：唤醒 ${picked.map(nm).join("、")}（睡眠 → 就绪）`);
+      if (ins.op === "signal" && def.kind && sc.threads[picked[0]].kind === def.kind) {
+        kind = "warn";
+        notes.push(`注意：${def.kind === "c" ? "消费者叫醒了消费者" : "生产者叫醒了生产者"}！`);
+      }
+      if (sc.hoare && ins.op === "signal" && ins.m) {
+        const w = picked[0];
+        S.forced = w; S.owner[ins.m] = w; S.th[w].need = null;
+        T.need = ins.m; T.st = "ready";
+        notes.push(`Hoare：锁直接交给 ${nm(w)} 并让它立刻运行，${def.name} 暂时让出锁和 CPU`);
+      }
+      break;
+    }
+    case "act": {
+      const r = ins.fn(S.sh, T, t) || {};
+      if (r.err) { S.err = r.err; kind = "bad"; notes.push(r.err); }
+      else if (r.note) notes.push(r.note);
+      break;
+    }
+  }
+  T.justWoke = false;
+  if (!blocked && !S.err && ins.next) next = labelIdx(prog, ins.next(S.sh, T));
+  if (!S.err) {
+    T.pc = next;
+    if (next === -1) { T.st = "done"; T.pc = prog.length; }
+  }
+  return finish();
+}
+// 从初始状态出发，按调度序列回放；遇到不能运行的线程就停下
+function vmReplay(sc, sched) {
+  let S = vmInit(sc);
+  const rows = [], states = [S];
+  for (const t of sched) {
+    const r = vmStep(sc, S, t);
+    if (!r) break;
+    S = r.S; states.push(S); rows.push(r.row);
+  }
+  return { S, rows, states };
+}
+
+// 随机调度批量实验：每次运行都在"可运行线程"里均匀随机挑一个执行下一行
+function mulberry(seed) {
+  let a = seed >>> 0 || 1;
+  return () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+function vmRandomRun(sc, seed, cap) {
+  const r = mulberry(seed);
+  let S = vmInit(sc);
+  for (let n = 0; n < cap && !S.halt; n++) {
+    const can = sc.threads.map((_, k) => k).filter((k) => vmRunnable(S, k));
+    if (!can.length) break;
+    S = vmStep(sc, S, can[Math.floor(r() * can.length)]).S;
+  }
+  return S;
+}
+function vmBatch(sc, n, cap) {
+  const res = { assert: 0, asleep: 0, ok: 0, cap: 0, wasted: 0, steps: 0 };
+  for (let k = 1; k <= n; k++) {
+    const S = vmRandomRun(sc, k * 7919, cap || 4000);
+    res[!S.halt ? "cap" : S.err ? "assert" : S.halt.kind === "bad" ? "asleep" : "ok"]++;
+    res.wasted += S.wasted; res.steps += S.steps;
+  }
+  return res;
+}
+
+// ---------- 场景 1：生产者/消费者 ----------
+// o = { ver: 1|2|3, max, np, nc, loops, hoare, wake, seed }
+function buildPC(o) {
+  // ver: 1 = if + 单 CV（Fig 30.8）；2 = while + 单 CV（Fig 30.10）；3 = while + empty/fill（Fig 30.12/30.14）；
+  //      4 = if + empty/fill（作业里的 main-two-cvs-if.c）
+  const useIf = o.ver === 1 || o.ver === 4, twoCV = o.ver === 3 || o.ver === 4;
+  const W = useIf ? "if" : "while";
+  const cvP = twoCV ? "empty" : "cond", cvC = twoCV ? "fill" : "cond";
+  const FULL = o.max === 1 ? "1" : "MAX";
+  const put = (sh, T, t) => {
+    if (sh.count === sh.max)
+      return { err: `put() 时缓冲区已满（count == ${sh.max}）！断言失败` + (T.justWoke && useIf ? "——它刚从 wait() 返回，用 if 不会重新检查条件，而在它被唤醒到真正运行之间，另一个生产者已经把空位填上了" : "") };
+    const v = T.i;
+    sh.buf[sh.fill] = [t, v];
+    sh.fill = (sh.fill + 1) % sh.max;
+    const c0 = sh.count++;
+    sh.produced++;
+    return { note: `put(${v})：count ${c0} → ${sh.count}` + (sh.count === sh.max ? "（缓冲区满）" : "") };
+  };
+  const get = (sh, T) => {
+    if (sh.count === 0)
+      return { err: "get() 时缓冲区是空的！断言失败（原书：Oh oh! No data）" + (T.justWoke && useIf ? "——它刚从 wait() 返回，用 if 不会重新检查条件；可在它被唤醒到真正运行之间，别的消费者已经把数据取走了" : "") };
+    const x = sh.buf[sh.use];
+    sh.buf[sh.use] = null;
+    sh.use = (sh.use + 1) % sh.max;
+    const c0 = sh.count--;
+    sh.consumed++; T.got++;
+    return { note: `get() 取到 ${x[1]}：count ${c0} → ${sh.count}` };
+  };
+  const prod = [
+    { lb: "p1", ind: 2, code: "Pthread_mutex_lock(&mutex);", op: "lock", m: "mutex" },
+    { lb: "p2", ind: 2, code: `${W} (count == ${FULL})`, op: "test", cond: (sh) => sh.count === sh.max, f: "p4",
+      yes: (sh) => `count == ${sh.count}，缓冲区满 → 需要等待`, no: (sh) => `count == ${sh.count}，有空位 → 不用等` },
+    { lb: "p3", ind: 3, code: `Pthread_cond_wait(&${cvP}, &mutex);`, op: "wait", cv: cvP, m: "mutex", ret: useIf ? "p4" : "p2" },
+    { lb: "p4", ind: 2, code: "put(i);", op: "act", fn: put },
+    { lb: "p5", ind: 2, code: `Pthread_cond_signal(&${cvC});`, op: "signal", cv: cvC, m: "mutex" },
+    { lb: "p6", ind: 2, code: "Pthread_mutex_unlock(&mutex);", op: "unlock", m: "mutex", next: (sh, T) => (++T.i < o.loops ? "p1" : "END") },
+  ];
+  const cons = [
+    { lb: "c1", ind: 2, code: "Pthread_mutex_lock(&mutex);", op: "lock", m: "mutex" },
+    { lb: "c2", ind: 2, code: `${W} (count == 0)`, op: "test", cond: (sh) => sh.count === 0, f: "c4",
+      yes: () => "count == 0，没有数据 → 需要等待", no: (sh) => `count == ${sh.count}，有数据 → 不用等` },
+    { lb: "c3", ind: 3, code: `Pthread_cond_wait(&${cvC}, &mutex);`, op: "wait", cv: cvC, m: "mutex", ret: useIf ? "c4" : "c2" },
+    { lb: "c4", ind: 2, code: "int tmp = get();", op: "act", fn: get },
+    { lb: "c5", ind: 2, code: `Pthread_cond_signal(&${cvP});`, op: "signal", cv: cvP, m: "mutex" },
+    { lb: "c6", ind: 2, code: "Pthread_mutex_unlock(&mutex);", op: "unlock", m: "mutex", next: () => "c1" },
+  ];
+  const threads = [];
+  const cHead = ["void *consumer(void *arg) {", "  while (1) {"], cTail = ['    printf("%d\\n", tmp);', "  }", "}"];
+  const pHead = ["void *producer(void *arg) {", "  for (i = 0; i < loops; i++) {"], pTail = ["  }", "}"];
+  for (let k = 0; k < o.nc; k++) threads.push({ name: "Tc" + (k + 1), kind: "c", group: "c", prog: cons, head: cHead, tail: cTail, title: "消费者" });
+  for (let k = 0; k < o.np; k++) threads.push({ name: o.np === 1 ? "Tp" : "Tp" + (k + 1), kind: "p", group: "p", prog: prod, head: pHead, tail: pTail, title: "生产者" });
+  return {
+    threads, hoare: !!o.hoare, wake: o.wake || "fifo", seed: o.seed || 7,
+    mutexes: ["mutex"], cvs: twoCV ? ["empty", "fill"] : ["cond"],
+    shared: { count: 0, max: o.max, buf: Array(o.max).fill(null), fill: 0, use: 0, produced: 0, consumed: 0, total: o.np * o.loops },
+    col: (sh) => sh.count,
+    judge(S) {
+      const left = S.th.map((x, k) => k).filter((k) => threads[k].kind === "p" && S.th[k].st !== "done");
+      const names = (ks) => ks.map((k) => threads[k].name).join("、");
+      if (left.length)
+        return { kind: "bad", msg: `所有线程都睡着了！${names(left)} 还有数据要放却在睡眠，而能叫醒它的消费者也都睡了——没有人会再叫醒任何人（原书 Figure 30.11：Everyone asleep…）` };
+      if (S.sh.count > 0) return { kind: "bad", msg: `缓冲区里还有 ${S.sh.count} 个数据，消费者却都睡着了` };
+      return { kind: "ok", msg: `生产者全部完成（共 ${S.sh.total} 个数据都已被取走），消费者睡着等更多数据——这是正常结束` };
+    },
+  };
+}
+// 原书两张轨迹表对应的调度序列（线程下标：0=Tc1, 1=Tc2, 2=Tp）
+const FIG309 = [0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 0];
+const FIG3011 = [0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 1, 1];
+
+// ---------- 场景 2：join 的三种写法 ----------
+function buildJoin(variant) {
+  const P = [], C = [];
+  const pr = (s) => (sh) => { sh.out.push(s); return { note: `打印 "${s}"` }; };
+  let pHead, pTail, cHead, cTail;
+  if (variant === "ok") {
+    pHead = ["void thr_join() {"]; pTail = ["}"];
+    P.push({ lb: "19", ind: 1, code: "Pthread_mutex_lock(&m);", op: "lock", m: "m" });
+    P.push({ lb: "20", ind: 1, code: "while (done == 0)", op: "test", cond: (sh) => sh.done === 0, f: "22", yes: () => "done == 0，孩子还没结束 → 等待", no: () => "done == 1，孩子已结束 → 不用等" });
+    P.push({ lb: "21", ind: 2, code: "Pthread_cond_wait(&c, &m);", op: "wait", cv: "c", m: "m", ret: "20" });
+    P.push({ lb: "22", ind: 1, code: "Pthread_mutex_unlock(&m);", op: "unlock", m: "m" });
+    P.push({ lb: "30", ind: 0, code: 'printf("parent: end\\n");   // main 里', op: "act", fn: pr("parent: end"), next: () => "END" });
+    cHead = ["void *child(void *arg) {"]; cTail = ["}"];
+    C.push({ lb: "13", ind: 1, code: 'printf("child\\n");', op: "act", fn: pr("child") });
+    C.push({ lb: "6", ind: 1, code: "Pthread_mutex_lock(&m);   // thr_exit()", op: "lock", m: "m" });
+    C.push({ lb: "7", ind: 1, code: "done = 1;", op: "act", fn: (sh) => { sh.done = 1; return { note: "done = 1（把\"孩子结束了\"记在状态变量里）" }; } });
+    C.push({ lb: "8", ind: 1, code: "Pthread_cond_signal(&c);", op: "signal", cv: "c", m: "m" });
+    C.push({ lb: "9", ind: 1, code: "Pthread_mutex_unlock(&m);", op: "unlock", m: "m", next: () => "END" });
+  } else if (variant === "nostate") {
+    pHead = ["void thr_join() {"]; pTail = ["}"];
+    P.push({ lb: "8", ind: 1, code: "Pthread_mutex_lock(&m);", op: "lock", m: "m" });
+    P.push({ lb: "9", ind: 1, code: "Pthread_cond_wait(&c, &m);", op: "wait", cv: "c", m: "m", ret: "10" });
+    P.push({ lb: "10", ind: 1, code: "Pthread_mutex_unlock(&m);", op: "unlock", m: "m" });
+    P.push({ lb: "end", ind: 0, code: 'printf("parent: end\\n");   // main 里', op: "act", fn: pr("parent: end"), next: () => "END" });
+    cHead = ["void *child(void *arg) {"]; cTail = ["}"];
+    C.push({ lb: "ch", ind: 1, code: 'printf("child\\n");', op: "act", fn: pr("child") });
+    C.push({ lb: "2", ind: 1, code: "Pthread_mutex_lock(&m);   // thr_exit()", op: "lock", m: "m" });
+    C.push({ lb: "3", ind: 1, code: "Pthread_cond_signal(&c);", op: "signal", cv: "c", m: "m" });
+    C.push({ lb: "4", ind: 1, code: "Pthread_mutex_unlock(&m);", op: "unlock", m: "m", next: () => "END" });
+  } else {
+    pHead = ["void thr_join() {"]; pTail = ["}"];
+    P.push({ lb: "7", ind: 1, code: "if (done == 0)", op: "test", cond: (sh) => sh.done === 0, f: "end", yes: () => "done == 0 → 准备去睡", no: () => "done == 1 → 不用等" });
+    P.push({ lb: "8", ind: 2, code: "Pthread_cond_wait(&c);   // 假想的无锁接口", op: "wait", cv: "c", m: null, ret: "end" });
+    P.push({ lb: "end", ind: 0, code: 'printf("parent: end\\n");   // main 里', op: "act", fn: pr("parent: end"), next: () => "END" });
+    cHead = ["void *child(void *arg) {"]; cTail = ["}"];
+    C.push({ lb: "ch", ind: 1, code: 'printf("child\\n");', op: "act", fn: pr("child") });
+    C.push({ lb: "2", ind: 1, code: "done = 1;   // thr_exit()", op: "act", fn: (sh) => { sh.done = 1; return { note: "done = 1" }; } });
+    C.push({ lb: "3", ind: 1, code: "Pthread_cond_signal(&c);", op: "signal", cv: "c", m: null, next: () => "END" });
+  }
+  const threads = [
+    { name: "父", group: "parent", prog: P, head: pHead, tail: pTail },
+    { name: "子", group: "child", prog: C, head: cHead, tail: cTail },
+  ];
+  return {
+    threads, mutexes: variant === "nolock" ? [] : ["m"], cvs: ["c"], wake: "fifo",
+    shared: { done: 0, out: ["parent: begin"] },
+    col: (sh) => (variant === "nostate" ? "—" : sh.done),
+    judge(S) {
+      if (S.th[0].st !== "done")
+        return { kind: "bad", msg: "父线程永远睡下去了：它要等的 signal 早就发生过了，而条件变量没有记忆——没人等时 signal 就丢了" };
+      return { kind: "ok", msg: "输出顺序正确：parent 在 child 之后结束" };
+    },
+  };
+}
+
+// ---------- 场景 3：覆盖条件（内存分配器） ----------
+// o = { a, b, f, broadcast }
+function buildAlloc(o) {
+  const alloc = (size) => [
+    { lb: "10", ind: 1, code: "Pthread_mutex_lock(&m);", op: "lock", m: "m" },
+    { lb: "11", ind: 1, code: `while (bytesLeft < size)   // size = ${size}`, op: "test", cond: (sh) => sh.left < size, f: "14",
+      yes: (sh) => `bytesLeft = ${sh.left} < ${size} → 不够，等待`, no: (sh) => `bytesLeft = ${sh.left} ≥ ${size} → 够了` },
+    { lb: "12", ind: 2, code: "Pthread_cond_wait(&c, &m);", op: "wait", cv: "c", m: "m", ret: "11" },
+    { lb: "14", ind: 1, code: "bytesLeft -= size;", op: "act", fn: (sh) => { const b = sh.left; sh.left -= size; return { note: `分配 ${size} 字节：bytesLeft ${b} → ${sh.left}` }; } },
+    { lb: "15", ind: 1, code: "Pthread_mutex_unlock(&m);", op: "unlock", m: "m", next: () => "END" },
+  ];
+  const fr = [
+    { lb: "20", ind: 1, code: "Pthread_mutex_lock(&m);", op: "lock", m: "m" },
+    { lb: "22", ind: 1, code: `bytesLeft += size;   // size = ${o.f}`, op: "act", fn: (sh) => { const b = sh.left; sh.left += o.f; return { note: `释放 ${o.f} 字节：bytesLeft ${b} → ${sh.left}` }; } },
+    { lb: "23", ind: 1, code: o.broadcast ? "Pthread_cond_broadcast(&c);" : "Pthread_cond_signal(&c);   // 叫醒谁？", op: o.broadcast ? "broadcast" : "signal", cv: "c", m: "m" },
+    { lb: "24", ind: 1, code: "Pthread_mutex_unlock(&m);", op: "unlock", m: "m", next: () => "END" },
+  ];
+  const sizes = [o.a, o.b];
+  const threads = [
+    { name: "Ta", group: "alloc", prog: alloc(o.a), head: [`void *allocate(int size) {   // Ta: allocate(${o.a})`], tail: ["}"] },
+    { name: "Tb", group: "alloc2", prog: alloc(o.b), head: [`void *allocate(int size) {   // Tb: allocate(${o.b})`], tail: ["}"] },
+    { name: "Tc", group: "free", prog: fr, head: [`void free(void *ptr, int size) {   // Tc: free(${o.f})`], tail: ["}"] },
+  ];
+  return {
+    threads, mutexes: ["m"], cvs: ["c"], wake: "fifo",
+    shared: { left: 0 },
+    col: (sh) => sh.left,
+    judge(S) {
+      const stuck = [0, 1].filter((k) => S.th[k].st === "sleep" && sizes[k] <= S.sh.left);
+      if (stuck.length)
+        return { kind: "bad", msg: `${stuck.map((k) => threads[k].name).join("、")} 需要的内存（${stuck.map((k) => sizes[k]).join("、")} 字节）明明已经有了（bytesLeft = ${S.sh.left}），却还在睡——signal 叫醒了错误的线程` };
+      const wait = [0, 1].filter((k) => S.th[k].st === "sleep");
+      if (wait.length)
+        return { kind: "ok", msg: `${wait.map((k) => threads[k].name).join("、")} 仍在等待，但这是合理的：bytesLeft = ${S.sh.left}，确实不够它用` };
+      return { kind: "ok", msg: "所有请求都完成了" };
+    },
+  };
+}
+// ==VM-END==
+
+// ==UI-BEGIN==
+const { h, color } = OSTEP;
+const STZH = { run: "运行", ready: "就绪", sleep: "睡眠", lock: "等锁", done: "结束" };
+const STEN = { run: "Run", ready: "Ready", sleep: "Sleep", lock: "Lock", done: "Done" };
+const INF = 1e9;
+
+// 通用"交错执行器"界面：代码 + 线程状态 + 共享状态 + 原书风格轨迹表
+function Interleave(root, cfg) {
+  const mount = root.querySelector(".sim-mount");
+  const runBar = h("div", { class: "controls runbar" });
+  const stepHost = h("div");
+  const notice = h("div", { class: "notice" });
+  notice.hidden = true;
+  const codeEl = h("div", { class: "codecols" });
+  const thEl = h("div", { class: "thpanel" });
+  const shEl = h("div", { class: "shpanel" });
+  const traceWrap = h("div", { class: "trace-wrap" });
+  const stage = h("div", { class: "stage" }, codeEl, h("div", { class: "midrow" }, thEl, shEl), traceWrap);
+  const narr = h("div", { class: "narrate" });
+  const statsEl = h("div", { class: "stats" });
+  const out = h("div", { class: "readout" });
+  out.hidden = true;
+  const presets = {};
+  let presetBar = null;
+  if (cfg.presets) {
+    presetBar = h("div", { class: "controls presets" }, h("span", { class: "muted small" }, "载入示例："));
+    cfg.presets.forEach((p) => { presets[p.id] = p; presetBar.append(h("button", { onclick: () => load(p.id) }, p.label)); });
+  }
+  mount.append(...[presetBar, runBar, stepHost, notice, stage, narr, statsEl, out].filter(Boolean));
+
+  let sc, states, rows, rnd;
+  const seedIn = h("input", { type: "number", value: 1, min: 1, title: "随机种子" });
+  const stepper = OSTEP.stepper(stepHost, { steps: () => (states ? states.length : 1), render });
+
+  function rebuild() {
+    sc = cfg.build();
+    states = [vmInit(sc)];
+    rows = [];
+    rnd = OSTEP.rng(Number(seedIn.value) || 1);
+    notice.hidden = true;
+    out.hidden = true;
+    drawRunBar();
+  }
+  function drawRunBar() {
+    runBar.replaceChildren(h("span", { class: "muted small" }, "下一步运行："));
+    sc.threads.forEach((t, k) => runBar.append(h("button", {
+      class: "tbtn", "data-k": k, style: { borderColor: color(k) },
+      onclick: () => { cut(); if (push(k)) stepper.go(states.length - 1); },
+    }, h("span", { class: "dot", style: { background: color(k) } }), t.name)));
+    runBar.append(h("span", { class: "sep" }),
+      h("button", { onclick: () => { cut(); randomSteps(1); } }, "随机一步"),
+      h("button", { onclick: () => { cut(); randomSteps(400); } }, "随机跑到底"),
+      h("label", {}, "种子", seedIn),
+      h("button", { onclick: () => { rebuild(); stepper.go(0); } }, "重来"));
+    if (cfg.batch) runBar.append(h("button", { onclick: batch }, "批量随机 500 次"));
+  }
+  function cut() {
+    const i = stepper.index;
+    states.length = i + 1;
+    rows.length = i;
+    notice.hidden = true;
+  }
+  function push(k) {
+    const r = vmStep(sc, states[states.length - 1], k);
+    if (!r) return false;
+    states.push(r.S);
+    rows.push(r.row);
+    return true;
+  }
+  function randomSteps(n) {
+    for (let j = 0; j < n; j++) {
+      const S = states[states.length - 1];
+      const can = sc.threads.map((_, k) => k).filter((k) => vmRunnable(S, k));
+      if (!can.length) break;
+      push(rnd.pick(can));
+    }
+    stepper.go(states.length - 1);
+  }
+  function batch() {
+    const r = vmBatch(cfg.build(), 500, 4000);
+    out.hidden = false;
+    out.textContent = `用当前设置跑 500 个不同的随机调度（每一行之后都可能切换线程）：\n` +
+      `  断言失败（get 空缓冲 / put 满缓冲）：${r.assert} 次\n` +
+      `  所有线程都睡着（Figure 30.11 型）：  ${r.asleep} 次\n` +
+      `  正常结束：                          ${r.ok} 次\n` +
+      `  平均每次运行白醒 ${(r.wasted / 500).toFixed(2)} 次（被唤醒后发现条件仍不满足，又去睡）`;
+  }
+  // plan: [[线程下标, 步数(INF = 一直跑到它不能运行)] ...]
+  function applyPlan(plan) {
+    for (const [k, n] of plan) {
+      for (let j = 0; j < n; j++) {
+        const S = states[states.length - 1];
+        if (S.halt) return;
+        if (!vmRunnable(S, k)) {
+          if (n < INF) {
+            const x = S.th[k];
+            notice.hidden = false;
+            notice.textContent = `原书的调度接下来要运行 ${sc.threads[k].name}，但在当前设置下它处于「${STZH[x.st]}${x.cv ? "（" + x.cv + "）" : ""}」${S.forced >= 0 ? "，且 Hoare 语义要求 " + sc.threads[S.forced].name + " 必须先运行" : ""}，不能被调度——从这里开始轨迹与原书分叉，请用上面的线程按钮手动继续。`;
+            return "diverged";
+          }
+          break;
+        }
+        push(k);
+      }
+    }
+  }
+  function load(id) {
+    const p = presets[id];
+    if (p.set) p.set();
+    rebuild();
+    const plan = typeof p.plan === "function" ? p.plan() : p.plan;
+    applyPlan(plan);
+    stepper.go(0);
+    root.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function markerPos(x) {
+    if (x.st === "done") return -1;
+    return x.wpc >= 0 ? x.wpc : x.pc;
+  }
+  function render(i) {
+    if (!sc) rebuild();
+    i = Math.min(i, states.length - 1);
+    const S = states[i], row = i > 0 ? rows[i - 1] : null;
+    // 线程按钮可用性
+    runBar.querySelectorAll(".tbtn").forEach((b) => { b.disabled = !vmRunnable(S, Number(b.dataset.k)); });
+    // 代码
+    codeEl.replaceChildren();
+    const groups = [];
+    sc.threads.forEach((t, k) => { let g = groups.find((x) => x.id === t.group); if (!g) groups.push((g = { id: t.group, def: t, ks: [] })); g.ks.push(k); });
+    for (const g of groups) {
+      const box = h("div", { class: "codebox" }, h("div", { class: "cb-title" }, (g.def.title || g.ks.map((k) => sc.threads[k].name).join("、")) + "：", g.ks.map((k) => h("span", { class: "tchip", style: { background: color(k) } }, sc.threads[k].name))));
+      (g.def.head || []).forEach((tx) => box.append(h("div", { class: "cl" }, h("span", { class: "lb" }), h("span", { class: "tx" }, tx))));
+      g.def.prog.forEach((ins, j) => {
+        const marks = g.ks.filter((k) => markerPos(S.th[k]) === j).map((k) => {
+          const x = S.th[k];
+          const tag = x.st === "sleep" ? " 睡" : x.st === "lock" ? " 等锁" : x.woke ? " 已醒" : x.need ? " 待拿锁" : "";
+          return h("span", { class: "tchip" + (x.st === "sleep" || x.st === "lock" ? " dim" : ""), style: { background: color(k) } }, sc.threads[k].name + tag);
+        });
+        const exec = row && g.ks.includes(row.t) && ins.lb === row.lb && !(row.t !== undefined && sc.threads[row.t].group !== g.id);
+        box.append(h("div", { class: "cl" + (exec ? " exec" + (row.kind === "bad" ? " bad" : "") : "") },
+          h("span", { class: "lb" }, ins.lb), h("span", { class: "tx" }, "  ".repeat(ins.ind) + ins.code), h("span", { class: "mk" }, marks)));
+      });
+      (g.def.tail || []).forEach((tx) => box.append(h("div", { class: "cl" }, h("span", { class: "lb" }), h("span", { class: "tx" }, tx))));
+      codeEl.append(box);
+    }
+    // 线程状态
+    thEl.replaceChildren(h("table", { class: "mini" },
+      h("thead", {}, h("tr", {}, h("th", {}, "线程"), h("th", {}, "下一行"), h("th", {}, "状态"), h("th", {}, "备注"))),
+      h("tbody", {}, sc.threads.map((t, k) => {
+        const x = S.th[k];
+        const stx = x.st === "sleep" ? `睡眠（在 ${x.cv} 上）` : x.st === "lock" ? "阻塞（等锁）" : STZH[x.st] + (x.woke ? "（已被唤醒）" : x.need ? "（需重新拿锁）" : "");
+        const pos = markerPos(x);
+        return h("tr", { class: row && row.t === k ? "cur" : "" },
+          h("td", {}, h("span", { class: "tchip", style: { background: color(k) } }, t.name)),
+          h("td", { class: "mono" }, pos >= 0 ? t.prog[pos].lb : "—"),
+          h("td", { class: "st-" + x.st }, stx),
+          h("td", { class: "small muted" }, cfg.threadNote ? cfg.threadNote(S, k, sc) : ""));
+      }))));
+    // 共享状态
+    const locks = (sc.mutexes || []).map((m) => h("div", { class: "kv" }, h("span", { class: "k" }, `锁 ${m}`),
+      S.owner[m] >= 0 ? h("span", { class: "tchip", style: { background: color(S.owner[m]) } }, sc.threads[S.owner[m]].name + " 持有") : h("span", { class: "pill" }, "空闲"),
+      (S.lockQ[m] || []).length ? h("span", { class: "small muted" }, " 等锁：" + S.lockQ[m].map((k) => sc.threads[k].name).join("、")) : null));
+    const cvs = (sc.cvs || []).map((c) => h("div", { class: "kv" }, h("span", { class: "k" }, `CV ${c} 队列`),
+      (S.cvq[c] || []).length ? (S.cvq[c] || []).map((k) => h("span", { class: "tchip dim", style: { background: color(k) } }, sc.threads[k].name)) : h("span", { class: "small muted" }, "（空）")));
+    shEl.replaceChildren(cfg.renderShared(S, sc), ...locks, ...cvs);
+    // 轨迹表（原书格式）
+    const tb = h("tbody");
+    tb.append(h("tr", { class: i === 0 ? "cur" : "" }, h("td", { class: "num" }, "0"), sc.threads.map(() => h("td", {}, "Ready")), h("td", { class: "num" }, String(sc.col(states[0].sh))), h("td", { class: "small muted" }, "初始状态")));
+    rows.forEach((r, j) => {
+      tb.append(h("tr", { class: (j + 1 === i ? "cur " : "") + (j + 1 > i ? "future " : "") + "k-" + r.kind },
+        h("td", { class: "num" }, String(j + 1)),
+        r.st.map((st, k) => h("td", { class: k === r.t ? "me" : "", style: k === r.t ? { color: color(k) } : null }, (k === r.t ? r.lb + " " : "") + STEN[st])),
+        h("td", { class: "num" }, String(r.col)),
+        h("td", { class: "small" }, r.note)));
+    });
+    traceWrap.replaceChildren(h("table", { class: "trace" },
+      h("thead", {}, h("tr", {}, h("th", {}, "#"), sc.threads.map((t, k) => h("th", { style: { color: color(k) } }, t.name)), h("th", {}, cfg.colName), h("th", {}, "说明"))), tb));
+    const cur = traceWrap.querySelector("tr.cur");
+    if (cur) traceWrap.scrollTop = Math.max(0, cur.offsetTop - traceWrap.clientHeight / 2);
+    // 解说
+    narr.className = "narrate";
+    narr.replaceChildren();
+    if (!row) narr.append(rows.length ? `已载入 ${rows.length} 步调度。按「下一步 ▶」逐行观看，或点击上方线程按钮自己决定下一步（会截断后面的步骤）。` : cfg.intro);
+    else narr.append(h("b", { style: { color: color(row.t) } }, `${sc.threads[row.t].name} 执行 ${row.lb}：`), row.note);
+    if (S.halt) {
+      narr.classList.add(S.halt.kind === "bad" ? "bad" : "ok");
+      narr.append(h("div", { class: "halt" }, (S.halt.kind === "bad" ? "✗ 出错：" : "✓ 结束：") + S.halt.msg));
+    } else if (row && row.kind === "warn") narr.classList.add("warn");
+    statsEl.replaceChildren(...cfg.stats(S, sc).map(([v, l]) => h("div", { class: "stat" }, h("div", { class: "v" }, String(v)), h("div", { class: "l" }, l))));
+  }
+  root.querySelectorAll("[data-p]").forEach((el) => el.addEventListener("change", () => { rebuild(); stepper.go(0); }));
+  rebuild();
+  return { load, rebuild, get sc() { return sc; } };
+}
+
+const val = (root, name) => root.querySelector(`[data-p="${name}"]`);
+const num = (root, name, lo, hi) => { const el = val(root, name); const v = Math.max(lo, Math.min(hi, Math.round(Number(el.value) || lo))); el.value = v; return v; };
+
+// ---------- 模拟器 1：生产者/消费者 ----------
+const pcRoot = document.getElementById("sim-pc");
+const pcSim = Interleave(pcRoot, {
+  colName: "count",
+  intro: "选好版本和线程数后，点击线程按钮决定「下一步由谁执行一行」，或点「载入示例」复现原书的两张轨迹表。",
+  batch: true,
+  build: () => buildPC({
+    ver: Number(val(pcRoot, "ver").value), max: num(pcRoot, "max", 1, 6), np: num(pcRoot, "np", 1, 3), nc: num(pcRoot, "nc", 1, 3),
+    loops: num(pcRoot, "loops", 1, 20), hoare: val(pcRoot, "sem").value === "hoare", wake: val(pcRoot, "wake").value,
+  }),
+  presets: [
+    { id: "fig309", label: "Figure 30.9（v1 的 if 错误）", set: () => pcSet(1, "mesa"), plan: FIG309.map((k) => [k, 1]) },
+    { id: "fig3011", label: "Figure 30.11（v2 全体睡眠）", set: () => pcSet(2, "mesa"), plan: FIG3011.map((k) => [k, 1]) },
+    { id: "fig309v2", label: "Figure 30.9 调度 × while", set: () => pcSet(2, "mesa"), plan: FIG309.map((k) => [k, 1]) },
+    { id: "fig3011v3", label: "Figure 30.11 调度 × 最终版", set: () => pcSet(3, "mesa"), plan: FIG3011.map((k) => [k, 1]) },
+    { id: "fig3011lifo", label: "Figure 30.11 调度 × LIFO 唤醒", set: () => pcSet(2, "mesa", "lifo"), plan: FIG3011.map((k) => [k, 1]) },
+    { id: "fig309hoare", label: "Figure 30.9 调度 × Hoare", set: () => pcSet(1, "hoare"), plan: FIG309.map((k) => [k, 1]) },
+  ],
+  threadNote: (S, k, sc) => (sc.threads[k].kind === "p" ? `已放 ${S.th[k].i} / ${num(pcRoot, "loops", 1, 20)}` : `已取 ${S.th[k].got} 个`),
+  renderShared(S, sc) {
+    const sh = S.sh;
+    const cells = sh.buf.map((x, j) => h("div", { class: "slot" },
+      h("span", { class: "cell" + (x ? " on" : ""), style: x ? { background: color(x[0]), color: "#fff", borderColor: color(x[0]) } : null }, x ? String(x[1]) : "·"),
+      sh.max > 1 ? h("span", { class: "ptr" }, (j === sh.fill ? "fill " : "") + (j === sh.use ? "use" : "")) : null));
+    return h("div", {},
+      h("div", { class: "kv" }, h("span", { class: "k" }, `缓冲区（MAX=${sh.max}）`), h("span", { class: "slots" }, cells)),
+      h("div", { class: "kv" }, h("span", { class: "k" }, "count"), h("b", { class: "mono" }, String(sh.count)),
+        h("span", { class: "small muted" }, `　已生产 ${sh.produced} / ${sh.total}，已消费 ${sh.consumed}`)));
+  },
+  stats: (S) => [[S.steps, "已执行行数"], [S.switches, "线程切换次数"], [S.wakeups, "被唤醒次数"], [S.wasted, "白醒（醒来仍不满足）"]],
+});
+function pcSet(ver, sem, wake) {
+  val(pcRoot, "ver").value = ver; val(pcRoot, "sem").value = sem; val(pcRoot, "wake").value = wake || "fifo";
+  val(pcRoot, "max").value = 1; val(pcRoot, "np").value = 1; val(pcRoot, "nc").value = 2; val(pcRoot, "loops").value = 5;
+}
+document.querySelectorAll("[data-load]").forEach((b) => b.addEventListener("click", () => pcSim.load(b.dataset.load)));
+
+// ---------- 模拟器 2：join ----------
+const joinRoot = document.getElementById("sim-join");
+const joinVariant = () => val(joinRoot, "variant").value;
+Interleave(joinRoot, {
+  colName: "done",
+  intro: "父线程已经打印了 parent: begin 并创建了子线程。现在由你决定两个线程的交错顺序。",
+  build: () => buildJoin(joinVariant()),
+  presets: [
+    { id: "pfirst", label: "父线程先运行", plan: [[0, INF], [1, INF], [0, INF]] },
+    { id: "cfirst", label: "子线程先运行完", plan: [[1, INF], [0, INF]] },
+    { id: "race", label: "父检查完 done 就被打断", set: () => { val(joinRoot, "variant").value = "nolock"; }, plan: [[0, 1], [1, INF], [0, INF]] },
+    { id: "lost", label: "无状态变量 + 子先运行", set: () => { val(joinRoot, "variant").value = "nostate"; }, plan: [[1, INF], [0, INF]] },
+  ],
+  renderShared(S) {
+    return h("div", {},
+      joinVariant() !== "nostate" ? h("div", { class: "kv" }, h("span", { class: "k" }, "状态变量 done"), h("b", { class: "mono" }, String(S.sh.done))) : h("div", { class: "kv" }, h("span", { class: "k" }, "状态变量"), h("span", { class: "small muted" }, "（这个版本没有 done）")),
+      h("div", { class: "kv" }, h("span", { class: "k" }, "输出"), h("pre", { class: "term" }, S.sh.out.join("\n"))));
+  },
+  stats: (S) => [[S.steps, "已执行行数"], [S.switches, "线程切换次数"], [S.wakeups, "被唤醒次数"]],
+});
+
+// ---------- 模拟器 3：覆盖条件 ----------
+const alRoot = document.getElementById("sim-alloc");
+Interleave(alRoot, {
+  colName: "bytesLeft",
+  intro: "堆里一开始 0 字节空闲。Ta 要 allocate(100)，Tb 要 allocate(10)，Tc 会 free(50)。先让 Ta、Tb 睡下，再让 Tc 释放内存。",
+  build: () => buildAlloc({ a: num(alRoot, "a", 1, 500), b: num(alRoot, "b", 1, 500), f: num(alRoot, "f", 1, 500), broadcast: val(alRoot, "how").value === "broadcast" }),
+  presets: [
+    { id: "sig", label: "原书场景 + signal", set: () => { val(alRoot, "how").value = "signal"; }, plan: [[0, INF], [1, INF], [2, INF], [0, INF], [1, INF]] },
+    { id: "bc", label: "原书场景 + broadcast", set: () => { val(alRoot, "how").value = "broadcast"; }, plan: [[0, INF], [1, INF], [2, INF], [0, INF], [1, INF]] },
+  ],
+  renderShared(S, sc) {
+    const need = [num(alRoot, "a", 1, 500), num(alRoot, "b", 1, 500)];
+    return h("div", {},
+      h("div", { class: "kv" }, h("span", { class: "k" }, "bytesLeft"), h("b", { class: "mono" }, String(S.sh.left))),
+      h("div", { class: "kv" }, h("span", { class: "k" }, "请求"), need.map((n, k) => h("span", { class: "pill", style: { borderColor: color(k) } },
+        `${sc.threads[k].name} 要 ${n}` + (S.th[k].st === "done" ? " ✓" : n <= S.sh.left ? "（现在够了）" : "（不够）")))));
+  },
+  stats: (S) => [[S.sh.left, "bytesLeft"], [S.wakeups, "被唤醒次数"], [S.wasted, "白醒"], [S.steps, "已执行行数"]],
+});
+// ==UI-END==
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1030 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 27 章 · 插叙：线程 API</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+  .codebox { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; font: 12.5px/1.55 var(--mono); padding: 8px 0; overflow-x: auto; }
+  .codebox .ln { display: block; padding: 0 10px 0 6px; white-space: pre; border-left: 3px solid transparent; }
+  .codebox .ln .no { color: var(--faint); display: inline-block; width: 2.2em; user-select: none; }
+  .codebox .ln.hl { background: var(--warn-soft); border-left-color: var(--warn); }
+  .codebox .ln.bad { background: var(--bad-soft); border-left-color: var(--bad); }
+  .sim-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.55fr); gap: 12px; align-items: start; }
+  .sim-grid.j-top { grid-template-columns: minmax(0, 1.7fr) minmax(0, 1fr); }
+  @media (max-width: 760px) { .sim-grid, .sim-grid.j-top { grid-template-columns: minmax(0, 1fr); } }
+  .outbox { font: 12.5px/1.5 var(--mono); align-self: stretch; background: var(--code-bg); border: 1px dashed var(--border); border-radius: 8px; padding: 8px 10px; margin-top: 10px; white-space: pre-wrap; min-height: 2.5em; }
+  .outbox b { color: var(--muted); font-weight: 600; font-family: var(--font); font-size: 12px; display: block; }
+  .lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
+  .lane { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); overflow: hidden; }
+  .lane.cur { box-shadow: 0 0 0 2px var(--accent); }
+  .lane .lh { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; font-weight: 650; font-size: 14px; border-bottom: 1px solid var(--border); }
+  .lane .lh .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: middle; }
+  .lane .codebox { border: 0; border-radius: 0; }
+  .st { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-2); font-weight: 500; }
+  .st.run { border-color: var(--ok); background: var(--ok-soft); }
+  .st.sleep { border-color: var(--accent); background: var(--accent-soft); }
+  .st.lockwait { border-color: var(--warn); background: var(--warn-soft); }
+  .st.bug { border-color: var(--bad); background: var(--bad-soft); }
+  .shared { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
+  .shared .box { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); padding: 6px 12px; font-size: 13.5px; }
+  .shared .box .k { color: var(--muted); font-size: 12px; display: block; }
+  .shared .box .v { font: 600 15px var(--mono); }
+  .log { font: 12.5px/1.55 var(--mono); background: var(--code-bg); border-radius: 8px; padding: 8px 10px; margin-top: 10px; max-height: 190px; overflow-y: auto; }
+  .log div.bad { color: var(--bad); font-weight: 600; }
+  .log div.cur { background: var(--accent-soft); }
+  .guide { counter-reset: g; list-style: none; padding: 0; }
+  .guide li { counter-increment: g; position: relative; padding: 8px 12px 8px 44px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); margin: 8px 0; }
+  .guide li::before { content: counter(g); position: absolute; left: 12px; top: 8px; width: 22px; height: 22px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-weight: 700; font-size: 13px; text-align: center; line-height: 22px; }
+</style>
+</head>
+<body data-chapter="27">
+<main>
+
+<h2 id="crux">本章要解决什么</h2>
+<div class="crux">
+  <p><strong>如何创建和控制线程？</strong>操作系统应该提供什么样的线程创建和控制接口？这些接口如何设计才能既好用又实用？</p>
+  <p class="small muted">CRUX: How to create and control threads. What interfaces should the OS present for thread creation and control? How should these interfaces be designed to enable ease of use as well as utility?</p>
+</div>
+<p>上一章我们知道了线程是什么、为什么共享数据会出现竞态条件（race condition）。这一章是一次"插叙"（interlude）：先把 POSIX 线程库（pthreads）里最常用的几组接口过一遍——<strong>创建与等待</strong>（<code>pthread_create</code> / <code>pthread_join</code>）、<strong>锁</strong>（<code>pthread_mutex_*</code>）、<strong>条件变量</strong>（<code>pthread_cond_*</code>）。</p>
+<p>原书说这一章更适合当"参考手册"：锁会在第 28 章详细讲怎么实现，条件变量在第 30 章细讲。本页的重点放在<strong>最容易写错的地方</strong>：参数和返回值的生命周期、忘记初始化锁、不检查返回码、用 <code>if</code> 而不是 <code>while</code> 等待条件。两个模拟器让你亲眼看到这些错误是怎么发生的。</p>
+
+<h2 id="concepts">核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>pthread_create</h4><p>创建一个新线程，从你指定的函数（start routine）开始执行，拥有自己的调用栈，与其他线程共享地址空间。</p></div>
+  <div class="card"><h4>pthread_join</h4><p>等待某个线程结束，并通过 <code>void **</code> 拿回它的返回值（一个 <code>void *</code>）。</p></div>
+  <div class="card"><h4>void * 参数与返回值</h4><p>用"无类型指针"让线程函数能接收和返回<em>任何</em>类型；代价是你必须自己负责类型转换和内存生命周期。</p></div>
+  <div class="card"><h4>每个线程有自己的栈</h4><p>线程函数里的局部变量只属于该线程，线程一结束就被回收——绝不能把它们的地址返回出去。</p></div>
+  <div class="card"><h4>互斥锁（mutex）</h4><p><code>pthread_mutex_lock/unlock</code> 保护临界区（critical section）；必须先<strong>初始化</strong>，调用后要<strong>检查返回码</strong>。</p></div>
+  <div class="card"><h4>条件变量（condition variable）</h4><p>一个线程等待另一个线程"做完某事"的机制：<code>wait</code> 睡眠并释放锁，<code>signal</code> 唤醒等待者。</p></div>
+  <div class="card"><h4>用 while 重新检查</h4><p>被唤醒只是"条件<em>可能</em>变了"的提示，不是保证；醒来后必须在 <code>while</code> 里重新检查。</p></div>
+  <div class="card"><h4>-pthread</h4><p>包含 <code>&lt;pthread.h&gt;</code>，编译链接时加 <code>-pthread</code>：<code>gcc -o main main.c -Wall -pthread</code>。</p></div>
+</div>
+
+<h2 id="create">创建线程：pthread_create</h2>
+<p>POSIX 里创建线程只需要一个调用：</p>
+<pre><code>#include &lt;pthread.h&gt;
+int pthread_create(pthread_t             *thread,
+                   const pthread_attr_t  *attr,
+                   void *               (*start_routine)(void *),
+                   void                  *arg);</code></pre>
+<p>第一次看到这个声明可能有点吓人（尤其是没用过函数指针的话），其实只有四个参数，逐个拆开就很简单：</p>
+
+<figure class="fig">
+<svg viewBox="0 0 760 300" width="760" role="img" aria-label="pthread_create 四个参数的含义">
+  <defs><marker id="ar27a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <rect x="150" y="14" width="460" height="40" rx="8" class="box-strong"/>
+  <text x="380" y="39" text-anchor="middle" class="mono" font-size="14">pthread_create(thread, attr, start_routine, arg)</text>
+  <g font-size="13">
+    <rect x="10" y="100" width="170" height="120" rx="8" class="accent-soft"/>
+    <text x="95" y="122" text-anchor="middle" font-weight="700" class="mono" font-size="12">pthread_t *thread</text>
+    <text x="95" y="146" text-anchor="middle">输出参数：库把新线程的</text>
+    <text x="95" y="164" text-anchor="middle">"句柄"写到这里</text>
+    <text x="95" y="188" text-anchor="middle" class="t-muted">之后 join 它时要用</text>
+    <text x="95" y="206" text-anchor="middle" class="t-muted">所以传 &amp;p</text>
+
+    <rect x="195" y="100" width="170" height="120" rx="8" class="box"/>
+    <text x="280" y="122" text-anchor="middle" font-weight="700" class="mono" font-size="12">pthread_attr_t *attr</text>
+    <text x="280" y="146" text-anchor="middle">线程属性：栈大小、</text>
+    <text x="280" y="164" text-anchor="middle">调度优先级等</text>
+    <text x="280" y="188" text-anchor="middle" class="t-muted">用 pthread_attr_init 设置</text>
+    <text x="280" y="206" text-anchor="middle" class="t-muted">大多数情况传 NULL＝默认</text>
+
+    <rect x="380" y="100" width="185" height="120" rx="8" class="warn-soft"/>
+    <text x="472" y="122" text-anchor="middle" font-weight="700" class="mono">start_routine</text>
+    <text x="472" y="146" text-anchor="middle">函数指针：新线程从</text>
+    <text x="472" y="164" text-anchor="middle">哪个函数开始执行</text>
+    <text x="472" y="188" text-anchor="middle" class="mono" font-size="11.5">void *f(void *arg)</text>
+    <text x="472" y="206" text-anchor="middle" class="t-muted">收 void*，返回 void*</text>
+
+    <rect x="580" y="100" width="170" height="120" rx="8" class="ok-soft"/>
+    <text x="665" y="122" text-anchor="middle" font-weight="700" class="mono">void *arg</text>
+    <text x="665" y="146" text-anchor="middle">传给 start_routine</text>
+    <text x="665" y="164" text-anchor="middle">的那一个参数</text>
+    <text x="665" y="188" text-anchor="middle" class="t-muted">多个参数？打包成结构体</text>
+    <text x="665" y="206" text-anchor="middle" class="t-muted">传结构体的地址</text>
+  </g>
+  <path d="M260,54 C200,70 120,78 95,98" class="arrow" marker-end="url(#ar27a)"/>
+  <path d="M330,54 C310,70 290,82 282,98" class="arrow" marker-end="url(#ar27a)"/>
+  <path d="M430,54 C450,70 465,82 470,98" class="arrow" marker-end="url(#ar27a)"/>
+  <path d="M500,54 C560,70 640,78 665,98" class="arrow" marker-end="url(#ar27a)"/>
+  <rect x="60" y="248" width="640" height="40" rx="8" class="box"/>
+  <text x="380" y="273" text-anchor="middle" font-size="13.5">结果：一个新的执行实体开始运行 <tspan class="mono">start_routine(arg)</tspan>，有自己的栈，共享地址空间</text>
+  <path d="M665,220 C665,236 600,246 590,248" class="arrow" marker-end="url(#ar27a)"/>
+</svg>
+<figcaption>图 27-A　pthread_create 的四个参数。返回值是错误码：0 表示成功。</figcaption>
+</figure>
+
+<h3>为什么是 void *？读懂函数指针签名</h3>
+<p>第三个参数 <code>void *(*start_routine)(void *)</code> 读法是：<code>start_routine</code> 是一个<strong>指针</strong>，指向一个"接收一个 <code>void *</code> 参数、返回 <code>void *</code>"的函数。原书举了两个对照：</p>
+<div class="table-wrap"><table>
+  <tr><th>如果线程函数……</th><th>声明会变成</th></tr>
+  <tr><td>接收 <code>int</code>，返回 <code>void *</code></td><td><code>void *(*start_routine)(int), int arg</code></td></tr>
+  <tr><td>接收 <code>void *</code>，返回 <code>int</code></td><td><code>int (*start_routine)(void *), void *arg</code></td></tr>
+  <tr><td><strong>实际的 pthreads</strong></td><td><code>void *(*start_routine)(void *), void *arg</code></td></tr>
+</table></div>
+<p>之所以都用 <code>void *</code>：参数用 <code>void *</code> 就能传<strong>任何类型</strong>的数据（传它的地址即可）；返回值用 <code>void *</code> 就能返回<strong>任何类型</strong>的结果。代价是 C 编译器帮不了你做类型检查，线程函数里要自己把 <code>void *</code> 转回真实类型。</p>
+
+<h3>传多个参数：打包成结构体（Figure 27.1）</h3>
+<pre><code>typedef struct {
+    int a;
+    int b;
+} myarg_t;
+
+void *mythread(void *arg) {
+    myarg_t *args = (myarg_t *) arg;     // ① 把 void* 转回真实类型
+    printf("%d %d\n", args-&gt;a, args-&gt;b);
+    return NULL;
+}
+
+int main(int argc, char *argv[]) {
+    pthread_t p;
+    myarg_t args = { 10, 20 };           // ② 两个参数装进一个结构体
+    int rc = pthread_create(&amp;p, NULL, mythread, &amp;args);  // ③ 传结构体的地址
+    ...
+}</code></pre>
+<ul>
+  <li>①：线程函数拿到的永远是 <code>void *</code>，第一件事就是转换成自己期待的类型再"拆包"。</li>
+  <li>③：这里传的是 main 栈上 <code>args</code> 的地址。之所以安全，是因为 main 之后会 <code>join</code> 等线程结束——<strong>参数的寿命必须覆盖线程使用它的整个期间</strong>。</li>
+</ul>
+<p>线程一旦创建，就是另一个活生生的执行实体：有自己的调用栈，与现有的所有线程运行在同一个地址空间里。</p>
+
+<h2 id="join">等待线程：pthread_join 与返回值</h2>
+<pre><code>int pthread_join(pthread_t thread, void **value_ptr);</code></pre>
+<p>第一个参数指定等哪个线程（就是 <code>pthread_create</code> 帮你填好的那个 <code>pthread_t</code>）。第二个参数是<strong>指向返回值的指针</strong>。线程函数返回的是 <code>void *</code>；<code>pthread_join</code> 要<em>修改</em>调用者的一个 <code>void *</code> 变量，所以必须拿到这个变量的地址——于是就成了 <code>void **</code>。</p>
+
+<figure class="fig">
+<svg viewBox="0 0 740 250" width="740" role="img" aria-label="pthread_join 的二级指针">
+  <defs><marker id="ar27b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker>
+  <marker id="ar27c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="110" y="22" text-anchor="middle" font-weight="700">main 的栈</text>
+  <rect x="20" y="36" width="180" height="46" rx="6" class="box-strong"/>
+  <text x="30" y="55" font-size="12" class="t-muted mono">myret_t *rvals</text>
+  <text x="30" y="74" font-size="13" class="mono">= 0x5555a0（写入后）</text>
+  <text x="20" y="100" font-size="12" class="t-muted mono">地址 &amp;rvals = 0x7ffe40</text>
+
+  <text x="370" y="22" text-anchor="middle" font-weight="700">pthread_join 内部</text>
+  <rect x="270" y="36" width="200" height="80" rx="6" class="accent-soft"/>
+  <text x="282" y="56" font-size="12.5" class="mono">value_ptr = 0x7ffe40</text>
+  <text x="282" y="76" font-size="12.5" class="mono">retval    = 0x5555a0</text>
+  <text x="282" y="100" font-size="12.5" class="mono" font-weight="700">*value_ptr = retval;</text>
+
+  <text x="620" y="22" text-anchor="middle" font-weight="700">堆</text>
+  <rect x="540" y="36" width="170" height="46" rx="6" class="ok-soft"/>
+  <text x="552" y="55" font-size="12" class="t-muted mono">myret_t @0x5555a0</text>
+  <text x="552" y="74" font-size="13" class="mono">x = 1,  y = 2</text>
+
+  <path d="M270,60 C240,60 230,60 202,60" class="arrow" marker-end="url(#ar27c)"/>
+  <text x="370" y="136" text-anchor="middle" font-size="12" class="t-muted">↑ value_ptr 指向 main 的 rvals 变量本身</text>
+  <path d="M192,82 C192,205 610,205 620,86" style="stroke:var(--accent);fill:none;stroke-width:1.8" marker-end="url(#ar27b)"/>
+  <text x="370" y="200" text-anchor="middle" font-size="12.5" style="fill:var(--accent)">写入后：rvals 指向线程在堆上分配的结果</text>
+  <text x="370" y="232" text-anchor="middle" font-size="13">调用：<tspan class="mono">pthread_join(p, (void **) &amp;rvals);</tspan>　——传的是 rvals 的<tspan font-weight="700">地址</tspan>，join 才能改它</text>
+</svg>
+<figcaption>图 27-B　为什么是 <code>void **</code>：join 要把线程的返回值（一个 void*）"写回"调用者的变量里，所以要拿到该变量的地址。</figcaption>
+</figure>
+
+<h3>返回一个结构体（Figure 27.2）</h3>
+<pre><code> 1  typedef struct { int a; int b; } myarg_t;
+ 2  typedef struct { int x; int y; } myret_t;
+ 3
+ 4  void *mythread(void *arg) {
+ 5      myret_t *rvals = Malloc(sizeof(myret_t));   // 在<strong>堆</strong>上分配
+ 6      rvals-&gt;x = 1;
+ 7      rvals-&gt;y = 2;
+ 8      return (void *) rvals;
+ 9  }
+10
+11  int main(int argc, char *argv[]) {
+12      pthread_t p;
+13      myret_t *rvals;
+14      myarg_t args = { 10, 20 };
+15      Pthread_create(&amp;p, NULL, mythread, &amp;args);
+16      Pthread_join(p, (void **) &amp;rvals);
+17      printf("returned %d %d\n", rvals-&gt;x, rvals-&gt;y);
+18      free(rvals);
+19      return 0;
+20  }</code></pre>
+<p>注意原书这里用的是首字母大写的<strong>包装函数</strong>（<code>Malloc</code>、<code>Pthread_create</code>、<code>Pthread_join</code>）：它们只是调用同名小写版本，并确认没有返回意外结果。几点值得记住：</p>
+<ul>
+  <li>不需要参数时，<code>pthread_create</code> 的 <code>arg</code> 传 <code>NULL</code> 即可；不关心返回值时，<code>pthread_join</code> 的第二个参数也传 <code>NULL</code>。</li>
+  <li>只传一个值（例如 <code>long long int</code>）时，不必打包，直接把值塞进 <code>void *</code>（Figure 27.3，见下面模拟器的第三个场景）。</li>
+  <li><strong>绝对不要返回指向线程调用栈上变量的指针。</strong>线程返回时，它的栈帧被自动回收（这正是栈好用的原因），留给 main 的就是一个悬空指针。</li>
+</ul>
+<pre><code>void *mythread(void *arg) {
+    myarg_t *args = (myarg_t *) arg;
+    printf("%d %d\n", args-&gt;a, args-&gt;b);
+    myret_t oops;               // ALLOCATED ON STACK: BAD!
+    oops.x = 1;
+    oops.y = 2;
+    return (void *) &amp;oops;
+}</code></pre>
+<p>原书说：打印你以为返回了的值时，你"很可能（但不一定）"会大吃一惊——<strong>未定义行为</strong>就是这个意思：有时碰巧正确，有时是垃圾，有时崩溃。好在 gcc 往往会对这种代码发出警告，这也是要认真看编译警告的又一个理由。下面的模拟器把这件事一步步画出来。</p>
+
+<section class="sim" id="sim-join">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>返回值的生命周期：栈、堆与 pthread_join</h3>
+    <div class="desc">三栏分别是 main 的栈、堆、线程 T1 的栈。单步执行，观察栈帧的压入/弹出、指针箭头指向哪里；比较"堆上返回"（正确）、"返回栈上指针"（错误）和"直接传值"三种写法。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>场景 <select id="j-scn">
+        <option value="heap">Figure 27.2：malloc 返回（正确）</option>
+        <option value="stack">oops：返回栈上指针（错误）</option>
+        <option value="value">Figure 27.3：值直接塞进 void*</option>
+      </select></label>
+      <label title="线程退出后，那块栈内存是否被后续调用复用"><input type="checkbox" id="j-over" checked> 线程退出后内存被复用（覆盖）</label>
+      <button id="j-book">载入原书示例</button>
+    </div>
+    <div id="j-step"></div>
+    <div class="sim-grid j-top">
+      <div class="codebox" id="j-code"></div>
+      <div class="outbox" id="j-out" style="margin-top:0"></div>
+    </div>
+    <div class="stage" id="j-stage" style="margin-top:12px"></div>
+    <div class="narrate" id="j-nar"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="j-s1">–</div><div class="l">T1 栈帧状态</div></div>
+      <div class="stat"><div class="v" id="j-s2">0</div><div class="l">存活的堆块</div></div>
+      <div class="stat"><div class="v" id="j-s3">0</div><div class="l">悬空指针（被使用）</div></div>
+      <div class="stat"><div class="v" id="j-s4">–</div><div class="l">main 读到的结果</div></div>
+    </div>
+  </div>
+</section>
+
+<p>什么时候用 join？先 <code>pthread_create</code> 再立刻 <code>pthread_join</code> 其实是一种很奇怪的写法——有个更简单的方法能完成完全相同的事，叫<strong>过程调用</strong>（procedure call）。实际程序通常会创建多个线程再等它们。也并非所有多线程程序都 join：例如多线程 Web 服务器可能创建一批工作线程，由主线程不停接收请求分发给它们，永不结束；而并行计算程序通常要用 join 确保所有工作完成后再退出或进入下一阶段。</p>
+
+<h2 id="locks">锁：pthread_mutex</h2>
+<p>除了创建和等待，pthreads 最有用的一组函数就是通过<strong>锁</strong>为临界区提供互斥（mutual exclusion）：</p>
+<pre><code>int pthread_mutex_lock(pthread_mutex_t *mutex);
+int pthread_mutex_unlock(pthread_mutex_t *mutex);</code></pre>
+<p>用法一看就懂：</p>
+<pre><code>pthread_mutex_t lock;
+pthread_mutex_lock(&amp;lock);
+x = x + 1;          // 或者任何临界区代码
+pthread_mutex_unlock(&amp;lock);</code></pre>
+<p>语义：如果调用 <code>lock</code> 时没有别的线程持有锁，调用者获得锁并进入临界区；如果锁已被别人持有，调用者<strong>不会从 lock 调用返回</strong>，直到它拿到锁为止（即持有者 unlock 之后）。可能有很多线程同时卡在 lock 里，但只有持有锁的那个线程应该调用 unlock。</p>
+<p>然而原书指出，<strong>上面这段代码有两个重要错误</strong>：</p>
+
+<h3>错误 1：没有初始化锁</h3>
+<p>所有锁都必须正确初始化，才能保证它一开始处于正确状态。POSIX 提供两种方式：</p>
+<div class="table-wrap"><table>
+  <tr><th>方式</th><th>代码</th><th>说明</th></tr>
+  <tr><td>静态初始化</td><td><code>pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;</code></td><td>把锁设为默认值，适合全局/静态锁</td></tr>
+  <tr><td>动态初始化（运行时）</td><td><code>int rc = pthread_mutex_init(&amp;lock, NULL);<br>assert(rc == 0); // always check success!</code></td><td>第二个参数是可选属性，NULL＝默认；原书作者通常用这种。用完要调用 <code>pthread_mutex_destroy()</code></td></tr>
+</table></div>
+
+<h3>错误 2：没有检查返回码</h3>
+<p>和 UNIX 里几乎所有库函数一样，lock 和 unlock 也<strong>可能失败</strong>！不检查错误码，失败就会悄无声息——在这里可能意味着<strong>多个线程同时进入了临界区</strong>。最低限度，用包装函数断言调用成功（Figure 27.4）：</p>
+<pre><code>// Keeps code clean; only use if exit() OK upon failure
+void Pthread_mutex_lock(pthread_mutex_t *mutex) {
+    int rc = pthread_mutex_lock(mutex);
+    assert(rc == 0);
+}</code></pre>
+<p>更成熟的（非玩具）程序不能简单地退出，就应该在失败时做恰当的处理。</p>
+
+<h3>另外两个获取锁的函数</h3>
+<pre><code>int pthread_mutex_trylock(pthread_mutex_t *mutex);
+int pthread_mutex_timedlock(pthread_mutex_t *mutex, struct timespec *abs_timeout);</code></pre>
+<div class="table-wrap"><table>
+  <tr><th>函数</th><th>锁空闲时</th><th>锁被占用时</th></tr>
+  <tr><td><code>lock</code></td><td>获得锁，返回 0</td><td>一直等（阻塞），直到拿到</td></tr>
+  <tr><td><code>trylock</code></td><td>获得锁，返回 0</td><td><strong>立即</strong>返回失败（EBUSY）</td></tr>
+  <tr><td><code>timedlock</code></td><td>获得锁，返回 0</td><td>等到拿到锁或超时，先到者为准；超时为 0 时就退化成 trylock</td></tr>
+</table></div>
+<p>这两个通常应当避免使用；但在某些场合（比如后面第 32 章讲的<strong>死锁</strong>）避免无限期卡在获取锁上是有用的。</p>
+<div class="aside" data-title="粗粒度 vs 细粒度">
+<p>lock/unlock 接收一个锁变量作为参数，因为不同的数据可以用不同的锁保护。一把大锁保护所有临界区是<strong>粗粒度</strong>（coarse-grained）加锁；为不同数据结构各配一把锁是<strong>细粒度</strong>（fine-grained）加锁，能让更多线程同时处于加锁代码中。第 28、29 章会深入这个话题。</p>
+</div>
+
+<h2 id="cond">条件变量：等待另一个线程</h2>
+<p>任何线程库的另一个主要组成部分是<strong>条件变量</strong>（condition variable）。当线程之间需要某种<em>信号</em>——一个线程要等另一个线程做完某事才能继续——就用它。两个基本函数：</p>
+<pre><code>int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex);
+int pthread_cond_signal(pthread_cond_t *cond);</code></pre>
+<p>使用条件变量还必须有一把与之关联的<strong>锁</strong>；调用上面任一函数时都应当持有这把锁。典型用法：</p>
+<div class="sim-grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr))">
+<pre><code>// 等待方
+pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  cond = PTHREAD_COND_INITIALIZER;
+
+Pthread_mutex_lock(&amp;lock);
+while (ready == 0)
+    Pthread_cond_wait(&amp;cond, &amp;lock);
+Pthread_mutex_unlock(&amp;lock);</code></pre>
+<pre><code>// 通知方（另一个线程）
+Pthread_mutex_lock(&amp;lock);
+ready = 1;
+Pthread_cond_signal(&amp;cond);
+Pthread_mutex_unlock(&amp;lock);</code></pre>
+</div>
+<p>要点逐条看：</p>
+<ol>
+  <li><strong>通知方修改 <code>ready</code> 和调用 signal 时都持有锁</strong>，这样就不会意外引入竞态条件。</li>
+  <li><strong>wait 的第二个参数是锁，signal 却没有。</strong>因为 wait 在让调用者睡眠的同时会<strong>释放这把锁</strong>——否则通知方怎么拿得到锁去 signal 呢？而 wait 在被唤醒、<em>返回之前</em>会<strong>重新获取锁</strong>。所以等待方在"开头 lock"到"结尾 unlock"之间运行的任何时刻，都持有锁。</li>
+  <li><strong>用 <code>while</code> 而不是 <code>if</code> 重新检查条件。</strong>有些 pthread 实现可能<strong>虚假唤醒</strong>（spurious wakeup）一个等待中的线程；如果不重新检查，它会以为条件已经变了。原书的说法是：把"被唤醒"看成"某些东西<em>可能</em>变了"的<strong>提示</strong>（hint），而不是确定的事实。第 30 章还会看到另一个原因：别的线程可能抢先把条件"用掉"。</li>
+</ol>
+
+<figure class="fig">
+<svg viewBox="0 0 760 250" width="760" role="img" aria-label="cond_wait 释放锁并重新获取锁的时序">
+  <defs><marker id="ar27d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker></defs>
+  <text x="14" y="62" font-weight="700">等待方</text>
+  <text x="14" y="142" font-weight="700">通知方</text>
+  <line x1="80" y1="100" x2="740" y2="100" style="stroke:var(--border)"/>
+  <line x1="80" y1="180" x2="740" y2="180" style="stroke:var(--border)"/>
+  <!-- waiter -->
+  <rect x="90" y="46" width="130" height="26" rx="4" style="fill:var(--c1)"/>
+  <text x="155" y="64" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">持锁：检查 ready==0</text>
+  <rect x="220" y="46" width="270" height="26" rx="4" class="box" stroke-dasharray="4 3"/>
+  <text x="355" y="64" text-anchor="middle" font-size="12">睡眠（不占 CPU，也<tspan font-weight="700">不持锁</tspan>）</text>
+  <rect x="490" y="46" width="60" height="26" rx="4" class="warn-soft"/>
+  <text x="520" y="64" text-anchor="middle" font-size="11.5">等锁</text>
+  <rect x="550" y="46" width="180" height="26" rx="4" style="fill:var(--c1)"/>
+  <text x="640" y="64" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">持锁：再查 ready==1 → 离开</text>
+  <text x="220" y="40" text-anchor="middle" font-size="11.5" class="t-muted">cond_wait：释放锁 + 睡眠</text>
+  <text x="550" y="40" text-anchor="middle" font-size="11.5" class="t-muted">wait 返回前重新拿到锁</text>
+  <!-- signaler -->
+  <rect x="300" y="126" width="190" height="26" rx="4" style="fill:var(--c2)"/>
+  <text x="395" y="144" text-anchor="middle" font-size="12" style="fill:#fff;font-weight:600">持锁：ready=1; signal</text>
+  <text x="300" y="170" text-anchor="middle" font-size="11.5" class="t-muted">lock 成功（锁已被 wait 释放）</text>
+  <text x="490" y="170" text-anchor="middle" font-size="11.5" class="t-muted">unlock</text>
+  <path d="M440,126 C440,100 470,90 486,74" style="stroke:var(--accent);fill:none;stroke-width:1.6" marker-end="url(#ar27d)"/>
+  <text x="410" y="96" text-anchor="end" font-size="11.5" style="fill:var(--accent)">signal 唤醒</text>
+  <line x1="80" y1="215" x2="740" y2="215" class="stroke"/>
+  <text x="740" y="236" text-anchor="end" font-size="12" class="t-muted">时间 →</text>
+  <text x="90" y="236" font-size="12" class="t-muted">任一时刻最多一个彩色（持锁）段</text>
+</svg>
+<figcaption>图 27-C　<code>pthread_cond_wait</code> 的关键：睡眠时释放锁（通知方才能进来），返回前重新获得锁（等待方在检查条件时总是持锁）。</figcaption>
+</figure>
+
+<h3>别用裸 flag 代替条件变量</h3>
+<p>有时很想省事，用一个简单的标志变量在两个线程之间传信号：</p>
+<div class="sim-grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr))">
+<pre><code>// 等待方
+while (ready == 0)
+    ; // spin</code></pre>
+<pre><code>// 通知方
+ready = 1;</code></pre>
+</div>
+<p>原书的态度很明确：<strong>永远不要这样做。</strong>理由有二：第一，性能往往很差——长时间自旋就是白白烧 CPU；第二，容易出错——研究 [X+10] 发现，这种"临时凑合"（ad hoc）的同步大约<strong>一半有 bug</strong>。别偷懒，即使觉得不用也能行，也要用条件变量。本章实验 <code>cond_wait.c</code> 在本机量出了两者的差距：</p>
+<figure class="fig">
+<svg viewBox="0 0 620 130" width="620" role="img" aria-label="条件变量与自旋等待的 CPU 消耗对比">
+  <text x="10" y="40" font-size="13">条件变量等待</text>
+  <rect x="130" y="26" width="3" height="22" style="fill:var(--ok)"/>
+  <text x="142" y="42" font-size="12.5" class="mono">0.000 s CPU（被唤醒 1 次）</text>
+  <text x="10" y="86" font-size="13">裸 flag 自旋</text>
+  <rect x="130" y="72" width="400" height="22" rx="3" style="fill:var(--bad)"/>
+  <text x="540" y="88" font-size="12.5" class="mono">0.500 s</text>
+  <text x="130" y="118" font-size="12" class="t-muted">两种情况下子线程都"工作"0.5 秒（sleep）；自旋版本空转了约 22 亿次循环</text>
+</svg>
+<figcaption>图 27-D　等待 0.5 秒期间消耗的 CPU 时间（本机实测，你的机器上数字会不同）。</figcaption>
+</figure>
+
+<section class="sim" id="sim-cond">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>cond_wait / signal 单步：while 与 if 的差别</h3>
+    <div class="desc">W1、W2 是"消费者"（等 ready 变成 1，然后把它"取走"置回 0），S 是"生产者"（置 ready=1 并 signal）。选择预设调度或自己点按钮决定下一步谁运行，观察锁的持有者、等待队列，以及 if 版本在"别人抢先"和"虚假唤醒"时如何拿到并不存在的数据。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>等待写法 <select id="c-mode"><option value="while">while (ready == 0)</option><option value="if">if (ready == 0)（错误）</option></select></label>
+      <label>预设调度 <select id="c-preset">
+        <option value="normal">正常：W1 等待 → S 通知</option>
+        <option value="barge">W2 抢先把数据取走</option>
+        <option value="spurious">虚假唤醒</option>
+        <option value="custom">自定义（用下面的按钮）</option>
+      </select></label>
+    </div>
+    <div class="controls" id="c-btns">
+      <span class="muted small">追加一步：</span>
+      <button data-t="0">▶ W1</button><button data-t="1">▶ S</button><button data-t="2">▶ W2</button><button data-t="sp">⚡ 虚假唤醒 W1</button>
+      <button id="c-undo">撤销</button><button id="c-clear">清空</button>
+    </div>
+    <div id="c-step"></div>
+    <div class="stage">
+      <div class="lanes" id="c-lanes"></div>
+      <div class="shared" id="c-shared"></div>
+    </div>
+    <div class="narrate" id="c-nar"></div>
+    <div class="log" id="c-log"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="c-s1">0</div><div class="l">成功取走的数据</div></div>
+      <div class="stat"><div class="v" id="c-s2">0</div><div class="l">错误：取走了"不存在"的数据</div></div>
+      <div class="stat"><div class="v" id="c-s3">0</div><div class="l">被唤醒次数</div></div>
+    </div>
+  </div>
+</section>
+
+<h2 id="compile">编译与运行，以及使用指南</h2>
+<p>本章所有例子都很容易跑起来：代码里包含头文件 <code>pthread.h</code>，链接时加上 <code>-pthread</code> 标志：</p>
+<pre><code class="cmd">gcc -o main main.c -Wall -pthread</code></pre>
+<p>只要 main.c 包含了 pthreads 头文件，你就成功编译了一个并发程序。至于它能不能正确工作——照例，那完全是另一回事。</p>
+<p>原书在本章末尾的旁注"线程 API 指南"（Thread API Guidelines）值得逐条记住：</p>
+<ol class="guide">
+  <li><strong>保持简单（Keep it simple）。</strong>线程之间加锁或发信号的代码越简单越好，复杂的线程交互会带来 bug。</li>
+  <li><strong>尽量减少线程之间的交互（Minimize thread interactions）。</strong>每一种交互方式都要深思熟虑，用久经考验的方法构建（后面几章会学很多）。</li>
+  <li><strong>初始化锁和条件变量。</strong>否则代码会"有时能跑、有时以非常奇怪的方式失败"。</li>
+  <li><strong>检查返回码。</strong>不检查会导致怪异、难以理解的行为，让你（a）尖叫、（b）揪头发，或者（c）两者兼有。</li>
+  <li><strong>小心传参和返回值的方式。</strong>特别是：只要你在传递一个指向<strong>栈上变量</strong>的引用，你很可能做错了什么。</li>
+  <li><strong>每个线程都有自己的栈。</strong>函数里的局部变量本质上是该线程私有的，其他线程（很难）访问到。要在线程间共享数据，值必须放在<strong>堆</strong>上或其他全局可访问的位置。</li>
+  <li><strong>总是用条件变量在线程之间发信号。</strong>虽然用简单的 flag 很诱人，但别这么做。</li>
+  <li><strong>使用手册页（man pages）。</strong>在 Linux 上 pthread 的手册页信息量很大，讨论了很多本章提到的细节。<code>man -k pthread</code> 能看到构成整个接口的一百多个 API。</li>
+</ol>
+
+<h2 id="predict">先预测再验证</h2>
+<div class="exercise"><div class="q">在"返回值的生命周期"模拟器中选择 <strong>oops</strong> 场景，<em>取消勾选</em>"内存被复用"。先预测：main 最后打印什么？这说明代码是正确的吗？</div>
+<details class="reveal"><summary>看答案</summary><div>会打印 <code>returned 1 2</code>——因为那块已回收的栈内存恰好还没被别人写过。但这<strong>不</strong>说明代码正确：读已回收的栈是未定义行为，结果取决于之后有没有别的调用复用那块内存、线程库会不会把线程栈归还（unmap）。勾选"被复用"再跑一次，就会读到垃圾；本章实验 <code>bad_return</code> 在本机实际读到的是 <code>8392704 0</code>，ASan 版本则直接 SEGV。</div></details></div>
+
+<div class="exercise"><div class="q">在 Figure 27.2 场景中，线程退出那一步之后，main 的 <code>args</code> 还"活着"吗？T1 的 <code>arg</code> 指针呢？如果 main 在 <code>pthread_create</code> 之后<strong>不</strong> join 就直接从一个函数返回（args 的栈帧被弹出），会发生什么？</div>
+<details class="reveal"><summary>看答案</summary><div><code>args</code> 在 main 的栈上，main 还没返回，所以活着；T1 的 <code>arg</code> 本身随 T1 栈帧一起回收了，但这无所谓——它只是个指向别处的指针。如果创建线程的函数不等线程就返回，<code>&amp;args</code> 就变成了悬空指针，而新线程可能稍后才读取它（线程何时运行取决于调度器）——同样是"传递指向栈上变量的引用"错误的变种。常见修法：给每个线程 malloc 一份参数，或保证创建者 join 之后才离开作用域。</div></details></div>
+
+<div class="exercise"><div class="q">在 cond 模拟器里选 <strong>W2 抢先</strong>，分别用 while 和 if 跑到底。先预测：if 版本的"错误"计数是多少？while 版本里 W1 最终处于什么状态？</div>
+<details class="reveal"><summary>看答案</summary><div>if 版本：W1 醒来后不再检查，直接"取走"数据，但 ready 已经被 W2 取走变回 0，错误计数为 1。while 版本：W1 重新检查发现 ready==0，于是<strong>再次 wait</strong>，最终停在睡眠状态（等下一次生产）——这才是正确行为：数据只被取走一次。</div></details></div>
+
+<div class="exercise"><div class="q">改编自 Homework 6–8（main-signal.c vs main-signal-cv.c）：父线程用 <code>while (done == 0) ;</code> 等子线程，子线程要运行很久。父线程把时间花在了哪里？换成条件变量版本，好处是正确性、性能，还是两者兼有？</div>
+<details class="reveal"><summary>看答案</summary><div>父线程在空转，把一整个 CPU 烧在反复读 <code>done</code> 上（本章实验测得等待 0.5 秒就消耗约 0.5 秒 CPU）。条件变量版本<strong>两者兼有</strong>：性能上，等待者睡眠不占 CPU；正确性上，<code>done</code> 的读写都在锁保护下，没有数据竞争（helgrind / ThreadSanitizer 对裸 flag 版本会报告竞争，对 cv 版本则不会——本章实验里的 <code>cond_wait_tsan</code> 可以验证）。</div></details></div>
+
+<div class="exercise"><div class="q">改编自 Homework 3–5：线程 1 先 lock(m1) 再 lock(m2)，线程 2 先 lock(m2) 再 lock(m1)。能找到一种调度让两个线程都永远卡住吗？如果两段代码外面再套一把全局锁 g，还会出问题吗？</div>
+<details class="reveal"><summary>看答案</summary><div>能：线程 1 拿到 m1 后被切走，线程 2 拿到 m2，然后各自等对方持有的锁——这就是<strong>死锁</strong>（第 32 章细讲）。套一把全局锁后，同一时刻只有一个线程能进入这段"先后加两把锁"的代码，死锁不会发生；但像 helgrind 这类工具只看"加锁顺序不一致"，可能仍然报告——说明工具报告的是<em>潜在</em>问题，需要人来判断。</div></details></div>
+
+<h2 id="lab">动手实验</h2>
+<div class="lab">
+<p>实验代码在 <code>labs/27-thread-api/</code>，包含包装函数头文件 <code>common_threads.h</code>（仿 Figure 27.4：每个 pthread 调用都检查返回码）和三个程序：</p>
+<pre><code class="cmd">cd labs/27-thread-api &amp;&amp; make &amp;&amp; ./create_args</code></pre>
+<ul>
+  <li><code>create_args.c</code>：结构体传参 + 堆上返回（Fig 27.2）、直接传值（Fig 27.3）、三个线程各给一份独立参数。</li>
+  <li><code>bad_return.c</code>：原书 oops 反例。普通编译 <code>./bad_return</code>；AddressSanitizer 版本 <code>./bad_return_asan</code> 与 <code>./bad_return_asan helper</code>。</li>
+  <li><code>cond_wait.c</code>：用条件变量等子线程，与裸 flag 自旋对比 CPU 消耗；<code>cond_wait_tsan</code> 是 ThreadSanitizer 版本。</li>
+</ul>
+<p class="small muted">示例输出（本机 AMD Ryzen 7 8745H / WSL2 / gcc 14.2 实测；你的机器上地址和数字会不同）：</p>
+<pre><code>$ ./create_args
+== 结构体参数 + 堆上返回值 (Figure 27.2) ==
+  [线程] 收到参数 a=10 b=20
+  [线程] 返回堆地址 0x7761b4000b70
+main: returned 11 22 (来自地址 0x7761b4000b70)
+== 直接传值 (Figure 27.3) ==
+  [线程] 收到值 100
+main: returned 101
+== 多个线程，各自的参数 ==
+  [线程] 收到参数 a=0 b=0
+  [线程] 返回堆地址 0x7761b4000b90
+main: 线程 0 返回 1 2
+  [线程] 收到参数 a=2 b=200
+  [线程] 收到参数 a=1 b=100
+  [线程] 返回堆地址 0x7761b4000bb0
+  [线程] 返回堆地址 0x7761ac000b70
+main: 线程 1 返回 2 102
+main: 线程 2 返回 3 202</code></pre>
+<p>注意最后一段：线程 2 比线程 1 <strong>先</strong>打印——创建顺序不等于运行顺序（第 26 章）。但 main 按顺序 join，所以拿到的结果总是一一对应。</p>
+<p>编译 <code>bad_return.c</code> 时，gcc 14 已经发出警告（即使代码借了一个中间变量想"骗过"编译器）：</p>
+<pre><code>bad_return.c:14:12: warning: using a dangling pointer to ‘oops’ [-Wdangling-pointer=]
+   14 |     return (void *) p;       // 线程返回后，这个栈帧（乃至整个线程栈）就被回收了</code></pre>
+<p>运行结果：</p>
+<pre><code>$ ./bad_return
+main: rvals 指向 0x70b9e87f4ed0
+main: returned 8392704 0 （期望 1 2）
+$ ./bad_return helper
+helper: 读到 1149155008 30905 （期望 1 2）
+
+$ ASAN_OPTIONS=detect_stack_use_after_return=1 ./bad_return_asan
+==343740==ERROR: AddressSanitizer: SEGV on unknown address 0x7a8a893ff024 ...
+==343740==The signal is caused by a READ memory access.
+    #0 0x5f2a886eeb8b in main bad_return.c:52
+
+$ ASAN_OPTIONS=detect_stack_use_after_return=1 ./bad_return_asan helper
+==343743==ERROR: AddressSanitizer: stack-use-after-return on address 0x72e1d6aff024 ...
+READ of size 4 at 0x72e1d6aff024 thread T1
+    #0 0x5c2c75be26ef in helper_thread bad_return.c:36
+Address 0x72e1d6aff024 is located in stack of thread T1 at offset 36 in frame
+    #0 0x5c2c75be2391 in make_ret bad_return.c:18
+  This frame has 1 object(s):
+    [32, 40) 'local' (line 19) &lt;== Memory access at offset 36 is inside this variable</code></pre>
+<p>怎么解读：</p>
+<ul>
+  <li>普通编译下读到的是垃圾（<code>8392704 0</code>），不是 <code>1 2</code>：线程退出时线程库在那块栈上做了清理工作，覆盖了 <code>oops</code>。</li>
+  <li>ASan 版本的 main 模式直接 <strong>SEGV</strong>：ASan 给每个线程单独映射的"伪栈"在线程退出时被整块回收，main 再去读就访问了未映射的地址——比"悄悄读到垃圾"好得多。</li>
+  <li><code>helper</code> 模式把同一错误放进普通函数调用：<code>make_ret()</code> 返回局部变量地址，调用者再读。ASan 精确报告 <strong>stack-use-after-return</strong>，并指出变量名 <code>local</code> 和它所属的栈帧 <code>make_ret</code>。（本机 gcc 14 的 ASan 默认已开启该检测，显式设置环境变量是为了兼容旧版本。）</li>
+</ul>
+<pre><code>$ ./cond_wait
+== 条件变量等待 ==
+  [子线程] ready = 1，signal
+main: 等到了 ready（被唤醒 1 次），等待期间消耗 CPU 0.000 秒
+== 反面教材：自旋等待 flag ==
+main: 等到了 flag（空转 2205325635 次），等待期间消耗 CPU 0.500 秒
+
+$ make cond_wait_tsan &amp;&amp; setarch -R ./cond_wait_tsan
+WARNING: ThreadSanitizer: data race (pid=344126)
+  Location is global 'done_flag' of size 4 at 0x5555555580e0 (cond_wait_tsan+0x40e0)
+SUMMARY: ThreadSanitizer: data race cond_wait.c:30 in child_spin</code></pre>
+<p>ThreadSanitizer 只对裸 flag 那一段报告数据竞争，条件变量那一段没有报告。（<code>setarch -R</code> 关闭地址随机化：本机较新内核下 TSan 偶尔会报 <code>unexpected memory mapping</code> 而无法启动。）</p>
+</div>
+
+<h2 id="quiz">自测题</h2>
+<p class="quiz-score"></p>
+
+<div class="mcq" data-answer="2"><div class="q">1. <code>pthread_create</code> 的第一个参数为什么是 <code>pthread_t *</code> 而不是 <code>pthread_t</code>？</div>
+<div class="opts"><button>A. 因为 pthread_t 太大，按值传递太慢</button><button>B. 因为新线程会在这个地址上分配自己的栈</button><button>C. 因为它是输出参数：库要把新线程的句柄写进调用者的变量</button><button>D. 因为可以传 NULL 表示使用默认属性</button></div>
+<div class="explain">pthread_create 需要<strong>初始化</strong>调用者的 <code>pthread_t</code> 变量，之后调用者用它来 join 这个线程。要修改调用者的变量就得拿到它的地址。传 NULL 表示默认的是第二个参数 attr。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">2. 下面哪种从线程返回结果的方式是<strong>错误</strong>的？</div>
+<div class="opts"><button>A. 返回线程函数里一个局部结构体变量的地址</button><button>B. 把一个 long long 值强制转换成 void * 返回</button><button>C. 返回 malloc 得到的指针，由 join 的一方 free</button><button>D. 把结果写进一个全局变量，返回 NULL</button></div>
+<div class="explain">线程返回时它的栈帧被回收，局部变量的地址变成悬空指针（原书的 oops 例子）。C 是 Figure 27.2 的做法，B 是 Figure 27.3 的做法（在 64 位系统上 void* 足够装下 long long），D 也可行（全局变量不在栈上）。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">3. <code>pthread_join(p, (void **) &amp;rvals)</code> 中第二个参数为什么是二级指针？</div>
+<div class="opts"><button>A. 线程返回值本身是 void *，join 要把它写进调用者的变量，所以需要该变量的地址</button><button>B. 因为线程可能返回多个值</button><button>C. 因为 rvals 指向的结构体里还有指针</button><button>D. 为了让 join 能释放线程返回的内存</button></div>
+<div class="explain">"要修改一个变量，就传它的地址"。被修改的变量类型是 <code>void *</code>（或其他指针），它的地址自然是 <code>void **</code>。join 不负责释放任何内存。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">4. 原书指出 "<code>pthread_mutex_t lock; pthread_mutex_lock(&amp;lock); ...</code>" 这段代码有两个问题，是哪两个？</div>
+<div class="opts"><button>A. 缺少条件变量；没有用 while 循环</button><button>B. 应该用 trylock 代替 lock；忘记调用 destroy</button><button>C. 锁应该是局部变量；临界区太长</button><button>D. 锁没有初始化；没有检查 lock/unlock 的返回码</button></div>
+<div class="explain">锁必须用 <code>PTHREAD_MUTEX_INITIALIZER</code> 或 <code>pthread_mutex_init()</code> 初始化；lock/unlock 可能失败，不检查的话失败是静默的，可能让多个线程同时进入临界区。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">5. 为什么 <code>pthread_cond_wait</code> 要接收一个锁作为参数，而 <code>pthread_cond_signal</code> 不用？</div>
+<div class="opts"><button>A. 因为 wait 要在让调用者睡眠时释放这把锁，并在返回前重新获取它</button><button>B. 因为 signal 不需要持有锁也能安全调用</button><button>C. 因为每个条件变量只能和一把锁关联一次</button><button>D. 因为 wait 会一直持有锁直到被唤醒，防止别人修改条件</button></div>
+<div class="explain">如果 wait 睡眠时不释放锁，通知方就永远拿不到锁去修改条件并 signal。wait 返回前重新获取锁，保证等待方检查条件时总是持锁。原书建议 signal 时也持有锁（B 错）。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">6. 等待条件时为什么要写 <code>while (ready == 0) wait(...)</code> 而不是 <code>if</code>？</div>
+<div class="opts"><button>A. while 比 if 执行得更快</button><button>B. if 会导致死锁</button><button>C. 被唤醒只是提示，条件未必成立（如虚假唤醒、别的线程抢先），醒来必须重新检查</button><button>D. 为了在 signal 丢失时自动重试 signal</button></div>
+<div class="explain">原书：有些 pthread 实现可能虚假唤醒等待线程；把唤醒看作"某些东西可能变了"的提示而不是事实。重新检查的代价只是一点点开销。可以在本页 cond 模拟器里对比两种写法。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">7. 关于 <code>pthread_mutex_trylock</code> 和 <code>pthread_mutex_timedlock</code>，哪句正确？</div>
+<div class="opts"><button>A. trylock 在锁被占用时会自旋等待一段时间</button><button>B. 超时为 0 的 timedlock 退化为 trylock；两者一般应避免使用，但在避免死锁等场合有用</button><button>C. 它们是获取锁的推荐方式，因为不会阻塞</button><button>D. timedlock 超时后会强制从持有者手中夺走锁</button></div>
+<div class="explain">trylock 在锁被持有时立即返回失败；timedlock 在超时或获得锁时返回（先到者为准），不会夺走别人的锁。原书说两者通常应避免，但在死锁相关场景中能派上用场。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">8. 编译一个使用 pthreads 的程序 main.c，正确的命令是？</div>
+<div class="opts"><button>A. <code>gcc -o main main.c -Wall -lthread</code></button><button>B. <code>gcc -o main main.c -Wall -threads=on</code></button><button>C. 不需要任何额外标志，只要 #include &lt;pthread.h&gt;</button><button>D. <code>gcc -o main main.c -Wall -pthread</code></button></div>
+<div class="explain">原书 27.5 节：包含 pthread.h，并在链接时显式加 <code>-pthread</code> 标志。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">9. 两个线程要共享一个计数器，应该把它放在哪里？</div>
+<div class="opts"><button>A. 主线程 main 函数里的局部变量，然后让其他线程直接按名字访问</button><button>B. 堆上或全局变量里（并用锁保护访问）</button><button>C. 线程的寄存器里</button><button>D. 每个线程函数里各声明一个同名局部变量</button></div>
+<div class="explain">每个线程有自己的栈，局部变量本质上是线程私有的；要共享数据，值必须放在堆上或其他全局可访问的位置（原书 Thread API Guidelines）。D 会得到两个互不相干的变量；寄存器是每个线程私有、上下文切换时保存恢复的。</div></div>
+
+<h2 id="pitfalls">常见误区</h2>
+<div class="warn">
+<ul>
+  <li><strong>"打印出来是对的，所以返回栈上指针没问题。"</strong>错。那是未定义行为碰巧表现正常，换个编译选项、换个时机就是垃圾或崩溃。用 <code>-Wall</code> 看警告，用 <code>-fsanitize=address</code> 捕获。</li>
+  <li><strong>"在循环里用同一个局部变量的地址给多个线程传参。"</strong>例如 <code>for (i…) pthread_create(…, &amp;i)</code>：所有线程拿到的是同一个地址，读到的值取决于调度，经常大家都读到最后的 i。每个线程给一份独立的参数。</li>
+  <li><strong>"pthread_create 返回时新线程已经跑过了 / 还没开始跑。"</strong>两者都不能假设：新线程可能立刻运行，也可能很久以后才运行（第 26 章的 Figure 26.3–26.5）。</li>
+  <li><strong>"声明了 pthread_mutex_t 就能用。"</strong>必须初始化（静态 <code>PTHREAD_MUTEX_INITIALIZER</code> 或 <code>pthread_mutex_init</code>），条件变量同理。</li>
+  <li><strong>"lock/unlock 不会失败，不用检查。"</strong>任何库调用都可能失败，失败时静默继续可能让多个线程进入临界区。</li>
+  <li><strong>"被 signal 唤醒就说明条件满足了，用 if 就够。"</strong>要用 while：虚假唤醒、别的线程抢先都会让条件在你醒来时不成立。</li>
+  <li><strong>"用一个 volatile flag 自旋等待更简单高效。"</strong>又浪费 CPU 又容易错；用条件变量。</li>
+</ul>
+</div>
+
+<h2 id="summary">本章小结</h2>
+<ul>
+  <li><strong>创建</strong>：<code>pthread_create(&amp;p, attr, func, arg)</code>，新线程从 <code>func(arg)</code> 开始，有自己的栈、共享地址空间；多个参数打包成结构体传地址，单个值可以直接塞进 <code>void *</code>。</li>
+  <li><strong>等待</strong>：<code>pthread_join(p, &amp;ret)</code> 等线程结束并取回 <code>void *</code> 返回值。返回值要指向堆或全局数据，<strong>永远不要指向线程栈</strong>。</li>
+  <li><strong>锁</strong>：<code>pthread_mutex_lock/unlock</code> 保护临界区；必须初始化、必须检查返回码；trylock/timedlock 一般少用。</li>
+  <li><strong>条件变量</strong>：<code>pthread_cond_wait(&amp;c, &amp;m)</code> 睡眠时释放锁、返回前重获锁；<code>pthread_cond_signal(&amp;c)</code> 唤醒等待者；修改条件和 signal 时持锁；等待用 <code>while</code>；别用裸 flag。</li>
+  <li><strong>编译</strong>：<code>gcc … -Wall -pthread</code>。</li>
+  <li>原书结语：写出健壮高效的多线程代码，除了这些 API 之外，你只需要<strong>耐心和极大的细心</strong>。难的不是 API，而是如何构建并发程序的那些微妙逻辑。</li>
+</ul>
+<p>接下来：<strong>第 28 章</strong>回答"锁到底是怎么实现的"——需要什么硬件支持（test-and-set、compare-and-swap……）、什么操作系统支持（park/unpark、futex）；第 29 章用锁构建并发数据结构；<strong>第 30 章</strong>详细讲条件变量，包括本页模拟器里"别的线程抢先"问题的完整来龙去脉。</p>
+
+</main>
+<script>
+(function () {
+  "use strict";
+  const { h, s } = window.OSTEP;
+
+  // ==core-begin==
+  // ---------- 模拟器 1：返回值生命周期（纯数据：生成每一步的快照） ----------
+  const JOIN_CODE = {
+    heap: [
+      "void *mythread(void *arg) {",
+      "  myret_t *rvals = Malloc(sizeof(myret_t));",
+      "  rvals->x = 1;",
+      "  rvals->y = 2;",
+      "  return (void *) rvals;",
+      "}",
+      "int main(int argc, char *argv[]) {",
+      "  pthread_t p;",
+      "  myret_t *rvals;",
+      "  myarg_t args = { 10, 20 };",
+      "  Pthread_create(&p, NULL, mythread, &args);",
+      "  Pthread_join(p, (void **) &rvals);",
+      "  printf(\"returned %d %d\\n\", rvals->x, rvals->y);",
+      "  free(rvals);",
+      "  return 0;",
+      "}",
+    ],
+    stack: [
+      "void *mythread(void *arg) {",
+      "  myarg_t *args = (myarg_t *) arg;",
+      "  printf(\"%d %d\\n\", args->a, args->b);",
+      "  myret_t oops; // ALLOCATED ON STACK: BAD!",
+      "  oops.x = 1;",
+      "  oops.y = 2;",
+      "  return (void *) &oops;",
+      "}",
+      "int main(int argc, char *argv[]) {",
+      "  pthread_t p;",
+      "  myret_t *rvals;",
+      "  myarg_t args = { 10, 20 };",
+      "  Pthread_create(&p, NULL, mythread, &args);",
+      "  Pthread_join(p, (void **) &rvals);",
+      "  printf(\"returned %d %d\\n\", rvals->x, rvals->y);",
+      "  return 0;",
+      "}",
+    ],
+    value: [
+      "void *mythread(void *arg) {",
+      "  long long int value = (long long int) arg;",
+      "  printf(\"%lld\\n\", value);",
+      "  return (void *) (value + 1);",
+      "}",
+      "int main(int argc, char *argv[]) {",
+      "  pthread_t p;",
+      "  long long int rvalue;",
+      "  Pthread_create(&p, NULL, mythread, (void *) 100);",
+      "  Pthread_join(p, (void **) &rvalue);",
+      "  printf(\"returned %lld\\n\", rvalue);",
+      "  return 0;",
+      "}",
+    ],
+  };
+
+  // 状态：main/t1 两个栈（各有 frames），heap 块，ptrs 指针边，out 输出
+  function buildJoinSteps(kind, overwrite) {
+    const S = { main: { frames: [], note: "运行中" }, t1: null, heap: [], ptrs: [], out: [], read: null, dangling: 0 };
+    const steps = [];
+    const snap = (line, text, bad) => steps.push({ S: JSON.parse(JSON.stringify(S)), line, text, bad: !!bad });
+    const mainVar = (v) => S.main.frames[0].vars.push(v);
+    const t1Frame = () => S.t1.frames[0];
+    const setVar = (stack, id, val) => { for (const f of stack.frames) for (const v of f.vars) if (v.id === id) v.val = val; };
+
+    if (kind === "heap") {
+      S.main.frames.push({ name: "main()", status: "live", vars: [] });
+      mainVar({ id: "p", name: "pthread_t p", val: "?", addr: "0x7ffe48" });
+      mainVar({ id: "mrv", name: "myret_t *rvals", val: "?", addr: "0x7ffe40" });
+      mainVar({ id: "args", name: "myarg_t args", val: "{a=10, b=20}", addr: "0x7ffe38" });
+      snap([7, 8, 9], "main 开始运行：在<strong>自己的栈</strong>上分配 p、rvals（尚未赋值）和参数结构体 args = {10, 20}。");
+      setVar(S.main, "p", "T1");
+      S.t1 = { frames: [{ name: "mythread(arg)", status: "live", vars: [{ id: "arg", name: "void *arg", val: "0x7ffe38", addr: "0x7f3a10" }] }], note: "刚创建" };
+      S.ptrs.push({ from: "arg", to: "args" });
+      snap([10], "pthread_create 创建线程 T1：T1 得到一个<strong>全新的栈</strong>，第一个栈帧是 mythread(arg)。arg 是 main 栈上 args 的地址——箭头从 T1 栈指向 main 栈，因为两个线程共享同一个地址空间。p 被填成 T1 的句柄。");
+      S.main.note = "阻塞在 join";
+      snap([11], "main 调用 pthread_join(p, &rvals)：T1 还没结束，main 在这里<strong>阻塞等待</strong>。它把自己的变量 rvals 的地址（0x7ffe40）交给 join，稍后 join 会往里写返回值。");
+      S.t1.note = "运行中";
+      S.heap.push({ id: "blk", name: "myret_t @0x5555a0", val: "{x=?, y=?}", status: "live" });
+      t1Frame().vars.push({ id: "trv", name: "myret_t *rvals", val: "0x5555a0", addr: "0x7f3a08" });
+      S.ptrs.push({ from: "trv", to: "blk" });
+      snap([1], "T1 执行 Malloc(sizeof(myret_t))：结果结构体分配在<strong>堆</strong>上。堆不属于任何一个线程的栈，线程结束后它依然存在。");
+      S.heap[0].val = "{x=1, y=2}";
+      snap([2, 3], "T1 填好返回值：rvals->x = 1，rvals->y = 2。");
+      t1Frame().status = overwrite ? "reused" : "dead";
+      t1Frame().vars.forEach((v) => (v.val = overwrite ? "???" : v.val));
+      S.ptrs = S.ptrs.filter((p) => p.from !== "arg" && p.from !== "trv");
+      S.t1.note = "已退出";
+      S.retval = "0x5555a0";
+      snap([4], "T1 执行 return (void *) rvals：返回的是一个<strong>值</strong>——堆地址 0x5555a0。随后 T1 的栈帧被回收（" + (overwrite ? "并且很快被其他数据覆盖" : "内容暂时还在，但已不属于任何人") + "）。这没关系：返回值指向的是堆，不是这个栈帧。");
+      setVar(S.main, "mrv", "0x5555a0");
+      S.ptrs.push({ from: "mrv", to: "blk" });
+      S.main.note = "运行中";
+      snap([11], "pthread_join 返回：它执行了 *(&rvals) = 0x5555a0，于是 main 的 rvals 指向堆上的结果。这就是第二个参数必须是 <code>void **</code> 的原因。");
+      S.out.push("returned 1 2");
+      S.read = "1 2";
+      snap([12], "main 读取 rvals->x、rvals->y：读到 1 和 2，<strong>正确</strong>。堆块在 T1 结束后依然有效。");
+      S.heap[0].status = "freed";
+      S.heap[0].val = "(已释放)";
+      snap([13], "main 调用 free(rvals)：堆上分配的内存由拿到它的一方负责释放。至此没有泄漏，也没有悬空访问。");
+    } else if (kind === "stack") {
+      S.main.frames.push({ name: "main()", status: "live", vars: [] });
+      mainVar({ id: "p", name: "pthread_t p", val: "?", addr: "0x7ffe48" });
+      mainVar({ id: "mrv", name: "myret_t *rvals", val: "?", addr: "0x7ffe40" });
+      mainVar({ id: "args", name: "myarg_t args", val: "{a=10, b=20}", addr: "0x7ffe38" });
+      snap([9, 10, 11], "main 开始运行：栈上有 p、rvals（未赋值）和 args = {10, 20}。");
+      setVar(S.main, "p", "T1");
+      S.t1 = { frames: [{ name: "mythread(arg)", status: "live", vars: [{ id: "arg", name: "void *arg", val: "0x7ffe38", addr: "0x7f3a10" }] }], note: "刚创建" };
+      S.ptrs.push({ from: "arg", to: "args" });
+      snap([12], "pthread_create 创建 T1，T1 有自己的栈，arg 指向 main 栈上的 args。");
+      S.main.note = "阻塞在 join";
+      snap([13], "main 在 pthread_join 里阻塞，等待 T1 结束，并把 &rvals 交给 join。");
+      S.t1.note = "运行中";
+      t1Frame().vars.push({ id: "targs", name: "myarg_t *args", val: "0x7ffe38", addr: "0x7f3a08" });
+      S.ptrs.push({ from: "targs", to: "args" });
+      S.out.push("10 20");
+      snap([1, 2], "T1 把 void* 转回 myarg_t* 并打印参数：输出 “10 20”。");
+      t1Frame().vars.push({ id: "oops", name: "myret_t oops", val: "{x=?, y=?}", addr: "0x7f3a00" });
+      snap([3], "T1 声明局部变量 oops：它分配在 <strong>T1 自己的栈帧</strong>里（地址 0x7f3a00）。危险的伏笔。", true);
+      t1Frame().vars[2].val = "{x=1, y=2}";
+      snap([4, 5], "T1 给 oops 赋值 x = 1、y = 2。到目前为止一切正常——oops 所在的栈帧还活着。");
+      S.retval = "0x7f3a00";
+      t1Frame().status = "dead";
+      S.ptrs = S.ptrs.filter((p) => p.from !== "arg" && p.from !== "targs");
+      S.t1.note = "已退出";
+      snap([6], "T1 执行 return (void *) &oops：返回值是 <strong>0x7f3a00——T1 栈上的地址</strong>。线程一返回，这个栈帧（以及整个线程栈）就被回收了：oops 已经不再“存在”，虽然字节可能暂时还在原处。", true);
+      setVar(S.main, "mrv", "0x7f3a00");
+      S.ptrs.push({ from: "mrv", to: "oops", bad: true });
+      S.main.note = "运行中";
+      S.dangling = 1;
+      snap([13], "pthread_join 返回，main 的 rvals = 0x7f3a00：一个指向<strong>已回收栈内存</strong>的悬空指针（红色虚线）。", true);
+      if (overwrite) {
+        t1Frame().status = "reused";
+        t1Frame().name = "（被复用的内存）";
+        t1Frame().vars.forEach((v) => { v.val = v.id === "oops" ? "{x=8392704, y=0}" : "0x????"; v.name = "（原 " + v.name.split(" ").pop() + "）"; });
+        snap([13], "之后，线程库的清理代码（或其他函数调用、新线程）复用了这块内存，把 0x7f3a00 处的字节改写了。main 对此一无所知。", true);
+        S.out.push("returned 8392704 0");
+        S.read = "8392704 0";
+        snap([14], "main 解引用 rvals：读到的是<strong>垃圾</strong>（这里用本章实验在本机真实读到的 8392704 和 0）。期望的 1 2 没有出现。ASan 编译的版本在这一步直接报错（SEGV）。", true);
+      } else {
+        S.out.push("returned 1 2");
+        S.read = "1 2 (?)";
+        snap([14], "main 解引用 rvals：碰巧还读到 1 2——因为那块内存还没被别人写。但这是<strong>未定义行为</strong>：结果取决于运气，程序是错的。试试勾选“内存被复用”。", true);
+      }
+    } else {
+      S.main.frames.push({ name: "main()", status: "live", vars: [] });
+      mainVar({ id: "p", name: "pthread_t p", val: "?", addr: "0x7ffe48" });
+      mainVar({ id: "rv", name: "long long rvalue", val: "?", addr: "0x7ffe40" });
+      snap([6, 7], "main 开始：只需要 p 和一个 long long 变量 rvalue。不需要打包参数，也不需要结构体。");
+      setVar(S.main, "p", "T1");
+      S.t1 = { frames: [{ name: "mythread(arg)", status: "live", vars: [{ id: "arg", name: "void *arg", val: "100 (0x64)", addr: "0x7f3a10" }] }], note: "刚创建" };
+      snap([8], "pthread_create(&p, NULL, mythread, (void *) 100)：把整数 100 <strong>直接当作 void* 的值</strong>传进去。T1 的 arg 里装的就是 100 本身，它不指向任何地方——所以这里没有箭头。");
+      S.main.note = "阻塞在 join";
+      snap([9], "main 在 pthread_join 里阻塞等待。");
+      S.t1.note = "运行中";
+      t1Frame().vars.push({ id: "val", name: "long long value", val: "100", addr: "0x7f3a08" });
+      S.out.push("100");
+      snap([1, 2], "T1 把 arg 转回 long long：value = 100，并打印。");
+      S.retval = "101";
+      t1Frame().status = overwrite ? "reused" : "dead";
+      if (overwrite) t1Frame().vars.forEach((v) => (v.val = "???"));
+      S.t1.note = "已退出";
+      snap([3], "T1 返回 (void *)(value + 1)：返回的“指针”其实就是数值 101。T1 的栈帧被回收" + (overwrite ? "并被覆盖" : "") + "也无所谓：返回值里没有任何指向栈的引用。");
+      setVar(S.main, "rv", "101");
+      S.main.note = "运行中";
+      snap([9], "pthread_join 把 101 写进 rvalue（传的是 &rvalue，同样是“要修改就传地址”）。这种写法依赖 void* 至少和 long long 一样宽——在 64 位 Linux 上成立。");
+      S.out.push("returned 101");
+      S.read = "101";
+      snap([10], "main 打印 returned 101。没有堆分配，也就不需要 free；没有指针，也就没有悬空指针。只传单个值时这是最简单的写法。");
+    }
+    return steps;
+  }
+
+  // ---------- 模拟器 2：条件变量解释器 ----------
+  // 程序：W（消费者）与 S（生产者）。每次调度执行一条“语句”。
+  const W_CODE = (mode) => [
+    "lock(&m);",
+    (mode === "while" ? "while" : "if") + " (ready == 0)",
+    "    cond_wait(&c, &m);",
+    "ready = 0;  // 取走数据",
+    "unlock(&m);",
+  ];
+  const S_CODE = ["lock(&m);", "ready = 1;", "cond_signal(&c);", "unlock(&m);"];
+  const PRESETS = {
+    normal: [0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0],
+    barge: [0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 0, 0, 0, 0],
+    spurious: [0, 0, 0, "sp", 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0],
+  };
+  const TNAMES = ["W1", "S", "W2"];
+
+  function condInit() {
+    return {
+      th: [
+        { pc: 0, st: "ready", kind: "W" },
+        { pc: 0, st: "ready", kind: "S" },
+        { pc: 0, st: "ready", kind: "W" },
+      ],
+      holder: -1, ready: 0, queue: [], consumed: 0, bugs: 0, wakeups: 0, log: [],
+    };
+  }
+  // 执行一步：返回 {text, bad}
+  function condStep(C, t, mode) {
+    const name = t === "sp" ? "系统" : TNAMES[t];
+    const say = (text, bad) => { C.log.push({ who: name, text, bad: !!bad }); return { text, bad: !!bad }; };
+    if (t === "sp") {
+      const i = C.queue.indexOf(0);
+      if (i < 0) return say("虚假唤醒：W1 此刻并没有在条件变量上睡眠，什么也没发生。");
+      C.queue.splice(i, 1);
+      C.th[0].st = "lockwait"; C.th[0].pc = "reacq"; C.wakeups++;
+      return say("⚡ 虚假唤醒：没有任何人 signal，W1 却被从等待队列里唤醒了（某些 pthread 实现允许这样）。它要先重新拿到锁 m。");
+    }
+    const T = C.th[t];
+    if (T.st === "done") return say(name + " 已经执行完毕。");
+    if (T.st === "sleep") return say(name + " 正在条件变量上睡眠，调度器不会选它运行（这一步什么也没做）。");
+    const tryLock = () => { if (C.holder === -1) { C.holder = t; return true; } return false; };
+    if (T.pc === "reacq") {
+      if (!tryLock()) { T.st = "lockwait"; return say(name + " 从 wait 中醒来，但锁 m 被 " + TNAMES[C.holder] + " 持有，继续等锁。"); }
+      T.st = "ready";
+      T.pc = mode === "while" ? 1 : 3;
+      return say(name + " 重新获得锁 m，cond_wait 返回。" + (mode === "while" ? "回到 while 重新检查条件。" : "if 写法：<strong>不再检查</strong>，直接往下执行。"));
+    }
+    if (T.kind === "W") {
+      switch (T.pc) {
+        case 0:
+          if (!tryLock()) { T.st = "lockwait"; return say(name + " 调用 lock(&m)，但锁被 " + TNAMES[C.holder] + " 持有，阻塞等锁。"); }
+          T.st = "ready"; T.pc = 1; return say(name + " 获得锁 m。");
+        case 1:
+          if (C.ready === 0) { T.pc = 2; return say(name + " 检查 ready == 0 成立：数据还没准备好，准备等待。"); }
+          T.pc = 3; return say(name + " 检查发现 ready == 1：数据已就绪，" + (mode === "while" ? "跳出循环" : "不必等待") + "。");
+        case 2:
+          C.holder = -1; T.st = "sleep"; C.queue.push(t); T.pc = "reacq";
+          return say(name + " 调用 cond_wait：<strong>释放锁 m</strong> 并在条件变量 c 上睡眠。");
+        case 3:
+          if (C.ready === 1) { C.ready = 0; C.consumed++; T.pc = 4; return say(name + " 取走数据：ready = 0。正确地消费了一次。"); }
+          C.bugs++; T.pc = 4;
+          return say(name + " 执行“取走数据”，可 ready 此刻是 0——它取走了一个<strong>不存在</strong>的数据！（if 没有重新检查条件）", true);
+        case 4:
+          C.holder = -1; T.st = "done"; T.pc = 5;
+          return say(name + " unlock(&m)，结束。");
+      }
+    } else {
+      switch (T.pc) {
+        case 0:
+          if (!tryLock()) { T.st = "lockwait"; return say("S 调用 lock(&m)，但锁被 " + TNAMES[C.holder] + " 持有，阻塞等锁。"); }
+          T.st = "ready"; T.pc = 1; return say("S 获得锁 m（等待者在 cond_wait 里已经把锁释放了）。");
+        case 1:
+          C.ready = 1; T.pc = 2; return say("S 持锁设置 ready = 1：数据准备好了。");
+        case 2: {
+          T.pc = 3;
+          if (C.queue.length === 0) return say("S 调用 cond_signal：等待队列为空，这次 signal 什么也不做（不会被“记住”）。");
+          const w = C.queue.shift(); C.th[w].st = "lockwait"; C.wakeups++;
+          return say("S 调用 cond_signal：唤醒 " + TNAMES[w] + "。" + TNAMES[w] + " 从睡眠变为“等锁”——锁还在 S 手里。");
+        }
+        case 3:
+          C.holder = -1; T.st = "done"; T.pc = 4; return say("S unlock(&m)，结束。");
+      }
+    }
+    return say("（无操作）");
+  }
+  function condRun(mode, sched) {
+    const C = condInit();
+    const frames = [{ C: JSON.parse(JSON.stringify(C)), t: null, r: { text: "初始状态：ready = 0，锁 m 空闲，没有线程在等待。点“下一步”开始。", bad: false } }];
+    for (const t of sched) {
+      const r = condStep(C, t, mode);
+      frames.push({ C: JSON.parse(JSON.stringify(C)), t, r });
+    }
+    return frames;
+  }
+  // ==core-end==
+
+  // ---------- 渲染：模拟器 1 ----------
+  const jScn = document.getElementById("j-scn"), jOver = document.getElementById("j-over");
+  const jCode = document.getElementById("j-code"), jOut = document.getElementById("j-out"), jStage = document.getElementById("j-stage"), jNar = document.getElementById("j-nar");
+  let jSteps = buildJoinSteps(jScn.value, jOver.checked);
+
+  function codeBox(host, lines, hl, bad) {
+    host.replaceChildren(...lines.map((l, i) => h("span", { class: "ln" + (hl.includes(i) ? (bad ? " hl bad" : " hl") : "") }, h("span", { class: "no" }, i + 1), l)));
+  }
+
+  function drawMem(st) {
+    const S = st.S, colW = 206, gap = 46, x0 = 10;
+    const cols = [
+      { title: "main 线程的栈", x: x0 },
+      { title: "堆（heap）", x: x0 + colW + gap },
+      { title: "T1 线程的栈", x: x0 + 2 * (colW + gap) },
+    ];
+    const W = x0 * 2 + 3 * colW + 2 * gap;
+    const box = {}; // id -> {x,y,w,h,col}
+    const items = []; let maxY = 60;
+    const rowH = 38;
+    function stackCol(stack, col, note) {
+      let y = 48;
+      items.push(s("text", { x: cols[col].x + colW / 2, y: 20, "text-anchor": "middle", "font-weight": 700, "font-size": 13.5, text: cols[col].title }));
+      if (!stack) { items.push(s("text", { x: cols[col].x + colW / 2, y: 70, "text-anchor": "middle", "font-size": 12, class: "t-muted", text: "（线程尚未创建）" })); return; }
+      items.push(s("text", { x: cols[col].x + colW / 2, y: 36, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", text: note }));
+      for (const f of stack.frames) {
+        const fh = 26 + f.vars.length * rowH + 6;
+        const cls = f.status === "live" ? "box" : f.status === "dead" ? "box" : "bad-soft";
+        items.push(s("rect", { x: cols[col].x, y, width: colW, height: fh, rx: 7, class: cls, "stroke-dasharray": f.status === "live" ? null : "5 4", style: f.status === "dead" ? "opacity:.6" : null }));
+        items.push(s("text", { x: cols[col].x + 8, y: y + 17, "font-size": 12, "font-weight": 600, class: "mono", text: f.name }));
+        const tag = f.status === "live" ? "" : f.status === "dead" ? "已回收" : "已被覆盖";
+        if (tag) items.push(s("text", { x: cols[col].x + colW - 8, y: y + 17, "text-anchor": "end", "font-size": 11.5, style: "fill:var(--bad);font-weight:700", text: tag }));
+        let vy = y + 26;
+        for (const v of f.vars) {
+          box[v.id] = { x: cols[col].x + 6, y: vy, w: colW - 12, h: rowH - 6, col };
+          items.push(s("rect", { x: cols[col].x + 6, y: vy, width: colW - 12, height: rowH - 6, rx: 5, class: f.status === "live" ? "box-strong" : "box", style: f.status === "live" ? null : "opacity:.75" }));
+          items.push(s("text", { x: cols[col].x + 12, y: vy + 13, "font-size": 10.5, class: "t-muted mono", text: v.name + "  @" + v.addr }));
+          items.push(s("text", { x: cols[col].x + 12, y: vy + 27, "font-size": 12.5, class: "mono", "font-weight": 600, text: v.val }));
+          vy += rowH;
+        }
+        y += fh + 8;
+      }
+      maxY = Math.max(maxY, y);
+    }
+    stackCol(S.main, 0, S.main.note);
+    stackCol(S.t1, 2, S.t1 ? S.t1.note : "");
+    // heap
+    items.push(s("text", { x: cols[1].x + colW / 2, y: 20, "text-anchor": "middle", "font-weight": 700, "font-size": 13.5, text: cols[1].title }));
+    let hy = 48;
+    if (!S.heap.length) items.push(s("text", { x: cols[1].x + colW / 2, y: 70, "text-anchor": "middle", "font-size": 12, class: "t-muted", text: "（没有分配）" }));
+    for (const b of S.heap) {
+      box[b.id] = { x: cols[1].x + 6, y: hy, w: colW - 12, h: 40, col: 1 };
+      items.push(s("rect", { x: cols[1].x + 6, y: hy, width: colW - 12, height: 40, rx: 6, class: b.status === "live" ? "ok-soft" : "box", "stroke-dasharray": b.status === "live" ? null : "5 4" }));
+      items.push(s("text", { x: cols[1].x + 12, y: hy + 15, "font-size": 10.5, class: "t-muted mono", text: b.name }));
+      items.push(s("text", { x: cols[1].x + 12, y: hy + 31, "font-size": 12.5, class: "mono", "font-weight": 600, text: b.val }));
+      hy += 50;
+    }
+    maxY = Math.max(maxY, hy);
+    const H = maxY + 44;
+    // arrows
+    const arrows = [];
+    let lane = 0;
+    for (const p of S.ptrs) {
+      const a = box[p.from], b = box[p.to];
+      if (!a || !b) continue;
+      const color = p.bad ? "var(--bad)" : "var(--accent)";
+      const mk = p.bad ? "url(#jm-bad)" : "url(#jm-ok)";
+      let d;
+      const ay = a.y + a.h / 2, by = b.y + b.h / 2;
+      if (Math.abs(a.col - b.col) === 1) {
+        const ax = a.col < b.col ? a.x + a.w : a.x, bx = a.col < b.col ? b.x - 2 : b.x + b.w + 2;
+        const mx = (ax + bx) / 2;
+        d = `M${ax},${ay} C${mx},${ay} ${mx},${by} ${bx},${by}`;
+      } else {
+        // 跨过中间列：从下方绕行
+        const low = maxY + 10 + lane * 12; lane++;
+        const ax = a.col < b.col ? a.x + a.w : a.x, bx = a.col < b.col ? b.x - 2 : b.x + b.w + 2;
+        const ax2 = a.col < b.col ? ax + 18 : ax - 18, bx2 = a.col < b.col ? bx - 18 : bx + 18;
+        d = `M${ax},${ay} H${ax2} V${low} H${bx2} V${by} H${bx}`;
+      }
+      arrows.push(s("path", { d, style: `stroke:${color};fill:none;stroke-width:1.8`, "stroke-dasharray": p.bad ? "6 4" : null, "marker-end": mk }));
+    }
+    const defs = s("defs", {},
+      s("marker", { id: "jm-ok", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto" }, s("path", { d: "M0,0 L10,5 L0,10 z", style: "fill:var(--accent)" })),
+      s("marker", { id: "jm-bad", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto" }, s("path", { d: "M0,0 L10,5 L0,10 z", style: "fill:var(--bad)" })));
+    const legend = s("text", { x: 10, y: H - 8, "font-size": 11.5, class: "t-muted", text: "蓝色箭头＝有效指针　红色虚线＝悬空指针　虚线框＝已回收的栈帧/已释放的堆块" });
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, style: "max-width:none;display:block;margin:0 auto", role: "img", "aria-label": "main 栈、堆、T1 栈的内存示意" }, defs, ...items, ...arrows, legend);
+    jStage.replaceChildren(svg);
+  }
+
+  const jSt = OSTEP.stepper(document.getElementById("j-step"), {
+    steps: () => jSteps.length,
+    autoplayMs: 1800,
+    render(i) {
+      const st = jSteps[i], kind = jScn.value;
+      codeBox(jCode, JOIN_CODE[kind], st.line, st.bad);
+      jOut.replaceChildren(h("b", {}, "程序输出"), st.S.out.join("\n") || "（暂无）");
+      drawMem(st);
+      jNar.innerHTML = st.text;
+      const f = st.S.t1 ? st.S.t1.frames[0].status : null;
+      document.getElementById("j-s1").textContent = !f ? "未创建" : f === "live" ? "存活" : f === "dead" ? "已回收" : "已覆盖";
+      document.getElementById("j-s2").textContent = st.S.heap.filter((b) => b.status === "live").length;
+      document.getElementById("j-s3").textContent = st.S.dangling;
+      const rd = document.getElementById("j-s4");
+      rd.textContent = st.S.read || "–";
+      rd.style.color = st.S.read && st.S.read !== "1 2" && st.S.read !== "101" ? "var(--bad)" : "";
+    },
+  });
+  function jReload() { jSteps = buildJoinSteps(jScn.value, jOver.checked); jSt.reset(); }
+  jScn.onchange = jReload; jOver.onchange = jReload;
+  document.getElementById("j-book").onclick = () => { jScn.value = "stack"; jOver.checked = true; jReload(); };
+
+  // ---------- 渲染：模拟器 2 ----------
+  const cMode = document.getElementById("c-mode"), cPreset = document.getElementById("c-preset");
+  let custom = [];
+  let cFrames = [];
+  const sched = () => (cPreset.value === "custom" ? custom : PRESETS[cPreset.value]);
+  function cRebuild() { cFrames = condRun(cMode.value, sched()); }
+  cRebuild();
+  const stName = { ready: ["就绪", "run"], sleep: ["睡眠（在 c 上等待）", "sleep"], lockwait: ["等锁 m", "lockwait"], done: ["已结束", ""] };
+
+  function pcLine(T, mode) {
+    if (T.pc === "reacq") return 2;
+    return T.pc;
+  }
+  const cSt = OSTEP.stepper(document.getElementById("c-step"), {
+    steps: () => cFrames.length,
+    autoplayMs: 1300,
+    render(i) {
+      const fr = cFrames[i], C = fr.C, mode = cMode.value;
+      const lanes = [0, 1, 2].map((t) => {
+        const T = C.th[t];
+        const lines = T.kind === "W" ? W_CODE(mode) : S_CODE;
+        const cb = h("div", { class: "codebox" });
+        const cur = T.st === "done" ? -1 : pcLine(T, mode);
+        codeBox(cb, lines, [cur], false);
+        const [label, cls] = stName[T.st];
+        const holds = C.holder === t ? " · 持有 m" : "";
+        return h("div", { class: "lane" + (fr.t === t || (fr.t === "sp" && t === 0) ? " cur" : "") },
+          h("div", { class: "lh" }, h("span", {}, h("span", { class: "dot", style: { background: OSTEP.color(t) } }), TNAMES[t] + (t === 1 ? "（生产者）" : "（消费者）")),
+            h("span", { class: "st " + cls }, label + holds)), cb);
+      });
+      document.getElementById("c-lanes").replaceChildren(...lanes);
+      document.getElementById("c-shared").replaceChildren(
+        h("div", { class: "box" }, h("span", { class: "k" }, "共享变量 ready"), h("span", { class: "v" }, String(C.ready))),
+        h("div", { class: "box" }, h("span", { class: "k" }, "锁 m 的持有者"), h("span", { class: "v" }, C.holder < 0 ? "空闲" : TNAMES[C.holder])),
+        h("div", { class: "box" }, h("span", { class: "k" }, "条件变量 c 的等待队列"), h("span", { class: "v" }, C.queue.length ? C.queue.map((q) => TNAMES[q]).join(", ") : "空")),
+        h("div", { class: "box" }, h("span", { class: "k" }, "等锁 m 的线程"), h("span", { class: "v" }, C.th.map((T, k) => (T.st === "lockwait" ? TNAMES[k] : null)).filter(Boolean).join(", ") || "无")));
+      const nar = document.getElementById("c-nar");
+      nar.innerHTML = (fr.t === null ? "" : "<strong>" + (fr.t === "sp" ? "系统" : TNAMES[fr.t]) + "：</strong>") + fr.r.text;
+      nar.style.background = fr.r.bad ? "var(--bad-soft)" : "";
+      const log = document.getElementById("c-log");
+      log.replaceChildren(...(C.log.length ? C.log.map((e, k) => h("div", { class: (e.bad ? "bad" : "") + (k === C.log.length - 1 ? " cur" : ""), html: (k + 1) + ". [" + e.who + "] " + e.text })) : [h("div", { class: "muted" }, "（事件日志）")]));
+      log.scrollTop = log.scrollHeight;
+      document.getElementById("c-s1").textContent = C.consumed;
+      const b = document.getElementById("c-s2"); b.textContent = C.bugs; b.style.color = C.bugs ? "var(--bad)" : "";
+      document.getElementById("c-s3").textContent = C.wakeups;
+    },
+  });
+  cMode.onchange = () => { cRebuild(); cSt.go(cFrames.length - 1); };
+  cPreset.onchange = () => { cRebuild(); cSt.reset(); };
+  document.querySelectorAll("#c-btns button[data-t]").forEach((b) => {
+    b.onclick = () => {
+      if (cPreset.value !== "custom") { custom = sched().slice(0, cSt.index); cPreset.value = "custom"; }
+      const v = b.dataset.t; custom.push(v === "sp" ? "sp" : Number(v));
+      cRebuild(); cSt.go(cFrames.length - 1);
+    };
+  });
+  document.getElementById("c-undo").onclick = () => { if (cPreset.value !== "custom") { custom = sched().slice(0, cSt.index); cPreset.value = "custom"; } custom.pop(); cRebuild(); cSt.go(cFrames.length - 1); };
+  document.getElementById("c-clear").onclick = () => { custom = []; cPreset.value = "custom"; cRebuild(); cSt.reset(); };
+})();
+</script>
+</body></html>

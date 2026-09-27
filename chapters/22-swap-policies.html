@@ -1,0 +1,1037 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 22 章 · 超越物理内存：策略</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+.trace td, .trace th { padding: 4px 10px; font-size: 13.5px; white-space: nowrap; }
+.trace td { font-family: var(--mono); }
+.trace tr.cur td { background: var(--accent-soft); }
+.trace tr.future td { color: var(--faint); }
+.trace .h { color: var(--ok); font-weight: 700; }
+.trace .m { color: var(--bad); font-weight: 700; }
+.frames { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 6px; margin: 4px 0 10px; }
+.frame { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.frame .cell { min-width: 44px; height: 38px; font-size: 15px; font-weight: 600; }
+.frame small { font-size: 11.5px; color: var(--muted); font-family: var(--mono); line-height: 1.2; text-align: center; }
+.frame .cell.evict { border-color: var(--bad); background: var(--bad-soft); text-decoration: line-through; }
+.dirty-mark { font-size: 10px; color: var(--warn); vertical-align: super; margin-left: 1px; }
+.lbl-end { font-size: 12.5px; color: var(--muted); align-self: center; }
+.cmp td.best { color: var(--ok); font-weight: 700; }
+.chart-tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; font-size: 12.5px; box-shadow: var(--shadow); white-space: nowrap; }
+.chart-wrap { position: relative; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13.5px; margin: 6px 0; }
+.legend label { display: inline-flex; align-items: center; gap: 6px; color: var(--fg); cursor: pointer; }
+.legend .sw { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+.twocol { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.twocol h4 { margin: 0 0 6px; font-size: 15px; }
+.subset-ok { color: var(--ok); font-weight: 600; }
+.subset-bad { color: var(--bad); font-weight: 600; }
+</style>
+</head>
+<body data-chapter="22">
+<main>
+
+<h2>这一章要解决什么</h2>
+<div class="crux">
+  <p><strong>如何决定踢出哪个页？</strong>操作系统如何决定从内存中踢出哪一页（或哪几页）？这个决定由系统的<strong>替换策略（replacement policy）</strong>做出，它通常遵循一些通用原则，同时也包含一些调整来避免极端情况下的糟糕表现。</p>
+  <p class="muted small">How can the OS decide which page (or pages) to evict from memory?</p>
+</div>
+<p>上一章（第 21 章）搭好了<strong>机制</strong>：present 位、页错误、交换空间。机制只回答"怎么把页换进换出"，却没回答最要命的问题：内存满了，<strong>该牺牲谁</strong>？选错了，程序会以磁盘速度（比内存慢上万倍）运行。</p>
+<p>本章把物理内存看成"虚拟页的缓存"，依次研究最优策略 OPT（作为标尺）、FIFO、Random、LRU，再看工作负载如何决定策略优劣、LRU 如何用 use 位和时钟算法近似实现、脏页如何影响决策，最后讨论内存彻底不够时的<strong>抖动（thrashing）</strong>。下一章（第 23 章）会看到 VAX/VMS 和 Linux 在真实系统里如何落地这些思想。</p>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>内存是页的缓存</h4><p>目标：让缓存未命中（cache miss）尽量少，也就是少从磁盘取页。</p></div>
+  <div class="card"><h4>AMAT</h4><p>平均内存访问时间 = T<sub>M</sub> + P<sub>Miss</sub>·T<sub>D</sub>。磁盘太慢，哪怕 0.1% 的未命中率也会主导总时间。</p></div>
+  <div class="card"><h4>最优策略 OPT / MIN</h4><p>踢出"将来最晚才被访问"的页。要预知未来，无法实现，但是绝佳的比较标尺。</p></div>
+  <div class="card"><h4>FIFO 与 Random</h4><p>实现简单，但不区分页的重要程度；FIFO 还会出现 Belady 异常。</p></div>
+  <div class="card"><h4>LRU</h4><p>踢出最近最少使用的页，依据局部性原理（principle of locality）用历史预测未来。</p></div>
+  <div class="card"><h4>use 位 + 时钟算法</h4><p>完美 LRU 太贵；硬件置 use 位、OS 用"转圈的指针"清位找 0，近似 LRU。</p></div>
+  <div class="card"><h4>脏页（dirty page）</h4><p>被修改过的页踢出前必须写回磁盘，代价更高；很多系统优先踢干净页。</p></div>
+  <div class="card"><h4>抖动（thrashing）</h4><p>进程们的工作集之和超过物理内存，系统一直在换页。对策：准入控制或 OOM killer。</p></div>
+</div>
+
+<h2>内存是页的缓存：用 AMAT 衡量</h2>
+<p>主存只能装下系统所有页的一个子集，所以它就是虚拟内存页的<strong>缓存</strong>。替换策略的目标是<strong>最小化缓存未命中次数</strong>（等价地，最大化命中次数）。有了命中与未命中，就可以计算平均内存访问时间（Average Memory Access Time，AMAT）：</p>
+<div class="key"><p style="text-align:center;font-size:18px;margin:0"><code>AMAT = T<sub>M</sub> + (P<sub>Miss</sub> · T<sub>D</sub>)</code></p>
+<p class="small muted" style="margin:6px 0 0">T<sub>M</sub>：访问内存的代价；T<sub>D</sub>：访问磁盘的代价；P<sub>Miss</sub>：未命中概率（0.0～1.0）。注意内存访问的代价<strong>总要付</strong>，未命中时再<strong>额外</strong>付一次磁盘代价。</p></div>
+
+<figure class="fig">
+<svg viewBox="0 0 640 170" width="640" role="img" aria-label="CPU、内存（页缓存）与磁盘">
+  <rect x="20" y="55" width="110" height="60" rx="8" class="box-strong"/>
+  <text x="75" y="82" text-anchor="middle" font-weight="600">CPU</text>
+  <text x="75" y="102" text-anchor="middle" font-size="12" class="t-muted">发出虚拟地址</text>
+  <rect x="220" y="35" width="180" height="100" rx="8" class="accent-soft"/>
+  <text x="310" y="62" text-anchor="middle" font-weight="600">物理内存</text>
+  <text x="310" y="82" text-anchor="middle" font-size="12.5">＝ 虚拟页的"缓存"</text>
+  <g font-family="var(--mono)" font-size="12">
+    <rect x="240" y="95" width="30" height="24" rx="3" class="box"/><text x="255" y="112" text-anchor="middle" class="mono">0</text>
+    <rect x="275" y="95" width="30" height="24" rx="3" class="box"/><text x="290" y="112" text-anchor="middle" class="mono">1</text>
+    <rect x="310" y="95" width="30" height="24" rx="3" class="box"/><text x="325" y="112" text-anchor="middle" class="mono">2</text>
+    <rect x="345" y="95" width="30" height="24" rx="3" class="box"/><text x="360" y="112" text-anchor="middle" class="mono">4</text>
+  </g>
+  <rect x="490" y="30" width="130" height="110" rx="8" class="box"/>
+  <text x="555" y="58" text-anchor="middle" font-weight="600">磁盘（交换空间）</text>
+  <text x="555" y="80" text-anchor="middle" font-size="12" class="t-muted">装得下全部页</text>
+  <text x="555" y="100" text-anchor="middle" font-size="12" class="t-muted">但慢 10⁴～10⁵ 倍</text>
+  <line x1="130" y1="85" x2="218" y2="85" class="arrow" marker-end="url(#a22)"/>
+  <text x="174" y="76" text-anchor="middle" font-size="12">T<tspan font-size="9" dy="3">M</tspan><tspan dy="-3"> ≈ 100 ns</tspan></text>
+  <line x1="400" y1="85" x2="488" y2="85" class="arrow" marker-end="url(#a22)" stroke-dasharray="5 4"/>
+  <text x="444" y="76" text-anchor="middle" font-size="12">未命中</text>
+  <text x="444" y="105" text-anchor="middle" font-size="12">T<tspan font-size="9" dy="3">D</tspan><tspan dy="-3"> ≈ 10 ms</tspan></text>
+  <defs><marker id="a22" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+</svg>
+<figcaption>内存命中只需 T<sub>M</sub>；未命中还得付磁盘代价 T<sub>D</sub>。两者相差五个数量级，这就是替换策略如此重要的原因。</figcaption>
+</figure>
+
+<p>原书的例子：4KB 地址空间、256 字节页（4 位 VPN + 8 位偏移），进程依次访问 <code>0x000, 0x100, …, 0x900</code>（前 10 个页各一次），除了 VPN 3 以外的页都已在内存。于是得到"命中、命中、命中、未命中、命中×6"，命中率 90%，P<sub>Miss</sub> = 0.1。取 T<sub>M</sub> = 100ns、T<sub>D</sub> = 10ms：AMAT = 100ns + 0.1·10ms ≈ <strong>1.0001 ms</strong>，大约 1 毫秒；若命中率为 99.9%，AMAT 变成 <strong>10.1 µs</strong>，快了约 100 倍。自己拖一拖滑块感受一下：</p>
+
+<section class="sim" id="sim-amat">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>AMAT 计算器</h3><div class="desc">改命中率、内存和磁盘延迟，看 AMAT 如何被磁盘主导。试试把命中率从 90% 调到 99%、99.9%、99.99%。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>命中率 <input type="range" id="amat-hit" min="0" max="1000" value="900" style="width:180px"></label>
+      <span id="amat-hitv" class="pill mono">90.0%</span>
+      <label>T<sub>M</sub>(ns) <input type="number" id="amat-tm" value="100" min="1"></label>
+      <label>T<sub>D</sub>(ms) <input type="number" id="amat-td" value="10" min="0.001" step="0.001"></label>
+    </div>
+    <div class="controls">
+      <button data-hit="900">原书：90%</button><button data-hit="999">原书：99.9%</button><button data-hit="990">99%</button><button data-hit="1000">100%</button>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="amat-v">—</div><div class="l">AMAT</div></div>
+      <div class="stat"><div class="v" id="amat-x">—</div><div class="l">是纯内存访问的多少倍</div></div>
+      <div class="stat"><div class="v" id="amat-share">—</div><div class="l">时间中花在磁盘上的比例</div></div>
+    </div>
+    <div class="narrate" id="amat-n"></div>
+  </div>
+</section>
+
+<h2>最优替换策略（OPT / MIN）</h2>
+<p>Belady 很早就证明：<strong>踢出将来最晚才会被访问的那个页</strong>，得到的未命中次数最少。直觉很简单——既然必须扔掉一个，就扔掉"离下次被需要最远"的那个；其他页都会比它先被用到，所以都比它重要。</p>
+<p>原书用的访问序列是 <code>0, 1, 2, 0, 1, 3, 0, 3, 1, 2, 1</code>，缓存能放 3 页。前 3 次访问是<strong>冷启动未命中（cold-start / compulsory miss）</strong>；随后 0、1 命中；访问 3 时缓存已满，必须替换。OPT 往未来看：</p>
+<figure class="fig">
+<svg viewBox="0 0 660 200" width="660" role="img" aria-label="OPT 在访问页 3 时向未来看">
+  <text x="20" y="28" font-size="13" class="t-muted">访问序号</text>
+  <text x="20" y="62" font-size="13" class="t-muted">页号</text>
+  <g id="opt-seq"></g>
+  <text x="20" y="150" font-size="13">缓存中的 0、1、2 下次何时被用到？</text>
+  <text x="20" y="178" font-size="13"><tspan style="fill:var(--ok)">0 → 第 6 次（马上）</tspan>　<tspan style="fill:var(--warn)">1 → 第 8 次</tspan>　<tspan style="fill:var(--bad);font-weight:700">2 → 第 9 次（最远）⇒ 淘汰 2</tspan></text>
+</svg>
+<figcaption>在第 5 次访问（页 3，0 基编号）时，OPT 比较缓存中每一页"下一次被访问的位置"，踢出最远的页 2。</figcaption>
+</figure>
+<p>结果（原书 Figure 22.1）：6 次命中、5 次未命中，命中率 <strong>6/11 = 54.5%</strong>；如果不计冷启动未命中（每个页的第一次访问），命中率是 6/7 = <strong>85.7%</strong>。第 9 次访问页 2 时，0 和 3 将来都不再被访问，踢谁都行，原书踢了 3。</p>
+<div class="aside" data-title="旁注：未命中的三种类型（Three C's）">
+  <p><strong>强制未命中（compulsory miss，又叫冷启动未命中）</strong>：缓存一开始是空的，第一次访问某项必然未命中。<strong>容量未命中（capacity miss）</strong>：缓存装满了，只好踢掉某项才能装新项。<strong>冲突未命中（conflict miss）</strong>：硬件缓存因组相联（set-associativity）限制了放置位置而产生；OS 的页缓存是<strong>全相联</strong>的（页可以放进任意页框），所以不存在这一类。</p>
+</div>
+<div class="tip"><p><strong>和最优比较很有用。</strong>单说"我的新算法命中率 80%"没有意义；说"最优也只有 82%"，就知道已经很接近理想、可以停手了。所以 OPT 虽然无法实现，却是所有模拟研究的标尺。</p></div>
+
+<h2>两个简单策略：FIFO 与 Random</h2>
+<h3>FIFO（先进先出）</h3>
+<p>页进入内存时排进队列，替换时踢掉最先进入的那个。优点只有一个：<strong>实现极其简单</strong>。同一序列下 FIFO 只有 4 次命中，命中率 <strong>36.4%</strong>（不计冷启动 57.1%）。问题出在第 5 次访问：页 0 已经被访问过好几次，FIFO 仍然因为它"来得最早"把它踢掉，紧接着访问 0 就又未命中。<strong>FIFO 无法判断页的重要性。</strong></p>
+<h3>Random（随机）</h3>
+<p>内存吃紧时随机挑一个踢掉。和 FIFO 一样简单，一样不"聪明"，表现完全取决于运气。原书 Figure 22.3 那一次运气不错，拿到 5 次命中。原书把这个实验重复了 10,000 次（不同随机种子）：略多于 40% 的情况下 Random 和 OPT 一样好（6 次命中），有时却只有 2 次甚至更少。下面在浏览器里现场重做这个实验：</p>
+
+<section class="sim" id="sim-randhist">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>Random 策略 10,000 次试验（复刻 Figure 22.4）</h3><div class="desc">对序列 0,1,2,0,1,3,0,3,1,2,1、缓存 3 页，用种子 1…N 各跑一次 Random，统计命中次数的分布。</div></div>
+  <div class="sim-body">
+    <div class="controls"><label>试验次数 <input type="number" id="rh-n" value="10000" min="100" max="100000" step="100"></label><button class="primary" id="rh-run">运行</button></div>
+    <div class="stage"><div class="chart-wrap" id="rh-chart"></div></div>
+    <div class="narrate" id="rh-n2">点"运行"开始。</div>
+  </div>
+</section>
+
+<h3>Belady 异常（Belady's Anomaly）</h3>
+<p>直觉上缓存变大，命中率只会变好或不变。可 Belady 和同事找到一个序列：<code>1,2,3,4,1,2,5,1,2,3,4,5</code>，用 FIFO 时，缓存从 3 页增加到 4 页，命中率反而<strong>下降</strong>了！LRU 则没有这个问题，因为它具有<strong>栈特性（stack property）</strong>：大小为 N+1 的缓存内容总是<strong>包含</strong>大小为 N 的缓存内容，所以缓存变大时命中只增不减。FIFO 和 Random 没有栈特性。用下面的模拟器亲手验证：</p>
+
+<section class="sim" id="sim-belady">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>Belady 异常：缓存 3 页 vs 4 页并排对比</h3><div class="desc">同一序列同时喂给两个缓存，逐步观察。切换到 LRU，看"小缓存内容 ⊆ 大缓存内容"是否每一步都成立。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>策略 <select id="bl-pol"><option value="FIFO">FIFO</option><option value="LRU">LRU</option><option value="OPT">OPT</option></select></label>
+      <label>序列 <input type="text" id="bl-refs" value="1,2,3,4,1,2,5,1,2,3,4,5" style="width:16em"></label>
+      <label>小 <input type="number" id="bl-a" value="3" min="1" max="10"></label>
+      <label>大 <input type="number" id="bl-b" value="4" min="1" max="10"></label>
+    </div>
+    <div id="bl-step"></div>
+    <div class="stage"><div class="twocol" id="bl-stage"></div></div>
+    <div class="narrate" id="bl-n"></div>
+    <div class="stats" id="bl-stats"></div>
+  </div>
+</section>
+
+<h2>利用历史：LRU</h2>
+<p>FIFO、Random 的通病是可能踢掉一个马上就要用到的重要页。和调度一章一样，我们再次<strong>用过去预测未来</strong>。两种历史信息：</p>
+<ul>
+  <li><strong>频率（frequency）</strong>：被访问很多次的页可能有价值 → <strong>LFU（Least-Frequently-Used）</strong>，踢出访问最少的页。</li>
+  <li><strong>近期性（recency）</strong>：越近被访问的页越可能再次被访问 → <strong>LRU（Least-Recently-Used）</strong>，踢出最久没被访问的页。</li>
+</ul>
+<p>这类策略都建立在<strong>局部性原理（principle of locality）</strong>上：程序倾向于反复访问某些代码（如循环）和数据结构（如循环里访问的数组）。</p>
+<div class="aside" data-title="旁注：两种局部性">
+  <p><strong>空间局部性（spatial locality）</strong>：访问了页 P，很可能接着访问 P−1 或 P+1。<strong>时间局部性（temporal locality）</strong>：最近访问过的页很可能不久后再次被访问。局部性只是一种经验规律（启发式），并非所有程序都遵守，有些程序的访问几乎是随机的。</p>
+</div>
+<p>在同一序列上，LRU 第一次替换时踢掉 2（0、1 更近被用过），第二次踢掉 0（1、3 更近）。两次决定都正确，结果 6 次命中，<strong>与 OPT 持平</strong>（原书脚注坦白：这个例子是"特意挑的"）。与之相反的 MFU、MRU 在大多数情况下表现很差，因为它们与局部性背道而驰。</p>
+
+<h2>替换策略模拟器（仿 paging-policy.py）</h2>
+<p>这是本章的核心模拟器。输入页访问序列和缓存大小，选择策略，逐步观察：每次访问是否命中、踢掉了谁、为什么踢它（OPT 显示每页的"下次使用位置"，LRU 显示最近使用顺序，Clock 显示指针和 use 位）。在页号后加 <code>w</code> 表示写（例如 <code>3w</code>），被写过的页成为脏页，踢出时要写回磁盘。</p>
+
+<section class="sim" id="sim-policy">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>页替换策略逐步追踪</h3><div class="desc">先在心里预测下一步会不会命中、踢谁，再点"下一步"验证。表格格式与原书 Figure 22.1–22.5 一致。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>访问序列 <input type="text" id="pp-refs" value="0,1,2,0,1,3,0,3,1,2,1" style="width:20em"></label>
+      <label>缓存大小 <input type="number" id="pp-size" value="3" min="1" max="12"></label>
+      <label>策略 <select id="pp-pol"><option value="OPT">OPT（最优）</option><option value="FIFO">FIFO</option><option value="RAND">Random</option><option value="LRU">LRU</option><option value="CLOCK">Clock</option></select></label>
+      <label>随机种子 <input type="number" id="pp-seed" value="12"></label>
+      <label><input type="checkbox" id="pp-dirty"> Clock 优先踢干净页</label>
+    </div>
+    <div class="controls">
+      <span class="muted small">预设：</span>
+      <button data-preset="book">原书序列（Fig 22.1–22.5）</button>
+      <button data-preset="belady">Belady 序列</button>
+      <button data-preset="dirty">带写操作</button>
+      <button data-preset="loop">循环顺序（LRU 最坏）</button>
+      <span class="sep"></span>
+      <label>随机生成 -s <input type="number" id="pp-gs" value="0" style="width:4em"></label>
+      <label>-n <input type="number" id="pp-gn" value="10" style="width:4em"></label>
+      <label>-m <input type="number" id="pp-gm" value="10" style="width:4em"></label>
+      <button id="pp-gen">生成</button>
+    </div>
+    <div id="pp-step"></div>
+    <div class="stage">
+      <div id="pp-vis"></div>
+      <div class="table-wrap"><table class="trace" id="pp-trace"></table></div>
+    </div>
+    <div class="narrate" id="pp-n"></div>
+    <div class="stats" id="pp-stats"></div>
+    <details class="reveal"><summary>同一序列、同一缓存大小下，各策略的最终成绩对比</summary><div><div class="table-wrap"><table class="cmp" id="pp-cmp"></table></div></div></details>
+  </div>
+</section>
+<p class="small muted">说明：Random 用本站可复现的伪随机数（mulberry32），种子 12 恰好复现原书 Figure 22.3 那一次的选择（依次踢掉 0、1、3，共 5 次命中）；它与 paging-policy.py 用的 Python 随机数不同，所以同一种子下的具体选择不必与官方工具一致。Clock 用的是经典"转圈指针"版本。</p>
+
+<h2>工作负载决定一切（复刻 Figure 22.6–22.9）</h2>
+<p>小序列只能说明机制，要比较策略还得看更大的工作负载。原书用了三种（都是 100 个不同页附近、共 10,000 次访问），横轴是缓存大小（1～100 页），纵轴是命中率：</p>
+<ul>
+  <li><strong>无局部性（no-locality）</strong>：每次在 100 个页中均匀随机挑一个。</li>
+  <li><strong>80-20</strong>：80% 的访问落在 20% 的"热"页（20 个），其余 20% 的访问落在 80 个"冷"页。</li>
+  <li><strong>循环顺序（looping-sequential）</strong>：依次访问 0,1,…,49，然后从头循环，共 10,000 次访问 50 个页。</li>
+</ul>
+<p>下面的曲线由你的浏览器用固定随机种子现场计算（每种负载 × 5 种策略 × 22 个缓存大小），数值每次都可复现。</p>
+
+<section class="sim" id="sim-workload">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>三种工作负载下的命中率曲线</h3><div class="desc">切换工作负载、勾选策略，把鼠标移到图上看每个缓存大小下的精确命中率。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>工作负载 <select id="wl-kind"><option value="none">无局部性（Fig 22.6）</option><option value="8020" selected>80-20（Fig 22.7 / 22.9）</option><option value="loop">循环顺序（Fig 22.8）</option></select></label>
+      <label>随机种子 <input type="number" id="wl-seed" value="42"></label>
+      <label>访问次数 <input type="number" id="wl-n" value="10000" min="1000" max="50000" step="1000"></label>
+      <button class="primary" id="wl-run">重新计算</button>
+    </div>
+    <div class="legend" id="wl-legend"></div>
+    <div class="stage"><div class="chart-wrap" id="wl-chart"></div></div>
+    <div class="narrate" id="wl-n2"></div>
+    <details class="reveal"><summary>表格视图（精确数值）</summary><div><div class="table-wrap"><table id="wl-table"></table></div></div></details>
+  </div>
+</section>
+<p>从这三张图可以读出原书的结论：</p>
+<ol>
+  <li><strong>无局部性</strong>时，LRU、FIFO、Random 表现几乎一样，命中率就等于"缓存大小 / 100"；缓存能装下全部页时，所有策略（包括 Random）都收敛到 100%；OPT 明显更好——偷看未来确实有用。</li>
+  <li><strong>80-20</strong> 负载下，Random 和 FIFO 还算不错，LRU 更好，因为它更可能留住热页；OPT 仍然更好，说明 LRU 的历史信息并不完美。Clock 介于 LRU 和 FIFO/Random 之间（Figure 22.9）。</li>
+  <li><strong>循环顺序</strong>是 LRU 和 FIFO 的<strong>最坏情况</strong>：它们总踢掉最老的页，而循环下最老的页恰恰马上要用。缓存 49 页、循环 50 页，命中率竟是 <strong>0%</strong>！Random 反而好得多——Random 的一个优点就是<strong>没有奇怪的极端行为</strong>。这类访问在数据库等重要应用中很常见。</li>
+</ol>
+<p>LRU 比 Random/FIFO 高出的那几个百分点重要吗？"看情况"：如果每次未命中代价巨大（这很常见），一点点命中率提升也能带来巨大的性能差异。</p>
+
+<h2>实现历史算法：LRU 太贵，用 Clock 近似</h2>
+<p>完美的 LRU 要在<strong>每一次内存访问</strong>（取指、load、store）时更新数据结构，把该页移到 MRU 端。FIFO 只在装入和淘汰时操作队列，LRU 却要为每次访问记账，没有精心设计就会严重拖慢性能。</p>
+<p>一种思路是硬件辅助：每次访问时硬件把当前时间写进该页的"时间字段"，替换时 OS 扫描所有时间字段找最小者。可是 4GB 内存、4KB 页就有 100 万个页，每次替换都扫一百万项，太慢了。</p>
+<div class="crux"><p><strong>如何实现 LRU 替换策略？</strong>既然完美实现 LRU 代价高昂，能否以某种方式近似它，并且仍然获得想要的效果？</p><p class="muted small">Given that it will be expensive to implement perfect LRU, can we approximate it in some way, and still obtain the desired behavior?</p></div>
+<p>答案是可以。需要一点硬件支持：<strong>use 位（又叫 reference bit，引用位）</strong>，最早出现在第一个分页系统 Atlas 上。每个页一个 use 位；页被读或写时，硬件把它置 1；<strong>硬件从不清零</strong>，清零是 OS 的事。</p>
+<p><strong>时钟算法（clock algorithm，Corbató 提出）</strong>：把所有页排成一个环，一根"表针"指向某一页。需要替换时：</p>
+<ol>
+  <li>看表针指向的页 P：若 use = 1，说明 P 最近被用过，不是好的牺牲者 → 把 use 清 0，表针前进到 P+1；</li>
+  <li>重复，直到遇到 use = 0 的页，把它踢掉（最坏情况下转一整圈，把所有位都清掉后回到起点）。</li>
+</ol>
+<figure class="fig">
+<svg viewBox="0 0 560 260" width="560" role="img" aria-label="时钟算法示意">
+  <g id="clock-static"></g>
+</svg>
+<figcaption>时钟算法：表针从页 A 开始，A、B 的 use=1 被清零并跳过（给了它们"第二次机会"），C 的 use=0 被选为牺牲者。</figcaption>
+</figure>
+<p>这不是唯一的做法：任何"定期清 use 位、然后区分 1 和 0 来决定踢谁"的方案都可以。Clock 的好处是不需要反复扫描全部内存。原书 Figure 22.9 里的 Clock 变体是"随机挑页扫描"，遇到 use=1 就清零，遇到 use=0 就选它；它不如完美 LRU，但比完全不看历史的策略好——上面曲线图里的 Clock 线正是如此。</p>
+
+<h2>考虑脏页</h2>
+<p>Corbató 也提出了对时钟算法的一个常见改进：考虑页在内存中是否<strong>被修改过</strong>。被修改过的页叫<strong>脏页（dirty page）</strong>，踢出前必须写回磁盘，代价高；没修改过的<strong>干净页（clean page）</strong>可以直接重用页框，不需要额外 I/O。硬件为此提供<strong>修改位（modified bit，又叫 dirty bit）</strong>，页被写时置 1。</p>
+<p>于是时钟算法可以改成：先找<strong>既没被使用又干净</strong>的页踢；找不到，再找没被使用但脏的页；以此类推。在上面的模拟器里勾选"Clock 优先踢干净页"、载入"带写操作"预设，对比写回次数（本站的实现：第一圈只找 (use=0, 干净) 且不清位；找不到就第二圈找 (use=0, 脏)，途中把 use=1 清零；再不行重复）。</p>
+<figure class="fig">
+<svg viewBox="0 0 600 150" width="600" role="img" aria-label="脏页与干净页的淘汰代价">
+  <rect x="20" y="20" width="120" height="44" rx="6" class="ok-soft"/><text x="80" y="47" text-anchor="middle">干净页 (D=0)</text>
+  <line x1="140" y1="42" x2="300" y2="42" class="arrow" marker-end="url(#a22b)"/><text x="220" y="34" text-anchor="middle" font-size="12.5">直接重用页框</text>
+  <rect x="300" y="20" width="130" height="44" rx="6" class="box"/><text x="365" y="47" text-anchor="middle">装入新页</text>
+  <rect x="20" y="86" width="120" height="44" rx="6" class="warn-soft"/><text x="80" y="113" text-anchor="middle">脏页 (D=1)</text>
+  <line x1="140" y1="108" x2="300" y2="108" class="arrow" marker-end="url(#a22b)"/><text x="220" y="100" text-anchor="middle" font-size="12.5">先写回磁盘（一次 I/O）</text>
+  <rect x="300" y="86" width="130" height="44" rx="6" class="box"/><text x="365" y="113" text-anchor="middle">再装入新页</text>
+  <text x="450" y="47" font-size="12.5" class="t-muted">1 次磁盘读</text>
+  <text x="450" y="113" font-size="12.5" style="fill:var(--bad)">1 次写 + 1 次读</text>
+  <defs><marker id="a22b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+</svg>
+<figcaption>淘汰脏页比淘汰干净页多一次磁盘写，这就是"优先踢干净页"的理由。</figcaption>
+</figure>
+
+<h2>其他虚拟内存策略</h2>
+<p>替换不是 VM 子系统唯一的策略：</p>
+<ul>
+  <li><strong>页选择策略（page selection policy，Denning 的叫法）</strong>：何时把页调入内存？大多数页用<strong>按需分页（demand paging）</strong>——被访问时才调入。OS 也可以猜测某页即将被用到而提前调入，这叫<strong>预取（prefetching）</strong>，只有在成功概率较大时才值得做。例如代码页 P 被调入时，很可能 P+1 也快要用到，一起调入。</li>
+  <li><strong>写出策略</strong>：可以一页一页地写回，但很多系统会在内存里攒一批待写页，一次性写到磁盘，这叫<strong>聚集（clustering）或分组写（grouping）</strong>。磁盘做一次大写比很多次小写高效得多。</li>
+</ul>
+
+<h2>抖动与准入控制</h2>
+<p>最后一个问题：如果内存被<strong>超额订阅（oversubscribed）</strong>，正在运行的进程们的内存需求之和超过了物理内存，怎么办？系统会不停地换页，这种状况叫<strong>抖动（thrashing）</strong>。</p>
+<p>早期一些系统有相当复杂的机制来检测和应对抖动。例如给定一组进程，系统可以决定<strong>暂时不运行其中一部分</strong>，希望剩下进程的<strong>工作集（working set，正在活跃使用的页）</strong>能装进内存，从而取得进展。这叫<strong>准入控制（admission control）</strong>：有时候把少量工作做好，胜过把所有工作一起做砸。</p>
+<p>一些现代系统的做法更"粗暴"：某些版本的 Linux 在内存超额时运行<strong>OOM killer（out-of-memory killer）</strong>，挑一个吃内存的进程杀掉。它确实能缓解内存压力，但如果杀掉的是 X server，所有需要显示的应用都会无法使用。</p>
+
+<section class="sim" id="sim-thrash">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>抖动悬崖与准入控制</h3><div class="desc">n 个进程轮转运行，每个进程在自己的工作集里随机访问，全局 LRU 管理 M 个页框。观察进程数超过"内存 / 工作集"时有效吞吐量怎样断崖式下跌，以及准入控制如何保住吞吐量。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>物理页框 M <input type="number" id="th-m" value="64" min="8" max="512"></label>
+      <label>每进程工作集 W <input type="number" id="th-w" value="16" min="1" max="200"></label>
+      <label>缺页代价 D <input type="number" id="th-d" value="100" min="2" max="100000"></label>
+      <label>当前进程数 n <input type="range" id="th-n" min="1" max="10" value="4"></label><span id="th-nv" class="pill mono">4</span>
+      <label><input type="checkbox" id="th-ac"> 启用准入控制</label>
+    </div>
+    <div class="legend"><span><span class="sw" style="background:var(--c2)"></span> 不做准入控制</span><span><span class="sw" style="background:var(--c3)"></span> 准入控制（最多同时运行 ⌊M/W⌋ 个）</span></div>
+    <div class="stage"><div class="chart-wrap" id="th-chart"></div></div>
+    <div class="narrate" id="th-n2"></div>
+    <div class="stats" id="th-stats"></div>
+  </div>
+</section>
+<p class="small muted">模型说明：每个进程一次运行 50 次访问后轮转；命中耗时 1、未命中耗时 D（真实系统中磁盘比内存慢 10⁴～10⁵ 倍，这里取较小的 D 以便看清曲线）；"有效吞吐量" = 访问次数 / 总耗时，1.0 表示全速运行。准入控制下，被挂起的进程在排队，内存里同时只有 ⌊M/W⌋ 个进程的工作集。</p>
+
+<h2>先预测再验证</h2>
+<div class="exercise"><div class="q">（改编自 Homework 1）在策略模拟器里点"随机生成"，用 <code>-s 0 -n 10</code>、<code>-s 1 -n 10</code>、<code>-s 2 -n 10</code> 各生成一条序列，缓存 3 页。先在纸上分别按 FIFO、LRU、OPT 写出每次是命中还是未命中，再逐步验证。</div>
+<details class="reveal"><summary>看答案</summary><div>要点：每条序列的前几个不同页一定是冷启动未命中，三种策略都一样；分歧只发生在缓存满之后需要替换的那一刻。OPT 的命中数一定 ≥ 另外两个（这是它"最优"的含义）；LRU 通常 ≥ FIFO，但在个别序列上 FIFO 可能碰巧更好。展开模拟器下方的"各策略最终成绩对比"可以一眼核对。</div></details></div>
+
+<div class="exercise"><div class="q">（改编自 Homework 2）缓存大小为 5 时，给 FIFO 和 LRU 构造"最坏"序列（每次都未命中）。需要把缓存加到多大，命中率才会显著提升并接近 OPT？</div>
+<details class="reveal"><summary>看答案</summary><div>对 FIFO 和 LRU，循环访问 6 个页 <code>0,1,2,3,4,5,0,1,2,3,4,5,…</code> 就能让每次访问都未命中：刚好被踢掉的总是下一个要用的页（载入预设"循环顺序"并把缓存改为 5、序列改成 0～5 循环试试）。缓存一旦增加到 6（能装下整个循环），除了冷启动之外全部命中，瞬间接近 OPT。对 MRU 来说，最坏序列则是在两个页之间来回交替并夹杂新页，让"最近刚用过的"总是下一个要用的。</div></details></div>
+
+<div class="exercise"><div class="q">在 Belady 模拟器里，先预测 FIFO 缓存 3 页和 4 页在序列 <code>1,2,3,4,1,2,5,1,2,3,4,5</code> 上各命中几次，再验证。然后切到 LRU 再预测。</div>
+<details class="reveal"><summary>看答案</summary><div>FIFO：3 页命中 <strong>3</strong> 次（9 次未命中），4 页只命中 <strong>2</strong> 次（10 次未命中）——缓存大了反而更差。LRU：3 页命中 2 次，4 页命中 4 次，且每一步 3 页缓存的内容都是 4 页缓存内容的子集（栈特性），所以不可能出现异常。</div></details></div>
+
+<div class="exercise"><div class="q">在工作负载图中选"循环顺序"。预测：缓存 49 页时 LRU 和 FIFO 的命中率各是多少？Random 呢？缓存 50 页时又如何？</div>
+<details class="reveal"><summary>看答案</summary><div>缓存 49 页时 LRU 和 FIFO 都是 0%（每次都恰好踢掉下一个要用的页），Random 却很高（本站种子下约 95%），因为它不会系统性地踢错。缓存到 50 页时，所有策略都只剩 50 次冷启动未命中，命中率 99.5%。</div></details></div>
+
+<div class="exercise"><div class="q">在抖动模拟器中，M=64、W=16。预测吞吐量从哪个 n 开始断崖式下降？勾选准入控制后又会怎样？</div>
+<details class="reveal"><summary>看答案</summary><div>⌊64/16⌋ = 4 个进程的工作集恰好能装下，n ≤ 4 时吞吐量接近 1；n = 5 时工作集总和 80 &gt; 64，全局 LRU 下每个进程轮到自己时，它的页往往已被别人挤出去，吞吐量骤降——这就是抖动。启用准入控制后，同时只运行 4 个，其余排队，吞吐量保持在高位。</div></details></div>
+
+<h2>动手实验</h2>
+<div class="lab">
+  <p>在 C 里实现一个 paging-policy 模拟器（与本页 JS 模拟器逻辑相同），用它<strong>交叉验证</strong>原书示例，并跑一遍三种工作负载。</p>
+  <pre><code><span class="cmd">cd labs/22-swap-policies &amp;&amp; make</span>
+<span class="cmd">./paging-policy -p ALL -c 3 -a 0,1,2,0,1,3,0,3,1,2,1</span>
+<span class="cmd">./paging-policy -p FIFO -c 3 -a 1,2,3,4,1,2,5,1,2,3,4,5 -v</span>
+<span class="cmd">./workload</span></code></pre>
+  <p>示例输出（在本机 WSL2 + gcc 14 上实际运行，确定性模拟，你的结果应一致）：</p>
+  <pre><code id="lab22-out">$ ./paging-policy -p ALL -c 3 -a 0,1,2,0,1,3,0,3,1,2,1
+policy  hits  misses  hitrate  hitrate(excl. cold)
+OPT        6       5    54.5%    85.7%
+FIFO       4       7    36.4%    57.1%
+LRU        6       5    54.5%    85.7%
+CLOCK      4       7    36.4%    57.1%
+
+$ ./paging-policy -p FIFO -c 3 -a 1,2,3,4,1,2,5,1,2,3,4,5 -v
+Access: 1  MISS  FirstIn -> [1] &lt;- LastIn  Replaced:-  [Hits:0 Misses:1]
+Access: 2  MISS  FirstIn -> [1 2] &lt;- LastIn  Replaced:-  [Hits:0 Misses:2]
+Access: 3  MISS  FirstIn -> [1 2 3] &lt;- LastIn  Replaced:-  [Hits:0 Misses:3]
+Access: 4  MISS  FirstIn -> [2 3 4] &lt;- LastIn  Replaced:1  [Hits:0 Misses:4]
+Access: 1  MISS  FirstIn -> [3 4 1] &lt;- LastIn  Replaced:2  [Hits:0 Misses:5]
+Access: 2  MISS  FirstIn -> [4 1 2] &lt;- LastIn  Replaced:3  [Hits:0 Misses:6]
+Access: 5  MISS  FirstIn -> [1 2 5] &lt;- LastIn  Replaced:4  [Hits:0 Misses:7]
+Access: 1  HIT   FirstIn -> [1 2 5] &lt;- LastIn  Replaced:-  [Hits:1 Misses:7]
+Access: 2  HIT   FirstIn -> [1 2 5] &lt;- LastIn  Replaced:-  [Hits:2 Misses:7]
+Access: 3  MISS  FirstIn -> [2 5 3] &lt;- LastIn  Replaced:1  [Hits:2 Misses:8]
+Access: 4  MISS  FirstIn -> [5 3 4] &lt;- LastIn  Replaced:2  [Hits:2 Misses:9]
+Access: 5  HIT   FirstIn -> [5 3 4] &lt;- LastIn  Replaced:-  [Hits:3 Misses:9]
+FINALSTATS hits 3   misses 9   hitrate 25.00
+
+$ ./paging-policy -p FIFO -c 4 -a 1,2,3,4,1,2,5,1,2,3,4,5
+FINALSTATS hits 2   misses 10   hitrate 16.67
+
+$ ./workload        （节选：80-20 与循环顺序）
+== 80-20 workload ==
+cache   OPT    LRU   FIFO   RAND  CLOCK
+   10  60.0%  30.7%  29.6%  29.6%  30.2%
+   20  79.8%  57.6%  51.8%  51.4%  55.1%
+   30  87.4%  75.8%  65.8%  66.2%  72.5%
+   50  93.4%  87.1%  80.4%  81.4%  86.4%
+== looping workload ==
+   40  79.2%   0.0%   0.0%  62.3%   0.0%
+   49  97.5%   0.0%   0.0%  95.5%   0.0%
+   50  99.5%  99.5%  99.5%  99.5%  99.5%</code></pre>
+  <p>还可以把 <code>valgrind --tool=lackey --trace-mem=yes ls</code> 输出的地址右移 12 位转成页号，喂给 <code>./paging-policy -f trace.txt</code>，研究真实程序需要多大的缓存（Homework 5）。详见 <code>labs/22-swap-policies/README.md</code>。</p>
+</div>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="1"><div class="q">T<sub>M</sub>=100ns、T<sub>D</sub>=10ms，命中率 99.9% 时 AMAT 约为？</div>
+<div class="opts"><button>A. 110 ns</button><button>B. 10.1 µs</button><button>C. 100 ns</button><button>D. 1 ms</button></div>
+<div class="explain">AMAT = 100ns + 0.001 × 10ms = 100ns + 10µs = 10.1µs。即使只有千分之一的未命中，时间也比纯内存访问慢约 100 倍。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">OPT 策略在需要替换时踢出哪个页？</div>
+<div class="opts"><button>A. 被访问次数最少的页</button><button>B. 最早进入内存的页</button><button>C. 最久没被访问的页</button><button>D. 将来最晚才会被访问（或不再被访问）的页</button></div>
+<div class="explain">OPT（Belady 的 MIN）看的是未来：踢掉"下次使用最远"的页。C 是 LRU，B 是 FIFO，A 是 LFU。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">为什么 OS 的页缓存不存在"冲突未命中（conflict miss）"？</div>
+<div class="opts"><button>A. 因为有 TLB</button><button>B. 因为页都很大</button><button>C. 因为 OS 使用 LRU</button><button>D. 因为页缓存是全相联的，页可以放进任意页框</button></div>
+<div class="explain">冲突未命中源自硬件缓存的组相联限制（某项只能放在特定几个位置）。OS 管理物理内存时，任何页可以放进任何空闲页框，所以只有强制未命中和容量未命中。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">关于 Belady 异常，下列说法正确的是？</div>
+<div class="opts"><button>A. FIFO 可能出现"缓存变大、命中率反而下降"，因为它不具备栈特性</button><button>B. 只要缓存足够大，FIFO 就永远不会出现异常</button><button>C. LRU 在某些序列上也会出现 Belady 异常</button><button>D. Belady 异常说明 OPT 不是最优的</button></div>
+<div class="explain">具备栈特性的算法（如 LRU、OPT）中，大小为 N+1 的缓存总包含大小为 N 的缓存内容，因此不会异常。FIFO、Random 没有栈特性。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">在"循环访问 50 个页"的负载下，缓存有 49 页。LRU 的命中率大约是？</div>
+<div class="opts"><button>A. 和 Random 差不多</button><button>B. 0%</button><button>C. 98%</button><button>D. 50%</button></div>
+<div class="explain">LRU 总是踢掉最久没用过的页，而循环中它恰好是下一个要访问的页，于是每次都未命中。这是 LRU/FIFO 的最坏情况，Random 反而表现好得多。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">关于 use 位（引用位），哪项正确？</div>
+<div class="opts"><button>A. use 位为 1 表示页是脏的</button><button>B. OS 在每次内存访问时把它置 1</button><button>C. 硬件在页被访问时把它置 1，但从不清零；清零由 OS 负责</button><button>D. 硬件定期把所有 use 位清零</button></div>
+<div class="explain">硬件只负责"置 1"，OS（例如时钟算法扫描时）负责清零。脏页由另一个位——修改位（dirty bit）——表示。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">时钟算法扫描时遇到 use=1 的页，会怎么做？</div>
+<div class="opts"><button>A. 把 use 清 0，表针前进到下一页</button><button>B. 立即踢掉它</button><button>C. 把它移到链表头</button><button>D. 停止扫描，改用 FIFO</button></div>
+<div class="explain">use=1 说明它最近被用过，给它"第二次机会"：清零并跳过。若在表针转回来之前它又被访问，use 会再次被置 1。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">系统发生抖动（thrashing）时，下列哪种做法对应原书说的"准入控制"？</div>
+<div class="opts"><button>A. 换一个更好的替换算法</button><button>B. 杀掉占用内存最多的进程</button><button>C. 暂停一部分进程，让剩下进程的工作集能装进内存</button><button>D. 把页大小调大</button></div>
+<div class="explain">准入控制是"少做一些，但做好"：挑出一个子集运行。B 是 Linux OOM killer 的做法，更粗暴。抖动的根源是内存超额订阅，再好的替换算法也救不了（A 错）。</div></div>
+
+<h2>常见误区与小结</h2>
+<div class="warn">
+  <ul>
+    <li><strong>"缓存越大命中率一定越高"</strong>——对 FIFO、Random 不成立（Belady 异常）；只有具备栈特性的策略才有这种单调性。</li>
+    <li><strong>"LRU 总是最好的现实策略"</strong>——在循环顺序负载下 LRU 是最差的之一，Random 反而更稳；现代算法（如 ARC）强调"抗扫描（scan resistance）"。</li>
+    <li><strong>"OPT 能实现，只是开销大"</strong>——OPT 需要预知未来的访问序列，通用 OS 根本无法实现；它只用于离线比较。</li>
+    <li><strong>"命中率 90% 已经很好了"</strong>——对页缓存而言，10% 的未命中就会让 AMAT 变成约 1ms，比内存慢一万倍。</li>
+    <li><strong>把 use 位和 dirty 位混为一谈</strong>——use 位记录"最近是否被访问"（读或写），dirty 位记录"是否被写过"。</li>
+  </ul>
+</div>
+<div class="key">
+  <ul>
+    <li>物理内存是虚拟页的缓存；目标是最小化未命中，用 AMAT = T<sub>M</sub> + P<sub>Miss</sub>·T<sub>D</sub> 衡量，磁盘代价让未命中率极其敏感。</li>
+    <li>OPT 踢"最晚再用"的页，是无法实现的最优标尺；原书序列上 OPT 6/11 = 54.5%，FIFO 4/11 = 36.4%，Random（原书那次）5/11，LRU 6/11。</li>
+    <li>FIFO/Random 简单但不看重要性；LRU 利用局部性，但完美实现太贵；use 位 + 时钟算法是实用的近似，考虑 dirty 位还能少写回。</li>
+    <li>策略好坏取决于工作负载：无局部性时都差不多，80-20 时 LRU 占优，循环顺序时 LRU/FIFO 崩溃而 Random 稳健。</li>
+    <li>其他策略：按需分页 vs 预取；写回时聚集。内存超额订阅时出现抖动，应对方式有准入控制和 OOM killer。</li>
+    <li>SSD 等快速存储改变了内存与存储的速度比，替换算法正在迎来复兴。下一章看这些思想在 VAX/VMS 与 Linux 中的真实形态：分段 FIFO + 二次机会链表、Linux 的 2Q（active/inactive 链表）。</li>
+  </ul>
+</div>
+
+</main>
+<script>
+(function () {
+"use strict";
+const { h, s } = OSTEP;
+const $ = (id) => document.getElementById(id);
+
+// CORE-BEGIN
+// 页面替换策略核心（纯函数，无 DOM）。refs: [{p:页号, w:是否写}]
+function mulberry(seed) {
+  let a = (seed >>> 0) || 1;
+  return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+function parseRefs(text) {
+  return String(text).split(/[\s,，]+/).filter(Boolean).map((tok) => {
+    const m = /^(\d+)([wW*])?$/.exec(tok);
+    return m ? { p: Number(m[1]), w: !!m[2] } : null;
+  }).filter(Boolean);
+}
+// 逐步模拟：返回每一步的完整快照，供单步动画使用
+function simulatePolicy(refs, size, policy, opt) {
+  opt = opt || {};
+  const rnd = mulberry(opt.seed == null ? 1 : opt.seed);
+  let mem = [];                 // FIFO: 先进在前；LRU: LRU 在前；OPT/RAND: 插入序
+  const slots = new Array(size).fill(null), use = new Array(size).fill(0); // CLOCK 专用
+  let hand = 0;
+  const dirty = new Set();
+  const steps = [];
+  let hits = 0, misses = 0, writebacks = 0;
+  const firstSeen = new Set(); let cold = 0;
+  refs.forEach((r, i) => {
+    const page = r.p;
+    let hit, victim = null, scan = [];
+    const isCold = !firstSeen.has(page); firstSeen.add(page);
+    if (policy === "CLOCK") {
+      const at = slots.indexOf(page);
+      hit = at >= 0;
+      if (hit) { use[at] = 1; }
+      else {
+        let free = slots.indexOf(null);
+        if (free < 0) {
+          if (opt.dirtyAware) {
+            // 增强 Clock：先找 (use=0, clean)，不清 use 位；再找 (use=0, dirty)，途中清 use 位；循环
+            for (let guard = 0; guard < 4 * size + 4 && free < 0; guard++) {
+              let found = -1;
+              for (let k = 0; k < size; k++) {
+                const s2 = (hand + k) % size;
+                if (use[s2] === 0 && !dirty.has(slots[s2])) { found = s2; scan.push({ s: s2, act: "pick" }); break; }
+                scan.push({ s: s2, act: "skip" });
+              }
+              if (found < 0) {
+                for (let k = 0; k < size; k++) {
+                  const s2 = (hand + k) % size;
+                  if (use[s2] === 0) { found = s2; scan.push({ s: s2, act: "pick" }); break; }
+                  use[s2] = 0; scan.push({ s: s2, act: "clear" });
+                }
+              }
+              if (found >= 0) free = found;
+            }
+          } else {
+            while (true) {
+              if (use[hand] === 1) { use[hand] = 0; scan.push({ s: hand, act: "clear" }); hand = (hand + 1) % size; }
+              else { free = hand; scan.push({ s: hand, act: "pick" }); break; }
+            }
+          }
+          victim = slots[free];
+          hand = (free + 1) % size;
+        }
+        slots[free] = page; use[free] = 1;
+      }
+      mem = slots.filter((x) => x !== null);
+    } else {
+      const at = mem.indexOf(page);
+      hit = at >= 0;
+      if (hit) {
+        if (policy === "LRU") { mem.splice(at, 1); mem.push(page); }
+      } else {
+        if (mem.length >= size) {
+          let idx = 0;
+          if (policy === "RAND") idx = Math.floor(rnd() * mem.length);
+          else if (policy === "OPT") {
+            // 与 paging-policy.py 相同：选"下次使用最远"者，平局取内存列表中靠后的那个（>=）
+            let best = -1;
+            mem.forEach((pg, k) => {
+              let when = refs.length;
+              for (let j = i + 1; j < refs.length; j++) if (refs[j].p === pg) { when = j; break; }
+              if (when >= best) { best = when; idx = k; }
+            });
+          }
+          victim = mem.splice(idx, 1)[0];
+        }
+        mem.push(page);
+      }
+    }
+    if (hit) hits++; else { misses++; if (isCold) cold++; }
+    let wb = false;
+    if (victim !== null && dirty.has(victim)) { writebacks++; wb = true; dirty.delete(victim); }
+    if (r.w) dirty.add(page);
+    steps.push({
+      i, page, w: r.w, hit, victim, wb, cold: !hit && isCold,
+      mem: mem.slice(), slots: slots.slice(), use: use.slice(), hand, scan,
+      dirty: [...dirty], hits, misses, writebacks, coldMisses: cold,
+    });
+  });
+  return { steps, hits, misses, writebacks, cold };
+}
+// 批量快速版（工作负载曲线用）：只返回命中数
+function countHits(refs, size, policy, seed) {
+  const n = refs.length;
+  let hits = 0;
+  if (policy === "OPT") {
+    const next = new Array(n), last = new Map();
+    for (let i = n - 1; i >= 0; i--) { next[i] = last.has(refs[i]) ? last.get(refs[i]) : Infinity; last.set(refs[i], i); }
+    const inCache = new Map(); // page -> next use
+    for (let i = 0; i < n; i++) {
+      const p = refs[i];
+      if (inCache.has(p)) hits++;
+      else if (inCache.size >= size) {
+        let vp = -1, far = -1;
+        for (const [q, t] of inCache) if (t > far) { far = t; vp = q; }
+        inCache.delete(vp);
+      }
+      inCache.set(p, next[i]);
+    }
+    return hits;
+  }
+  if (policy === "LRU") {
+    const m = new Map();
+    for (const p of refs) {
+      if (m.has(p)) { hits++; m.delete(p); }
+      else if (m.size >= size) m.delete(m.keys().next().value);
+      m.set(p, 1);
+    }
+    return hits;
+  }
+  if (policy === "FIFO") {
+    const q = [], set = new Set(); let head = 0;
+    for (const p of refs) {
+      if (set.has(p)) { hits++; continue; }
+      if (set.size >= size) set.delete(q[head++]);
+      q.push(p); set.add(p);
+    }
+    return hits;
+  }
+  if (policy === "RAND") {
+    const rnd = mulberry(seed || 7), arr = [], pos = new Map();
+    for (const p of refs) {
+      if (pos.has(p)) { hits++; continue; }
+      if (arr.length >= size) {
+        const k = Math.floor(rnd() * arr.length), v = arr[k], last = arr.pop();
+        pos.delete(v);
+        if (k < arr.length) { arr[k] = last; pos.set(last, k); }
+      }
+      pos.set(p, arr.length); arr.push(p);
+    }
+    return hits;
+  }
+  if (policy === "CLOCK") {
+    const slots = new Array(size).fill(-1), use = new Uint8Array(size), where = new Map();
+    let hand = 0, filled = 0;
+    for (const p of refs) {
+      if (where.has(p)) { hits++; use[where.get(p)] = 1; continue; }
+      let s2;
+      if (filled < size) s2 = filled++;
+      else {
+        while (use[hand]) { use[hand] = 0; hand = (hand + 1) % size; }
+        s2 = hand; where.delete(slots[s2]); hand = (hand + 1) % size;
+      }
+      slots[s2] = p; use[s2] = 1; where.set(p, s2);
+    }
+    return hits;
+  }
+  return 0;
+}
+function makeWorkload(kind, n, seed) {
+  const rnd = mulberry(seed), out = new Array(n);
+  for (let i = 0; i < n; i++) {
+    if (kind === "loop") out[i] = i % 50;
+    else if (kind === "8020") out[i] = rnd() < 0.8 ? Math.floor(rnd() * 20) : 20 + Math.floor(rnd() * 80);
+    else out[i] = Math.floor(rnd() * 100);
+  }
+  return out;
+}
+// 抖动模型：n 个进程轮转，每进程在自己的 W 页工作集内均匀随机访问，全局 LRU 管理 M 个页框
+function thrashRun(n, M, W, D) {
+  const rnd = mulberry(5), lru = new Map(), Q = 50, rounds = 40, warm = 4;
+  let refs = 0, miss = 0;
+  for (let r = 0; r < rounds; r++) for (let p = 0; p < n; p++) for (let q = 0; q < Q; q++) {
+    const page = p * 100000 + Math.floor(rnd() * W);
+    let m = false;
+    if (lru.has(page)) lru.delete(page);
+    else { m = true; if (lru.size >= M) lru.delete(lru.keys().next().value); }
+    lru.set(page, 1);
+    if (r >= warm) { refs++; if (m) miss++; }
+  }
+  return { missRate: miss / refs, thr: refs / (refs + miss * (D - 1)) };
+}
+// CORE-END
+
+const POLS = ["OPT", "FIFO", "RAND", "LRU", "CLOCK"];
+const PNAME = { OPT: "OPT", FIFO: "FIFO", RAND: "Random", LRU: "LRU", CLOCK: "Clock" };
+
+// ---------------- AMAT ----------------
+(function amat() {
+  const hit = $("amat-hit"), tm = $("amat-tm"), td = $("amat-td");
+  function fmt(ns) {
+    if (ns >= 1e6) return (ns / 1e6).toPrecision(5).replace(/\.?0+$/, "") + " ms";
+    if (ns >= 1e3) return (ns / 1e3).toPrecision(4).replace(/\.?0+$/, "") + " µs";
+    return ns.toPrecision(4).replace(/\.?0+$/, "") + " ns";
+  }
+  function upd() {
+    const ph = Number(hit.value) / 1000, TM = Math.max(1e-9, Number(tm.value) || 0), TD = (Number(td.value) || 0) * 1e6;
+    const pm = 1 - ph, a = TM + pm * TD;
+    $("amat-hitv").textContent = (ph * 100).toFixed(1) + "%";
+    $("amat-v").textContent = fmt(a);
+    $("amat-x").textContent = (a / TM).toFixed(a / TM < 10 ? 2 : 0) + "×";
+    $("amat-share").textContent = ((pm * TD) / a * 100).toFixed(1) + "%";
+    $("amat-n").textContent = `P_Miss = ${pm.toFixed(3)}：AMAT = ${fmt(TM)} + ${pm.toFixed(3)} × ${fmt(TD)} = ${fmt(a)}。` +
+      (pm > 0 ? `其中 ${((pm * TD) / a * 100).toFixed(1)}% 的时间花在磁盘上——未命中率稍微下降一点，AMAT 就大幅下降。` : "全部命中时 AMAT 就等于内存访问时间。");
+  }
+  [hit, tm, td].forEach((e) => e.addEventListener("input", upd));
+  document.querySelectorAll("#sim-amat [data-hit]").forEach((b) => b.onclick = () => { hit.value = b.dataset.hit; upd(); });
+  upd();
+})();
+
+// ---------------- OPT 未来示意 ----------------
+(function optFig() {
+  const g = $("opt-seq"), seq = [0, 1, 2, 0, 1, 3, 0, 3, 1, 2, 1];
+  seq.forEach((p, k) => {
+    const x = 110 + k * 48;
+    g.append(s("text", { x: x + 17, y: 28, "text-anchor": "middle", "font-size": 12, class: "t-muted mono", text: k }));
+    const cls = k === 5 ? "bad-soft" : k < 5 ? "box" : "accent-soft";
+    g.append(s("rect", { x, y: 40, width: 34, height: 30, rx: 5, class: cls }));
+    g.append(s("text", { x: x + 17, y: 60, "text-anchor": "middle", class: "mono", "font-weight": 600, text: p }));
+  });
+  const arcs = [[6, "var(--ok)"], [8, "var(--warn)"], [9, "var(--bad)"]];
+  arcs.forEach(([k, c], j) => {
+    const x0 = 110 + 5 * 48 + 17, x1 = 110 + k * 48 + 17, y = 78, dy = 16 + j * 14;
+    g.append(s("path", { d: `M${x0},${y} C${x0},${y + dy + 8} ${x1},${y + dy + 8} ${x1},${y}`, fill: "none", style: `stroke:${c};stroke-width:2` }));
+  });
+  g.append(s("text", { x: 110 + 5 * 48 + 17, y: 132, "text-anchor": "middle", "font-size": 12, text: "↑ 此刻需替换" }));
+})();
+
+// ---------------- 时钟算法静态图 ----------------
+(function clockFig() {
+  const g = $("clock-static");
+  const items = [["A", 1, "清 0 跳过"], ["B", 1, "清 0 跳过"], ["C", 0, "淘汰"], ["D", 1, ""], ["E", 0, ""], ["F", 1, ""]];
+  const cx = 170, cy = 130, R = 92;
+  g.append(s("circle", { cx, cy, r: R, fill: "none", style: "stroke:var(--border);stroke-dasharray:4 4" }));
+  items.forEach(([name, u, note], k) => {
+    const ang = -Math.PI / 2 + (k * 2 * Math.PI) / items.length;
+    const x = cx + R * Math.cos(ang), y = cy + R * Math.sin(ang);
+    const cls = k === 2 ? "bad-soft" : k < 2 ? "warn-soft" : "box";
+    g.append(s("rect", { x: x - 24, y: y - 18, width: 48, height: 36, rx: 6, class: cls }));
+    g.append(s("text", { x, y: y - 2, "text-anchor": "middle", "font-weight": 600, text: name }));
+    g.append(s("text", { x, y: y + 13, "text-anchor": "middle", "font-size": 11, class: "mono", text: "use=" + (k < 2 ? "1→0" : u) }));
+  });
+  const a0 = -Math.PI / 2;
+  g.append(s("line", { x1: cx, y1: cy, x2: cx + 55 * Math.cos(a0), y2: cy + 55 * Math.sin(a0), style: "stroke:var(--accent);stroke-width:3", "marker-end": "url(#a22)" }));
+  g.append(s("circle", { cx, cy, r: 5, class: "accent" }));
+  g.append(s("text", { x: cx + 8, y: cy + 22, "font-size": 12, text: "表针起点" }));
+  const lines = ["① 指向 A：use=1 → 清 0，前进", "② 指向 B：use=1 → 清 0，前进", "③ 指向 C：use=0 → 选中，淘汰 C", "④ 新页装入 C 的位置，use=1", "    表针停在 D，下次从 D 开始"];
+  lines.forEach((t, k) => g.append(s("text", { x: 300, y: 70 + k * 26, "font-size": 13, text: t })));
+})();
+
+// ---------------- Random 直方图 ----------------
+(function randHist() {
+  const refs = parseRefs("0,1,2,0,1,3,0,3,1,2,1");
+  function run() {
+    const N = Math.max(100, Math.min(100000, Number($("rh-n").value) || 10000));
+    const hist = new Array(8).fill(0);
+    for (let sd = 1; sd <= N; sd++) hist[simulatePolicy(refs, 3, "RAND", { seed: sd }).hits]++;
+    const W = 560, H = 230, x0 = 50, y0 = 190, bw = 54, maxv = Math.max(...hist);
+    const top = Math.ceil((maxv / N) * 10) * 10;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "Random 命中次数分布" });
+    for (let t = 0; t <= top; t += 10) {
+      const y = y0 - (t / top) * 160;
+      svg.append(s("line", { x1: x0, x2: x0 + 8 * (bw + 8), y1: y, y2: y, style: "stroke:var(--border)" }));
+      svg.append(s("text", { x: x0 - 6, y: y + 4, "text-anchor": "end", "font-size": 11, class: "t-muted", text: t + "%" }));
+    }
+    hist.forEach((c, k) => {
+      const pct = (c / N) * 100, hh = (pct / top) * 160, x = x0 + 4 + k * (bw + 8);
+      const r = s("rect", { x, y: y0 - hh, width: bw, height: Math.max(0, hh), rx: 3, style: `fill:${k === 6 ? "var(--c3)" : "var(--c1)"}` });
+      r.append(s("title", { text: `${k} 次命中：${c} 次（${pct.toFixed(2)}%）` }));
+      svg.append(r);
+      if (c) svg.append(s("text", { x: x + bw / 2, y: y0 - hh - 5, "text-anchor": "middle", "font-size": 11, text: pct.toFixed(1) + "%" }));
+      svg.append(s("text", { x: x + bw / 2, y: y0 + 16, "text-anchor": "middle", "font-size": 12, class: "mono", text: k }));
+    });
+    svg.append(s("text", { x: x0 + 4 * (bw + 8), y: H - 4, "text-anchor": "middle", "font-size": 12, class: "t-muted", text: "命中次数（共 11 次访问）" }));
+    $("rh-chart").replaceChildren(svg);
+    const p6 = (hist[6] / N) * 100, le2 = ((hist[0] + hist[1] + hist[2]) / N) * 100;
+    $("rh-n2").innerHTML = `${N} 次试验中，<strong>${p6.toFixed(1)}%</strong> 的情况 Random 达到 6 次命中（与 OPT 一样好，原书："just over 40%"）；` +
+      `${le2.toFixed(2)}% 的情况只有 2 次或更少。不可能达到 7 次——OPT 的 6 次已是上限。平均命中 ${(hist.reduce((a, c, k) => a + c * k, 0) / N).toFixed(2)} 次。`;
+  }
+  $("rh-run").onclick = run;
+  run();
+})();
+
+// ---------------- 缓存内容可视化（通用） ----------------
+function nextUse(refs, i, page) {
+  for (let j = i + 1; j < refs.length; j++) if (refs[j].p === page) return j;
+  return -1;
+}
+function framesRow(policy, st, refs, size) {
+  const row = h("div", { class: "frames" });
+  if (!st) { row.append(h("span", { class: "muted small" }, "（缓存为空）")); return row; }
+  const dirty = new Set(st.dirty);
+  const lbl = { FIFO: ["先进 →", "← 后进"], LRU: ["LRU →", "← MRU"], OPT: ["", ""], RAND: ["", ""] }[policy] || ["", ""];
+  if (lbl[0]) row.append(h("span", { class: "lbl-end" }, lbl[0]));
+  st.mem.forEach((p) => {
+    const cls = "cell " + (p === st.page ? (st.hit ? "hit pulse" : "miss pulse") : "");
+    let sub = "";
+    if (policy === "OPT") { const nu = nextUse(refs, st.i, p); sub = nu < 0 ? "不再使用" : "下次 #" + nu; }
+    row.append(h("div", { class: "frame" }, h("div", { class: cls }, String(p), dirty.has(p) ? h("span", { class: "dirty-mark", title: "脏页" }, "D") : null), sub ? h("small", {}, sub) : null));
+  });
+  for (let k = st.mem.length; k < size; k++) row.append(h("div", { class: "frame" }, h("div", { class: "cell" }, "·"), policy === "OPT" ? h("small", {}, "空") : null));
+  if (lbl[1]) row.append(h("span", { class: "lbl-end" }, lbl[1]));
+  if (st.victim !== null) row.append(h("div", { class: "frame", style: { marginLeft: "14px" } }, h("div", { class: "cell evict" }, String(st.victim)), h("small", {}, st.wb ? "被淘汰·写回" : "被淘汰")));
+  return row;
+}
+function clockSvg(st, size) {
+  const R = Math.min(110, 62 + size * 5), cx = R + 60, cy = R + 44, W = cx + R + 200, H = 2 * R + 88, LX = cx + R + 56;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "时钟算法状态" });
+  svg.append(s("circle", { cx, cy, r: R, fill: "none", style: "stroke:var(--border);stroke-dasharray:4 4" }));
+  const dirty = st ? new Set(st.dirty) : new Set();
+  const scanMap = new Map(); if (st) st.scan.forEach((x) => scanMap.set(x.s, x.act));
+  for (let k = 0; k < size; k++) {
+    const ang = -Math.PI / 2 + (k * 2 * Math.PI) / size, x = cx + R * Math.cos(ang), y = cy + R * Math.sin(ang);
+    const p = st ? st.slots[k] : null, u = st ? st.use[k] : 0;
+    let cls = "box";
+    if (st && p === st.page) cls = st.hit ? "ok-soft" : "bad-soft";
+    else if (scanMap.get(k) === "clear") cls = "warn-soft";
+    svg.append(s("rect", { x: x - 25, y: y - 20, width: 50, height: 40, rx: 6, class: cls }));
+    svg.append(s("text", { x, y: y - 3, "text-anchor": "middle", "font-weight": 700, class: "mono", text: p === null ? "·" : p + (dirty.has(p) ? "ᴰ" : "") }));
+    svg.append(s("text", { x, y: y + 13, "text-anchor": "middle", "font-size": 11, class: "mono", text: "use=" + u }));
+    svg.append(s("text", { x: cx + (R + 36) * Math.cos(ang), y: cy + (R + 36) * Math.sin(ang) + 4, "text-anchor": "middle", "font-size": 10.5, class: "t-muted mono", text: "帧" + k }));
+  }
+  const hand = st ? st.hand : 0, ang = -Math.PI / 2 + (hand * 2 * Math.PI) / size;
+  svg.append(s("line", { x1: cx, y1: cy, x2: cx + (R - 32) * Math.cos(ang), y2: cy + (R - 32) * Math.sin(ang), style: "stroke:var(--accent);stroke-width:3", "marker-end": "url(#a22)" }));
+  svg.append(s("circle", { cx, cy, r: 5, class: "accent" }));
+  svg.append(s("text", { x: LX, y: 40, "font-size": 12.5, text: "表针 → 帧" + hand }));
+  svg.append(s("text", { x: LX, y: 62, "font-size": 11.5, class: "t-muted", text: "黄框：本次被清 0" }));
+  svg.append(s("text", { x: LX, y: 80, "font-size": 11.5, class: "t-muted", text: "ᴰ：脏页" }));
+  svg.append(s("text", { x: LX, y: 98, "font-size": 11.5, class: "t-muted", text: "绿/红框：本次命中/装入" }));
+  return svg;
+}
+
+// ---------------- 主模拟器 ----------------
+(function policySim() {
+  const el = { refs: $("pp-refs"), size: $("pp-size"), pol: $("pp-pol"), seed: $("pp-seed"), dirty: $("pp-dirty") };
+  let refs = [], size = 3, pol = "OPT", res = null;
+  function compute() {
+    refs = parseRefs(el.refs.value);
+    size = Math.max(1, Math.min(12, Number(el.size.value) || 3));
+    pol = el.pol.value;
+    res = simulatePolicy(refs, size, pol, { seed: Number(el.seed.value) || 0, dirtyAware: el.dirty.checked });
+    // 对比表
+    const t = $("pp-cmp");
+    const rows = POLS.map((p) => [p, simulatePolicy(refs, size, p, { seed: Number(el.seed.value) || 0, dirtyAware: el.dirty.checked })]);
+    const best = Math.max(...rows.map((r) => r[1].hits));
+    t.replaceChildren(h("tr", {}, h("th", {}, "策略"), h("th", { class: "num" }, "命中"), h("th", { class: "num" }, "未命中"), h("th", { class: "num" }, "命中率"), h("th", { class: "num" }, "不计冷启动"), h("th", { class: "num" }, "脏页写回")),
+      ...rows.map(([p, r]) => h("tr", {}, h("td", {}, PNAME[p] + (p === "RAND" ? `（种子 ${el.seed.value}）` : "")), h("td", { class: "num" + (r.hits === best ? " best" : "") }, r.hits), h("td", { class: "num" }, r.misses),
+        h("td", { class: "num" }, refs.length ? (100 * r.hits / refs.length).toFixed(1) + "%" : "—"),
+        h("td", { class: "num" }, refs.length - r.cold ? (100 * r.hits / (refs.length - r.cold)).toFixed(1) + "%" : "—"), h("td", { class: "num" }, r.writebacks))));
+  }
+  function narrate(st) {
+    if (!st) return "输入访问序列后开始。";
+    const p = st.page, prev = st.i > 0 ? res.steps[st.i - 1] : null;
+    let t = `第 ${st.i} 次访问：页 ${p}${st.w ? "（写）" : ""}。`;
+    if (st.hit) {
+      t += "<strong>命中</strong>，页已在内存中。";
+      if (pol === "LRU") t += `把 ${p} 移到 MRU 端（最近使用）。`;
+      if (pol === "CLOCK") t += `硬件把它的 use 位置 1。`;
+      if (pol === "FIFO") t += "FIFO 不因命中而调整顺序——这正是它的弱点。";
+    } else if (st.victim === null) {
+      t += `<strong>未命中</strong>${st.cold ? "（冷启动/强制未命中）" : ""}，缓存还有空位，直接装入。`;
+    } else {
+      t += `<strong>未命中</strong>${st.cold ? "（首次访问）" : ""}，缓存已满，必须替换。`;
+      if (pol === "OPT" && prev) {
+        const info = prev.mem.map((q) => { const nu = nextUse(refs, st.i, q); return `${q}→${nu < 0 ? "不再使用" : "#" + nu}`; }).join("，");
+        t += `看未来：${info}。踢出最远的 <strong>${st.victim}</strong>。`;
+      } else if (pol === "FIFO") t += `最先进入的是 <strong>${st.victim}</strong>，踢掉它（不管它最近有没有被用过）。`;
+      else if (pol === "LRU") t += `最久没被使用的是 <strong>${st.victim}</strong>，踢掉它。`;
+      else if (pol === "RAND") t += `随机挑中 <strong>${st.victim}</strong>。`;
+      else if (pol === "CLOCK") {
+        const parts = st.scan.map((x) => x.act === "clear" ? `帧${x.s}(use 1→0)` : x.act === "skip" ? `帧${x.s}(跳过)` : `帧${x.s}(use=0，选中)`);
+        t += `表针扫描：${parts.join(" → ")}，淘汰 <strong>${st.victim}</strong>，新页放入该帧，表针前进。`;
+      }
+      if (st.wb) t += ` 页 ${st.victim} 是<strong>脏页</strong>，淘汰前必须先写回磁盘（额外一次 I/O）。`;
+    }
+    return t;
+  }
+  function render(i) {
+    const st = res.steps[i];
+    const vis = $("pp-vis");
+    vis.replaceChildren();
+    if (pol === "CLOCK") vis.append(clockSvg(st, size));
+    else vis.append(framesRow(pol, st, refs, size));
+    // 表格
+    const orderLbl = { FIFO: "先进 → ", LRU: "LRU → " }[pol] || "";
+    const head = h("tr", {}, h("th", {}, "#"), h("th", {}, "访问"), h("th", {}, "命中？"), h("th", {}, "淘汰"), h("th", {}, "结果缓存状态"), pol === "CLOCK" ? h("th", {}, "use 位 / 表针") : null);
+    const rows = refs.map((r, k) => {
+      const x = res.steps[k];
+      if (k > i) return h("tr", { class: "future" }, h("td", {}, k), h("td", {}, r.p + (r.w ? "w" : "")), h("td", {}, "?"), h("td", {}, ""), h("td", {}, ""), pol === "CLOCK" ? h("td", {}, "") : null);
+      const state = pol === "CLOCK" ? x.slots.map((q) => q === null ? "·" : q).join(", ") : orderLbl + x.mem.join(", ");
+      return h("tr", { class: k === i ? "cur" : "" }, h("td", {}, k), h("td", {}, r.p + (r.w ? "w" : "")),
+        h("td", {}, h("span", { class: x.hit ? "h" : "m" }, x.hit ? "Hit" : "Miss")), h("td", {}, x.victim === null ? "" : x.victim + (x.wb ? "（写回）" : "")),
+        h("td", {}, state), pol === "CLOCK" ? h("td", {}, x.use.join("") + " / 帧" + x.hand) : null);
+    });
+    $("pp-trace").replaceChildren(head, ...rows);
+    $("pp-n").innerHTML = narrate(st);
+    const hits = st ? st.hits : 0, n = st ? st.i + 1 : 0, cold = st ? st.coldMisses : 0;
+    $("pp-stats").replaceChildren(
+      h("div", { class: "stat" }, h("div", { class: "v" }, hits), h("div", { class: "l" }, "命中")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, st ? st.misses : 0), h("div", { class: "l" }, "未命中（其中冷启动 " + cold + "）")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, n ? (100 * hits / n).toFixed(1) + "%" : "—"), h("div", { class: "l" }, "命中率（到当前步）")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, n - cold ? (100 * hits / (n - cold)).toFixed(1) + "%" : "—"), h("div", { class: "l" }, "不计冷启动的命中率")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, st ? st.writebacks : 0), h("div", { class: "l" }, "脏页写回次数")));
+  }
+  compute();
+  const stp = OSTEP.stepper($("pp-step"), { steps: () => Math.max(1, res.steps.length), render, autoplayMs: 1100 });
+  const redo = () => { compute(); stp.reset(); };
+  [el.refs, el.size, el.pol, el.seed, el.dirty].forEach((e) => e.addEventListener("change", redo));
+  const presets = {
+    book: ["0,1,2,0,1,3,0,3,1,2,1", 3],
+    belady: ["1,2,3,4,1,2,5,1,2,3,4,5", 3],
+    dirty: ["0w,1,2w,0,1,3,0w,3,1,2,4,1w,0,2,3", 3],
+    loop: ["0,1,2,3,0,1,2,3,0,1,2,3", 3],
+  };
+  document.querySelectorAll("#sim-policy [data-preset]").forEach((b) => b.onclick = () => {
+    const [r, c] = presets[b.dataset.preset];
+    el.refs.value = r; el.size.value = c;
+    if (b.dataset.preset === "book") el.seed.value = 12;
+    if (b.dataset.preset === "dirty") { el.pol.value = "CLOCK"; }
+    redo();
+  });
+  $("pp-gen").onclick = () => {
+    const rnd = mulberry(Number($("pp-gs").value) + 1), n = Math.max(1, Math.min(60, Number($("pp-gn").value) || 10)), m = Math.max(1, Number($("pp-gm").value) || 10);
+    el.refs.value = Array.from({ length: n }, () => Math.floor(rnd() * m)).join(",");
+    redo();
+  };
+})();
+
+// ---------------- Belady 并排 ----------------
+(function belady() {
+  let A, B, refs, pol;
+  function compute() {
+    refs = parseRefs($("bl-refs").value);
+    pol = $("bl-pol").value;
+    const a = Math.max(1, Number($("bl-a").value) || 3), b = Math.max(1, Number($("bl-b").value) || 4);
+    A = { size: a, r: simulatePolicy(refs, a, pol) };
+    B = { size: b, r: simulatePolicy(refs, b, pol) };
+  }
+  function col(X, i) {
+    const box = h("div", {});
+    box.append(h("h4", {}, `${pol}，缓存 ${X.size} 页`));
+    const t = h("table", { class: "trace" }, h("tr", {}, h("th", {}, "访问"), h("th", {}, "结果"), h("th", {}, "缓存")));
+    refs.forEach((r, k) => {
+      const x = X.r.steps[k];
+      t.append(k > i ? h("tr", { class: "future" }, h("td", {}, r.p), h("td", {}, "?"), h("td", {}, "")) :
+        h("tr", { class: k === i ? "cur" : "" }, h("td", {}, r.p), h("td", {}, h("span", { class: x.hit ? "h" : "m" }, x.hit ? "Hit" : "Miss")), h("td", {}, "[" + x.mem.join(" ") + "]")));
+    });
+    box.append(h("div", { class: "table-wrap" }, t));
+    return box;
+  }
+  function render(i) {
+    if (!refs.length) { $("bl-stage").replaceChildren(h("p", { class: "muted" }, "请输入序列")); return; }
+    $("bl-stage").replaceChildren(col(A, i), col(B, i));
+    const a = A.r.steps[i], b = B.r.steps[i];
+    const small = A.size <= B.size ? a : b, big = A.size <= B.size ? b : a;
+    const subset = small.mem.every((p) => big.mem.includes(p));
+    $("bl-n").innerHTML = `到第 ${i} 次访问为止：${A.size} 页缓存命中 <strong>${a.hits}</strong> 次，${B.size} 页缓存命中 <strong>${b.hits}</strong> 次。` +
+      `小缓存内容 {${small.mem.join(",")}} ${subset ? '<span class="subset-ok">⊆</span>' : '<span class="subset-bad">⊄</span>'} 大缓存内容 {${big.mem.join(",")}}。` +
+      (subset ? "" : " 这一步栈特性被破坏了——正是 FIFO 可能出现 Belady 异常的根源。");
+    const fa = A.r.hits, fb = B.r.hits;
+    $("bl-stats").replaceChildren(
+      h("div", { class: "stat" }, h("div", { class: "v" }, fa + " / " + refs.length), h("div", { class: "l" }, `最终命中（${A.size} 页）`)),
+      h("div", { class: "stat" }, h("div", { class: "v" }, fb + " / " + refs.length), h("div", { class: "l" }, `最终命中（${B.size} 页）`)),
+      h("div", { class: "stat" }, h("div", { class: "v", style: { color: (A.size < B.size ? fb < fa : fa < fb) ? "var(--bad)" : "var(--ok)" } }, (A.size < B.size ? fb < fa : fa < fb) ? "出现异常" : "无异常"), h("div", { class: "l" }, "大缓存是否更差")));
+  }
+  compute();
+  const stp = OSTEP.stepper($("bl-step"), { steps: () => Math.max(1, refs.length), render });
+  ["bl-pol", "bl-refs", "bl-a", "bl-b"].forEach((id) => $(id).addEventListener("change", () => { compute(); stp.reset(); }));
+})();
+
+// ---------------- 工作负载曲线 ----------------
+(function workload() {
+  const SIZES = [1]; for (let c = 5; c <= 100; c += 5) { if (c === 50) SIZES.push(49); SIZES.push(c); }
+  const COLORS = { OPT: "var(--c1)", LRU: "var(--c2)", FIFO: "var(--c3)", RAND: "var(--c4)", CLOCK: "var(--c5)" };
+  const ORDER = ["OPT", "LRU", "FIFO", "RAND", "CLOCK"];
+  const shown = { OPT: true, LRU: true, FIFO: true, RAND: true, CLOCK: true };
+  let data = null;
+  const leg = $("wl-legend");
+  ORDER.forEach((p) => {
+    const cb = h("input", { type: "checkbox", checked: true });
+    cb.onchange = () => { shown[p] = cb.checked; draw(); };
+    leg.append(h("label", {}, cb, h("span", { class: "sw", style: { background: COLORS[p] } }), PNAME[p]));
+  });
+  function compute() {
+    const kind = $("wl-kind").value, seed = Number($("wl-seed").value) || 1, n = Math.max(1000, Math.min(50000, Number($("wl-n").value) || 10000));
+    const refs = makeWorkload(kind, n, seed);
+    data = { kind, n, series: {} };
+    ORDER.forEach((p) => data.series[p] = SIZES.map((c) => countHits(refs, c, p, seed + 7) / n * 100));
+  }
+  function draw() {
+    const W = 640, H = 330, L = 50, R = 20, T = 16, B = 44, pw = W - L - R, ph = H - T - B;
+    const X = (c) => L + ((c - 0) / 100) * pw, Y = (v) => T + ph - (v / 100) * ph;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "命中率随缓存大小变化" });
+    for (let v = 0; v <= 100; v += 20) {
+      svg.append(s("line", { x1: L, x2: W - R, y1: Y(v), y2: Y(v), style: "stroke:var(--border)" }));
+      svg.append(s("text", { x: L - 8, y: Y(v) + 4, "text-anchor": "end", "font-size": 11, class: "t-muted", text: v + "%" }));
+    }
+    for (let c = 0; c <= 100; c += 20) svg.append(s("text", { x: X(c), y: H - B + 18, "text-anchor": "middle", "font-size": 11, class: "t-muted", text: c }));
+    svg.append(s("text", { x: L + pw / 2, y: H - 6, "text-anchor": "middle", "font-size": 12, class: "t-muted", text: "缓存大小（页）" }));
+    svg.append(s("text", { x: 14, y: T + ph / 2, "text-anchor": "middle", "font-size": 12, class: "t-muted", transform: `rotate(-90 14 ${T + ph / 2})`, text: "命中率" }));
+    ORDER.forEach((p) => {
+      if (!shown[p]) return;
+      const pts = SIZES.map((c, k) => `${X(c).toFixed(1)},${Y(data.series[p][k]).toFixed(1)}`).join(" ");
+      svg.append(s("polyline", { points: pts, fill: "none", style: `stroke:${COLORS[p]};stroke-width:2;stroke-linejoin:round` }));
+    });
+    const cross = s("line", { x1: 0, x2: 0, y1: T, y2: T + ph, style: "stroke:var(--muted);stroke-dasharray:3 3", visibility: "hidden" });
+    svg.append(cross);
+    const dots = ORDER.map((p) => { const d = s("circle", { r: 4.5, style: `fill:${COLORS[p]};stroke:var(--surface);stroke-width:2`, visibility: "hidden" }); svg.append(d); return d; });
+    const hit = s("rect", { x: L, y: T, width: pw, height: ph, fill: "transparent" });
+    svg.append(hit);
+    const wrap = $("wl-chart"), tip = h("div", { class: "chart-tip", hidden: true });
+    function move(ev) {
+      const pt = svg.createSVGPoint(); pt.x = ev.clientX; pt.y = ev.clientY;
+      const loc = pt.matrixTransform(svg.getScreenCTM().inverse());
+      let k = 0, best = 1e9; SIZES.forEach((c, j) => { const d = Math.abs(X(c) - loc.x); if (d < best) { best = d; k = j; } });
+      const c = SIZES[k];
+      cross.setAttribute("x1", X(c)); cross.setAttribute("x2", X(c)); cross.setAttribute("visibility", "visible");
+      ORDER.forEach((p, j) => { const d = dots[j]; if (!shown[p]) { d.setAttribute("visibility", "hidden"); return; } d.setAttribute("cx", X(c)); d.setAttribute("cy", Y(data.series[p][k])); d.setAttribute("visibility", "visible"); });
+      tip.replaceChildren(h("b", {}, `缓存 ${c} 页`), ...ORDER.filter((p) => shown[p]).map((p) => h("div", {}, h("span", { class: "sw", style: { display: "inline-block", width: "10px", height: "3px", background: COLORS[p], marginRight: "6px", verticalAlign: "middle" } }), `${PNAME[p]}：${data.series[p][k].toFixed(1)}%`)));
+      tip.hidden = false;
+      const r = wrap.getBoundingClientRect();
+      let lx = ev.clientX - r.left + 14; if (lx > r.width - 150) lx = ev.clientX - r.left - 150;
+      tip.style.left = lx + "px"; tip.style.top = Math.max(0, ev.clientY - r.top - 40) + "px";
+    }
+    hit.addEventListener("pointermove", move);
+    hit.addEventListener("pointerleave", () => { tip.hidden = true; cross.setAttribute("visibility", "hidden"); dots.forEach((d) => d.setAttribute("visibility", "hidden")); });
+    wrap.replaceChildren(svg, tip);
+    // 表格
+    const t = $("wl-table");
+    t.replaceChildren(h("tr", {}, h("th", {}, "缓存"), ...ORDER.map((p) => h("th", { class: "num" }, PNAME[p]))),
+      ...SIZES.map((c, k) => h("tr", {}, h("td", {}, c), ...ORDER.map((p) => h("td", { class: "num" }, data.series[p][k].toFixed(1) + "%")))));
+    const g = (p, c) => data.series[p][SIZES.indexOf(c)].toFixed(1) + "%";
+    const msg = {
+      none: `无局部性：缓存 50 页时 LRU ${g("LRU", 50)}、FIFO ${g("FIFO", 50)}、Random ${g("RAND", 50)}，几乎都等于 50/100；OPT 却有 ${g("OPT", 50)}。`,
+      "8020": `80-20：缓存 20 页时 OPT ${g("OPT", 20)}、LRU ${g("LRU", 20)}、Clock ${g("CLOCK", 20)}、FIFO ${g("FIFO", 20)}、Random ${g("RAND", 20)}。LRU 留住热页，Clock 介于 LRU 与 FIFO/Random 之间。`,
+      loop: `循环顺序：缓存 49 页时 LRU ${g("LRU", 49)}、FIFO ${g("FIFO", 49)}，Random ${g("RAND", 49)}，OPT ${g("OPT", 49)}。缓存到 50 页（装下整个循环）时全部接近 100%。`,
+    };
+    $("wl-n2").textContent = msg[data.kind] + `（${data.n} 次访问，种子 ${$("wl-seed").value}）`;
+  }
+  function go() { $("wl-n2").textContent = "计算中…"; setTimeout(() => { compute(); draw(); }, 10); }
+  $("wl-run").onclick = go;
+  $("wl-kind").onchange = go;
+  go();
+})();
+
+// ---------------- 抖动 ----------------
+(function thrash() {
+  function draw() {
+    const M = Math.max(8, Number($("th-m").value) || 64), Wset = Math.max(1, Number($("th-w").value) || 16), D = Math.max(2, Number($("th-d").value) || 100);
+    const n = Number($("th-n").value), ac = $("th-ac").checked, k = Math.max(1, Math.floor(M / Wset));
+    $("th-nv").textContent = n;
+    const NS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const raw = NS.map((x) => thrashRun(x, M, Wset, D));
+    const adm = NS.map((x) => thrashRun(Math.min(x, k), M, Wset, D));
+    const Wd = 600, H = 280, L = 50, R = 20, T = 16, B = 44, pw = Wd - L - R, ph = H - T - B;
+    const X = (x) => L + ((x - 1) / 9) * pw, Y = (v) => T + ph - v * ph;
+    const svg = s("svg", { viewBox: `0 0 ${Wd} ${H}`, width: Wd, role: "img", "aria-label": "吞吐量随进程数变化" });
+    for (let v = 0; v <= 1.0001; v += 0.25) {
+      svg.append(s("line", { x1: L, x2: Wd - R, y1: Y(v), y2: Y(v), style: "stroke:var(--border)" }));
+      svg.append(s("text", { x: L - 8, y: Y(v) + 4, "text-anchor": "end", "font-size": 11, class: "t-muted", text: v.toFixed(2) }));
+    }
+    NS.forEach((x) => svg.append(s("text", { x: X(x), y: H - B + 18, "text-anchor": "middle", "font-size": 11, class: "t-muted", text: x })));
+    svg.append(s("text", { x: L + pw / 2, y: H - 6, "text-anchor": "middle", "font-size": 12, class: "t-muted", text: "想要同时运行的进程数 n" }));
+    const kx = X(Math.min(10, k + 0.5));
+    if (k < 10) {
+      svg.append(s("line", { x1: kx, x2: kx, y1: T, y2: T + ph, style: "stroke:var(--bad);stroke-dasharray:4 4" }));
+      svg.append(s("text", { x: kx + 5, y: T + 14, "font-size": 11.5, style: "fill:var(--bad)", text: `n > ${k} 时 n·W > M = ${M}` }));
+    }
+    [[raw, "var(--c2)"], [adm, "var(--c3)"]].forEach(([arr, c]) => {
+      svg.append(s("polyline", { points: NS.map((x, j) => `${X(x)},${Y(arr[j].thr)}`).join(" "), fill: "none", style: `stroke:${c};stroke-width:2` }));
+      NS.forEach((x, j) => { const d = s("circle", { cx: X(x), cy: Y(arr[j].thr), r: x === n ? 6 : 3.5, style: `fill:${c};stroke:var(--surface);stroke-width:2` }); d.append(s("title", { text: `n=${x}：吞吐量 ${arr[j].thr.toFixed(3)}，缺页率 ${(arr[j].missRate * 100).toFixed(1)}%` })); svg.append(d); });
+    });
+    svg.append(s("line", { x1: X(n), x2: X(n), y1: T, y2: T + ph, style: "stroke:var(--accent);stroke-width:1.5" }));
+    $("th-chart").replaceChildren(svg);
+    const cur = ac ? adm[n - 1] : raw[n - 1];
+    $("th-stats").replaceChildren(
+      h("div", { class: "stat" }, h("div", { class: "v" }, (cur.missRate * 100).toFixed(1) + "%"), h("div", { class: "l" }, "缺页率")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, cur.thr.toFixed(3)), h("div", { class: "l" }, "有效吞吐量（1 = 全速）")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, (ac ? Math.min(n, k) : n) + " / " + n), h("div", { class: "l" }, "内存中同时运行的进程")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, (Math.min(n, ac ? k : n) * Wset) + " / " + M), h("div", { class: "l" }, "工作集总和 / 页框")));
+    const over = n * Wset > M;
+    $("th-n2").innerHTML = !over ? `n=${n} 个进程的工作集总和 ${n * Wset} ≤ ${M} 个页框，都能装下；热身后几乎不缺页，吞吐量接近 1。` :
+      ac ? `工作集总和 ${n * Wset} &gt; ${M}，但准入控制只让 ${k} 个进程同时运行（其余排队），内存装得下它们的工作集，吞吐量保持 ${cur.thr.toFixed(2)}。"少做一点，但做好"。` :
+      `工作集总和 ${n * Wset} &gt; ${M}：每个进程刚被换出的页，轮到它运行时又要用，全局 LRU 下缺页率升到 ${(cur.missRate * 100).toFixed(1)}%，吞吐量跌到 ${cur.thr.toFixed(3)}——系统在<strong>抖动</strong>，大部分时间在等磁盘。`;
+  }
+  ["th-m", "th-w", "th-d", "th-n", "th-ac"].forEach((id) => $(id).addEventListener("input", draw));
+  draw();
+})();
+})();
+</script>
+</body></html>

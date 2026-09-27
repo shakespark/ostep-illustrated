@@ -1,0 +1,1586 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 31 章 · 信号量</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+.trace { font-family: var(--mono); font-size: 12.5px; }
+.trace th, .trace td { padding: 3px 8px; white-space: nowrap; }
+.trace tr.cur td { background: var(--accent-soft); }
+.trace td.val { font-weight: 700; text-align: right; }
+.trace td.neg { color: var(--bad); }
+.st-run { color: var(--ok); font-weight: 600; }
+.st-sleep { color: var(--bad); font-weight: 600; }
+.st-ready, .st-none, .st-done { color: var(--muted); }
+.semrow { display: flex; flex-wrap: wrap; gap: 10px; align-items: stretch; margin-bottom: 10px; }
+.sembox { border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; background: var(--surface); min-width: 130px; }
+.sembox .nm { font-size: 12.5px; color: var(--muted); }
+.sembox .v { font: 700 22px/1.2 var(--mono); }
+.sembox.neg { border-color: var(--bad); }
+.sembox.neg .v { color: var(--bad); }
+.sembox .qq { font-size: 12px; color: var(--muted); min-height: 30px; }
+.thr { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
+.thcard { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); padding: 8px 10px; font-size: 13.5px; }
+.thcard.run { border-color: var(--ok); box-shadow: 0 0 0 2px var(--ok-soft); }
+.thcard.sleep { border-color: var(--bad); background: var(--bad-soft); }
+.thcard.done { opacity: .6; }
+.thcard .hd { display: flex; justify-content: space-between; gap: 6px; align-items: center; }
+.thcard .hd b { display: inline-flex; align-items: center; gap: 6px; }
+.thcard .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.code-mini { font: 12px/1.6 var(--mono); margin-top: 6px; }
+.code-mini div { padding: 0 6px; border-radius: 4px; white-space: pre; }
+.code-mini div.cur { background: color-mix(in srgb, var(--warn) 28%, transparent); }
+.code-mini .ln { color: var(--faint); display: inline-block; min-width: 3.2em; }
+.pickbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 10px 0 0; font-size: 13.5px; }
+.pickbar .muted { margin-right: 4px; }
+.alert { border-radius: 8px; padding: 8px 12px; margin-top: 10px; font-size: 14px; }
+.alert.bad { border: 1px solid var(--bad); background: var(--bad-soft); }
+.alert.ok { border: 1px solid var(--ok); background: var(--ok-soft); }
+.bufrow { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 2px; margin: 6px 0 10px; }
+.bufslot { display: flex; flex-direction: column; align-items: center; font: 11px var(--mono); color: var(--muted); }
+.bufslot .cell { min-width: 38px; }
+.bufslot .ptr { height: 16px; }
+.outline { font: 13px var(--mono); color: var(--muted); }
+.twocol { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.minitable td, .minitable th { padding: 4px 8px; font-size: 13px; }
+.phil-table { display: grid; grid-template-columns: minmax(260px, 360px) 1fr; gap: 14px; align-items: start; }
+@media (max-width: 640px) { .phil-table { grid-template-columns: 1fr; } }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12.5px; color: var(--muted); margin-top: 8px; }
+.legend i { display: inline-block; width: 14px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; border: 1px solid var(--border); }
+</style>
+</head>
+<body data-chapter="31">
+<main>
+
+<h2>关键问题与本章定位</h2>
+<div class="crux">
+<p><strong>如何使用信号量？</strong>怎样用信号量代替锁和条件变量？信号量的定义是什么？什么是二值信号量？用锁和条件变量构造信号量是否简单？反过来，用信号量构造锁和条件变量呢？</p>
+<p class="small muted">原文：How can we use semaphores instead of locks and condition variables? What is the definition of a semaphore? What is a binary semaphore? Is it straightforward to build a semaphore out of locks and condition variables? To build locks and condition variables out of semaphores?</p>
+</div>
+<p>前两章我们知道：解决各种并发问题既需要<strong>锁（lock）</strong>，也需要<strong>条件变量（condition variable）</strong>。Dijkstra 和同事们很早就意识到了这一点，于是发明了<strong>信号量（semaphore）</strong>——一个想"包打天下"的同步原语：同一个东西，初值设成 1 就是锁，设成 0 就能表达"等某件事发生"。</p>
+<p>本章先给出信号量的精确定义，然后用它重做一遍熟悉的问题（锁、join、生产者/消费者），再看几个经典问题（读写锁、哲学家就餐、线程节流），最后用锁 + 条件变量亲手实现一个信号量。本章中"拿着一把锁去等另一样东西"引发的死锁，将在下一章《常见并发问题》里被系统地分析。</p>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>信号量（semaphore）</h4><p>一个带整数值的对象，只能用 sem_wait() 和 sem_post() 两个操作来改变它；使用前必须用 sem_init() 设定初值。</p></div>
+  <div class="card"><h4>sem_wait()（P / down）</h4><p>先把值减 1；如果减完是负数，调用者就睡眠等待。</p></div>
+  <div class="card"><h4>sem_post()（V / up）</h4><p>先把值加 1；如果有线程在等，唤醒其中一个。它从不等待。</p></div>
+  <div class="card"><h4>负值 = 等待者数</h4><p>值为负时，其绝对值恰好等于正在等待的线程个数（Dijkstra 定义下的不变量）。</p></div>
+  <div class="card"><h4>二值信号量（binary semaphore）</h4><p>初值为 1、只在"持有/未持有"两态间使用的信号量——就是一把锁。</p></div>
+  <div class="card"><h4>初值的含义</h4><p>初值 = 初始化后"愿意立刻送出去的资源数"：锁是 1，排序是 0，空槽数是 MAX，节流是 K。</p></div>
+  <div class="card"><h4>有界缓冲区</h4><p>empty / full 两个信号量计数空槽和满槽；mutex 只包住 put/get，否则会死锁。</p></div>
+  <div class="card"><h4>Zemaphore</h4><p>用一把锁 + 一个条件变量 + 一个整数实现的信号量；值永远不小于 0，与 Linux 实现一致。</p></div>
+</div>
+
+<h2>信号量的定义</h2>
+<p>信号量是一个带整数值的对象。因为<strong>初值决定了它的行为</strong>，所以用它之前必须先初始化（Figure 31.1）：</p>
+<pre><code>#include &lt;semaphore.h&gt;
+sem_t s;
+sem_init(&amp;s, 0, 1);   // 第 3 个参数：初值 1；第 2 个参数 0：在同一进程的线程之间共享</code></pre>
+<p>初始化之后，只能用两个函数操作它（Figure 31.2）。先不管它们内部怎么实现（显然需要小心处理并发），先假设这两个操作都是<strong>原子的</strong>：</p>
+<pre><code>int sem_wait(sem_t *s) {
+    decrement the value of semaphore s by one     // 先减 1
+    wait if value of semaphore s is negative      // 减完是负数就睡
+}
+
+int sem_post(sem_t *s) {
+    increment the value of semaphore s by one     // 先加 1
+    if there are one or more threads waiting, wake one   // 有人在等就唤醒一个
+}</code></pre>
+
+<figure class="fig">
+<svg viewBox="0 0 760 270" width="760" role="img" aria-label="信号量结构与 wait/post 流程">
+  <rect x="270" y="14" width="220" height="92" rx="10" class="box-strong"/>
+  <text x="380" y="36" text-anchor="middle" font-size="14" font-weight="700">sem_t s</text>
+  <rect x="290" y="46" width="70" height="46" rx="6" class="accent-soft"/>
+  <text x="325" y="64" text-anchor="middle" font-size="11" class="t-muted">value</text>
+  <text x="325" y="85" text-anchor="middle" font-size="20" font-weight="700" class="mono">-2</text>
+  <text x="372" y="64" font-size="11" class="t-muted">等待队列</text>
+  <rect x="372" y="70" width="46" height="22" rx="4" class="bad-soft"/><text x="395" y="85" text-anchor="middle" font-size="12">T1</text>
+  <rect x="424" y="70" width="46" height="22" rx="4" class="bad-soft"/><text x="447" y="85" text-anchor="middle" font-size="12">T2</text>
+  <text x="380" y="124" text-anchor="middle" font-size="12" class="t-muted">值为 -2 ⇔ 恰好 2 个线程在等</text>
+  <!-- wait -->
+  <text x="130" y="30" text-anchor="middle" font-size="14" font-weight="700">sem_wait(&amp;s)</text>
+  <rect x="50" y="44" width="160" height="30" rx="6" class="box"/><text x="130" y="64" text-anchor="middle" font-size="13">value = value − 1</text>
+  <line x1="130" y1="74" x2="130" y2="96" class="arrow"/><polygon points="126,92 134,92 130,99" fill="var(--muted)"/>
+  <polygon points="130,100 200,128 130,156 60,128" class="warn-soft"/><text x="130" y="133" text-anchor="middle" font-size="13">value &lt; 0 ?</text>
+  <line x1="130" y1="156" x2="130" y2="186" class="arrow"/><text x="138" y="176" font-size="12" class="t-muted">是</text>
+  <rect x="40" y="188" width="180" height="30" rx="6" class="bad-soft"/><text x="130" y="208" text-anchor="middle" font-size="13">入队，睡眠（让出 CPU）</text>
+  <line x1="200" y1="128" x2="236" y2="128" class="arrow"/><text x="214" y="120" font-size="12" class="t-muted">否</text>
+  <rect x="150" y="232" width="110" height="28" rx="6" class="ok-soft"/><text x="205" y="251" text-anchor="middle" font-size="13">返回，继续执行</text>
+  <path d="M236 128 L236 232" class="arrow"/>
+  <text x="40" y="250" font-size="11.5" class="t-muted">被 post 唤醒后 →</text>
+  <!-- post -->
+  <text x="630" y="30" text-anchor="middle" font-size="14" font-weight="700">sem_post(&amp;s)</text>
+  <rect x="550" y="44" width="160" height="30" rx="6" class="box"/><text x="630" y="64" text-anchor="middle" font-size="13">value = value + 1</text>
+  <line x1="630" y1="74" x2="630" y2="96" class="arrow"/><polygon points="626,92 634,92 630,99" fill="var(--muted)"/>
+  <polygon points="630,100 710,128 630,156 550,128" class="warn-soft"/><text x="630" y="133" text-anchor="middle" font-size="13">队列非空 ?</text>
+  <line x1="630" y1="156" x2="630" y2="186" class="arrow"/><text x="638" y="176" font-size="12" class="t-muted">是</text>
+  <rect x="530" y="188" width="200" height="30" rx="6" class="accent-soft"/><text x="630" y="208" text-anchor="middle" font-size="13">唤醒队首一个线程（→就绪）</text>
+  <rect x="570" y="232" width="120" height="28" rx="6" class="ok-soft"/><text x="630" y="251" text-anchor="middle" font-size="13">返回（从不等待）</text>
+  <line x1="550" y1="128" x2="516" y2="128" class="arrow"/><text x="524" y="120" font-size="12" class="t-muted">否</text>
+  <path d="M516 128 L516 246 L570 246" class="arrow"/>
+  <path d="M470 81 C 520 90, 540 150, 548 190" class="arrow" stroke-dasharray="4 3"/>
+</svg>
+<figcaption>信号量 = 一个整数 + 一个等待队列。wait 可能睡眠，post 永远不会；两者都先改值、再判断。</figcaption>
+</figure>
+
+<p>关于这两个接口，原书强调三点：</p>
+<ol>
+  <li><strong>sem_wait() 要么立即返回</strong>（调用时值 ≥ 1），<strong>要么让调用者挂起</strong>，等待之后的某次 post。多个线程可以同时卡在 sem_wait() 里排队。</li>
+  <li><strong>sem_post() 从不等待</strong>任何条件。它只是把值加 1，如果有线程在等就唤醒一个。</li>
+  <li><strong>值为负时，其绝对值等于等待线程数</strong>。使用者通常看不到这个值，但记住这个不变量有助于理解信号量如何运作。</li>
+</ol>
+<div class="aside" data-title="P() 和 V() 从哪来">
+<p>Dijkstra 最早把 sem_wait() 叫作 P()，sem_post() 叫作 V()，来自荷兰语。起初 P 来自 passering（通过）、V 来自 vrijgave（释放）；后来 Dijkstra 又说 P 来自 prolaag（probeer "尝试" + verlaag "减少"），V 来自 verhoog（"增加"）。也有人叫它们 down 和 up。</p>
+</div>
+
+<h2>二值信号量：把信号量当锁用</h2>
+<p>第一个用法我们已经很熟悉了：用 sem_wait()/sem_post() 包住临界区（Figure 31.3）。关键问题是：<strong>初值 X 应该是多少？</strong>先想一想再往下看。</p>
+<pre><code>sem_t m;
+sem_init(&amp;m, 0, X);   // X 应该是多少？
+
+sem_wait(&amp;m);
+// 临界区
+sem_post(&amp;m);</code></pre>
+<p>答案是 <strong>1</strong>。第一个线程调用 sem_wait() 把值从 1 减到 0，0 不是负数，于是直接返回、进入临界区；如果这时第二个线程也来 sem_wait()，它把值减到 -1，只能睡眠。第一个线程离开时 sem_post() 把值加回 0 并唤醒第二个线程；第二个线程用完后再 post，值回到 1。</p>
+<figure class="fig">
+<svg viewBox="0 0 720 150" width="720" role="img" aria-label="锁用法下信号量值的含义">
+  <line x1="60" y1="60" x2="680" y2="60" class="stroke" stroke-width="1.5"/>
+  <g font-size="13" text-anchor="middle">
+    <circle cx="620" cy="60" r="18" class="ok-soft"/><text x="620" y="65" font-weight="700" class="mono">1</text>
+    <circle cx="460" cy="60" r="18" class="accent-soft"/><text x="460" y="65" font-weight="700" class="mono">0</text>
+    <circle cx="300" cy="60" r="18" class="warn-soft"/><text x="300" y="65" font-weight="700" class="mono">-1</text>
+    <circle cx="140" cy="60" r="18" class="bad-soft"/><text x="140" y="65" font-weight="700" class="mono">-2</text>
+    <text x="620" y="102">锁空闲</text>
+    <text x="460" y="102">被持有，无人等待</text>
+    <text x="300" y="102">被持有，1 个在等</text>
+    <text x="140" y="102">被持有，2 个在等</text>
+  </g>
+  <text x="540" y="30" text-anchor="middle" font-size="12" class="t-muted">sem_wait ← 减 1</text>
+  <text x="380" y="30" text-anchor="middle" font-size="12" class="t-muted">sem_post → 加 1</text>
+  <text x="380" y="136" text-anchor="middle" font-size="12" class="t-muted">锁只有"持有 / 未持有"两种状态，所以这种用法叫二值信号量（binary semaphore）</text>
+</svg>
+<figcaption>初值为 1 的信号量当锁用时，每个取值的含义。</figcaption>
+</figure>
+<p>原书 Figure 31.5 给出了两个线程争锁的完整轨迹：T0 进入临界区后被中断，T1 调用 sem_wait() 把值减到 -1 并睡眠；T0 回来后 post，值变回 0 并唤醒 T1；T1 从 sem_wait() 返回、执行临界区、post，值回到 1。<strong>在下方"信号量执行器"里选择 Figure 31.5 预设，可以逐行复现这张表。</strong>注意一个细节：T1 被唤醒后从 sem_wait() 返回时<strong>不会再减一次</strong>——它的那次减 1 在睡下去之前就做完了。</p>
+<p>如果只把信号量当二值锁用，其实可以实现得比通用信号量更简单。</p>
+
+<h2>信号量用于排序：实现 join</h2>
+<p>信号量也可以用来<strong>给事件排序</strong>：一个线程等某件事发生，另一个线程让这件事发生后发信号——这和上一章用条件变量做的事一样。经典例子是父线程等待子线程结束（Figure 31.6）：</p>
+<pre><code>sem_t s;
+
+void *child(void *arg) {
+    printf("child\n");
+    sem_post(&amp;s);        // 发信号：子线程完成了
+    return NULL;
+}
+
+int main(int argc, char *argv[]) {
+    sem_init(&amp;s, 0, X);  // X 应该是多少？
+    printf("parent: begin\n");
+    pthread_t c;
+    Pthread_create(&amp;c, NULL, child, NULL);
+    sem_wait(&amp;s);        // 在这里等子线程
+    printf("parent: end\n");
+    return 0;
+}</code></pre>
+<p>我们希望输出总是 <code>parent: begin</code> → <code>child</code> → <code>parent: end</code>。答案是 <strong>X = 0</strong>。要考虑两种情况：</p>
+<figure class="fig">
+<svg viewBox="0 0 760 230" width="760" role="img" aria-label="join 的两种情况">
+  <text x="190" y="20" text-anchor="middle" font-size="14" font-weight="700">情况 1：父线程先 sem_wait()</text>
+  <text x="570" y="20" text-anchor="middle" font-size="14" font-weight="700">情况 2：子线程先跑完</text>
+  <g font-size="12">
+    <text x="20" y="58" class="t-muted">父</text><text x="20" y="118" class="t-muted">子</text>
+    <rect x="40" y="42" width="70" height="26" rx="4" fill="var(--c1)"/><text x="75" y="60" text-anchor="middle" style="fill:#fff">create</text>
+    <rect x="112" y="42" width="80" height="26" rx="4" fill="var(--c1)"/><text x="152" y="60" text-anchor="middle" style="fill:#fff">wait: 0→-1</text>
+    <rect x="194" y="42" width="110" height="26" rx="4" class="bad-soft"/><text x="249" y="60" text-anchor="middle">睡眠</text>
+    <rect x="194" y="102" width="110" height="26" rx="4" fill="var(--c2)"/><text x="249" y="120" text-anchor="middle" style="fill:#fff">post: -1→0 唤醒父</text>
+    <rect x="306" y="42" width="60" height="26" rx="4" fill="var(--c1)"/><text x="336" y="60" text-anchor="middle" style="fill:#fff">返回</text>
+    <path d="M249 102 L 249 72" class="arrow"/><polygon points="245,76 253,76 249,69" fill="var(--muted)"/>
+
+    <text x="400" y="58" class="t-muted">父</text><text x="400" y="118" class="t-muted">子</text>
+    <rect x="420" y="42" width="70" height="26" rx="4" fill="var(--c1)"/><text x="455" y="60" text-anchor="middle" style="fill:#fff">create</text>
+    <rect x="492" y="102" width="130" height="26" rx="4" fill="var(--c2)"/><text x="557" y="120" text-anchor="middle" style="fill:#fff">post: 0→1 无人可唤醒</text>
+    <rect x="624" y="42" width="120" height="26" rx="4" fill="var(--c1)"/><text x="684" y="60" text-anchor="middle" style="fill:#fff">wait: 1→0 直接返回</text>
+  </g>
+  <text x="190" y="165" text-anchor="middle" font-size="12.5">值为 0 → 父线程减到 -1，只能睡着等子线程 post</text>
+  <text x="570" y="165" text-anchor="middle" font-size="12.5">子线程的 post 把"完成"记在值里（变成 1）</text>
+  <text x="380" y="205" text-anchor="middle" font-size="12.5" class="t-muted">与条件变量不同：没有人等时 post 也不会"丢"，它被信号量的值记住了</text>
+</svg>
+<figcaption>原书 Figure 31.7（情况 1）与 Figure 31.8（情况 2）的示意。两种交错下 child 都一定先于 parent: end。</figcaption>
+</figure>
+<p>情况 1：子线程已创建但还没运行，父线程先调用 sem_wait()。我们希望父线程等待，唯一的办法是值不大于 0——所以初值是 0。父线程把值减到 -1 后睡眠；子线程运行后 sem_post() 把值加到 0 并唤醒父线程。情况 2：子线程在父线程调用 sem_wait() 之前就跑完了，post 把值从 0 加到 1；之后父线程 sem_wait() 把 1 减到 0，不需要等待就返回。两种情况都达到了目的。</p>
+
+<div class="tip">
+<p><strong>怎样设置信号量的初值？</strong>Perry Kivolowitz 给了一个简单的思考方式：<strong>初值 = 初始化之后你愿意立刻送出去的资源个数</strong>。锁：初始化后愿意让它立刻被"拿走"一次，所以是 1；排序：一开始没有东西可给，只有子线程完成后才"产生"这个资源，所以是 0。</p>
+</div>
+<div class="table-wrap"><table>
+<thead><tr><th>用法</th><th class="num">初值</th><th>"一开始能送出去的资源"</th></tr></thead>
+<tbody>
+<tr><td>锁（二值信号量）</td><td class="num">1</td><td>一把锁，可以立刻被拿走</td></tr>
+<tr><td>排序 / join</td><td class="num">0</td><td>还没有——事件发生后才产生</td></tr>
+<tr><td>有界缓冲区的 empty</td><td class="num">MAX</td><td>MAX 个空槽</td></tr>
+<tr><td>有界缓冲区的 full</td><td class="num">0</td><td>一开始没有数据</td></tr>
+<tr><td>线程节流</td><td class="num">K</td><td>同时允许 K 个线程进入</td></tr>
+</tbody></table></div>
+
+<section class="sim" id="sim-sem">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>信号量执行器：锁与 join 的逐行轨迹</h3>
+    <div class="desc">每个 sem_wait/sem_post 拆成 4 个微步骤（与原书轨迹表粒度一致）。先载入原书预设逐步对照表格；任意时刻都可以点"让 Tx 执行一步"自己调度，走出不同的交错。观察：值、等待队列、每个线程的状态（运行/就绪/睡眠）。</div></div>
+  <div class="sim-body">
+    <div class="controls" id="sem-presets"></div>
+    <div class="controls">
+      <label>自定义：线程数 <input type="number" id="sem-n" min="1" max="4" value="3"></label>
+      <label>初值 <input type="number" id="sem-init" min="0" max="3" value="1"></label>
+      <button id="sem-custom">新建"锁"场景</button>
+    </div>
+    <div id="sem-step"></div>
+    <div class="stage">
+      <div class="semrow" id="sem-box"></div>
+      <div class="thr" id="sem-threads"></div>
+      <div class="pickbar" id="sem-pick"></div>
+      <div class="table-wrap"><table class="trace" id="sem-trace"></table></div>
+    </div>
+    <div class="narrate" id="sem-nar"></div>
+    <div class="stats" id="sem-stats"></div>
+  </div>
+</section>
+
+<h2>生产者/消费者（有界缓冲区）问题</h2>
+<p>上一章用条件变量解决过这个问题；现在只用信号量来做。先写好 put 和 get（Figure 31.9），注意这里 put/get 本身不带任何同步：</p>
+<pre><code>int buffer[MAX];
+int fill = 0;
+int use  = 0;
+
+void put(int value) {
+    buffer[fill] = value;       // Line F1
+    fill = (fill + 1) % MAX;    // Line F2
+}
+
+int get() {
+    int tmp = buffer[use];      // Line G1
+    use = (use + 1) % MAX;      // Line G2
+    return tmp;
+}</code></pre>
+
+<h3>第一次尝试：empty 和 full</h3>
+<p>引入两个信号量：<code>empty</code> 表示空槽数，<code>full</code> 表示满槽数（Figure 31.10）。生产者先等一个空槽再放数据，然后宣布多了一个满槽；消费者对称。</p>
+<pre><code>sem_t empty;
+sem_t full;
+
+void *producer(void *arg) {
+    for (int i = 0; i &lt; loops; i++) {
+        sem_wait(&amp;empty);       // Line P1
+        put(i);                 // Line P2
+        sem_post(&amp;full);        // Line P3
+    }
+}
+
+void *consumer(void *arg) {
+    int tmp = 0;
+    while (tmp != -1) {
+        sem_wait(&amp;full);        // Line C1
+        tmp = get();            // Line C2
+        sem_post(&amp;empty);       // Line C3
+        printf("%d\n", tmp);
+    }
+}
+
+int main(int argc, char *argv[]) {
+    // ...
+    sem_init(&amp;empty, 0, MAX);   // MAX 个空槽
+    sem_init(&amp;full, 0, 0);      // 0 个满槽
+    // ...
+}</code></pre>
+<figure class="fig">
+<svg viewBox="0 0 720 190" width="720" role="img" aria-label="有界缓冲区与 empty/full 计数">
+  <text x="360" y="22" text-anchor="middle" font-size="13" class="t-muted">buffer[MAX]，MAX = 6（环形使用）</text>
+  <g font-size="13" text-anchor="middle" class="mono">
+    <rect x="180" y="40" width="60" height="44" rx="5" class="box"/>
+    <rect x="240" y="40" width="60" height="44" rx="5" class="accent-soft"/><text x="270" y="67">7</text>
+    <rect x="300" y="40" width="60" height="44" rx="5" class="accent-soft"/><text x="330" y="67">8</text>
+    <rect x="360" y="40" width="60" height="44" rx="5" class="accent-soft"/><text x="390" y="67">9</text>
+    <rect x="420" y="40" width="60" height="44" rx="5" class="box"/>
+    <rect x="480" y="40" width="60" height="44" rx="5" class="box"/>
+  </g>
+  <text x="270" y="108" text-anchor="middle" font-size="12">▲ use</text>
+  <text x="450" y="108" text-anchor="middle" font-size="12">▲ fill</text>
+  <text x="120" y="67" text-anchor="end" font-size="13">消费者从这取 →</text>
+  <text x="560" y="67" font-size="13">← 生产者往这放</text>
+  <rect x="150" y="128" width="190" height="44" rx="8" class="ok-soft"/>
+  <text x="245" y="148" text-anchor="middle" font-size="13">full = 3</text><text x="245" y="165" text-anchor="middle" font-size="11.5" class="t-muted">消费者 sem_wait(&amp;full) 拿一个</text>
+  <rect x="380" y="128" width="190" height="44" rx="8" class="warn-soft"/>
+  <text x="475" y="148" text-anchor="middle" font-size="13">empty = 3</text><text x="475" y="165" text-anchor="middle" font-size="11.5" class="t-muted">生产者 sem_wait(&amp;empty) 拿一个</text>
+</svg>
+<figcaption>empty + full 始终等于 MAX（除去正在 put/get 中途的那一点时间）。两个信号量本质上是"空槽计数器"和"满槽计数器"。</figcaption>
+</figure>
+<p>先看 MAX = 1、一个生产者一个消费者。假设消费者先运行：它在 C1 调用 sem_wait(&amp;full)，full 初值 0，被减到 -1，消费者睡眠。然后生产者运行：P1 把 empty 从 1 减到 0，通过；P2 放入数据；P3 把 full 从 -1 加到 0 并唤醒消费者。之后如果生产者继续跑，它在 P1 把 empty 减到 -1 而睡眠；如果换消费者跑，它从 C1 返回、取走数据。两种情况都正确。多个生产者、多个消费者（MAX = 1）也仍然正确。</p>
+
+<h3>MAX &gt; 1 时的竞争：数据被覆盖</h3>
+<p>现在让 MAX = 10，并且有多个生产者。问题出在 put() 和 get() 上：设生产者 Pa 先运行，在 F1 往 buffer[0] 写数据，还没来得及执行 F2 把 fill 加到 1 就被中断；生产者 Pb 运行，它在 F1 也往 buffer[0] 写——Pa 的数据被覆盖、永远丢失了。原因是<strong>忘了互斥</strong>：填缓冲区和移动 fill 下标是一个临界区。</p>
+
+<h3>加锁，但放错了位置：死锁</h3>
+<p>用一个二值信号量 mutex 把整个 put/get 部分包起来（Figure 31.11，NEW LINE 标出的是新加的两行）：</p>
+<pre><code>void *producer(void *arg) {
+    for (int i = 0; i &lt; loops; i++) {
+        sem_wait(&amp;mutex);       // Line P0 (NEW LINE)
+        sem_wait(&amp;empty);       // Line P1
+        put(i);                 // Line P2
+        sem_post(&amp;full);        // Line P3
+        sem_post(&amp;mutex);       // Line P4 (NEW LINE)
+    }
+}
+
+void *consumer(void *arg) {
+    for (int i = 0; i &lt; loops; i++) {
+        sem_wait(&amp;mutex);       // Line C0 (NEW LINE)
+        sem_wait(&amp;full);        // Line C1
+        int tmp = get();        // Line C2
+        sem_post(&amp;empty);       // Line C3
+        sem_post(&amp;mutex);       // Line C4 (NEW LINE)
+        printf("%d\n", tmp);
+    }
+}</code></pre>
+<p>看起来对，但会<strong>死锁（deadlock）</strong>。设一个生产者一个消费者，消费者先运行：它在 C0 拿到 mutex，然后在 C1 对 full 调用 sem_wait()——没有数据，于是睡眠。<strong>关键是：它睡着的时候仍然持有 mutex。</strong>接着生产者运行，它本来可以放入数据并唤醒消费者，可它第一件事是在 P0 等 mutex——mutex 已被占用，生产者也睡着了。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 210" width="640" role="img" aria-label="Figure 31.11 的等待环">
+  <rect x="40" y="80" width="150" height="50" rx="10" fill="var(--c2)"/><text x="115" y="102" text-anchor="middle" font-size="14" style="fill:#fff;font-weight:600">消费者</text><text x="115" y="120" text-anchor="middle" font-size="11.5" style="fill:#fff">睡在 C1: wait(full)</text>
+  <rect x="450" y="80" width="150" height="50" rx="10" fill="var(--c1)"/><text x="525" y="102" text-anchor="middle" font-size="14" style="fill:#fff;font-weight:600">生产者</text><text x="525" y="120" text-anchor="middle" font-size="11.5" style="fill:#fff">睡在 P0: wait(mutex)</text>
+  <rect x="270" y="14" width="100" height="40" rx="8" class="warn-soft"/><text x="320" y="39" text-anchor="middle" font-size="14" class="mono">mutex</text>
+  <rect x="270" y="156" width="100" height="40" rx="8" class="ok-soft"/><text x="320" y="181" text-anchor="middle" font-size="14" class="mono">full</text>
+  <path d="M190 90 C 230 60, 240 40, 268 34" class="arrow" stroke="var(--bad)" style="stroke:var(--bad)"/>
+  <text x="196" y="52" font-size="12">持有</text>
+  <path d="M450 90 C 410 60, 400 40, 372 34" class="arrow" style="stroke:var(--bad)" stroke-dasharray="5 3"/><polygon points="376,30 376,40 369,34" fill="var(--bad)"/>
+  <text x="408" y="52" font-size="12">想要</text>
+  <path d="M190 120 C 230 150, 240 170, 268 176" class="arrow" style="stroke:var(--bad)" stroke-dasharray="5 3"/><polygon points="264,171 264,181 271,176" fill="var(--bad)"/>
+  <text x="194" y="170" font-size="12">等待</text>
+  <path d="M450 120 C 410 150, 400 170, 372 176" class="arrow" style="stroke:var(--muted)" stroke-dasharray="2 3"/>
+  <text x="402" y="172" font-size="12" class="t-muted">只有它能 post</text>
+</svg>
+<figcaption>一个简单的环：消费者持有 mutex、等 full；唯一能 post full 的生产者在等 mutex。两者互相等待，谁也走不动。</figcaption>
+</figure>
+
+<h3>正确的解法：缩小锁的范围</h3>
+<p>只需把 mutex 的获取和释放<strong>挪到只包住临界区（put/get）</strong>，full/empty 的等待和通知留在外面（Figure 31.12）：</p>
+<pre><code>void *producer(void *arg) {
+    for (int i = 0; i &lt; loops; i++) {
+        sem_wait(&amp;empty);       // Line P1
+        sem_wait(&amp;mutex);       // Line P1.5 (lock)
+        put(i);                 // Line P2
+        sem_post(&amp;mutex);       // Line P2.5 (unlock)
+        sem_post(&amp;full);        // Line P3
+    }
+}
+
+void *consumer(void *arg) {
+    for (int i = 0; i &lt; loops; i++) {
+        sem_wait(&amp;full);        // Line C1
+        sem_wait(&amp;mutex);       // Line C1.5 (lock)
+        int tmp = get();        // Line C2
+        sem_post(&amp;mutex);       // Line C2.5 (unlock)
+        sem_post(&amp;empty);       // Line C3
+        printf("%d\n", tmp);
+    }
+}</code></pre>
+<p>现在任何线程<strong>都不会拿着 mutex 去睡</strong>：它只在确定有空槽/有数据之后才进锁，锁内的 put/get 很短、不会阻塞。这就是常用的有界缓冲区模式——原书说"现在弄懂它，以后会用上"，面试和期末考试尤其爱考。（原书脚注：为了模块化，把 mutex 的获取/释放放进 put() 和 get() 里面可能更自然。）</p>
+
+<section class="sim" id="sim-pc">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>信号量版生产者/消费者：逐行交错执行</h3>
+    <div class="desc">选择版本（正确 Figure 31.12 / 错误 Figure 31.11 / 无 mutex Figure 31.10）、缓冲区大小和线程数，然后点"运行 Xx 一步"亲自当调度器，或用随机调度。put/get 被拆成 F1/F2、G1/G2 两行，这样才能看到无锁时的覆盖。观察：三个信号量的值和等待队列、谁持有 mutex、死锁时的等待环。</div></div>
+  <div class="sim-body">
+    <div class="controls" id="pc-presets"></div>
+    <div class="controls">
+      <label>版本 <select id="pc-ver"><option value="good">正确版（Fig 31.12）</option><option value="bad">mutex 在外层（Fig 31.11）</option><option value="nomutex">无 mutex（Fig 31.10）</option></select></label>
+      <label>MAX <input type="number" id="pc-max" min="1" max="10" value="1"></label>
+      <label>生产者 <input type="number" id="pc-np" min="1" max="3" value="1"></label>
+      <label>消费者 <input type="number" id="pc-nc" min="1" max="3" value="1"></label>
+      <label>每个生产者产出 <input type="number" id="pc-loops" min="1" max="9" value="3"></label>
+      <button id="pc-reset">按参数重置</button>
+      <span class="sep"></span>
+      <label>种子 <input type="number" id="pc-seed" value="7"></label>
+      <button id="pc-rand">随机调度到底</button>
+    </div>
+    <div id="pc-step"></div>
+    <div class="stage">
+      <div class="semrow" id="pc-sems"></div>
+      <div class="outline">buffer：</div>
+      <div class="bufrow" id="pc-buf"></div>
+      <div class="thr" id="pc-threads"></div>
+      <div class="pickbar" id="pc-pick"></div>
+      <div class="outline" id="pc-out"></div>
+    </div>
+    <div class="narrate" id="pc-nar"></div>
+    <div id="pc-alert"></div>
+    <div class="stats" id="pc-stats"></div>
+  </div>
+</section>
+
+<h2>读写锁</h2>
+<p>另一个经典问题来自这样的需求：不同的数据结构访问需要不同的锁。比如一个并发链表，插入会修改链表（需要传统的临界区），而查找只是读——只要保证没有插入在进行，<strong>多个查找完全可以同时进行</strong>。支持这种操作的锁叫<strong>读写锁（reader-writer lock）</strong>（Figure 31.13）：</p>
+<pre><code>typedef struct _rwlock_t {
+    sem_t lock;       // 二值信号量（普通锁），保护 readers
+    sem_t writelock;  // 允许 1 个写者 或 多个读者
+    int   readers;    // 临界区里有几个读者
+} rwlock_t;
+
+void rwlock_init(rwlock_t *rw) {
+    rw-&gt;readers = 0;
+    sem_init(&amp;rw-&gt;lock, 0, 1);
+    sem_init(&amp;rw-&gt;writelock, 0, 1);
+}
+
+void rwlock_acquire_readlock(rwlock_t *rw) {
+    sem_wait(&amp;rw-&gt;lock);
+    rw-&gt;readers++;
+    if (rw-&gt;readers == 1)          // 第一个读者负责拿 writelock
+        sem_wait(&amp;rw-&gt;writelock);
+    sem_post(&amp;rw-&gt;lock);
+}
+
+void rwlock_release_readlock(rwlock_t *rw) {
+    sem_wait(&amp;rw-&gt;lock);
+    rw-&gt;readers--;
+    if (rw-&gt;readers == 0)          // 最后一个读者负责放掉它
+        sem_post(&amp;rw-&gt;writelock);
+    sem_post(&amp;rw-&gt;lock);
+}
+
+void rwlock_acquire_writelock(rwlock_t *rw) { sem_wait(&amp;rw-&gt;writelock); }
+void rwlock_release_writelock(rwlock_t *rw) { sem_post(&amp;rw-&gt;writelock); }</code></pre>
+<p>写者很简单：直接用 writelock 保证只有一个写者进入。读者更有意思：先拿 lock，把 readers 加 1；<strong>如果自己是第一个读者</strong>，就顺带替整个"读者群"拿走 writelock，然后释放 lock。之后的读者只需 readers++ 就能进去；而写者必须等到<strong>所有读者都离开</strong>——最后一个离开的读者 post writelock。</p>
+<figure class="fig">
+<svg viewBox="0 0 700 190" width="700" role="img" aria-label="读写锁：读者群持有 writelock">
+  <rect x="200" y="30" width="300" height="130" rx="14" class="accent-soft"/>
+  <text x="350" y="52" text-anchor="middle" font-size="13">临界区（链表）</text>
+  <g font-size="12" text-anchor="middle">
+    <circle cx="260" cy="100" r="20" fill="var(--c3)"/><text x="260" y="104" style="fill:#fff">R0</text>
+    <circle cx="320" cy="100" r="20" fill="var(--c3)"/><text x="320" y="104" style="fill:#fff">R1</text>
+    <circle cx="380" cy="100" r="20" fill="var(--c3)"/><text x="380" y="104" style="fill:#fff">R2</text>
+    <circle cx="440" cy="100" r="20" fill="var(--c3)" opacity=".55"/><text x="440" y="104" style="fill:#fff">R3</text>
+  </g>
+  <text x="350" y="146" text-anchor="middle" font-size="12" class="t-muted">readers = 4；R0 进来时替大家拿走了 writelock</text>
+  <circle cx="600" cy="100" r="22" fill="var(--c2)"/><text x="600" y="104" text-anchor="middle" font-size="12" style="fill:#fff">W</text>
+  <text x="600" y="140" text-anchor="middle" font-size="12">sem_wait(writelock)</text><text x="600" y="156" text-anchor="middle" font-size="12" class="t-muted">睡着等……</text>
+  <path d="M575 100 L 505 100" class="arrow" stroke-dasharray="5 3"/>
+  <circle cx="90" cy="100" r="20" fill="var(--c3)"/><text x="90" y="104" text-anchor="middle" font-size="12" style="fill:#fff">R4</text>
+  <path d="M112 100 L 196 100" class="arrow"/><polygon points="192,96 192,104 199,100" fill="var(--muted)"/>
+  <text x="140" y="86" text-anchor="middle" font-size="12">新读者直接进</text>
+</svg>
+<figcaption>只要读者络绎不绝、readers 从不降到 0，写者就永远等不到 writelock——读者饿死了写者。</figcaption>
+</figure>
+<p>这个实现能用，但<strong>不公平</strong>：读者很容易<strong>饿死（starve）</strong>写者。更复杂的方案可以解决它——提示：一旦有写者在等，就不再让新读者进入。另外要注意，读写锁通常开销更大（尤其是复杂实现），和简单快速的锁相比，未必真能提速。</p>
+<div class="aside" data-title="简单笨办法可能更好（Hill 定律）">
+<p>永远不要低估"简单笨办法"。加锁时，简单的自旋锁有时效果最好，因为它容易实现而且快。读写锁听起来很酷，但复杂往往意味着慢。Mark Hill 的博士论文研究 CPU 缓存设计，发现简单的直接映射缓存比花哨的组相联设计更好，他总结为 "Big and dumb is better"——所以这条建议叫 Hill 定律。</p>
+</div>
+
+<section class="sim" id="sim-rw">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>读写锁时间线：读者如何饿死写者</h3>
+    <div class="desc">读者每隔 gap 个时间单位到达一个，每人读 rd 个单位；写者在 tw 时刻到达，要写 wd 个单位。"原书实现"下，只要读者的读区间彼此重叠，写者就一直等；切换到"写者优先"（写者在等时新读者排队）对比写者等待时间。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>读者数 <input type="number" id="rw-n" min="1" max="12" value="8"></label>
+      <label>gap <input type="number" id="rw-gap" min="1" max="10" value="2"></label>
+      <label>rd <input type="number" id="rw-rd" min="1" max="10" value="5"></label>
+      <label>tw <input type="number" id="rw-tw" min="0" max="20" value="3"></label>
+      <label>wd <input type="number" id="rw-wd" min="1" max="10" value="3"></label>
+      <label>策略 <select id="rw-mode"><option value="book">原书实现（读者优先）</option><option value="wpref">写者优先（改进）</option></select></label>
+    </div>
+    <div id="rw-step"></div>
+    <div class="stage" id="rw-stage"></div>
+    <div class="legend"><span><i style="background:var(--c3)"></i>读</span><span><i style="background:var(--c2)"></i>写</span><span><i style="background:var(--warn-soft);border-color:var(--warn)"></i>等待</span></div>
+    <div class="narrate" id="rw-nar"></div>
+    <div class="stats" id="rw-stats"></div>
+  </div>
+</section>
+
+<h2>哲学家就餐问题</h2>
+<p>Dijkstra 提出并解决的最著名的并发问题之一是<strong>哲学家就餐问题（dining philosophers）</strong>。它有趣、也有点智力挑战，实用价值不高——但名气太大，面试可能会问到。</p>
+<p>设定：5 位哲学家围坐一桌，每两人之间放一把叉子（共 5 把）。哲学家时而思考（不需要叉子），时而吃饭；吃饭需要<strong>左右两把叉子</strong>。每位哲学家 p（0~4）的循环是：</p>
+<pre><code>while (1) {
+    think();
+    get_forks(p);
+    eat();
+    put_forks(p);
+}</code></pre>
+<p>挑战是写出 get_forks() 和 put_forks()，使得<strong>没有死锁、没有哲学家饿死、并发度尽量高</strong>（尽可能多的人同时吃）。按 Downey 的写法，先定义两个辅助函数和 5 个信号量（每把叉子一个，初值 1）：</p>
+<pre><code>int left(int p)  { return p; }
+int right(int p) { return (p + 1) % 5; }   // p=4 时右叉是 fork 0
+sem_t forks[5];</code></pre>
+<h3>错误的解法</h3>
+<pre><code>void get_forks(int p) {
+    sem_wait(&amp;forks[left(p)]);
+    sem_wait(&amp;forks[right(p)]);
+}
+
+void put_forks(int p) {
+    sem_post(&amp;forks[left(p)]);
+    sem_post(&amp;forks[right(p)]);
+}</code></pre>
+<p>直觉很简单：先"锁住"左叉，再锁住右叉，吃完都放下。可惜简单在这里意味着错误：如果<strong>每位哲学家都在任何人拿右叉之前拿起了左叉</strong>——P0 拿 f0、P1 拿 f1、P2 拿 f2、P3 拿 f3、P4 拿 f4——所有叉子都被拿走，每个人都攥着一把叉子等另一把，永远等下去：死锁。</p>
+<h3>解法：打破依赖</h3>
+<p>最简单的办法是让<strong>至少一位</strong>哲学家换个顺序拿叉子——Dijkstra 本人就是这样解决的。让编号最大的 P4 先拿右叉再拿左叉（Figure 31.16），put_forks() 不变：</p>
+<pre><code>void get_forks(int p) {
+    if (p == 4) {
+        sem_wait(&amp;forks[right(p)]);
+        sem_wait(&amp;forks[left(p)]);
+    } else {
+        sem_wait(&amp;forks[left(p)]);
+        sem_wait(&amp;forks[right(p)]);
+    }
+}</code></pre>
+<p>因为最后一位哲学家先拿右叉，就不可能出现"每人拿一把、都在等下一把"的局面——<strong>等待的环被打破了</strong>。想一想为什么：P4 的右叉是 f0，它和 P0 抢的是同一把"第一把叉子"；谁没抢到，谁手里就是空的，不会占着叉子等人。下一章会把这个思想总结为"破坏循环等待（circular wait）"。</p>
+
+<section class="sim" id="sim-dp">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>哲学家就餐：死锁与"P4 反序"</h3>
+    <div class="desc">每位哲学家的一步 = think → 拿第一把叉 → 拿第二把叉 → eat → 放下两把叉。点"Px 走一步"手动调度，或随机调度（可复现的种子）。先载入"原书死锁调度"，再切换到修复版用同样的调度对比。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>算法 <select id="dp-mode"><option value="broken">全部先左后右（Fig 31.15）</option><option value="fixed">P4 先右后左（Fig 31.16）</option></select></label>
+      <button id="dp-book">原书死锁调度</button>
+      <button id="dp-reset">清空重来</button>
+      <span class="sep"></span>
+      <label>种子 <input type="number" id="dp-seed" value="3"></label>
+      <label>步数 <input type="number" id="dp-max" min="10" max="400" value="120"></label>
+      <button id="dp-rand">随机调度</button>
+      <button id="dp-batch">随机跑 1000 次统计</button>
+    </div>
+    <div id="dp-step"></div>
+    <div class="stage">
+      <div class="phil-table"><div id="dp-svg"></div><div><div class="table-wrap"><table class="minitable" id="dp-tab"></table></div><div class="pickbar" id="dp-pick"></div></div></div>
+    </div>
+    <div class="narrate" id="dp-nar"></div>
+    <div id="dp-alert"></div>
+    <div class="stats" id="dp-stats"></div>
+  </div>
+</section>
+
+<p class="small muted">类似的"著名问题"还有吸烟者问题（cigarette smoker's problem）、睡眠理发师问题（sleeping barber problem）等，它们大多是练习并发思维的借口。Downey 的《The Little Book of Semaphores》收录了大量这类题目。</p>
+
+<h2>线程节流</h2>
+<p>信号量还有一个简单用途：程序员怎样防止"太多"线程同时做某件事、把系统拖垮？答案：定一个"太多"的阈值，然后用信号量限制同时执行那段代码的线程数。这叫<strong>节流（throttling）</strong>，是一种<strong>准入控制（admission control）</strong>。</p>
+<p>具体例子：你创建了几百个线程并行处理一个问题，但代码中某一段（称为<strong>内存密集区</strong>）每个线程都要申请一大块内存。如果所有线程同时进入这一段，内存申请总量超过物理内存，机器就开始<strong>抖动（thrashing）</strong>——不停地换页，整个计算慢如蜗牛。只要把信号量初值设为"允许同时进入的最大线程数"，并在这段代码前后放 sem_wait() 和 sem_post()，就能自然地限流：</p>
+<pre><code>sem_t gate;
+sem_init(&amp;gate, 0, K);     // 最多 K 个线程同时在内存密集区
+
+void *worker(void *arg) {
+    ...                    // 普通计算
+    sem_wait(&amp;gate);       // 进门拿一个名额
+    memory_intensive_region();
+    sem_post(&amp;gate);       // 出门还回名额
+    ...
+}</code></pre>
+<figure class="fig">
+<svg viewBox="0 0 700 150" width="700" role="img" aria-label="节流闸门">
+  <g font-size="12" text-anchor="middle">
+    <circle cx="40" cy="75" r="15" fill="var(--c8)"/><circle cx="80" cy="75" r="15" fill="var(--c8)"/><circle cx="120" cy="75" r="15" fill="var(--c8)"/><circle cx="160" cy="75" r="15" fill="var(--c8)"/>
+    <text x="100" y="118" class="t-muted">在 sem_wait(&amp;gate) 睡着排队</text>
+  </g>
+  <rect x="200" y="30" width="16" height="90" rx="3" class="warn-soft"/><text x="208" y="22" text-anchor="middle" font-size="12">gate</text>
+  <rect x="240" y="30" width="260" height="90" rx="12" class="accent-soft"/>
+  <text x="370" y="50" text-anchor="middle" font-size="13">内存密集区（最多 K = 3）</text>
+  <g font-size="12" text-anchor="middle">
+    <circle cx="300" cy="85" r="17" fill="var(--c1)"/><circle cx="370" cy="85" r="17" fill="var(--c1)"/><circle cx="440" cy="85" r="17" fill="var(--c1)"/>
+  </g>
+  <rect x="530" y="40" width="140" height="70" rx="8" class="box"/>
+  <text x="600" y="66" text-anchor="middle" font-size="12.5">3 × 8 MB = 24 MB</text>
+  <text x="600" y="88" text-anchor="middle" font-size="12" class="t-muted">不超过物理内存</text>
+</svg>
+<figcaption>信号量值 = 剩余名额。第 K+1 个线程在门口睡着，直到有人出来 post。</figcaption>
+</figure>
+
+<section class="sim" id="sim-thr">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>线程节流：K 选多大？</h3>
+    <div class="desc">N 个线程先做一小段普通计算，再进入内存密集区（每个占 mem 单位内存，工作量 work）。区内内存总量超过物理内存 cap 时发生抖动，每个线程的进度只有平时的 1/4。改变 K，看同时在区内的线程数和总完成时间。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>线程数 N <input type="number" id="thr-n" min="2" max="16" value="8"></label>
+      <label>K <input type="number" id="thr-k" min="1" max="16" value="3"></label>
+      <label>每线程内存 <input type="number" id="thr-mem" min="1" max="8" value="2"></label>
+      <label>物理内存 cap <input type="number" id="thr-cap" min="2" max="40" value="8"></label>
+      <label>工作量 <input type="number" id="thr-work" min="1" max="10" value="4"></label>
+      <button id="thr-cmp">比较所有 K</button>
+    </div>
+    <div id="thr-step"></div>
+    <div class="stage" id="thr-stage"></div>
+    <div class="legend"><span><i style="background:var(--surface-2)"></i>普通计算</span><span><i style="background:var(--warn-soft);border-color:var(--warn)"></i>在 gate 等待</span><span><i style="background:var(--accent)"></i>区内（正常）</span><span><i style="background:var(--bad)"></i>区内（抖动）</span><span><i style="background:var(--ok-soft);border-color:var(--ok)"></i>完成</span></div>
+    <div class="narrate" id="thr-nar"></div>
+    <div class="stats" id="thr-stats"></div>
+  </div>
+</section>
+
+<h2>如何实现信号量：Zemaphore</h2>
+<p>最后，用底层同步原语——锁和条件变量——构造我们自己的信号量，叫作……（敲鼓）……<strong>Zemaphore</strong>（Figure 31.17）：</p>
+<pre><code>typedef struct __Zem_t {
+    int value;
+    pthread_cond_t cond;
+    pthread_mutex_t lock;
+} Zem_t;
+
+// 只能由一个线程调用
+void Zem_init(Zem_t *s, int value) {
+    s-&gt;value = value;
+    Cond_init(&amp;s-&gt;cond);
+    Mutex_init(&amp;s-&gt;lock);
+}
+
+void Zem_wait(Zem_t *s) {
+    Mutex_lock(&amp;s-&gt;lock);
+    while (s-&gt;value &lt;= 0)             // 没有名额就等（while，不是 if！）
+        Cond_wait(&amp;s-&gt;cond, &amp;s-&gt;lock);
+    s-&gt;value--;                       // 有名额才减
+    Mutex_unlock(&amp;s-&gt;lock);
+}
+
+void Zem_post(Zem_t *s) {
+    Mutex_lock(&amp;s-&gt;lock);
+    s-&gt;value++;
+    Cond_signal(&amp;s-&gt;cond);
+    Mutex_unlock(&amp;s-&gt;lock);
+}</code></pre>
+<p>只用了一把锁、一个条件变量，再加一个记录信号量值的状态变量。和 Dijkstra 定义的"纯"信号量有一个细微差别：<strong>Zemaphore 不维护"值为负时等于等待者数"这个不变量——它的值永远不会小于 0</strong>（先判断、有名额才减）。这种做法更容易实现，也和当前 Linux 的实现一致。</p>
+<figure class="fig">
+<svg viewBox="0 0 700 170" width="700" role="img" aria-label="Dijkstra 信号量与 Zemaphore 的比较">
+  <text x="170" y="22" text-anchor="middle" font-size="14" font-weight="700">Dijkstra：先减再判断</text>
+  <text x="530" y="22" text-anchor="middle" font-size="14" font-weight="700">Zemaphore：先判断再减</text>
+  <rect x="60" y="40" width="220" height="80" rx="10" class="box-strong"/>
+  <text x="110" y="70" text-anchor="middle" font-size="12" class="t-muted">value</text><text x="110" y="100" text-anchor="middle" font-size="26" font-weight="700" class="mono" style="fill:var(--bad)">-3</text>
+  <text x="210" y="70" text-anchor="middle" font-size="12" class="t-muted">等待者</text><text x="210" y="100" text-anchor="middle" font-size="16" class="mono">T0 T1 T2</text>
+  <rect x="420" y="40" width="220" height="80" rx="10" class="box-strong"/>
+  <text x="470" y="70" text-anchor="middle" font-size="12" class="t-muted">value</text><text x="470" y="100" text-anchor="middle" font-size="26" font-weight="700" class="mono">0</text>
+  <text x="570" y="70" text-anchor="middle" font-size="12" class="t-muted">cond 上等待</text><text x="570" y="100" text-anchor="middle" font-size="16" class="mono">T0 T1 T2</text>
+  <text x="170" y="146" text-anchor="middle" font-size="12.5">值的绝对值 = 等待者数</text>
+  <text x="530" y="146" text-anchor="middle" font-size="12.5">值 ≥ 0；等待者数要去看条件变量的队列</text>
+</svg>
+<figcaption>同样是"初值 0、三个线程 wait"，两种实现的内部状态不同，但对使用者表现相同：三个线程都在等。</figcaption>
+</figure>
+<p>反过来，<strong>用信号量构造条件变量要难得多</strong>。一些经验丰富的并发程序员在 Windows 环境下尝试过，结果冒出了许多不同的 bug（Birrell 的文章记录了这段经历）。你可以自己试试，想想为什么它比看上去难——提示：条件变量的 signal 在没人等时什么都不做，而信号量的 post 会被"记住"。</p>
+<div class="aside" data-title="小心泛化（Lampson）">
+<p>泛化在系统设计里很有用：一个好想法稍加扩展就能解决更大一类问题。但 Lampson 警告："不要泛化；泛化通常是错的"（Don't generalize; generalizations are generally wrong）。可以把信号量看作锁和条件变量的泛化——但真的需要这种泛化吗？考虑到在信号量之上实现条件变量有多难，这个泛化也许没有你以为的那么"通用"。</p>
+</div>
+
+<section class="sim" id="sim-zem">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>Dijkstra 信号量 vs Zemaphore：同一串操作，两种内部状态</h3>
+    <div class="desc">输入一串操作：<code>W0</code> = T0 调用 wait，<code>P3</code> = T3 调用 post，<code>R0</code> = 被唤醒的 T0 真正获得 CPU（Zemaphore 里它要重新检查 while 条件）。观察 Zemaphore 的值从不为负；"插队"预设展示 Mesa 语义下为什么必须用 while。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>初值 <input type="number" id="zem-init" min="0" max="3" value="0"></label>
+      <label>操作 <input type="text" id="zem-ops" value="W0 W1 W2 P3 R0 P3 R1" style="width:16em"></label>
+      <button id="zem-run">运行</button>
+      <button id="zem-p1">预设：三人排队</button>
+      <button id="zem-p2">预设：插队（barging）</button>
+    </div>
+    <div id="zem-step"></div>
+    <div class="stage"><div class="twocol" id="zem-stage"></div></div>
+    <div class="narrate" id="zem-nar"></div>
+  </div>
+</section>
+
+<h2>先预测再验证</h2>
+<div class="exercise"><div class="q">在"信号量执行器"里载入"3 个线程排队等锁"。<strong>先预测</strong>：值最低会降到多少？那一刻等待队列里有谁？T0 释放后，是 T1 还是 T2 先进入临界区？</div>
+<details class="reveal"><summary>看答案</summary><div>最低 -2，队列是 [T1, T2]（值的绝对值 = 等待者数）。T0 post 时值从 -2 变为 -1，唤醒队首的 T1；T1 用完后 post，值变 0，唤醒 T2；T2 post 后值回到 1。本模拟器的等待队列是先进先出的，真实系统里唤醒哪个线程取决于实现。</div></details></div>
+
+<div class="exercise"><div class="q">在执行器里载入 Figure 31.8（子线程先跑完），在第 2 行（切到 Child 之前）改为自己调度：让 Parent 先执行几步。会不会出现 parent: end 先于 child？再想想：如果初值误设为 1 呢？（可用 C 实验 <code>./fork_join 1</code> 验证。）</div>
+<details class="reveal"><summary>看答案</summary><div>初值 0 时不会：无论怎么交错，父线程要么睡在 sem_wait()（值 -1）等子线程 post，要么在子线程 post 之后才 wait（值 1→0）。初值为 1 时，父线程 sem_wait() 把 1 减到 0 直接返回，不等子线程——实验里会看到 <code>parent: end</code> 出现在 <code>child</code> 之前。</div></details></div>
+
+<div class="exercise"><div class="q">生产者/消费者模拟器，选"mutex 在外层（Fig 31.11）"，MAX=1、各 1 个线程。<strong>先预测</strong>：是不是每一种调度都会死锁？如果不是，什么样的调度能侥幸跑完？然后用不同种子"随机调度到底"验证。</div>
+<details class="reveal"><summary>看答案</summary><div>不是每次都死锁。死锁需要"拿着 mutex 去睡"：消费者拿到 mutex 时缓冲区是空的（睡在 full 上），或生产者拿到 mutex 时缓冲区是满的（睡在 empty 上）。如果运气好，每次拿到 mutex 的一方恰好都能继续，就能跑完。本页逻辑在 node 中随机跑 3000 次（1 生产者 1 消费者、MAX=1、各 5 个），约 60% 死锁；正确版 3000 次无一死锁。这正是并发 bug 的可怕之处：它可能只是"偶尔"发生。</div></details></div>
+
+<div class="exercise"><div class="q">哲学家模拟器切到"P4 先右后左"，载入原书死锁调度。<strong>先预测</strong>：这串调度走完之后，谁能吃上饭？最多能有几位哲学家同时吃？</div>
+<details class="reveal"><summary>看答案</summary><div>P4 第一步去拿 f0，而 f0 已被 P0 拿走，于是 P4 两手空空地睡着；f4 就空出来了。P3 拿到 f3 后能再拿到 f4，于是 P3 可以吃。5 把叉子、每人要 2 把，所以最多同时 2 人吃饭（例如 P0 和 P2）。</div></details></div>
+
+<div class="exercise"><div class="q">读写锁模拟器默认参数下（gap=2、rd=5、写者 t=3 到达），<strong>先预测</strong>写者要等多久？把 gap 改成 6（大于 rd）呢？再切到"写者优先"。</div>
+<details class="reveal"><summary>看答案</summary><div>默认参数下读区间首尾相接地重叠，readers 从不归零，写者从 t=3 一直等到最后一个读者在 t=19 离开，等了 16 个单位。gap=6 时每个读者读完下一个才来，写者只需等当前那个读者读完（t=5 开始写）。写者优先时，写者到达后新读者排队，写者在已有读者读完后（t=7）就能写，只等 4 个单位。</div></details></div>
+
+<div class="exercise"><div class="q">节流模拟器默认参数（8 个线程、每个占 2、物理内存 8），<strong>先预测</strong>哪个 K 总时间最短？点"比较所有 K"验证。</div>
+<details class="reveal"><summary>看答案</summary><div>K=4 最短：4 × 2 = 8 恰好不超过物理内存，并发度又最高。K 更小则浪费了并行度；K ≥ 5 时区内内存超出，发生抖动，所有人都变慢，K=8（相当于不节流）反而最慢。</div></details></div>
+
+<h2>动手实验</h2>
+<div class="lab">
+<p>五个小程序，都只用 POSIX 信号量：<code>fork_join</code>（join）、<code>pc</code>（生产者/消费者，<code>-b</code> 为错误版）、<code>dining</code>（哲学家就餐，带死锁检测）、<code>barrier</code>（屏障）、<code>throttle</code>（节流）。详见 <code>labs/31-semaphores/README.md</code>。</p>
+<pre><code><span class="cmd">cd labs/31-semaphores &amp;&amp; make</span>
+<span class="cmd">./fork_join; ./fork_join 1</span>
+<span class="cmd">./pc -p 2 -c 3 -m 10 -l 100000</span>
+<span class="cmd">./pc -b</span>
+<span class="cmd">./dining broken; ./dining fixed</span>
+<span class="cmd">./barrier 5</span>
+<span class="cmd">./throttle 20 3; ./throttle 20 0</span></code></pre>
+<p class="small muted">示例输出（在 WSL2 / gcc 14 上实际运行所得，你的机器上数字会不同）：</p>
+<pre><code>$ ./fork_join
+parent: begin (sem 初值 = 0)
+child
+parent: end
+$ ./fork_join 1
+parent: begin (sem 初值 = 1)
+parent: end
+child
+
+$ ./pc -p 2 -c 3 -m 10 -l 100000
+正确版：2 个生产者，3 个消费者，MAX=10，每个生产者 100000 个
+   消费者 C0 取走 64225 个
+   消费者 C1 取走 76677 个
+   消费者 C2 取走 59098 个
+生产 200000 个 (校验和 109999900000)，消费 200000 个 (校验和 109999900000) → 一致 ✓
+$ ./pc -b
+错误（mutex 在外层）版：1 个生产者，1 个消费者，MAX=1，每个生产者 10000 个
+!! 2 秒没有进展：检测到死锁。各线程状态：
+   生产者 P0: 等 mutex
+   消费者 C0: 持有 mutex 并等 full
+   已完成 put/get 次数 = 0
+
+$ ./dining broken
+错误版（全部先左后右）：5 位哲学家，每人吃 1000 次
+!! 2 秒内没有人吃上饭：检测到死锁（已吃 6 顿）
+   P0 拿着 f0，等待 f1
+   P1 拿着 f1，等待 f2
+   P2 拿着 f2，等待 f3
+   P3 拿着 f3，等待 f4
+   P4 拿着 f4，等待 f0
+   等待链：P0→f1(P1持有)→f2(P2持有)→…→f0(P0持有)，形成环
+$ ./dining fixed
+修复版（P4 先右后左）：5 位哲学家，每人吃 1000 次
+全部吃完，用时 3.21 秒；每人吃的次数： P0=1000 P1=1000 P2=1000 P3=1000 P4=1000
+
+$ ./barrier 5
+线程 0: P1
+线程 2: P1
+线程 1: P1
+线程 4: P1
+线程 3: P1
+线程 3:     P2 (此时已完成 P1 的线程数 = 5)
+线程 2:     P2 (此时已完成 P1 的线程数 = 5)
+线程 0:     P2 (此时已完成 P1 的线程数 = 5)
+线程 1:     P2 (此时已完成 P1 的线程数 = 5)
+线程 4:     P2 (此时已完成 P1 的线程数 = 5)
+✓ 所有 P2 都发生在全部 P1 之后
+
+$ ./throttle 20 3; ./throttle 20 0
+20 个线程，K=3：内存密集区里同时最多有 3 个线程（峰值约 24 MB）
+20 个线程，K=0（不节流）：内存密集区里同时最多有 20 个线程（峰值约 160 MB）</code></pre>
+<p><strong>要观察什么、为什么：</strong></p>
+<ul>
+<li><code>pc</code> 故意让消费者先启动，所以错误版几乎必然走进原书描述的那条死锁路径；两个程序都带"看门狗"，2 秒无进展就打印各线程停在哪里并退出，不会永远挂住。</li>
+<li><code>dining</code> 在拿到第一把叉子后 <code>usleep(1000)</code>，放大竞争窗口，使"人人拿左叉"几乎必然发生；修复版只改了 P4 的顺序，就能吃完全部 5000 顿。</li>
+<li><code>barrier</code> 用 mutex 保护计数器，最后到达者打开 turnstile（旋转门），每个人穿过后再 post 一次把门留给下一个人（Homework 第 3 题）。</li>
+</ul>
+</div>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+
+<div class="mcq" data-answer="3"><div class="q">按 Dijkstra 的定义，信号量的值为 -3 意味着什么？</div>
+<div class="opts"><button>A. 还能再成功 wait 3 次</button><button>B. 信号量被误用，程序已经出错</button><button>C. 有 3 个线程同时在临界区里</button><button>D. 有 3 个线程在这个信号量上等待</button></div>
+<div class="explain">sem_wait 先减后判断，每个睡下去的线程都让值多减了 1，所以负值的绝对值恰好等于等待者数。注意这一不变量对 Zemaphore / Linux 实现不成立（它们的值不会小于 0）。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">用信号量实现"父线程等待子线程结束"（join），信号量初值应该是多少？</div>
+<div class="opts"><button>A. 1</button><button>B. 0</button><button>C. 子线程个数</button><button>D. -1</button></div>
+<div class="explain">初值 0：一开始"没有东西可给"。父线程先 wait 时减到 -1 而睡眠；子线程先 post 时值变 1，父线程再 wait 直接通过。初值 1 会让父线程根本不等。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">MAX = 1，只用 empty/full 两个信号量、不加 mutex（Figure 31.10），多个生产者和多个消费者，会出问题吗？</div>
+<div class="opts"><button>A. 会：一定死锁</button><button>B. 会：消费者可能读到空槽</button><button>C. 不会：MAX = 1 时 empty/full 保证同一时刻最多一个线程在 put 或 get</button><button>D. 会：两个生产者可能同时写 buffer[0]</button></div>
+<div class="explain">empty 初值 1，至多一个生产者能通过 P1，且只有消费者 get 完 post empty 后下一个生产者才能进来；full 同理。原书说这种情况"仍然能工作"。竞争只在 MAX &gt; 1 时出现：多个生产者可同时通过 P1，在 F1 覆盖彼此的数据。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">Figure 31.11 把 mutex 放在 sem_wait(&amp;full) 外面，为什么会死锁？</div>
+<div class="opts"><button>A. sem_post 可能唤醒错误的线程</button><button>B. 消费者持有 mutex 睡在 full 上，而唯一能 post full 的生产者正在等 mutex</button><button>C. 信号量不能嵌套使用</button><button>D. mutex 的初值应该是 0</button></div>
+<div class="explain">睡在 sem_wait 上的线程不会释放它已持有的其他信号量。"拿着锁去等别的东西"形成了等待环。解决方法是把 mutex 缩小到只包住 put/get。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">关于原书 Figure 31.13 的读写锁，哪个说法正确？</div>
+<div class="opts"><button>A. 只要不断有读者到来、readers 从不降到 0，写者就可能一直等下去</button><button>B. 每个读者进入时都要 sem_wait(&amp;writelock)</button><button>C. 读写锁总是比普通锁快</button><button>D. 写者可能饿死读者</button></div>
+<div class="explain">只有第一个读者拿 writelock、最后一个读者释放它，所以读者可以"接力"一直占着。原书也提醒：读写锁开销更大，未必比简单的锁快（Hill 定律）。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">哲学家就餐问题中，让 P4 先拿右叉再拿左叉，本质上消除了什么？</div>
+<div class="opts"><button>A. 饥饿：保证每位哲学家都能吃到</button><button>B. 持有并等待：哲学家一次拿两把叉子</button><button>C. 循环等待：不可能出现每人拿一把、都等下一把的环</button><button>D. 互斥：叉子可以共享了</button></div>
+<div class="explain">P4 仍然会拿着一把叉子等另一把（持有并等待还在），但获取顺序被改了，等待关系无法闭合成环。它不保证公平（饥饿问题另说）。下一章会系统讲死锁的四个条件。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">Zemaphore（Figure 31.17）和 Dijkstra 定义的信号量有什么区别？</div>
+<div class="opts"><button>A. Zemaphore 的值不会小于 0，不能从值看出等待者个数</button><button>B. Zemaphore 不需要锁</button><button>C. Zemaphore 只能当二值信号量用</button><button>D. Zemaphore 的 post 可能会阻塞</button></div>
+<div class="explain">Zem_wait 先 while 判断 value &lt;= 0 再减，所以值始终 ≥ 0。这更容易实现，也与当前 Linux 实现一致。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">做线程节流时，信号量初值应该设为什么？</div>
+<div class="opts"><button>A. 1，节流就是加锁</button><button>B. 0，由第一个线程 post 开门</button><button>C. 线程总数</button><button>D. 允许同时进入该代码段的最大线程数</button></div>
+<div class="explain">初值 = "一开始愿意送出去的资源数" = 名额数 K。初值 1 退化为锁（完全串行），初值为线程总数则等于不节流。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">没有任何线程在等待时，分别调用 sem_post() 和 pthread_cond_signal()，会怎样？</div>
+<div class="opts"><button>A. sem_post 把值加 1，这个"信号"会被记住；cond_signal 什么也不做</button><button>B. 两者都会把"信号"保存起来</button><button>C. 两者都什么也不做</button><button>D. sem_post 什么也不做；cond_signal 会被记住</button></div>
+<div class="explain">这正是 join 用信号量不需要额外状态变量（done）的原因——值本身就是状态。条件变量没有记忆，所以必须配合状态变量使用，这也是用信号量实现条件变量很难的原因之一。</div></div>
+
+<h2>常见误区与小结</h2>
+<div class="warn">
+<ul>
+<li><strong>"sem_wait 是先判断再减"</strong>——按原书定义是<strong>先减再判断</strong>，所以值可以为负且等于等待者数（Zemaphore/Linux 实现才是先判断）。</li>
+<li><strong>"被唤醒的线程还要再减一次"</strong>——不会。它睡前已经减过，醒来直接从 sem_wait 返回。</li>
+<li><strong>"加锁范围越大越安全"</strong>——Figure 31.11 正是反例：拿着 mutex 去 sem_wait(&amp;full) 会死锁。锁只包住真正的临界区。</li>
+<li><strong>"信号量初值随便设个 1"</strong>——初值决定语义：锁是 1、排序是 0、空槽是 MAX、节流是 K。</li>
+<li><strong>"信号量是锁和条件变量的泛化，所以能轻松互相实现"</strong>——用锁+CV 实现信号量很简单，反过来却很难（Birrell 的经历）。</li>
+<li><strong>"修复哲学家死锁就保证了公平"</strong>——打破循环只消除死锁，不保证没人饿死。</li>
+</ul>
+</div>
+<div class="key">
+<p><strong>本章小结</strong></p>
+<ul>
+<li>信号量 = 整数值 + 等待队列；sem_wait 先减 1、为负则睡；sem_post 先加 1、有人等则唤醒一个。</li>
+<li>初值 1：二值信号量（锁）；初值 0：排序（join）；这两种用法分别替代了锁和条件变量。</li>
+<li>有界缓冲区：empty（初值 MAX）+ full（初值 0）+ mutex（只包 put/get）。mutex 放外层会死锁。</li>
+<li>读写锁：第一个读者拿、最后一个读者放 writelock；简单但会饿死写者，且未必更快。</li>
+<li>哲学家就餐：人人先左后右会死锁；让一个人反序拿叉即可打破等待环。</li>
+<li>节流：初值为 K 的信号量限制同时进入某段代码的线程数，防止抖动。</li>
+<li>Zemaphore：一把锁 + 一个条件变量 + 一个整数即可实现信号量，值不小于 0。</li>
+</ul>
+<p>与后续章节的联系：本章多次出现"拿着一个资源去等另一个资源"导致的死锁（Figure 31.11、哲学家就餐）。下一章《常见并发问题》将给出死锁的四个必要条件以及预防、避免、检测的方法；再下一章《基于事件的并发》则换一种思路：干脆不用线程和锁。</p>
+</div>
+
+</main>
+<script>
+// ===== 第 31 章模拟器的纯逻辑（不碰 DOM，可以直接在 node 里测试） =====
+var SEM = (function () {
+  "use strict";
+  const clone = (o) => JSON.parse(JSON.stringify(o));
+
+  // ---------------------------------------------------------------
+  // a. 通用信号量执行器：严格按 Figure 31.2 的定义
+  //    sem_wait: 先减 1；若值 < 0 则睡眠。sem_post: 先加 1；若有等待者则唤醒一个。
+  //    每个 sem_wait / sem_post 拆成 4 个微步骤，与原书轨迹表的粒度一致。
+  // ---------------------------------------------------------------
+  function semInit(cfg) {
+    const S = { val: cfg.init, q: [], run: -1, th: cfg.progs.map((p, i) => ({ pc: 0, sub: 0, st: cfg.start[i] })) };
+    S.run = S.th.findIndex((t) => t.st === "run");
+    return S;
+  }
+  function semSwitch(S, tid) {
+    if (S.run >= 0 && S.th[S.run].st === "run") S.th[S.run].st = "ready";
+    S.th[tid].st = "run";
+    S.run = tid;
+  }
+  function finishOp(S, cfg, tid) {
+    const T = S.th[tid];
+    T.sub = 0; T.pc++;
+    if (T.pc >= cfg.progs[tid].length) { T.st = "done"; if (S.run === tid) S.run = -1; }
+  }
+  function semMicro(S, cfg, tid) {
+    const T = S.th[tid], op = cfg.progs[tid][T.pc], nm = cfg.names;
+    const me = nm[tid];
+    if (!op) return { lab: "(结束)", nar: me + " 已经执行完了。" };
+    if (op.t === "wait") {
+      if (T.sub === 0) { T.sub = 1; return { lab: "call sem_wait()", nar: `${me} 调用 sem_wait()，此时值为 ${S.val}。` }; }
+      if (T.sub === 1) { S.val--; T.sub = 2; return { lab: "decr sem", nar: `${me} 先把值减 1 → ${S.val}。` }; }
+      if (T.sub === 2) {
+        T.sub = 3;
+        if (S.val < 0) { T.st = "sleep"; S.q.push(tid); if (S.run === tid) S.run = -1;
+          return { lab: "(sem<0)→sleep", nar: `值为 ${S.val} < 0，${me} 进入等待队列睡眠，让出 CPU。负值的绝对值 ${-S.val} 正好等于等待者个数。` }; }
+        return { lab: "(sem≥0)→awake", nar: `值为 ${S.val} ≥ 0，${me} 不需要等待。` };
+      }
+      finishOp(S, cfg, tid);
+      return { lab: "sem_wait() returns", nar: `${me} 从 sem_wait() 返回，继续往下执行。` };
+    }
+    if (op.t === "post") {
+      if (T.sub === 0) { T.sub = 1; return { lab: "call sem_post()", nar: `${me} 调用 sem_post()，此时值为 ${S.val}。` }; }
+      if (T.sub === 1) { S.val++; T.sub = 2; return { lab: "incr sem", nar: `${me} 先把值加 1 → ${S.val}。` }; }
+      if (T.sub === 2) {
+        T.sub = 3;
+        if (S.q.length) { const w = S.q.shift(); S.th[w].st = "ready";
+          return { lab: `wake(${nm[w]})`, nar: `等待队列里有线程，唤醒队首的 ${nm[w]}：它从"睡眠"变成"就绪"，但还没有真正运行。` }; }
+        return { lab: "wake(nobody)", nar: "等待队列是空的，没有人需要唤醒。" };
+      }
+      finishOp(S, cfg, tid);
+      return { lab: "sem_post() returns", nar: `${me} 从 sem_post() 返回。` };
+    }
+    if (op.t === "create") {
+      S.th[op.who].st = "ready"; finishOp(S, cfg, tid);
+      return { lab: `create(${nm[op.who]})`, nar: `${me} 创建了 ${nm[op.who]}：新线程进入就绪状态，可以被调度。` };
+    }
+    finishOp(S, cfg, tid);
+    return { lab: op.lab, nar: `${me} 执行 ${op.lab}。` };
+  }
+  // 按"剧本"生成一串快照。剧本一行 = 轨迹表的一行：
+  //   {sw: tid} 先切换到 tid；{run:[tid, n]} 让 tid 连续执行 n 个微步骤；{lab:{tid:'文字'}} 覆盖显示文字；{nar} 覆盖解说
+  function semBuild(cfg, script) {
+    const S = semInit(cfg);
+    const rows = [{ S: clone(S), lab: {}, nar: cfg.intro || "初始状态。" }];
+    for (const r of script) {
+      const lab = {}, nar = [];
+      if (r.sw !== undefined) { semSwitch(S, r.sw); nar.push(`切换到 ${cfg.names[r.sw]}。`); }
+      if (r.run) { let last; for (let k = 0; k < r.run[1]; k++) { last = semMicro(S, cfg, r.run[0]); nar.push(last.nar); } lab[r.run[0]] = last.lab; }
+      if (r.lab) Object.assign(lab, r.lab);
+      rows.push({ S: clone(S), lab, nar: r.nar || nar.join(" ") });
+    }
+    return rows;
+  }
+  // 原书假设 sem_wait/sem_post 是原子的：值改完（sub=2）到判断/唤醒之间不允许切换。返回处于该窗口的线程，否则 -1
+  function semBusy(cfg, S) {
+    if (S.run < 0) return -1;
+    const T = S.th[S.run], op = cfg.progs[S.run][T.pc];
+    return op && (op.t === "wait" || op.t === "post") && T.sub === 2 ? S.run : -1;
+  }
+  // 自由模式：从第 i 行之后，让 tid 执行一个微步骤（必要时先上下文切换）
+  function semFree(cfg, rows, i, tid) {
+    const S = clone(rows[i].S), lab = {}, nar = [];
+    const T = S.th[tid];
+    if (T.st === "sleep" || T.st === "done" || T.st === "none") return null;
+    if (semBusy(cfg, S) >= 0 && S.run !== tid) return null;   // 原子性：别人正处在"改完值、还没判断"的中间
+    if (S.run !== tid) { const prev = S.run; semSwitch(S, tid); if (prev >= 0) lab[prev] = "Switch→" + cfg.names[tid]; nar.push(`上下文切换到 ${cfg.names[tid]}。`); }
+    const m = semMicro(S, cfg, tid); lab[tid] = m.lab; nar.push(m.nar);
+    return rows.slice(0, i + 1).concat([{ S, lab, nar: nar.join(" "), free: true }]);
+  }
+
+  // 预设：与原书轨迹表逐行对应
+  const LOCK = (cs) => [{ t: "wait" }].concat(cs.map((l) => ({ t: "cs", lab: l })), [{ t: "post" }, { t: "cs", lab: "(之后的代码)" }]);
+  const semPresets = {
+    f314: {
+      title: "Figure 31.4：单线程用信号量当锁",
+      cfg: { init: 1, names: ["T0"], start: ["run"], progs: [LOCK(["(crit sect)"])], intro: "信号量初值 1（锁空闲）。只有一个线程 T0。" },
+      script: [{ run: [0, 1] }, { run: [0, 3], lab: { 0: "sem_wait() returns" }, nar: "值 1 减到 0，不是负数，sem_wait() 立即返回：T0 拿到了\"锁\"。" },
+        { run: [0, 1] }, { run: [0, 1] }, { run: [0, 3], lab: { 0: "sem_post() returns" }, nar: "值 0 加回 1，没有等待者，不用唤醒任何人。锁又空闲了。" }],
+    },
+    f315: {
+      title: "Figure 31.5：两个线程争同一把\"锁\"",
+      cfg: { init: 1, names: ["T0", "T1"], start: ["run", "ready"], progs: [LOCK(["(crit sect begin)", "(crit sect end)"]), LOCK(["(crit sect)"])], intro: "信号量初值 1。T0 正在运行，T1 就绪。" },
+      script: [
+        { run: [0, 1] },
+        { run: [0, 3], lab: { 0: "sem_wait() returns" }, nar: "T0 把值减到 0，0 不是负数 → 直接返回，进入临界区。" },
+        { run: [0, 1] },
+        { sw: 1, lab: { 0: "Interrupt; Switch→T1" }, nar: "时钟中断！T0 还在临界区里就被切走了（它仍然\"持有锁\"，值为 0）。" },
+        { run: [1, 1] }, { run: [1, 1] }, { run: [1, 1] },
+        { sw: 0, lab: { 1: "Switch→T0" }, nar: "T1 睡着了，调度器只能运行 T0。" },
+        { run: [0, 1] }, { run: [0, 1] }, { run: [0, 1] }, { run: [0, 1] }, { run: [0, 1] },
+        { sw: 1, lab: { 0: "Interrupt; Switch→T1" }, nar: "又一次中断，切换到已经就绪的 T1。" },
+        { run: [1, 1], nar: "T1 从当初睡下去的 sem_wait() 里返回——注意它不会再减一次值，它的那次减 1 早就做过了。" },
+        { run: [1, 1] }, { run: [1, 1] },
+        { run: [1, 3], lab: { 1: "sem_post() returns" }, nar: "T1 把值从 0 加回 1，没有等待者。整个过程值走过 1 → 0 → -1 → 0 → 1。" },
+      ],
+    },
+    f317: {
+      title: "Figure 31.7：join，情况 1（父线程先等）",
+      cfg: { init: 0, names: ["Parent", "Child"], start: ["run", "none"], progs: [[{ t: "create", who: 1 }, { t: "wait" }, { t: "cs", lab: 'printf("parent: end")' }], [{ t: "post" }, { t: "cs", lab: "return NULL" }]], intro: "信号量初值 0：一开始\"没有东西可给\"。子线程尚未创建。" },
+      script: [
+        { run: [0, 1], lab: { 1: "(Child exists, can run)" } },
+        { run: [0, 1] }, { run: [0, 1] }, { run: [0, 1] },
+        { sw: 1, lab: { 0: "Switch→Child", 1: "child runs" }, nar: "父线程睡了，子线程开始运行（打印 child）。" },
+        { run: [1, 1] }, { run: [1, 1] }, { run: [1, 1] }, { run: [1, 1] },
+        { sw: 0, lab: { 1: "Interrupt→Parent" }, nar: "中断，切回父线程。" },
+        { run: [0, 1], nar: "父线程从 sem_wait() 返回，打印 parent: end。顺序得到保证。" },
+      ],
+    },
+    f318: {
+      title: "Figure 31.8：join，情况 2（子线程先跑完）",
+      cfg: { init: 0, names: ["Parent", "Child"], start: ["run", "none"], progs: [[{ t: "create", who: 1 }, { t: "wait" }, { t: "cs", lab: 'printf("parent: end")' }], [{ t: "post" }, { t: "cs", lab: "return NULL" }]], intro: "信号量初值 0。这次子线程被创建后立刻得到 CPU。" },
+      script: [
+        { run: [0, 1], lab: { 1: "(Child exists; can run)" } },
+        { sw: 1, lab: { 0: "Interrupt→Child", 1: "child runs" }, nar: "父线程还没来得及 sem_wait()，就切到了子线程。" },
+        { run: [1, 1] }, { run: [1, 1] },
+        { run: [1, 1], nar: "没有人在等，所以不唤醒任何人——但值已经变成 1，这个\"完成\"被记住了。" },
+        { run: [1, 1] },
+        { sw: 0, lab: { 0: "parent runs", 1: "Interrupt→Parent" } },
+        { run: [0, 1] }, { run: [0, 1], lab: { 0: "decrement sem" } }, { run: [0, 1] },
+        { run: [0, 1], nar: "值为 0 ≥ 0，父线程不必睡眠，直接返回。两种情况结果一样：child 一定先于 parent: end。" },
+      ],
+    },
+    q3: {
+      title: "3 个线程排队等锁（值降到 -2）",
+      cfg: { init: 1, names: ["T0", "T1", "T2"], start: ["run", "ready", "ready"], progs: [LOCK(["(crit sect)"]), LOCK(["(crit sect)"]), LOCK(["(crit sect)"])], intro: "初值 1，三个线程都要进临界区。观察值变成 -2 时，等待队列里恰好 2 个线程。" },
+      script: [
+        { run: [0, 4], lab: { 0: "sem_wait() returns" } }, { run: [0, 1] },
+        { sw: 1, lab: { 0: "Interrupt; Switch→T1" } }, { run: [1, 3], lab: { 1: "(sem<0)→sleep" } },
+        { sw: 2, lab: { 1: "Switch→T2" } }, { run: [2, 3], lab: { 2: "(sem<0)→sleep" }, nar: "T2 也把值减到 -2 并睡眠。值 = -2，队列 = [T1, T2]。" },
+        { sw: 0, lab: { 2: "Switch→T0" } }, { run: [0, 3], lab: { 0: "wake(T1)" }, nar: "T0 释放：值 -2 → -1，唤醒队首的 T1（FIFO）。" }, { run: [0, 1] },
+        { sw: 1, lab: { 0: "Switch→T1" } }, { run: [1, 1] }, { run: [1, 1] }, { run: [1, 3], lab: { 1: "wake(T2)" }, nar: "T1 释放：值 -1 → 0，唤醒 T2。" }, { run: [1, 1] },
+        { sw: 2, lab: { 1: "Switch→T2" } }, { run: [2, 1] }, { run: [2, 1] }, { run: [2, 4], lab: { 2: "sem_post() returns" }, nar: "T2 释放：值回到 1。三个线程依次通过，没有两个同时在临界区。" },
+      ],
+    },
+  };
+
+  // ---------------------------------------------------------------
+  // b. 用信号量解决生产者/消费者：三个版本
+  // ---------------------------------------------------------------
+  const PC_CODE = {
+    good: {
+      P: [["P1", "sem_wait(&empty);", "w", "empty"], ["P1.5", "sem_wait(&mutex);", "w", "mutex"], ["F1", "buffer[fill] = i;", "f1"], ["F2", "fill = (fill + 1) % MAX;", "f2"], ["P2.5", "sem_post(&mutex);", "p", "mutex"], ["P3", "sem_post(&full);", "p", "full"]],
+      C: [["C1", "sem_wait(&full);", "w", "full"], ["C1.5", "sem_wait(&mutex);", "w", "mutex"], ["G1", "tmp = buffer[use];", "g1"], ["G2", "use = (use + 1) % MAX;", "g2"], ["C2.5", "sem_post(&mutex);", "p", "mutex"], ["C3", "sem_post(&empty);", "p", "empty"], ["", 'printf("%d\\n", tmp);', "pr"]],
+    },
+    bad: {
+      P: [["P0", "sem_wait(&mutex);", "w", "mutex"], ["P1", "sem_wait(&empty);", "w", "empty"], ["F1", "buffer[fill] = i;", "f1"], ["F2", "fill = (fill + 1) % MAX;", "f2"], ["P3", "sem_post(&full);", "p", "full"], ["P4", "sem_post(&mutex);", "p", "mutex"]],
+      C: [["C0", "sem_wait(&mutex);", "w", "mutex"], ["C1", "sem_wait(&full);", "w", "full"], ["G1", "tmp = buffer[use];", "g1"], ["G2", "use = (use + 1) % MAX;", "g2"], ["C3", "sem_post(&empty);", "p", "empty"], ["C4", "sem_post(&mutex);", "p", "mutex"], ["", 'printf("%d\\n", tmp);', "pr"]],
+    },
+    nomutex: {
+      P: [["P1", "sem_wait(&empty);", "w", "empty"], ["F1", "buffer[fill] = i;", "f1"], ["F2", "fill = (fill + 1) % MAX;", "f2"], ["P3", "sem_post(&full);", "p", "full"]],
+      C: [["C1", "sem_wait(&full);", "w", "full"], ["G1", "tmp = buffer[use];", "g1"], ["G2", "use = (use + 1) % MAX;", "g2"], ["C3", "sem_post(&empty);", "p", "empty"], ["", 'printf("%d\\n", tmp);', "pr"]],
+    },
+  };
+  function pcInit(o) {
+    const th = [];
+    for (let i = 0; i < o.np; i++) th.push({ k: "P", idx: i, name: "P" + "abc"[i], pc: 0, i: 0, st: "ready", on: null, mx: false, tmp: null });
+    for (let j = 0; j < o.nc; j++) th.push({ k: "C", idx: j, name: "C" + "abc"[j], pc: 0, i: 0, st: "ready", on: null, mx: false, tmp: null });
+    return { o: clone(o), sem: { empty: o.MAX, full: 0, mutex: 1 }, q: { empty: [], full: [], mutex: [] },
+      buf: Array.from({ length: o.MAX }, () => ({ v: null, full: false })), fill: 0, use: 0, th, out: [], err: null, status: "ok", last: -1, steps: 0 };
+  }
+  const itemVal = (T, i) => T.idx * 10 + i; // Pa 生产 0,1,2…；Pb 生产 10,11,12…
+  function pcCode(S, T) { return PC_CODE[S.o.ver][T.k]; }
+  function pcStep(S, tid) {
+    const T = S.th[tid];
+    if (T.st !== "ready") return null;
+    const code = pcCode(S, T), line = code[T.pc], [id, , kind, sem] = line;
+    const tag = (id ? id + " " : "") + line[1];
+    let nar = `${T.name} 执行 ${tag}`;
+    S.last = tid; S.steps++;
+    let advance = true;
+    if (kind === "w") {
+      S.sem[sem]--;
+      if (S.sem[sem] < 0) { T.st = "sleep"; T.on = sem; S.q[sem].push(tid); advance = false;
+        nar += `：${sem} 减到 ${S.sem[sem]} < 0，${T.name} 睡在 ${sem} 上` + (T.mx && sem !== "mutex" ? `——注意它仍然持有 mutex！` : "。"); }
+      else { if (sem === "mutex") T.mx = true; nar += `：${sem} 减到 ${S.sem[sem]}，通过。`; }
+    } else if (kind === "p") {
+      S.sem[sem]++;
+      if (sem === "mutex") T.mx = false;
+      nar += `：${sem} 加到 ${S.sem[sem]}`;
+      if (S.q[sem].length) { const w = S.q[sem].shift(), W = S.th[w]; W.st = "ready"; W.on = null; W.pc++; if (sem === "mutex") W.mx = true;
+        nar += `，唤醒睡在 ${sem} 上的 ${W.name}（它下次运行时从 sem_wait 返回）。`; }
+      else nar += "，没有等待者。";
+    } else if (kind === "f1") {
+      const slot = S.buf[S.fill], v = itemVal(T, T.i);
+      if (slot.full) { S.err = `数据被覆盖！${T.name} 把 ${v} 写进 buffer[${S.fill}]，冲掉了还没被消费的 ${slot.v}。`; S.status = "err"; }
+      S.buf[S.fill] = { v, full: true };
+      nar += `：把 ${v} 写入 buffer[${S.fill}]。` + (S.err && S.status === "err" && slot.full ? "" : "");
+    } else if (kind === "f2") {
+      S.fill = (S.fill + 1) % S.o.MAX; nar += `：fill 变为 ${S.fill}。`;
+    } else if (kind === "g1") {
+      const slot = S.buf[S.use];
+      if (!slot.full) { S.err = `${T.name} 从空槽 buffer[${S.use}] 读数据！`; S.status = "err"; }
+      T.tmp = slot.v; S.buf[S.use] = { v: slot.v, full: false };
+      nar += `：从 buffer[${S.use}] 取出 ${slot.v}。`;
+    } else if (kind === "g2") {
+      S.use = (S.use + 1) % S.o.MAX; nar += `：use 变为 ${S.use}。`;
+    } else if (kind === "pr") {
+      S.out.push(T.tmp); nar += `：输出 ${T.tmp}。`;
+    }
+    if (advance) {
+      T.pc++;
+      if (T.pc >= code.length) {
+        T.pc = 0;
+        if (T.k === "P") { T.i++; if (T.i >= S.o.loops) { T.st = "done"; nar += ` ${T.name} 生产完 ${S.o.loops} 个，结束。`; } }
+      }
+    }
+    // 全局状态判断
+    if (S.status !== "err") {
+      const live = S.th.filter((t) => t.st !== "done");
+      if (live.length && live.every((t) => t.st === "sleep")) {
+        const prodLeft = S.th.some((t) => t.k === "P" && t.st !== "done");
+        S.status = prodLeft ? "deadlock" : "finished";
+      } else if (!live.length) S.status = "finished";
+      else S.status = "ok";
+    }
+    return nar;
+  }
+  // 生成一串快照：schedule 是线程下标数组
+  function pcBuild(o, schedule) {
+    const S = pcInit(o);
+    const rows = [{ S: clone(S), nar: "初始：empty = MAX，full = 0，mutex = 1。" }];
+    for (const tid of schedule) { const nar = pcStep(S, tid); if (nar == null) break; rows.push({ S: clone(S), nar }); if (S.status !== "ok") break; }
+    return rows;
+  }
+  function pcRandom(o, seed, maxSteps, rngFn) {
+    const S = pcInit(o), r = rngFn(seed);
+    const rows = [{ S: clone(S), nar: "初始。" }];
+    for (let k = 0; k < maxSteps && S.status === "ok"; k++) {
+      const ready = S.th.map((t, i) => (t.st === "ready" ? i : -1)).filter((i) => i >= 0);
+      if (!ready.length) break;
+      const nar = pcStep(S, r.pick(ready));
+      rows.push({ S: clone(S), nar });
+    }
+    return rows;
+  }
+  const pcPresets = {
+    dead: { o: { ver: "bad", MAX: 1, np: 1, nc: 1, loops: 3 }, sched: [1, 1, 0], title: "Figure 31.11 的死锁：消费者先跑" },
+    goodSame: { o: { ver: "good", MAX: 1, np: 1, nc: 1, loops: 3 }, sched: [1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1], title: "同样\"消费者先跑\"，换成正确版 Figure 31.12" },
+    race: { o: { ver: "nomutex", MAX: 10, np: 2, nc: 1, loops: 3 }, sched: [0, 0, 1, 1], title: "没有 mutex、MAX=10：两个生产者都写 buffer[0]" },
+  };
+
+  // ---------------------------------------------------------------
+  // c. 读写锁时间线（Figure 31.13 的行为；可选"写者优先"改进）
+  // ---------------------------------------------------------------
+  function rwSim(o) {
+    // o: {nR, gap, rd, tw, wd, mode:'book'|'wpref'}
+    const R = Array.from({ length: o.nR }, (_, i) => ({ arr: i * o.gap, start: null, end: null }));
+    const W = { arr: o.tw, start: null, end: null };
+    const frames = [];
+    let readers = 0, writerIn = false;
+    const Tmax = o.nR * o.gap + o.rd * 2 + o.wd + o.tw + 40;
+    for (let t = 0; t <= Tmax; t++) {
+      const ev = [];
+      R.forEach((r, i) => { if (r.end === t) { readers--; ev.push(`R${i} 读完离开（readers=${readers}${readers === 0 ? "，最后一个读者释放 writelock" : ""}）`); } });
+      if (W.end === t) { writerIn = false; ev.push("W 写完，释放 writelock"); }
+      if (W.arr === t) ev.push("W 到达，调用 rwlock_acquire_writelock()");
+      R.forEach((r, i) => { if (r.arr === t) ev.push(`R${i} 到达`); });
+      // 写者：等待中且没有读者、没有别的写者 → 进入（它比新来的读者先在 writelock 上排队）
+      if (W.arr <= t && W.start === null && readers === 0 && !writerIn) { W.start = t; W.end = t + o.wd; writerIn = true; ev.push("W 拿到 writelock，开始写"); }
+      const writerWaiting = W.arr <= t && W.start === null;
+      R.forEach((r, i) => {
+        if (r.arr <= t && r.start === null && !writerIn && !(o.mode === "wpref" && writerWaiting)) {
+          r.start = t; r.end = t + o.rd; readers++;
+          ev.push(`R${i} 进入读（readers=${readers}${readers === 1 ? "，第一个读者顺手拿走 writelock" : ""}）`);
+        }
+      });
+      frames.push({ t, readers, writerIn, writerWaiting: W.arr <= t && W.start === null, ev });
+      if (W.end !== null && W.end <= t && R.every((r) => r.end !== null && r.end <= t)) break;
+    }
+    return { R, W, frames, wait: W.start - W.arr };
+  }
+
+  // ---------------------------------------------------------------
+  // d. 哲学家就餐
+  // ---------------------------------------------------------------
+  const N = 5, left = (p) => p, right = (p) => (p + 1) % N;
+  function dpInit(mode) {
+    return { mode, forks: Array.from({ length: N }, () => ({ val: 1, holder: -1, q: [] })),
+      ph: Array.from({ length: N }, () => ({ pc: 0, st: "ready", meals: 0, has: [] })), status: "ok", steps: 0, last: -1 };
+  }
+  function dpOrder(mode, p) { return mode === "fixed" && p === 4 ? [right(p), left(p)] : [left(p), right(p)]; }
+  function dpPost(S, p, f) {
+    const F = S.forks[f], P = S.ph[p];
+    F.val++; F.holder = -1; P.has = P.has.filter((x) => x !== f);
+    if (F.q.length) { const w = F.q.shift(), Wp = S.ph[w]; F.holder = w; Wp.has.push(f); Wp.st = "ready"; Wp.pc++; return w; }
+    return -1;
+  }
+  const PH_LINES = ["think();", "sem_wait(第一把叉);", "sem_wait(第二把叉);", "eat();", "put_forks(p);"];
+  function dpStep(S, p) {
+    const P = S.ph[p];
+    if (P.st !== "ready" || S.status !== "ok") return null;
+    S.steps++; S.last = p;
+    const [a, b] = dpOrder(S.mode, p);
+    let nar = "";
+    if (P.pc === 0) { P.pc = 1; nar = `P${p} 思考完毕，准备拿叉子（先 f${a} 后 f${b}）。`; }
+    else if (P.pc === 1 || P.pc === 2) {
+      const f = P.pc === 1 ? a : b, F = S.forks[f];
+      F.val--;
+      if (F.val < 0) { P.st = "sleep"; F.q.push(p); nar = `P${p} 想拿 f${f}，但它在 P${F.holder} 手里 → 睡眠等待` + (P.has.length ? `（手里还攥着 f${P.has[0]}）` : "") + "。"; }
+      else { F.holder = p; P.has.push(f); P.pc++; nar = `P${p} 拿到 f${f}。`; }
+    } else if (P.pc === 3) { P.meals++; P.pc = 4; nar = `P${p} 同时拿着 f${a}、f${b}，吃饭！（第 ${P.meals} 顿）`; }
+    else {
+      const w1 = dpPost(S, p, left(p)), w2 = dpPost(S, p, right(p));
+      P.pc = 0;
+      nar = `P${p} 放下 f${left(p)}、f${right(p)}。` + [w1, w2].filter((w) => w >= 0).map((w) => `唤醒了 P${w}，它拿到了叉子。`).join("");
+    }
+    if (S.ph.every((x) => x.st === "sleep")) S.status = "deadlock";
+    return nar;
+  }
+  function dpBuild(mode, sched) {
+    const S = dpInit(mode), rows = [{ S: clone(S), nar: "5 位哲学家都在思考，5 把叉子都在桌上（每个叉子信号量初值 1）。" }];
+    for (const p of sched) { const nar = dpStep(S, p); if (nar == null) continue; rows.push({ S: clone(S), nar }); if (S.status !== "ok") break; }
+    return rows;
+  }
+  function dpRandom(mode, seed, maxSteps, rngFn) {
+    const S = dpInit(mode), r = rngFn(seed), rows = [{ S: clone(S), nar: "随机调度开始。" }];
+    for (let k = 0; k < maxSteps && S.status === "ok"; k++) {
+      const ready = S.ph.map((x, i) => (x.st === "ready" ? i : -1)).filter((i) => i >= 0);
+      rows.push({ S: null, nar: dpStep(S, r.pick(ready)) });
+      rows[rows.length - 1].S = clone(S);
+    }
+    return rows;
+  }
+  // 原书描述的死锁：每人先思考、拿起左叉，然后都去拿右叉
+  const dpDeadSched = [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 0, 1, 2, 3, 4];
+
+  // ---------------------------------------------------------------
+  // e. 线程节流
+  // ---------------------------------------------------------------
+  function thrSim(o) {
+    // o: {n, K, mem(每线程 MB), cap(物理内存 MB), work(区内工作量), seed}; K>=n 相当于不节流
+    const th = Array.from({ length: o.n }, (_, i) => ({ pre: 1 + ((i * 7 + o.seed) % 3), st: "calc", left: o.work, start: null, end: null }));
+    const frames = []; let q = [], inside = 0, peak = 0, maxIn = 0, thrashTicks = 0;
+    for (let t = 0; t < 400; t++) {
+      // 1) 区内线程推进；内存超出时抖动：进度只有 1/4
+      const demand = inside * o.mem, thrash = demand > o.cap;
+      if (thrash) thrashTicks++;
+      th.forEach((x, i) => {
+        if (x.st === "in") { x.left -= thrash ? 0.25 : 1; if (x.left <= 1e-9) { x.st = "done"; x.end = t; inside--; if (q.length) { const w = q.shift(); th[w].st = "in"; th[w].start = t; inside++; } } }
+      });
+      // 2) 计算阶段结束 → sem_wait(gate)
+      th.forEach((x, i) => {
+        if (x.st === "calc") { x.pre--; if (x.pre <= 0) { if (inside < o.K) { x.st = "in"; x.start = t; inside++; } else { x.st = "wait"; q.push(i); } } }
+      });
+      maxIn = Math.max(maxIn, inside); peak = Math.max(peak, inside * o.mem);
+      frames.push({ t, st: th.map((x) => x.st), inside, mem: inside * o.mem, thrash: inside * o.mem > o.cap, waiting: q.length });
+      if (th.every((x) => x.st === "done")) break;
+    }
+    return { frames, maxIn, peak, total: frames.length - 1, thrashTicks };
+  }
+
+  // ---------------------------------------------------------------
+  // f. Dijkstra 信号量 vs Zemaphore（Figure 31.17）
+  // ---------------------------------------------------------------
+  function zemParse(txt) {
+    return txt.trim().split(/[\s,]+/).filter(Boolean).map((tok) => {
+      const m = /^([WPRwpr])(\d)$/.exec(tok); return m ? { op: m[1].toUpperCase(), t: +m[2] } : { bad: tok };
+    });
+  }
+  function zemRun(init, ops) {
+    const D = { val: init, q: [], st: {} }, Z = { val: init, q: [], st: {} };
+    const frames = [{ D: clone(D), Z: clone(Z), op: null, dn: "初始。", zn: "初始。" }];
+    for (const o of ops) {
+      if (o.bad) { frames.push({ D: clone(D), Z: clone(Z), op: o, dn: `无法识别的指令 ${o.bad}`, zn: "" }); continue; }
+      const n = "T" + o.t; let dn = "", zn = "";
+      // Dijkstra
+      if (o.op === "W") {
+        if (D.st[o.t] === "sleep") dn = `${n} 已经在睡眠，不能再次调用。`;
+        else { D.val--; if (D.val < 0) { D.q.push(o.t); D.st[o.t] = "sleep"; dn = `值减到 ${D.val} < 0，${n} 睡眠。`; } else { D.st[o.t] = "pass"; dn = `值减到 ${D.val}，${n} 通过。`; } }
+      } else if (o.op === "P") {
+        D.val++; dn = `值加到 ${D.val}`;
+        if (D.q.length) { const w = D.q.shift(); D.st[w] = "pass"; dn += `，唤醒 T${w}——它醒来后直接从 sem_wait 返回（名额已经转交给它）。`; } else dn += "。";
+      } else { dn = D.st[o.t] === "pass" ? `${n} 早在被唤醒时就已通过，无事可做。` : `${n} 仍在睡眠，无法运行。`; }
+      // Zemaphore
+      if (o.op === "W") {
+        if (Z.st[o.t] === "sleep" || Z.st[o.t] === "woken") zn = `${n} 已在等待中。`;
+        else if (Z.val <= 0) { Z.q.push(o.t); Z.st[o.t] = "sleep"; zn = `value=${Z.val} ≤ 0，${n} 在 cond 上 wait（值不会变成负数）。`; }
+        else { Z.val--; Z.st[o.t] = "pass"; zn = `value>0，减到 ${Z.val}，${n} 通过。`; }
+      } else if (o.op === "P") {
+        Z.val++; zn = `value 加到 ${Z.val}`;
+        if (Z.q.length) { const w = Z.q.shift(); Z.st[w] = "woken"; zn += `，signal 唤醒 T${w}：它只是"就绪"，要等运行时重新检查 while 条件。`; } else zn += "。";
+      } else {
+        if (Z.st[o.t] !== "woken") zn = Z.st[o.t] === "sleep" ? `${n} 还在睡眠，没有被唤醒，不能运行。` : `${n} 不在等待。`;
+        else if (Z.val <= 0) { Z.q.push(o.t); Z.st[o.t] = "sleep"; zn = `${n} 醒来重新检查：value=${Z.val} ≤ 0（被人抢先拿走了），只好再次睡眠。这就是必须用 while 的原因。`; }
+        else { Z.val--; Z.st[o.t] = "pass"; zn = `${n} 醒来重新检查：value>0，减到 ${Z.val}，通过。`; }
+      }
+      frames.push({ D: clone(D), Z: clone(Z), op: o, dn, zn });
+    }
+    return frames;
+  }
+
+  return { clone, semInit, semMicro, semBuild, semFree, semBusy, semPresets, PC_CODE, pcInit, pcStep, pcBuild, pcRandom, pcPresets,
+    rwSim, dpInit, dpStep, dpBuild, dpRandom, dpDeadSched, dpOrder, PH_LINES, thrSim, zemParse, zemRun };
+})();
+if (typeof module !== "undefined") module.exports = SEM;
+</script>
+<script>
+(function () {
+  "use strict";
+  const { h, s, color, stepper, rng } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  const ST = { run: "运行", ready: "就绪", sleep: "睡眠", none: "未创建", done: "结束" };
+  const EN = { run: "Run", ready: "Ready", sleep: "Sleep", none: "—", done: "Done" };
+  const num = (id, lo, hi, d) => { const v = parseInt($(id).value, 10); const r = isNaN(v) ? d : Math.max(lo, Math.min(hi, v)); $(id).value = r; return r; };
+  const stat = (v, l) => h("div", { class: "stat" }, h("div", { class: "v" }, String(v)), h("div", { class: "l" }, l));
+
+  // =====================================================================
+  // a. 信号量执行器
+  // =====================================================================
+  (function () {
+    let cfg, rows, cur = "f315";
+    const opLine = (op) => op.t === "wait" ? "sem_wait(&s);" : op.t === "post" ? "sem_post(&s);" : op.t === "create" ? "Pthread_create(child);" : op.lab;
+    const subName = ["", "  ← 已调用", "  ← 已减 1", "  ← 已判断"];
+    const subNameP = ["", "  ← 已调用", "  ← 已加 1", "  ← 已唤醒"];
+    const st = stepper($("sem-step"), { steps: () => rows.length, render });
+    function load(key) {
+      cur = key;
+      const p = SEM.semPresets[key];
+      cfg = p.cfg; rows = SEM.semBuild(cfg, p.script);
+      [...$("sem-presets").children].forEach((b) => b.classList.toggle("primary", b.dataset.k === key));
+      st.reset();
+    }
+    function custom() {
+      const n = num("sem-n", 1, 4, 3), init = num("sem-init", 0, 3, 1);
+      const names = Array.from({ length: n }, (_, i) => "T" + i);
+      const LOCK = [{ t: "wait" }, { t: "cs", lab: "(crit sect)" }, { t: "post" }, { t: "cs", lab: "(之后的代码)" }];
+      cfg = { init, names, start: names.map((_, i) => (i === 0 ? "run" : "ready")), progs: names.map(() => LOCK),
+        intro: `自定义：${n} 个线程都执行 sem_wait → 临界区 → sem_post，初值 ${init}。用下面的按钮自己当调度器。` };
+      rows = SEM.semBuild(cfg, []);
+      [...$("sem-presets").children].forEach((b) => b.classList.remove("primary"));
+      st.reset();
+    }
+    function render(i) {
+      const r = rows[i], S = r.S;
+      // 信号量盒子
+      $("sem-box").replaceChildren(
+        h("div", { class: "sembox" + (S.val < 0 ? " neg" : "") }, h("div", { class: "nm" }, "信号量值"), h("div", { class: "v" }, String(S.val))),
+        h("div", { class: "sembox" }, h("div", { class: "nm" }, "等待队列（队首在左）"),
+          h("div", { class: "qq" }, S.q.length ? S.q.map((t) => h("span", { class: "cell miss" }, cfg.names[t])) : "（空）")),
+        h("div", { class: "sembox" }, h("div", { class: "nm" }, "不变量检查"), h("div", { class: "qq" },
+          S.val < 0 ? `值 ${S.val} ⇒ ${-S.val} 个等待者；队列里 ${S.q.length} 个 ${-S.val === S.q.length ? "✓" : "（中途）"}` : `值 ≥ 0 ⇒ 无人等待；队列 ${S.q.length} 个`)));
+      // 线程卡片
+      $("sem-threads").replaceChildren(...S.th.map((T, k) => {
+        const prog = cfg.progs[k];
+        return h("div", { class: "thcard " + T.st },
+          h("div", { class: "hd" }, h("b", {}, h("span", { class: "dot", style: { background: color(k) } }), cfg.names[k]), h("span", { class: "st-" + T.st }, ST[T.st])),
+          h("div", { class: "code-mini" }, prog.map((op, j) => h("div", { class: j === T.pc && T.st !== "done" ? "cur" : "" },
+            h("span", { class: "ln" }, j === T.pc && T.st !== "done" ? "▶" : ""), opLine(op) + (j === T.pc && T.sub ? (op.t === "post" ? subNameP : subName)[T.sub] : "")))));
+      }));
+      // 自选调度按钮
+      const busy = SEM.semBusy(cfg, S);
+      $("sem-pick").replaceChildren(h("span", { class: "muted" }, "从这一步起自己调度："),
+        ...S.th.map((T, k) => h("button", { disabled: T.st === "sleep" || T.st === "done" || T.st === "none" || (busy >= 0 && busy !== k), style: { borderLeft: `4px solid ${color(k)}` },
+          onclick: () => { const nr = SEM.semFree(cfg, rows, st.index, k); if (nr) { rows = nr; st.go(rows.length - 1); } } }, `让 ${cfg.names[k]} 执行一步`)),
+        busy >= 0 ? h("span", { class: "small muted" }, `（${cfg.names[busy]} 刚改完值，sem_wait/sem_post 视为原子操作，此刻不能切走）`) : "");
+      // 轨迹表
+      const head = h("tr", {}, h("th", { class: "num" }, "Val"), ...cfg.names.flatMap((n) => [h("th", {}, n), h("th", {}, "State")]));
+      const body = rows.slice(0, i + 1).map((row, j) => h("tr", { class: j === i ? "cur" : "" },
+        h("td", { class: "val" + (row.S.val < 0 ? " neg" : "") }, String(row.S.val)),
+        ...row.S.th.flatMap((T, k) => [h("td", {}, row.lab[k] || ""), h("td", { class: "st-" + T.st }, EN[T.st])])));
+      $("sem-trace").replaceChildren(h("thead", {}, head), h("tbody", {}, body));
+      $("sem-nar").textContent = (r.free ? "【自由调度】" : "") + r.nar;
+      $("sem-stats").replaceChildren(stat(S.val, "当前值"), stat(S.q.length, "等待者"), stat(S.th.filter((t) => t.st === "run").length ? cfg.names[S.run] : "—", "正在运行"),
+        stat(Math.min(...rows.slice(0, i + 1).map((x) => x.S.val)), "到目前为止最低值"));
+    }
+    $("sem-presets").append(h("span", { class: "muted small" }, "载入原书示例："),
+      ...Object.entries(SEM.semPresets).map(([k, p]) => h("button", { "data-k": k, onclick: () => load(k) }, p.title)));
+    $("sem-custom").onclick = custom;
+    load(cur);
+  })();
+
+  // =====================================================================
+  // b. 生产者/消费者
+  // =====================================================================
+  (function () {
+    let o, rows;
+    const st = stepper($("pc-step"), { steps: () => rows.length, render });
+    function readParams() {
+      return { ver: $("pc-ver").value, MAX: num("pc-max", 1, 10, 1), np: num("pc-np", 1, 3, 1), nc: num("pc-nc", 1, 3, 1), loops: num("pc-loops", 1, 9, 3) };
+    }
+    function setParams(p) { $("pc-ver").value = p.ver; $("pc-max").value = p.MAX; $("pc-np").value = p.np; $("pc-nc").value = p.nc; $("pc-loops").value = p.loops; }
+    function reset() { o = readParams(); rows = SEM.pcBuild(o, []); st.reset(); }
+    function preset(k) { const p = SEM.pcPresets[k]; setParams(p.o); o = SEM.clone(p.o); rows = SEM.pcBuild(o, p.sched); st.go(rows.length - 1); }
+    function stepThread(tid) {
+      const S = SEM.clone(rows[st.index].S);
+      if (S.status !== "ok") return;
+      const nar = SEM.pcStep(S, tid);
+      if (nar == null) return;
+      rows = rows.slice(0, st.index + 1).concat([{ S, nar }]);
+      st.go(rows.length - 1);
+    }
+    function randomRun() { o = readParams(); rows = SEM.pcRandom(o, num("pc-seed", -1e9, 1e9, 7), 400, rng); st.go(rows.length - 1); }
+    function semBox(S, k) {
+      const v = S.sem[k];
+      if (S.o.ver === "nomutex" && k === "mutex") return null;
+      const holder = k === "mutex" ? S.th.filter((t) => t.mx).map((t) => t.name).join(",") : "";
+      return h("div", { class: "sembox" + (v < 0 ? " neg" : "") }, h("div", { class: "nm" }, k + (k === "mutex" ? `（持有者：${holder || "无"}）` : "")), h("div", { class: "v" }, String(v)),
+        h("div", { class: "qq" }, S.q[k].length ? ["睡着：", ...S.q[k].map((t) => h("span", { class: "cell miss" }, S.th[t].name))] : "无人等待"));
+    }
+    function render(i) {
+      const r = rows[i], S = r.S;
+      $("pc-sems").replaceChildren(...["empty", "full", "mutex"].map((k) => semBox(S, k)).filter(Boolean));
+      $("pc-buf").replaceChildren(...S.buf.map((b, j) => h("div", { class: "bufslot" },
+        h("span", { class: "cell" + (b.full ? " on" : "") }, b.full ? String(b.v) : "·"),
+        h("span", { class: "ptr" }, [j === S.fill ? "fill" : "", j === S.use ? "use" : ""].filter(Boolean).join("/")), h("span", {}, `[${j}]`))));
+      $("pc-threads").replaceChildren(...S.th.map((T, k) => {
+        const code = SEM.PC_CODE[S.o.ver][T.k];
+        const cls = T.st === "sleep" ? "sleep" : T.st === "done" ? "done" : k === S.last ? "run" : "";
+        const info = T.st === "sleep" ? `睡在 ${T.on} 上` + (T.mx ? "，持有 mutex" : "") : T.st === "done" ? "已结束" : (T.mx ? "就绪，持有 mutex" : "就绪");
+        return h("div", { class: "thcard " + cls },
+          h("div", { class: "hd" }, h("b", {}, h("span", { class: "dot", style: { background: color(T.k === "P" ? T.idx : 4 + T.idx) } }), T.name, T.k === "P" ? `（生产 ${Math.min(T.i, S.o.loops)}/${S.o.loops}）` : ""), h("span", { class: T.st === "sleep" ? "st-sleep" : "st-ready" }, info)),
+          h("div", { class: "code-mini" }, code.map((ln, j) => h("div", { class: j === T.pc && T.st !== "done" ? "cur" : "" }, h("span", { class: "ln" }, ln[0]), ln[1]))));
+      }));
+      $("pc-pick").replaceChildren(h("span", { class: "muted" }, "下一步运行："),
+        ...S.th.map((T, k) => h("button", { disabled: T.st !== "ready" || S.status !== "ok", style: { borderLeft: `4px solid ${color(T.k === "P" ? T.idx : 4 + T.idx)}` }, onclick: () => stepThread(k) }, `运行 ${T.name} 一步`)));
+      $("pc-out").textContent = "消费者输出：" + (S.out.length ? S.out.join(", ") : "（还没有）");
+      $("pc-nar").textContent = r.nar;
+      let alert = null;
+      if (S.status === "deadlock") {
+        const holder = S.th.find((t) => t.mx && t.st === "sleep");
+        const others = S.th.filter((t) => t.st === "sleep" && t.on === "mutex").map((t) => t.name);
+        const cyc = holder && others.length ? `环：${holder.name} 持有 mutex 却睡在 ${holder.on} 上；能 post ${holder.on} 的 ${others.join("、")} 都睡在 mutex 上——互相等待，永远醒不来。` : "所有未结束的线程都睡着了。";
+        alert = h("div", { class: "alert bad" }, "死锁！" + S.th.filter((t) => t.st === "sleep").map((t) => `${t.name} 睡在 ${t.on}${t.mx ? "（持有 mutex）" : ""}`).join("；") + "。" + cyc);
+      } else if (S.status === "err") alert = h("div", { class: "alert bad" }, "竞争条件：" + S.err + " 原因：put() 的 F1/F2 不是原子的，需要 mutex 互斥。");
+      else if (S.status === "finished") alert = h("div", { class: "alert ok" }, `生产者全部完成，${S.out.length} 个数据都被消费（输出 ${S.out.join(", ")}）。消费者睡在 full 上等更多数据，这是正常的。`);
+      $("pc-alert").replaceChildren(...(alert ? [alert] : []));
+      const produced = S.th.filter((t) => t.k === "P").reduce((a, t) => a + Math.min(t.i, S.o.loops), 0);
+      $("pc-stats").replaceChildren(stat(produced, "已生产"), stat(S.out.length, "已消费"), stat(S.steps, "已执行行数"),
+        stat({ ok: "运行中", deadlock: "死锁", err: "出错", finished: "完成" }[S.status], "状态"));
+    }
+    $("pc-presets").append(h("span", { class: "muted small" }, "载入示例："), ...Object.entries(SEM.pcPresets).map(([k, p]) => h("button", { onclick: () => preset(k) }, p.title)));
+    $("pc-reset").onclick = reset;
+    $("pc-rand").onclick = randomRun;
+    ["pc-ver", "pc-max", "pc-np", "pc-nc", "pc-loops"].forEach((id) => $(id).addEventListener("change", reset));
+    preset("dead");
+  })();
+
+  // =====================================================================
+  // c. 读写锁时间线
+  // =====================================================================
+  (function () {
+    let R;
+    const st = stepper($("rw-step"), { steps: () => R.frames.length, render, autoplayMs: 500 });
+    function build() {
+      R = SEM.rwSim({ nR: num("rw-n", 1, 12, 8), gap: num("rw-gap", 1, 10, 2), rd: num("rw-rd", 1, 10, 5), tw: num("rw-tw", 0, 20, 3), wd: num("rw-wd", 1, 10, 3), mode: $("rw-mode").value });
+      st.reset();
+    }
+    function render(i) {
+      const f = R.frames[i], t = f.t, T = R.frames.length, px = Math.max(14, Math.min(30, 620 / T)), rowH = 22, left = 44;
+      const rowsN = R.R.length + 1, W = left + T * px + 20, H = rowsN * rowH + 40;
+      const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "读写锁时间线" });
+      const bar = (y, a, b, style) => { if (b > a) svg.append(s("rect", { x: left + a * px, y: y + 3, width: (b - a) * px - 1, height: rowH - 6, rx: 3, style })); };
+      const who = R.R.map((r, k) => ({ nm: "R" + k, ...r, c: "var(--c3)" })).concat([{ nm: "W", ...R.W, c: "var(--c2)" }]);
+      who.forEach((x, k) => {
+        const y = 8 + k * rowH;
+        svg.append(s("text", { x: 6, y: y + rowH / 2 + 4, "font-size": 12, class: "mono", text: x.nm }));
+        if (x.arr > t) return;
+        const st0 = x.start === null ? Infinity : x.start;
+        bar(y, x.arr, Math.min(st0, t + 1), "fill:var(--warn-soft);stroke:var(--warn)");
+        if (x.start !== null && x.start <= t) bar(y, x.start, Math.min(x.end, t + 1), `fill:${x.c}`);
+      });
+      for (let k = 0; k <= T; k += 5) {
+        const x = left + k * px;
+        svg.append(s("line", { x1: x, x2: x, y1: 4, y2: H - 26, style: "stroke:var(--border)" }));
+        svg.append(s("text", { x, y: H - 10, "text-anchor": "middle", "font-size": 11, class: "t-muted mono", text: k }));
+      }
+      svg.append(s("line", { x1: left + (t + 0.5) * px, x2: left + (t + 0.5) * px, y1: 2, y2: H - 24, style: "stroke:var(--accent);stroke-width:2" }));
+      $("rw-stage").replaceChildren(svg);
+      $("rw-nar").textContent = `t = ${t}：` + (f.ev.length ? f.ev.join("；") + "。" : "（无事件）") +
+        (f.writerWaiting ? ` 写者仍在等 writelock（已等 ${t - R.W.arr + 1} 个单位），readers = ${f.readers}。` : "");
+      $("rw-stats").replaceChildren(stat(f.readers, "当前读者数"), stat(f.writerIn ? "写中" : f.writerWaiting ? "等待" : R.W.end !== null && R.W.end <= t ? "已完成" : "未到", "写者状态"),
+        stat(R.wait, "写者总等待时间"), stat(R.W.start, "写者开始时刻"));
+    }
+    ["rw-n", "rw-gap", "rw-rd", "rw-tw", "rw-wd", "rw-mode"].forEach((id) => $(id).addEventListener("change", build));
+    build();
+  })();
+
+  // =====================================================================
+  // d. 哲学家就餐
+  // =====================================================================
+  (function () {
+    let rows, mode = "broken";
+    const st = stepper($("dp-step"), { steps: () => rows.length, render, autoplayMs: 600 });
+    const CX = 170, CY = 165, RP = 122, RF = 70;
+    const ang = (a) => (a * Math.PI) / 180;
+    const phPos = (p) => [CX + RP * Math.cos(ang(-90 + p * 72)), CY + RP * Math.sin(ang(-90 + p * 72))];
+    const fkPos = (k) => [CX + RF * Math.cos(ang(-90 + (k - 0.5) * 72)), CY + RF * Math.sin(ang(-90 + (k - 0.5) * 72))];
+    const phase = (P, S, p) => {
+      const [a, b] = SEM.dpOrder(S.mode, p);
+      if (P.st === "sleep") return `等 f${P.pc === 1 ? a : b}`;
+      return ["思考", `想拿 f${a}`, `想拿 f${b}`, "拿齐两把叉", "吃饭中"][P.pc];
+    };
+    function reset() { mode = $("dp-mode").value; rows = SEM.dpBuild(mode, []); st.reset(); }
+    function book() { mode = $("dp-mode").value; rows = SEM.dpBuild(mode, SEM.dpDeadSched); st.go(rows.length - 1); }
+    function rand() { mode = $("dp-mode").value; rows = SEM.dpRandom(mode, num("dp-seed", -1e9, 1e9, 3), num("dp-max", 10, 400, 120), rng); st.go(rows.length - 1); }
+    function batch() {
+      mode = $("dp-mode").value;
+      let dead = 0, meals = 0, firstDead = null;
+      for (let sd = 1; sd <= 1000; sd++) {
+        const rr = SEM.dpRandom(mode, sd, 200, rng), L = rr[rr.length - 1].S;
+        if (L.status === "deadlock") { dead++; if (firstDead === null) firstDead = sd; } meals += L.ph.reduce((a, x) => a + x.meals, 0);
+      }
+      $("dp-alert").replaceChildren(h("div", { class: "alert " + (dead ? "bad" : "ok") },
+        `${mode === "broken" ? "全部先左后右" : "P4 先右后左"}：随机调度 1000 次（每次最多 200 步），死锁 ${dead} 次，平均每次吃了 ${(meals / 1000).toFixed(1)} 顿。` +
+        (firstDead !== null ? `种子 ${firstDead} 就会死锁，填进"种子"再点"随机调度"可以复现。` : "没有任何一次死锁。")));
+    }
+    function stepP(p) {
+      const S = SEM.clone(rows[st.index].S);
+      const nar = SEM.dpStep(S, p); if (nar == null) return;
+      rows = rows.slice(0, st.index + 1).concat([{ S, nar }]); st.go(rows.length - 1);
+    }
+    function render(i) {
+      const r = rows[i], S = r.S;
+      const svg = s("svg", { viewBox: "0 0 340 330", width: 340, height: 330, role: "img", "aria-label": "哲学家就餐桌面" });
+      svg.append(s("circle", { cx: CX, cy: CY, r: 92, class: "box" }));
+      // 等待箭头
+      S.ph.forEach((P, p) => {
+        if (P.st !== "sleep") return;
+        const [a, b] = SEM.dpOrder(S.mode, p), f = P.pc === 1 ? a : b, [x1, y1] = phPos(p), [x2, y2] = fkPos(f);
+        svg.append(s("line", { x1, y1, x2, y2, style: "stroke:var(--bad);stroke-width:2;stroke-dasharray:5 3" }));
+      });
+      S.forks.forEach((F, k) => {
+        let [x, y] = fkPos(k);
+        if (F.holder >= 0) { const [px, py] = phPos(F.holder); x = x + (px - x) * 0.55; y = y + (py - y) * 0.55; }
+        const g = s("g", {});
+        g.append(s("rect", { x: x - 16, y: y - 10, width: 32, height: 20, rx: 5, style: F.holder >= 0 ? `fill:${color(F.holder)};stroke:var(--fg)` : "fill:var(--surface);stroke:var(--fg)" }));
+        g.append(s("text", { x, y: y + 4, "text-anchor": "middle", "font-size": 11, class: "mono", style: F.holder >= 0 ? "fill:#fff;font-weight:700" : "", text: "f" + k }));
+        svg.append(g);
+      });
+      S.ph.forEach((P, p) => {
+        const [x, y] = phPos(p), eating = P.has.length === 2;
+        svg.append(s("circle", { cx: x, cy: y, r: 24, style: `fill:${color(p)};stroke:${P.st === "sleep" ? "var(--bad)" : eating ? "var(--ok)" : "var(--surface)"};stroke-width:${P.st === "sleep" || eating ? 4 : 2}` }));
+        svg.append(s("text", { x, y: y + 5, "text-anchor": "middle", "font-size": 13, style: "fill:#fff;font-weight:700", text: "P" + p }));
+        const ty = y < CY - 10 ? y - 30 : y + 40;
+        svg.append(s("text", { x, y: ty, "text-anchor": "middle", "font-size": 11.5, class: P.st === "sleep" ? "" : "t-muted", style: P.st === "sleep" ? "fill:var(--bad)" : "", text: phase(P, S, p) }));
+      });
+      $("dp-svg").replaceChildren(svg);
+      $("dp-tab").replaceChildren(h("thead", {}, h("tr", {}, h("th", {}, "哲学家"), h("th", {}, "状态"), h("th", {}, "手里"), h("th", {}, "顺序"), h("th", { class: "num" }, "已吃"))),
+        h("tbody", {}, S.ph.map((P, p) => { const [a, b] = SEM.dpOrder(S.mode, p);
+          return h("tr", { style: S.last === p && i > 0 ? { background: "var(--accent-soft)" } : {} }, h("td", {}, h("span", { class: "dot", style: { background: color(p), display: "inline-block", width: "10px", height: "10px", borderRadius: "50%", marginRight: "6px" } }), "P" + p),
+            h("td", { class: P.st === "sleep" ? "st-sleep" : "" }, phase(P, S, p)), h("td", { class: "mono" }, P.has.map((f) => "f" + f).join(" ") || "—"), h("td", { class: "mono" }, `f${a}→f${b}`), h("td", { class: "num" }, P.meals)); })));
+      $("dp-pick").replaceChildren(h("span", { class: "muted" }, "下一步："), ...S.ph.map((P, p) => h("button", { disabled: P.st !== "ready" || S.status !== "ok", style: { borderLeft: `4px solid ${color(p)}` }, onclick: () => stepP(p) }, `P${p} 走一步`)));
+      $("dp-nar").textContent = r.nar;
+      const al = [];
+      if (S.status === "deadlock") al.push(h("div", { class: "alert bad" }, "死锁！" + S.ph.map((P, p) => `P${p} 拿着 ${P.has.map((f) => "f" + f).join(",") || "（无）"}`).join("，") + "——每个人都在等别人手里的叉子，等待关系围成了一个环。"));
+      $("dp-alert").replaceChildren(...al);
+      $("dp-stats").replaceChildren(stat(S.steps, "已执行步数"), stat(S.ph.reduce((a, x) => a + x.meals, 0), "总共吃了几顿"),
+        stat(S.ph.filter((x) => x.has.length === 2).length, "此刻手握两叉"), stat(S.status === "deadlock" ? "死锁" : "正常", "状态"));
+    }
+    $("dp-mode").addEventListener("change", () => { const wasBook = rows && rows.length === SEM.dpDeadSched.length + 1; reset(); if (wasBook) book(); });
+    $("dp-reset").onclick = reset; $("dp-book").onclick = book; $("dp-rand").onclick = rand; $("dp-batch").onclick = batch;
+    reset();
+  })();
+
+  // =====================================================================
+  // e. 线程节流
+  // =====================================================================
+  (function () {
+    let R, o;
+    const st = stepper($("thr-step"), { steps: () => R.frames.length, render, autoplayMs: 500 });
+    function params() { return { n: num("thr-n", 2, 16, 8), K: num("thr-k", 1, 16, 3), mem: num("thr-mem", 1, 8, 2), cap: num("thr-cap", 2, 40, 8), work: num("thr-work", 1, 10, 4), seed: 1 }; }
+    function build() { o = params(); R = SEM.thrSim(o); st.reset(); }
+    function render(i) {
+      const f = R.frames[i], T = R.frames.length, cw = Math.max(10, Math.min(26, 560 / T)), rh = 18, left = 40;
+      const W = left + T * cw + 170, H = o.n * rh + 36;
+      const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "节流时间线" });
+      const fill = { calc: "var(--surface-2)", wait: "var(--warn-soft)", in: "var(--accent)", done: "var(--ok-soft)" };
+      for (let k = 0; k < o.n; k++) {
+        const y = 6 + k * rh;
+        svg.append(s("text", { x: 4, y: y + 13, "font-size": 11, class: "mono", text: "T" + k }));
+        for (let t = 0; t <= i; t++) {
+          const stt = R.frames[t].st[k];
+          svg.append(s("rect", { x: left + t * cw, y, width: cw - 1, height: rh - 3, style: `fill:${stt === "in" && R.frames[t].thrash ? "var(--bad)" : fill[stt]};stroke:var(--border)` }));
+        }
+      }
+      for (let t = 0; t < T; t += 5) svg.append(s("text", { x: left + t * cw + cw / 2, y: H - 8, "text-anchor": "middle", "font-size": 10.5, class: "t-muted mono", text: t }));
+      // 内存条
+      const bx = left + T * cw + 30, bh = o.n * rh - 4, maxM = Math.max(o.cap, o.n * o.mem), used = f.mem;
+      svg.append(s("rect", { x: bx, y: 6, width: 40, height: bh, class: "box" }));
+      svg.append(s("rect", { x: bx, y: 6 + bh - (used / maxM) * bh, width: 40, height: (used / maxM) * bh, style: `fill:${f.thrash ? "var(--bad)" : "var(--accent)"}` }));
+      const capY = 6 + bh - (o.cap / maxM) * bh;
+      svg.append(s("line", { x1: bx - 6, x2: bx + 46, y1: capY, y2: capY, style: "stroke:var(--fg);stroke-width:2;stroke-dasharray:4 2" }));
+      svg.append(s("text", { x: bx + 50, y: capY + 4, "font-size": 11, text: "物理内存 " + o.cap }));
+      svg.append(s("text", { x: bx + 50, y: 6 + bh, "font-size": 11, class: "t-muted", text: "已用 " + used }));
+      $("thr-stage").replaceChildren(svg);
+      $("thr-nar").textContent = `t = ${f.t}：区内 ${f.inside} 个线程（上限 K = ${o.K}），在 gate 等待 ${f.waiting} 个，内存占用 ${f.mem} / ${o.cap}` +
+        (f.thrash ? " —— 超出物理内存，系统在抖动，区内每个线程的进度只有平时的 1/4！" : "。");
+      $("thr-stats").replaceChildren(stat(R.maxIn, "区内最多同时"), stat(R.peak, "内存峰值"), stat(R.total, "全部完成用时"), stat(R.thrashTicks, "抖动的时间单位"));
+    }
+    $("thr-cmp").onclick = () => {
+      const base = params(), res = [];
+      for (let K = 1; K <= base.n; K++) res.push([K, SEM.thrSim({ ...base, K }).total]);
+      const best = res.reduce((a, b) => (b[1] < a[1] ? b : a));
+      $("thr-nar").textContent = "各 K 的总完成时间：" + res.map(([K, t]) => `K=${K}: ${t}`).join("，") + `。最优 K = ${best[0]}（${best[0]} × ${base.mem} = ${best[0] * base.mem} ≤ 物理内存 ${base.cap}）。`;
+    };
+    ["thr-n", "thr-k", "thr-mem", "thr-cap", "thr-work"].forEach((id) => $(id).addEventListener("change", build));
+    build();
+  })();
+
+  // =====================================================================
+  // f. Dijkstra vs Zemaphore
+  // =====================================================================
+  (function () {
+    let F;
+    const st = stepper($("zem-step"), { steps: () => F.length, render, autoplayMs: 1000 });
+    function run() { F = SEM.zemRun(num("zem-init", 0, 3, 0), SEM.zemParse($("zem-ops").value)); st.reset(); }
+    const zst = { pass: "已通过", sleep: "睡眠", woken: "已唤醒·待重查" };
+    function panel(title, X, neg) {
+      const ids = Object.keys(X.st).sort();
+      return h("div", { class: "sembox" }, h("div", { class: "nm" }, title),
+        h("div", { class: "v", style: X.val < 0 ? { color: "var(--bad)" } : {} }, "value = " + X.val),
+        h("div", { class: "qq" }, "等待队列：", X.q.length ? X.q.map((t) => h("span", { class: "cell miss" }, "T" + t)) : "（空）"),
+        h("div", { class: "qq" }, ids.map((t) => h("span", { class: "pill", style: { marginRight: "4px" } }, `T${t} ${zst[X.st[t]]}`))),
+        h("div", { class: "small muted" }, neg));
+    }
+    function render(i) {
+      const f = F[i];
+      $("zem-stage").replaceChildren(panel("Dijkstra 信号量（先减再判断）", f.D, f.D.val < 0 ? `值为负：${-f.D.val} 个等待者` : ""), panel("Zemaphore（锁 + 条件变量，先判断再减）", f.Z, "值永远 ≥ 0"));
+      $("zem-nar").textContent = (f.op ? `操作 ${f.op.bad ? f.op.bad : f.op.op + f.op.t}：` : "") + `【Dijkstra】${f.dn}　【Zemaphore】${f.zn}`;
+    }
+    $("zem-run").onclick = run;
+    $("zem-p1").onclick = () => { $("zem-init").value = 0; $("zem-ops").value = "W0 W1 W2 P3 R0 P3 R1"; run(); };
+    $("zem-p2").onclick = () => { $("zem-init").value = 0; $("zem-ops").value = "W0 P1 W2 R0"; run(); };
+    run();
+  })();
+})();
+</script>
+</body>
+</html>

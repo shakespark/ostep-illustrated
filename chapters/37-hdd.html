@@ -1,0 +1,899 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 37 章 · 磁盘驱动器</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+/* 仅本页样式 */
+.disk-wrap { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; }
+.disk-wrap > .disk-view { flex: 0 0 auto; }
+.disk-wrap > .disk-side { flex: 1 1 260px; min-width: 0; }
+.disk-view svg { display: block; width: 100%; max-width: 380px; height: auto; }
+.sec-wedge { stroke: var(--border); stroke-width: 1; }
+.sec-t0 { fill: color-mix(in srgb, var(--c1) 10%, var(--surface)); }
+.sec-t1 { fill: color-mix(in srgb, var(--c3) 12%, var(--surface)); }
+.sec-t2 { fill: color-mix(in srgb, var(--c5) 14%, var(--surface)); }
+.sec-want { fill: color-mix(in srgb, var(--c2) 45%, var(--surface)); }
+.sec-done { fill: var(--surface-2); }
+.sec-now { fill: var(--c2); }
+.sec-label { font-family: var(--mono); font-size: 11px; }
+.head-arm { fill: var(--muted); }
+.head-tip { fill: var(--bad); }
+.phase-pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12.5px; color: #fff; font-weight: 600; }
+.ph-seek { background: var(--c1); } .ph-rot { background: var(--c2); } .ph-xfer { background: var(--c3); } .ph-pick { background: var(--c4); }
+.reqtab td, .reqtab th { font-family: var(--mono); font-size: 12.5px; padding: 4px 8px; text-align: right; }
+.reqtab td:first-child, .reqtab th:first-child { text-align: left; }
+.reqtab tr.cur td { background: var(--warn-soft); }
+.reqtab tr.pend td { color: var(--faint); }
+.cand { font-family: var(--mono); font-size: 12.5px; }
+.cand .best { color: var(--ok); font-weight: 700; }
+.frac { display: inline-flex; flex-direction: column; vertical-align: middle; text-align: center; margin: 0 3px; font-size: 14px; line-height: 1.25; }
+.frac > span:first-child { border-bottom: 1px solid var(--fg); padding: 0 3px; }
+.frac s { color: var(--bad); text-decoration-thickness: 1.5px; }
+.dim { font-family: var(--mono); overflow-x: auto; white-space: nowrap; padding: 8px 4px; }
+.calc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.calc-grid .drive { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; background: var(--surface); }
+.calc-grid .drive h4 { margin: 0 0 8px; font-size: 15px; }
+.calc-grid label { display: flex; justify-content: space-between; gap: 8px; margin: 4px 0; font-size: 13.5px; color: var(--muted); }
+.bar-row { display: grid; grid-template-columns: 150px 1fr 90px; gap: 8px; align-items: center; font-size: 13px; margin: 4px 0; }
+.bar-row .bar { height: 16px; border-radius: 4px; }
+.bar-row .v { font-family: var(--mono); text-align: right; }
+@media (max-width: 560px) { .bar-row { grid-template-columns: 96px 1fr 72px; font-size: 12px; } }
+</style>
+</head>
+<body data-chapter="37">
+<main>
+
+<h2><span class="num">1</span>本章要解决的问题</h2>
+<div class="crux">
+<p><strong>如何在磁盘上存储和访问数据？</strong>现代硬盘怎样存储数据？接口是什么？数据在盘上怎样布局、怎样被访问？磁盘调度如何提升性能？</p>
+<p class="muted small">How do modern hard-disk drives store data? What is the interface? How is the data actually laid out and accessed? How does disk scheduling improve performance?</p>
+</div>
+<p>上一章讲了操作系统和一般 I/O 设备打交道的通用机制（轮询、中断、DMA、驱动）。这一章专门研究其中最重要的一种设备：<strong>硬盘驱动器（hard disk drive, HDD）</strong>。几十年来它一直是持久化存储的主力，后面的文件系统（FFS、日志、LFS……）几乎每一个设计决策都建立在"磁盘怎样工作"的认识之上。</p>
+<p>本章的核心收获只有一句话，却贯穿整个持久化部分：<strong>一次磁盘 I/O 的时间 = 寻道 + 旋转 + 传输</strong>，前两项是机械运动，慢得可怕；所以顺序访问比随机访问快几百倍，而磁盘调度就是想办法少做机械运动。</p>
+
+<h2><span class="num">2</span>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>扇区数组（array of sectors）</h4><p>磁盘对外就是 0 到 n−1 编号的 512 字节扇区；只有单个扇区的写是原子的。</p></div>
+  <div class="card"><h4>盘片 · 表面 · 磁道</h4><p>盘片两面都是表面；每个表面上有成千上万条同心圆磁道，每条磁道上排着扇区。</p></div>
+  <div class="card"><h4>寻道（seek）</h4><p>磁臂把磁头移到目标磁道：加速、滑行、减速、稳定，毫秒级，最贵的操作之一。</p></div>
+  <div class="card"><h4>旋转延迟（rotational delay）</h4><p>磁头到位后等目标扇区转过来。平均半圈：15000 RPM 时是 2ms。</p></div>
+  <div class="card"><h4>传输（transfer）</h4><p>扇区从磁头下经过时真正读写数据。对小请求来说它只占很少时间。</p></div>
+  <div class="card"><h4>T<sub>I/O</sub> 与 R<sub>I/O</sub></h4><p>T<sub>I/O</sub> = T<sub>seek</sub> + T<sub>rotation</sub> + T<sub>transfer</sub>；R<sub>I/O</sub> = 传输大小 / T<sub>I/O</sub>。</p></div>
+  <div class="card"><h4>磁盘调度（disk scheduling）</h4><p>磁盘请求的"作业长度"可以估算，所以能做近似 SJF：SSTF、SCAN/C-SCAN、SPTF。</p></div>
+  <div class="card"><h4>磁道偏斜 · 缓存</h4><p>track skew 让跨磁道顺序读不错过扇区；磁道缓冲（track buffer）缓存整条磁道，write-back 更快但有风险。</p></div>
+</div>
+
+<h2><span class="num">3</span>接口：一个扇区数组</h2>
+<p>现代磁盘的基本接口很简单：驱动器由大量<strong>扇区（sector）</strong>组成，每个 512 字节，可读可写。在有 n 个扇区的磁盘上，扇区编号从 0 到 n−1，这就是驱动器的<strong>地址空间</strong>。多扇区操作当然可以（很多文件系统一次读写 4KB 甚至更多），但厂商只保证<strong>单个 512 字节的写是原子的</strong>：要么完整写入，要么完全没写。如果写 4KB 的过程中突然断电，可能只有其中一部分扇区写上了，这叫<strong>撕裂写（torn write）</strong>。</p>
+<figure class="fig">
+<svg viewBox="0 0 660 190" width="660" role="img" aria-label="扇区数组与撕裂写">
+  <text x="10" y="20" font-size="13" font-weight="600">磁盘 = 扇区数组（每格 512 字节）</text>
+  <g font-family="var(--mono)" font-size="11">
+    <g id="sa-cells"></g>
+  </g>
+  <text x="10" y="108" font-size="13" font-weight="600">写一个 4KB 块（扇区 8–15）时断电：</text>
+  <g id="sa-torn" font-family="var(--mono)" font-size="11"></g>
+  <text x="10" y="180" font-size="12" class="t-muted">前 5 个扇区已是新数据（N），后 3 个还是旧数据（O）——"撕裂写"。每个扇区内部不会出现半新半旧。</text>
+</svg>
+<figcaption>磁盘接口：扇区编号 0…n−1；只有单扇区写是原子的</figcaption>
+</figure>
+<p>此外还有一些接口里没写、但大家都默认的<strong>"不成文的约定"（unwritten contract）</strong>：地址空间里相邻的两个块，访问起来比相距很远的两个块快；连续访问一段块（顺序读写）是最快的方式，通常比任何随机访问模式快得多。读完本章你会明白这些约定从何而来。</p>
+
+<h2><span class="num">4</span>基本几何结构</h2>
+<p><strong>盘片（platter）</strong>是一张坚硬的圆盘（比如铝），表面镀一层很薄的磁性层，通过改变磁性来持久存储比特，断电后数据依然保留。一个磁盘可以有一张或多张盘片，每张盘片有两面，每一面叫一个<strong>表面（surface）</strong>。所有盘片固定在<strong>主轴（spindle）</strong>上，电机带动主轴以恒定速率旋转，速率用 <strong>RPM（每分钟转数）</strong>衡量，常见 7200–15000 RPM。10000 RPM 的磁盘转一圈大约 6ms。</p>
+<p>每个表面上的数据按同心圆组织，一圈叫一条<strong>磁道（track）</strong>；一个表面有成千上万条磁道，一根头发丝的宽度里就能挤下几百条。读写靠<strong>磁头（disk head）</strong>完成，每个表面一个；所有磁头装在同一个<strong>磁臂（disk arm）</strong>上，磁臂在表面上移动，把磁头定位到想要的磁道。</p>
+<figure class="fig">
+<svg viewBox="0 0 660 230" width="660" role="img" aria-label="磁盘几何结构侧视图与俯视图">
+  <defs><marker id="ah37" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="20" y="20" font-size="13" font-weight="600">侧视：多张盘片共用一根主轴</text>
+  <rect x="148" y="34" width="14" height="170" rx="3" class="box-strong"/>
+  <text x="155" y="222" text-anchor="middle" font-size="11">主轴 spindle</text>
+  <g>
+    <rect x="40" y="64" width="230" height="10" rx="5" style="fill:color-mix(in srgb, var(--c1) 35%, var(--surface));stroke:var(--c1)"/>
+    <rect x="40" y="114" width="230" height="10" rx="5" style="fill:color-mix(in srgb, var(--c1) 35%, var(--surface));stroke:var(--c1)"/>
+    <rect x="40" y="164" width="230" height="10" rx="5" style="fill:color-mix(in srgb, var(--c1) 35%, var(--surface));stroke:var(--c1)"/>
+  </g>
+  <g class="head-arm">
+    <rect x="215" y="53" width="95" height="4" rx="2"/><rect x="215" y="81" width="95" height="4" rx="2"/>
+    <rect x="215" y="103" width="95" height="4" rx="2"/><rect x="215" y="131" width="95" height="4" rx="2"/>
+    <rect x="215" y="153" width="95" height="4" rx="2"/><rect x="215" y="181" width="95" height="4" rx="2"/>
+    <rect x="306" y="50" width="10" height="138" rx="3"/>
+  </g>
+  <g class="head-tip"><rect x="213" y="57" width="10" height="5"/><rect x="213" y="76" width="10" height="5"/><rect x="213" y="107" width="10" height="5"/><rect x="213" y="126" width="10" height="5"/><rect x="213" y="157" width="10" height="5"/><rect x="213" y="176" width="10" height="5"/></g>
+  <text x="325" y="70" font-size="11">盘片 platter ×3</text>
+  <text x="325" y="86" font-size="11" class="t-muted">每片上下两个表面 surface</text>
+  <text x="325" y="120" font-size="11">磁头 head：每个表面一个</text>
+  <text x="325" y="136" font-size="11" class="t-muted">全部装在同一个磁臂 arm 上，一起移动</text>
+  <text x="470" y="20" font-size="13" font-weight="600">俯视：一个表面</text>
+  <circle cx="540" cy="125" r="90" style="fill:color-mix(in srgb, var(--c1) 12%, var(--surface));stroke:var(--c1)"/>
+  <circle cx="540" cy="125" r="70" class="stroke" style="stroke:var(--border)"/>
+  <circle cx="540" cy="125" r="50" class="stroke" style="stroke:var(--border)"/>
+  <circle cx="540" cy="125" r="30" class="stroke" style="stroke:var(--border)"/>
+  <circle cx="540" cy="125" r="8" class="box-strong"/>
+  <circle cx="540" cy="125" r="80" style="fill:none;stroke:var(--c2);stroke-width:3"/>
+  <text x="470" y="228" font-size="11">橙色一圈 = 一条磁道 track</text>
+  <path d="M 540 125 m 0 -100 a 100 100 0 0 0 -70 29" class="arrow" marker-end="url(#ah37)"/>
+  <text x="440" y="40" font-size="11" class="t-muted">逆时针旋转</text>
+</svg>
+<figcaption>盘片、表面、主轴、磁道、磁头、磁臂</figcaption>
+</figure>
+
+<h2><span class="num">5</span>一个简单的磁盘：单磁道与旋转延迟</h2>
+<p>从最简单的模型开始，一次加一条磁道。假设磁盘只有<strong>一条磁道</strong>，12 个扇区，编号 0–11，每个 512 字节（Figure 37.1）。加上磁头和磁臂（Figure 37.2），磁头此刻停在扇区 6 上方，盘片<strong>逆时针</strong>旋转——所以扇区按 6、7、8……11、0、1 的顺序依次经过磁头。</p>
+<figure class="fig"><div class="disk-fig" data-cfg='{"tracks":1,"head":0,"want":[0],"caption":"读扇区 0：等 0 转到磁头下"}'></div>
+<figcaption>Figure 37.1 / 37.2：只有一条磁道的磁盘 + 磁头（停在扇区 6）。橙色是请求的扇区 0</figcaption></figure>
+<p>现在来了一个读扇区 0 的请求。在单磁道磁盘上，驱动器什么也不用移动，只需<strong>等待</strong>扇区 0 转到磁头下面。这段等待在现代磁盘里经常发生，而且占 I/O 服务时间的很大比重，因此专门叫<strong>旋转延迟（rotational delay）</strong>。如果转一整圈要 R，从 6 等到 0 大约要 <strong>R/2</strong>。最坏的请求是扇区 5：刚刚错过，几乎要等一整圈。</p>
+
+<h2><span class="num">6</span>多磁道：寻道</h2>
+<p>再现实一点：三条磁道（Figure 37.3 左）。外道是扇区 0–11，中道 12–23，内道 24–35；磁头现在在最内道。来了一个读扇区 11 的请求，驱动器必须先把磁臂移到正确的磁道（最外道），这叫<strong>寻道（seek）</strong>。寻道和旋转一起，是磁盘最昂贵的操作。</p>
+<div class="disk-wrap">
+<figure class="fig" style="flex:1 1 280px;margin:10px 0"><div class="disk-fig" data-cfg='{"tracks":3,"head":2,"want":[11],"caption":"寻道前：磁头在内道"}'></div><figcaption>Figure 37.3 左：磁头在内道，请求扇区 11</figcaption></figure>
+<figure class="fig" style="flex:1 1 280px;margin:10px 0"><div class="disk-fig" data-cfg='{"tracks":3,"head":0,"want":[11],"rot":75,"caption":"寻道后：盘片已转过约 3 个扇区"}'></div><figcaption>Figure 37.3 右：寻道期间盘片转过约 3 个扇区，9 正要经过磁头，再等一小段就到 11</figcaption></figure>
+</div>
+<p>寻道本身分好几个阶段：<strong>加速</strong>（磁臂开始移动）→ <strong>滑行</strong>（全速移动）→ <strong>减速</strong> → <strong>稳定（settling）</strong>——磁头必须精确地停在正确的磁道上（差一点都不行），稳定时间往往就要 0.5–2ms。</p>
+<figure class="fig">
+<svg viewBox="0 0 620 190" width="620" role="img" aria-label="寻道的四个阶段">
+  <defs><marker id="ah37b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <line x1="50" y1="150" x2="600" y2="150" class="arrow" marker-end="url(#ah37b)"/>
+  <line x1="50" y1="150" x2="50" y2="20" class="arrow" marker-end="url(#ah37b)"/>
+  <text x="590" y="172" font-size="11" class="t-muted">时间</text>
+  <text x="58" y="26" font-size="11" class="t-muted">磁臂速度</text>
+  <path d="M 50 150 L 150 50 L 330 50 L 430 150" style="fill:none;stroke:var(--c1);stroke-width:2.5"/>
+  <path d="M 430 150 q 12 -10 24 0 q 12 8 24 0 q 10 -5 20 0 L 560 150" style="fill:none;stroke:var(--c2);stroke-width:2.5"/>
+  <g font-size="12" text-anchor="middle">
+    <text x="100" y="140">加速</text><text x="240" y="44">滑行（全速）</text><text x="380" y="140">减速</text><text x="500" y="126">稳定 settle</text>
+  </g>
+  <text x="500" y="176" text-anchor="middle" font-size="11" class="t-muted">0.5–2ms：反复微调直到确认在正确磁道上</text>
+</svg>
+<figcaption>一次寻道的速度-时间曲线（示意）</figcaption>
+</figure>
+<p>寻道完成后，磁头已经在正确磁道上，但盘片在这段时间里也在转（Figure 37.3 右，约转过 3 个扇区），此时扇区 9 正要经过磁头，只需再忍受一小段旋转延迟。当扇区 11 经过磁头时，进入最后一个阶段：<strong>传输（transfer）</strong>，数据被读出或写入。完整的 I/O 时间由此得出：<strong>先寻道，再等旋转，最后传输。</strong></p>
+
+<h2><span class="num">7</span>一些其他细节：偏斜、多区与缓存</h2>
+<h3>磁道偏斜（track skew）</h3>
+<p>很多驱动器会让相邻磁道的扇区编号错开一些，保证跨磁道的顺序读也能顺畅进行。原因是：从一条磁道切换到相邻磁道时，磁头需要时间重新定位（即使只移动一道）。如果没有偏斜，磁头刚到下一条磁道，想要的下一个块已经从它下面转过去了，只能再等将近一整圈。</p>
+<div class="disk-wrap">
+<figure class="fig" style="flex:1 1 280px;margin:10px 0"><div class="disk-fig" data-cfg='{"tracks":3,"head":0,"skew":0,"rot":165,"want":[11,12],"caption":"无偏斜：11 结束时正对 12 的起点"}'></div><figcaption>无偏斜：读完 11 再寻道到中道，12 已经转过去了</figcaption></figure>
+<figure class="fig" style="flex:1 1 280px;margin:10px 0"><div class="disk-fig" data-cfg='{"tracks":3,"head":0,"skew":2,"rot":165,"want":[11,12],"caption":"偏斜 2：12 比 0 晚两个扇区出现"}'></div><figcaption>Figure 37.4：偏斜 2 个扇区，寻道完成时 12 恰好快要转到</figcaption></figure>
+</div>
+<p>在后面的模拟器里载入 <code>10,11,12,13</code> 这组请求，对比偏斜 0 和偏斜 2：总时间从 585 降到 285。</p>
+<h3>多区（multi-zoned）</h3>
+<p>外圈磁道比内圈长，自然能放更多扇区。<strong>多区磁盘</strong>把表面分成若干<strong>区（zone）</strong>，一个区是一组连续的磁道；同一区内每条磁道扇区数相同，外侧的区每道扇区更多。由于转速恒定，外圈每秒经过磁头的扇区更多，所以<strong>外圈的顺序带宽更高</strong>。</p>
+<figure class="fig">
+<svg viewBox="0 0 560 200" width="560" role="img" aria-label="多区磁盘">
+  <g transform="translate(100,100)">
+    <circle r="90" style="fill:color-mix(in srgb, var(--c1) 16%, var(--surface));stroke:var(--c1)"/>
+    <circle r="60" style="fill:color-mix(in srgb, var(--c3) 16%, var(--surface));stroke:var(--c3)"/>
+    <circle r="32" style="fill:color-mix(in srgb, var(--c5) 18%, var(--surface));stroke:var(--c5)"/>
+    <circle r="8" class="box-strong"/>
+    <g id="zone-ticks"></g>
+  </g>
+  <g font-size="12">
+    <rect x="220" y="40" width="14" height="14" rx="3" style="fill:color-mix(in srgb, var(--c1) 40%, var(--surface));stroke:var(--c1)"/><text x="242" y="52">外区：每道 24 个扇区（示意）</text>
+    <rect x="220" y="80" width="14" height="14" rx="3" style="fill:color-mix(in srgb, var(--c3) 40%, var(--surface));stroke:var(--c3)"/><text x="242" y="92">中区：每道 16 个扇区</text>
+    <rect x="220" y="120" width="14" height="14" rx="3" style="fill:color-mix(in srgb, var(--c5) 40%, var(--surface));stroke:var(--c5)"/><text x="242" y="132">内区：每道 10 个扇区</text>
+    <text x="220" y="170" class="t-muted">转速相同 → 外区每转一圈读到的数据更多</text>
+  </g>
+</svg>
+<figcaption>多区磁盘：同一区内每道扇区数相同，越往外越多</figcaption>
+</figure>
+<h3>磁道缓冲：write-back 与 write-through</h3>
+<p>现代驱动器都有一块<strong>缓存（cache）</strong>，历史原因也叫<strong>磁道缓冲（track buffer）</strong>，通常 8 或 16MB。读一个扇区时，驱动器可能顺手把整条磁道都读进缓存，之后对同一磁道的请求就能立刻返回。写的时候驱动器有个选择：数据放进缓存就报告"写完了"，叫 <strong>write-back 缓存</strong>（又叫 immediate reporting）；真正写到盘面上才报告，叫 <strong>write-through</strong>。write-back 让磁盘"看起来"更快，但有风险：如果文件系统或应用依赖写入顺序来保证正确性（第 42 章的日志就是这样），write-back 可能打乱顺序、断电时造成问题。</p>
+<figure class="fig">
+<svg viewBox="0 0 620 170" width="620" role="img" aria-label="write-back 与 write-through">
+  <defs><marker id="ah37c" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <g font-size="12">
+    <text x="10" y="22" font-weight="600">write-through</text>
+    <rect x="10" y="34" width="80" height="30" rx="5" class="box-strong"/><text x="50" y="54" text-anchor="middle">主机</text>
+    <rect x="170" y="34" width="90" height="30" rx="5" class="box"/><text x="215" y="54" text-anchor="middle">盘内缓存</text>
+    <rect x="340" y="34" width="90" height="30" rx="5" class="ok-soft"/><text x="385" y="54" text-anchor="middle">盘面</text>
+    <path d="M 90 44 L 168 44" class="arrow" marker-end="url(#ah37c)"/><path d="M 260 44 L 338 44" class="arrow" marker-end="url(#ah37c)"/>
+    <path d="M 338 58 C 250 80, 180 80, 92 58" class="arrow" marker-end="url(#ah37c)" style="stroke:var(--ok)"/>
+    <text x="450" y="54">落盘后才确认：慢但安全</text>
+    <text x="10" y="112" font-weight="600">write-back</text>
+    <rect x="10" y="124" width="80" height="30" rx="5" class="box-strong"/><text x="50" y="144" text-anchor="middle">主机</text>
+    <rect x="170" y="124" width="90" height="30" rx="5" class="warn-soft"/><text x="215" y="144" text-anchor="middle">盘内缓存</text>
+    <rect x="340" y="124" width="90" height="30" rx="5" class="box"/><text x="385" y="144" text-anchor="middle">盘面（稍后）</text>
+    <path d="M 90 134 L 168 134" class="arrow" marker-end="url(#ah37c)"/><path d="M 168 148 L 92 148" class="arrow" marker-end="url(#ah37c)" style="stroke:var(--warn)"/>
+    <path d="M 260 139 L 338 139" class="arrow" marker-end="url(#ah37c)" style="stroke-dasharray:4 3"/>
+    <text x="450" y="144">进缓存就确认：快，断电可能丢、可能乱序</text>
+  </g>
+</svg>
+<figcaption>两种写缓存策略</figcaption>
+</figure>
+
+<h2><span class="num">8</span>I/O 时间：算一算</h2>
+<div class="aside" data-title="旁注 · 量纲分析">
+<p>化学课上"让单位互相约掉，答案自己冒出来"的方法叫<strong>量纲分析（dimensional analysis）</strong>，在系统分析里同样好用。例 1：10000 RPM 的磁盘转一圈多少毫秒？把想要的单位写在左边，再把已知条件依次乘上，让单位约掉：</p>
+<div class="dim">
+<span class="frac"><span>Time (ms)</span><span>1 Rotation</span></span> =
+<span class="frac"><span>1 <s>minute</s></span><span>10,000 Rot.</span></span> ·
+<span class="frac"><span>60 <s>seconds</s></span><span>1 <s>minute</s></span></span> ·
+<span class="frac"><span>1000 ms</span><span>1 <s>second</s></span></span> =
+<span class="frac"><span>60,000 ms</span><span>10,000 Rot.</span></span> = <strong>6 ms / 圈</strong>
+</div>
+<p>例 2：传输速率 100MB/s，传 512KB 要多少毫秒？</p>
+<div class="dim">
+<span class="frac"><span>Time (ms)</span><span>1 Request</span></span> =
+<span class="frac"><span>512 <s>KB</s></span><span>1 Request</span></span> ·
+<span class="frac"><span>1 <s>MB</s></span><span>1024 <s>KB</s></span></span> ·
+<span class="frac"><span>1 <s>second</s></span><span>100 <s>MB</s></span></span> ·
+<span class="frac"><span>1000 ms</span><span>1 <s>second</s></span></span> = <strong>5 ms / 请求</strong>
+</div>
+</div>
+<p>有了磁盘的抽象模型，就可以用一点数学来分析性能。I/O 时间是三部分之和：</p>
+<pre><code>T_I/O = T_seek + T_rotation + T_transfer          (37.1)
+R_I/O = Size_Transfer / T_I/O                      (37.2)</code></pre>
+<p>比较驱动器时，I/O 速率 R<sub>I/O</sub> 更好用。原书拿两块 Seagate 磁盘做对比：高性能 SCSI 盘 <strong>Cheetah 15K.5</strong> 和面向容量的 SATA 盘 <strong>Barracuda</strong>（Figure 37.5）：</p>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Cheetah 15K.5</th><th>Barracuda</th></tr></thead>
+<tbody>
+<tr><td>容量</td><td>300 GB</td><td>1 TB</td></tr>
+<tr><td>转速</td><td>15,000 RPM</td><td>7,200 RPM</td></tr>
+<tr><td>平均寻道</td><td>4 ms</td><td>9 ms</td></tr>
+<tr><td>最大传输率</td><td>125 MB/s</td><td>105 MB/s</td></tr>
+<tr><td>盘片数</td><td>4</td><td>4</td></tr>
+<tr><td>缓存</td><td>16 MB</td><td>16/32 MB</td></tr>
+<tr><td>接口</td><td>SCSI</td><td>SATA</td></tr>
+</tbody></table></div>
+<p>这两块盘正好代表磁盘市场的两极："高性能"市场追求转得快、寻道短、传得快；"容量"市场最在乎每字节的成本，盘慢一些，但尽量塞下更多比特。考虑两种负载：<strong>随机负载（random）</strong>向磁盘随机位置发出小的（如 4KB）读请求，数据库等应用很常见；<strong>顺序负载（sequential）</strong>连续读大量扇区。用下面的计算器复现原书的计算（参数可改）：</p>
+
+<section class="sim" id="sim-calc">
+  <div class="sim-head"><span class="tag">计算器</span><h3>随机 vs 顺序：两块磁盘的 T<sub>I/O</sub> 与 R<sub>I/O</sub></h3>
+    <div class="desc">改转速、平均寻道、传输率、请求大小，看三部分时间各占多少、I/O 速率差多少倍。约定 1MB = 1024KB；平均旋转延迟取半圈。</div></div>
+  <div class="sim-body">
+    <div class="calc-grid">
+      <div class="drive"><h4>Cheetah 15K.5</h4>
+        <label>转速 RPM <input type="number" id="ca-rpm" value="15000" step="100"></label>
+        <label>平均寻道 ms <input type="number" id="ca-seek" value="4" step="0.5"></label>
+        <label>最大传输率 MB/s <input type="number" id="ca-rate" value="125"></label></div>
+      <div class="drive"><h4>Barracuda</h4>
+        <label>转速 RPM <input type="number" id="cb-rpm" value="7200" step="100"></label>
+        <label>平均寻道 ms <input type="number" id="cb-seek" value="9" step="0.5"></label>
+        <label>最大传输率 MB/s <input type="number" id="cb-rate" value="105"></label></div>
+      <div class="drive"><h4>负载</h4>
+        <label>随机请求大小 KB <input type="number" id="c-rsz" value="4" min="1"></label>
+        <label>顺序传输大小 MB <input type="number" id="c-ssz" value="100" min="1"></label>
+        <button id="c-book" style="margin-top:6px">恢复原书参数</button></div>
+    </div>
+    <div class="table-wrap"><table id="c-table"></table></div>
+    <div id="c-bars"></div>
+    <div class="narrate" id="c-narr"></div>
+  </div>
+</section>
+
+<p>逐项看原书的 Cheetah 随机负载：平均寻道直接取厂商给的 4ms（全程寻道大约要 2–3 倍长）；15000 RPM = 250 转/秒，一圈 4ms，平均等半圈 <strong>2ms</strong>；4KB 以 125MB/s 传输只要约 <strong>30µs</strong>（1ms 可是 1000µs！），小到可以忽略。于是 T<sub>I/O</sub> ≈ <strong>6ms</strong>，R<sub>I/O</sub> ≈ 4KB / 6ms ≈ <strong>0.66MB/s</strong>。Barracuda 的 T<sub>I/O</sub> ≈ 13.2ms，慢一倍多，R<sub>I/O</sub> ≈ 0.31MB/s。顺序负载假设只寻道、旋转一次，然后传 100MB：T<sub>I/O</sub> 约为 800ms 和 950ms，I/O 速率几乎就是峰值传输率 125 和 105MB/s（Figure 37.6）：</p>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Cheetah</th><th>Barracuda</th></tr></thead>
+<tbody><tr><td>R<sub>I/O</sub> 随机</td><td>0.66 MB/s</td><td>0.31 MB/s</td></tr>
+<tr><td>R<sub>I/O</sub> 顺序</td><td>125 MB/s</td><td>105 MB/s</td></tr></tbody></table></div>
+<p class="small muted">说明：原书数字是四舍五入的近似（把 T 取成约 6ms、13ms，把 4KB 当成约 0.004MB）。计算器按 1MB = 1024KB 精确计算，得到 0.65 和 0.30MB/s、顺序 124 和 104MB/s，结论完全一样。</p>
+<p>这张表说明了两件事。第一，也是最重要的：随机和顺序负载之间有<strong>巨大</strong>的性能差距，Cheetah 约 200 倍，Barracuda 超过 300 倍。由此得到计算史上最显而易见的设计建议：</p>
+<div class="tip"><p><strong>顺序地使用磁盘（Use disks sequentially）。</strong>只要可能，就按顺序传输数据；做不到顺序，至少要用大块传输，越大越好。如果 I/O 是零零碎碎的随机小块，性能会急剧下降，用户会受苦，你也会受苦——因为你知道这都是你那些随手的随机 I/O 造成的。</p></div>
+<p>第二点更微妙："高性能"盘和"容量"盘的性能差距也很大。所以人们愿意为前者付高价，而对后者则尽量买便宜的。</p>
+
+<h2><span class="num">9</span>旁注：为什么平均寻道是全程的 1/3</h2>
+<p>书和论文里常说"平均寻道时间约为全程寻道的三分之一"。这来自平均<strong>寻道距离</strong>的计算（不是时间）。把磁道编号为 0 到 N，任意两道 x、y 之间的寻道距离是 |x − y|。所有可能寻道的距离之和用积分近似：</p>
+<pre><code>∫₀ᴺ ∫₀ᴺ |x − y| dy dx
+内层拆开绝对值：∫₀ˣ (x − y) dy + ∫ₓᴺ (y − x) dy = x² − Nx + N²/2
+外层：∫₀ᴺ (x² − Nx + N²/2) dx = N³/3 − N³/2 + N³/2 = N³/3
+除以寻道总数 N²：平均距离 = N/3</code></pre>
+<section class="sim" id="sim-avg">
+  <div class="sim-head"><span class="tag">小实验</span><h3>用穷举验证 N/3</h3>
+    <div class="desc">枚举所有 (x, y) 磁道对，画出寻道距离的分布（越短的距离出现越多），并比较真实平均值与 N/3。</div></div>
+  <div class="sim-body">
+    <div class="controls"><label>磁道数 N <input type="range" id="av-n" min="2" max="200" value="30"></label><span class="pill" id="av-nv">30</span></div>
+    <div class="stage" id="av-stage"></div>
+    <div class="stats" id="av-stats"></div>
+  </div>
+</section>
+
+<h2><span class="num">10</span>磁盘调度</h2>
+<p>I/O 代价这么高，操作系统历来会插手决定磁盘请求的顺序。给定一组 I/O 请求，<strong>磁盘调度程序（disk scheduler）</strong>检查它们并决定下一个服务哪个。和进程调度不同，进程的运行时间通常不可知，而磁盘请求要花多久却能<strong>估算得相当准</strong>：估计寻道和可能的旋转延迟即可。于是磁盘调度器可以贪心地先做最短的那个——遵循 <strong>SJF（最短作业优先）</strong>的原则。</p>
+<h3>SSTF：最短寻道时间优先</h3>
+<p><strong>SSTF（shortest-seek-time-first，也叫 SSF）</strong>按磁道排序请求，先服务最近磁道上的请求。原书的例子（Figure 37.7）：磁头在内道，有扇区 21（中道）和 2（外道）两个请求，SSTF 先发 21，完成后再发 2。</p>
+<figure class="fig"><div class="disk-fig" data-cfg='{"tracks":3,"head":2,"want":[21,2],"caption":"SSTF：先 21（1 道之遥），再 2"}'></div><figcaption>Figure 37.7：SSTF 调度请求 21 和 2</figcaption></figure>
+<p>SSTF 不是万能的。第一，<strong>操作系统看不到驱动器的几何结构</strong>，只看到一个块数组。这好解决：OS 可以改用<strong>最近块优先（nearest-block-first, NBF）</strong>，下一个服务块地址最近的请求。第二个问题更根本：<strong>饥饿（starvation）</strong>。如果磁头所在的内道源源不断地来请求，纯 SSTF 会完全忽略其他磁道上的请求。</p>
+<div class="crux"><p><strong>如何处理磁盘饥饿？</strong>怎样实现类似 SSTF 的调度，同时避免饥饿？</p><p class="muted small">How can we implement SSTF-like scheduling but avoid starvation?</p></div>
+<h3>电梯算法：SCAN 与 C-SCAN</h3>
+<p>答案早就有了。<strong>SCAN</strong> 让磁头在磁盘上来回扫，按磁道顺序服务请求。从外到内（或从内到外）扫一遍叫一个<strong>扫描（sweep）</strong>。如果某个请求所在的磁道这一趟已经扫过了，它不会被立即处理，而是排到下一趟（反方向）。变种有：</p>
+<ul>
+<li><strong>F-SCAN</strong>：扫描期间冻结要服务的队列，扫描中新到的请求放进另一个队列稍后服务。这样，远处的请求不会因为不断到来的近处新请求而饿死。</li>
+<li><strong>C-SCAN（Circular SCAN）</strong>：只从外向内扫，扫到头就回到最外道重新开始。这对内外磁道更公平：来回扫的 SCAN 偏爱中间磁道——服务完最外道后，要经过中间两次才会再回到最外道。</li>
+</ul>
+<figure class="fig">
+<svg viewBox="0 0 640 230" width="640" role="img" aria-label="SCAN 与 C-SCAN 的磁头轨迹">
+  <defs><marker id="ah37d" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--c1)"/></marker></defs>
+  <g font-size="12">
+    <text x="20" y="18" font-weight="600">SCAN：来回扫</text>
+    <text x="340" y="18" font-weight="600">C-SCAN：单向扫，到头跳回</text>
+    <text x="20" y="214" class="t-muted">外道 ← 磁道 → 内道</text><text x="340" y="214" class="t-muted">外道 ← 磁道 → 内道</text>
+  </g>
+  <g>
+    <line x1="30" y1="30" x2="30" y2="196" style="stroke:var(--border)"/><line x1="150" y1="30" x2="150" y2="196" style="stroke:var(--warn);stroke-dasharray:3 3"/><line x1="270" y1="30" x2="270" y2="196" style="stroke:var(--border)"/>
+    <path d="M 30 36 L 270 76 L 30 116 L 270 156 L 30 196" style="fill:none;stroke:var(--c1);stroke-width:2" marker-end="url(#ah37d)"/>
+    <circle cx="150" cy="56" r="5" class="accent"/><circle cx="150" cy="96" r="5" class="accent"/><circle cx="150" cy="136" r="5" class="accent"/><circle cx="150" cy="176" r="5" class="accent"/>
+    <circle cx="30" cy="36" r="5" style="fill:var(--bad)"/><circle cx="30" cy="116" r="5" style="fill:var(--bad)"/><circle cx="30" cy="196" r="5" style="fill:var(--bad)"/>
+    <text x="156" y="210" font-size="11" style="fill:var(--warn)">中间道：等间隔经过</text>
+    <text x="36" y="160" font-size="11" style="fill:var(--bad)">最外道：间隔两倍长</text>
+  </g>
+  <g transform="translate(320,0)">
+    <line x1="30" y1="30" x2="30" y2="196" style="stroke:var(--border)"/><line x1="150" y1="30" x2="150" y2="196" style="stroke:var(--border)"/><line x1="270" y1="30" x2="270" y2="196" style="stroke:var(--border)"/>
+    <path d="M 30 36 L 270 88" style="fill:none;stroke:var(--c1);stroke-width:2"/>
+    <path d="M 270 88 L 30 98" style="fill:none;stroke:var(--muted);stroke-width:1.5;stroke-dasharray:4 3"/>
+    <path d="M 30 98 L 270 150" style="fill:none;stroke:var(--c1);stroke-width:2"/>
+    <path d="M 270 150 L 30 160" style="fill:none;stroke:var(--muted);stroke-width:1.5;stroke-dasharray:4 3"/>
+    <path d="M 30 160 L 190 194" style="fill:none;stroke:var(--c1);stroke-width:2" marker-end="url(#ah37d)"/>
+    <circle cx="30" cy="36" r="5" style="fill:var(--bad)"/><circle cx="30" cy="98" r="5" style="fill:var(--bad)"/><circle cx="30" cy="160" r="5" style="fill:var(--bad)"/>
+    <circle cx="150" cy="62" r="5" class="accent"/><circle cx="150" cy="124" r="5" class="accent"/><circle cx="150" cy="186" r="5" class="accent"/>
+    <text x="160" y="104" font-size="11" class="t-muted">虚线：快速回到外道</text>
+    <text x="36" y="130" font-size="11">每条磁道都等间隔经过</text>
+  </g>
+  <text x="620" y="200" font-size="11" class="t-muted" text-anchor="end">时间 ↓</text>
+</svg>
+<figcaption>磁头位置随时间的轨迹：SCAN 偏爱中间磁道，C-SCAN 对所有磁道一视同仁</figcaption>
+</figure>
+<p>SCAN 也叫<strong>电梯算法（elevator algorithm）</strong>，因为它像电梯一样要么向上要么向下，而不是看哪层近就去哪层。想象你从 10 楼下到 1 楼，有人在 3 楼进来按了 4，电梯却因为 4 楼"更近"而掉头上去——多气人！电梯算法在现实中避免了打架，在磁盘上则避免了饥饿。</p>
+<p>可惜 SCAN 及其变种（甚至 SSTF）都没有尽可能地贴近 SJF：它们<strong>忽略了旋转</strong>。</p>
+<div class="crux"><p><strong>如何计入磁盘旋转的开销？</strong>怎样实现同时考虑寻道和旋转、更接近 SJF 的算法？</p><p class="muted small">How can we implement an algorithm that more closely approximates SJF by taking both seek and rotation into account?</p></div>
+<h3>SPTF：最短定位时间优先</h3>
+<p><strong>SPTF（shortest positioning time first，也叫 SATF, shortest access time first）</strong>就是答案。看原书的例子（Figure 37.8）：磁头在内道扇区 30 上方，下一个该服务中道的 16，还是外道的 8？</p>
+<figure class="fig"><div class="disk-fig" data-cfg='{"tracks":3,"head":2,"want":[16,8],"caption":"16：寻道近但要等将近一圈；8：寻道远但马上转到"}'></div><figcaption>Figure 37.8：SSTF 有时不够好</figcaption></figure>
+<p>答案是"看情况"（it depends）。取决于寻道和旋转的相对快慢：如果寻道比旋转慢得多，SSTF 及其变种就够了；但如果寻道比旋转快不少，那就应该多寻一段道去服务外道的 8，而不是就近去中道服务 16——16 刚刚转过磁头，得等几乎一整圈。在下面的模拟器里用"原书 Figure 37.8"两个预设按钮对比：寻道速率 S=4 时 SPTF 先做 8，总时间 315；SSTF 先做 16，总时间 435。把 S 改成 1，两者都会先做 16。</p>
+<div class="aside" data-title="提示 · 总是看情况（Livny 定律）">
+<p>几乎任何问题都可以用"看情况"回答，就像作者的同事 Miron Livny 常说的。但请谨慎使用：回答太多次"看情况"，人们就不再问你问题了。比如有人问"去吃午饭吗？"你答："看情况，你也去吗？"更重要的是知道<strong>为什么</strong>要看情况、看什么情况。</p>
+</div>
+<p>在现代驱动器上，寻道和旋转大致相当（当然取决于具体请求），所以 SPTF 有用、能提升性能。但它在 OS 里更难实现：OS 通常不知道磁道边界在哪，也不知道磁头此刻转到了哪个角度。所以 SPTF 通常在<strong>驱动器内部</strong>实现。</p>
+<h3>其他调度问题</h3>
+<ul>
+<li><strong>在哪里调度？</strong>老系统里 OS 包办一切：从待处理请求中选最好的发给磁盘，完成后再选下一个。现代磁盘能同时容纳多个未完成的请求，内部有精巧的调度器（掌握磁头精确位置等所有细节，可以准确实现 SPTF）。于是 OS 调度器通常挑出它认为最好的若干个（比如 16 个）一起发下去，由磁盘按 SPTF 顺序服务。</li>
+<li><strong>I/O 合并（I/O merging）</strong>：比如依次来了读块 33、8、34 的请求（Figure 37.8），调度器应把 33 和 34 合并成一个两块的请求，再对合并后的请求排序。合并在 OS 层尤其重要，能减少发给磁盘的请求数、降低开销。</li>
+<li><strong>该等多久再发请求？</strong>直觉是只要有一个 I/O 就立刻发给磁盘，这叫<strong>work-conserving（保持工作）</strong>：有请求时磁盘绝不空闲。但<strong>预期调度（anticipatory disk scheduling）</strong>的研究表明，有时稍等一下更好（<strong>non-work-conserving</strong>）：也许马上就会来一个"更好"的请求（比如同一进程的下一个相邻块），整体效率反而更高。难点是决定何时等、等多久；Linux 内核里有相关实现。</li>
+</ul>
+
+<h2><span class="num">11</span>模拟器：仿 disk.py 看寻道、旋转与传输</h2>
+<p>下面的模拟器复现了原书作业工具 <code>disk.py</code> 的模型：3 条磁道（外道 0–11、中道 12–23、内道 24–35），每道 12 个扇区、每扇区 30°，磁道间距 40 个距离单位。默认寻道速率 <code>-S 1</code>（每时间单位移动 1 个距离单位，所以换一道要 40）、旋转速率 <code>-R 1</code>（每时间单位转 1°，所以传输一个扇区要 30、转一圈要 360）。时间 0 时磁头在外道、正对扇区 6 的中间。输入请求序列，逐步观察每个请求的<span class="phase-pill ph-seek">寻道</span> <span class="phase-pill ph-rot">旋转</span> <span class="phase-pill ph-xfer">传输</span>。</p>
+
+<section class="sim" id="sim-disk">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>disk.py：请求序列、调度策略与三段时间</h3>
+    <div class="desc">改请求、策略、寻道/旋转速率、磁道偏斜、调度窗口。每个请求分 4 步：调度器挑选 → 寻道 → 等旋转 → 传输；盘片和磁臂会动画移动。表格给出每个请求的 Seek / Rotate / Transfer / Total，与 disk.py 的输出格式相同。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>请求 <input type="text" id="dk-req" value="7,30,8" style="width:10em"></label>
+      <label>策略 <select id="dk-pol"><option value="FIFO">FIFO</option><option value="SSTF">SSTF</option><option value="SCAN">SCAN（电梯）</option><option value="CSCAN">C-SCAN</option><option value="SATF">SPTF / SATF</option></select></label>
+      <label>寻道速率 S <input type="number" id="dk-S" value="1" min="0.05" step="0.5"></label>
+      <label>旋转速率 R <input type="number" id="dk-R" value="1" min="0.01" step="0.1"></label>
+      <label>偏斜 skew <input type="number" id="dk-skew" value="0" min="0" max="11"></label>
+      <label>窗口 <input type="number" id="dk-win" value="0" min="0" title="0 = 看全部请求"></label>
+      <label>起始磁道 <select id="dk-st"><option value="0">外道 0</option><option value="1">中道 1</option><option value="2">内道 2</option></select></label>
+    </div>
+    <div class="controls">
+      <span class="muted small">原书作业 1：</span>
+      <button data-p="a0">-a 0</button><button data-p="a6">-a 6</button><button data-p="a30">-a 30</button><button data-p="a7308">-a 7,30,8</button><button data-p="a10">-a 10,11,12,13</button>
+    </div>
+    <div class="controls">
+      <span class="muted small">原书示例：</span>
+      <button data-p="skew2">10–13 + 偏斜 2</button><button data-p="sstf">SSTF：7,30,8</button><button data-p="f377">Figure 37.7 SSTF 21,2</button><button data-p="f378a">Figure 37.8 SSTF（S=4）</button><button data-p="f378b">Figure 37.8 SPTF（S=4）</button>
+    </div>
+    <div id="dk-step"></div>
+    <div class="stage">
+      <div class="disk-wrap">
+        <div class="disk-view" id="dk-view" style="flex:1 1 300px;max-width:380px"></div>
+        <div class="disk-side">
+          <div class="table-wrap" style="margin:0"><table class="reqtab" id="dk-table"></table></div>
+          <div id="dk-cand" class="cand" style="margin-top:8px"></div>
+        </div>
+      </div>
+      <div id="dk-gantt" style="margin-top:10px"></div>
+    </div>
+    <div class="narrate" id="dk-narr"></div>
+    <div class="stats" id="dk-stats"></div>
+  </div>
+</section>
+
+<div class="tip"><p>动画里盘片逆时针转，磁头固定在右侧（3 点钟方向）沿半径方向移动（真实磁臂是绕轴摆动的，这里简化成直线）。浅色扇区是已服务的，橙色是还没服务的请求，深橙色是正在传输的扇区。</p></div>
+
+<h2><span class="num">12</span>先预测，再验证</h2>
+<div class="exercise"><div class="q">（原书作业 1）默认参数下，分别计算 <code>-a 0</code>、<code>-a 6</code>、<code>-a 30</code>、<code>-a 7,30,8</code>、<code>-a 10,11,12,13</code> 的寻道、旋转、传输时间。提示：起点是扇区 6 的正中间，每扇区 30。</div>
+<details class="reveal"><summary>看答案</summary><div>
+<ul>
+<li><code>-a 0</code>：Seek 0、Rotate 165（6 的后半 15 + 7…11 共 5×30）、Transfer 30、Total 195。</li>
+<li><code>-a 6</code>：Seek 0、Rotate 345（刚错过 6 的开头，要等 360−15）、Transfer 30、Total 375。</li>
+<li><code>-a 30</code>：Seek 80（两道 × 40）、Rotate 265、Transfer 30、Total 375。30 和 6 角度对齐，寻道 80 之后还得等到同一时刻 345。</li>
+<li><code>-a 7,30,8</code>：7 → (0, 15, 30, 45)；30 → (80, 220, 30, 330)；8 → (80, 310, 30, 420)。合计 Seek 160、Rotate 545、Transfer 90、Total 795。</li>
+<li><code>-a 10,11,12,13</code>：10 → (0, 105, 30, 135)；11 → (0, 0, 30, 30)；12 → (40, 320, 30, 390)；13 → (0, 0, 30, 30)。合计 Seek 40、Rotate 425、Transfer 120、Total 585。</li>
+</ul>
+</div></details></div>
+
+<div class="exercise"><div class="q">（原书作业 2）对 <code>-a 7,30,8</code>，把寻道速率改成 <code>-S 2</code>、<code>4</code>、<code>8</code>、<code>10</code>、<code>40</code>、<code>0.1</code>。先预测：寻道快 2 倍，总时间会少一半吗？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>S=2：寻道合计 80，但 Total 仍是 <strong>795</strong>——省下的寻道时间全变成了旋转等待（30 和 8 都"早到了但扇区还没来"）。S=4、8、10、40：Total 都是 <strong>435</strong>，因为从 30 到 8 寻道足够快，赶在 8 转过来之前就位，省掉了一整圈；之后再快也没用，瓶颈变成旋转。S=0.1：寻道 800 一次，Total <strong>2235</strong>。结论：寻道和旋转是耦合的，只优化其中一项，收益可能是零，也可能是跳变。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（原书作业 3）还是 <code>-a 7,30,8</code>，把旋转速率改成 <code>-R 0.1</code>、<code>0.5</code>、<code>0.01</code>。时间怎么变？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>转得越慢，旋转和传输都等比例变长：R=0.5 Total 1590，R=0.1 Total 4350，R=0.01 Total 43500。有意思的是 R=0.1 时第三个请求 8 只需旋转 220：寻道 80 这段时间盘几乎没转，等待模式完全不同。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（原书作业 4、5）<code>-a 7,30,8</code> 用 SSTF 和 SATF 各是什么顺序、多长时间？再找一组 SATF 明显优于 SSTF 的请求。</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>SSTF：7 和 8 都在当前磁道（距离 0），按队列顺序先 7 再 8，最后 30。7 → (0, 15, 30, 45)；8 → (0, 0, 30, 30)；30 → (80, 190, 30, 300)；合计 Seek 80、Rotate 205、Transfer 90、Total <strong>375</strong>（FIFO 是 795）。SATF 选出同样的顺序，也是 375。</p>
+<p>SATF 胜出的例子：<code>-a 0,20</code>（默认参数）。SSTF 先做同道的 0（要等 165），Total 435；SATF 发现 20 寻道 40 后只需再等 5，先做 20，Total 195。或者用原书 Figure 37.8 的预设：S=4 时 SSTF 435 对 SPTF 315。一般地，当寻道相对旋转很快、而近处磁道上的请求刚刚错过时，SATF 更好。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">（原书作业 6）<code>-a 10,11,12,13</code> 哪里表现差？加磁道偏斜能改善吗？默认寻道速率下偏斜设多少最好？S=2、S=4 时呢？能写出公式吗？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>问题出在 11 → 12 跨磁道：寻道 40，而读完 11 时 12 的起点正好在磁头下，寻道完它已转过去，要等 320。偏斜试验结果（Total）：S=1 时 skew 0/1/2/3 = 585/615/<strong>285</strong>/315，最佳 2；S=2 或 4 时 = 585/<strong>255</strong>/285/315，最佳 1。</p>
+<p>公式：换一道的寻道时间是 40/S，这段时间盘转过 (40/S)·R 度，每扇区 30°，所以偏斜至少要 <code>skew = ⌈(40 / S) · R / 30⌉</code> 个扇区。偏斜再大也不好：多等的每个扇区都是浪费。</p>
+</div></details></div>
+
+<div class="exercise"><div class="q">用计算器：如果把 Cheetah 的随机请求从 4KB 改成 1MB，R<sub>I/O</sub> 变成多少？这说明了原书哪条 TIP？</div>
+<details class="reveal"><summary>看答案</summary><div>
+<p>1MB 的传输要 8ms，T<sub>I/O</sub> ≈ 4 + 2 + 8 = 14ms，R<sub>I/O</sub> ≈ 71MB/s，是 4KB 随机读的一百多倍。这就是"做不到顺序，至少用大块传输，越大越好"：寻道和旋转是每个请求的固定成本，请求越大，固定成本被摊得越薄。</p>
+</div></details></div>
+
+<h2><span class="num">13</span>动手实验：顺序读 vs 随机读</h2>
+<div class="lab">
+<p><code>labs/37-hdd/seqrand.c</code> 在当前目录写一个 128MB 的测试文件，然后用 <code>O_DIRECT</code>（绕过页缓存，每次读都真的到达设备）分别测：1MB 一次的顺序读、4KB 一次的顺序读、4KB 一次的随机读。测完自动删除文件。</p>
+<pre><code class="cmd">cd labs/37-hdd &amp;&amp; make &amp;&amp; ./seqrand</code></pre>
+<p class="small muted">示例输出（WSL2 · ext4，底层是 SSD 上的虚拟磁盘；你的机器上数字会不同）：</p>
+<pre><code>测试文件 128 MB = 32768 个 4KB 块（O_DIRECT，绕过页缓存）
+
+顺序读  1MB × 128   :     57.1 ms    2243.6 MB/s
+顺序读  4KB × 4000  :    481.2 ms      32.5 MB/s  平均每次  120.3 us
+随机读  4KB × 4000  :    648.9 ms      24.1 MB/s  平均每次  162.2 us
+
+顺序(1MB) / 随机(4KB) 带宽比 ≈ 93 倍</code></pre>
+<p>怎么解读：</p>
+<ul>
+<li>1MB 顺序读比 4KB 随机读快约 <strong>90 倍</strong>——即使在没有机械部件的 SSD 上，"大块、顺序"依然是王道，因为每个请求都有固定开销（系统调用、虚拟化层、设备命令处理）。</li>
+<li>4KB 随机读只比 4KB 顺序读慢一点：SSD 没有磁头，也就<strong>没有寻道和旋转延迟</strong>。在真正的 HDD 上，随机 4KB 每次要付出 5–15ms，只有 0.3–1MB/s（本章 Figure 37.6），与顺序读相差几百倍。</li>
+<li>为什么要 <code>O_DIRECT</code>：刚写完的文件还在页缓存里，不绕过缓存的话读到的是内存，测不到设备。<code>O_DIRECT</code> 要求缓冲区、偏移、长度按块对齐，所以用 <code>posix_memalign</code>。SSD 的内部结构在第 44 章详细讨论。</li>
+</ul>
+</div>
+
+<h2><span class="num">14</span>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="3"><div class="q">1. 磁盘厂商保证什么样的写是原子的？</div>
+<div class="opts"><button>A. 一整条磁道</button><button>B. 一个 4KB 文件系统块</button><button>C. 任意大小的写</button><button>D. 单个 512 字节扇区</button></div>
+<div class="explain">只有单扇区写是原子的。4KB 写跨越 8 个扇区，断电时可能只写了一部分（撕裂写），文件系统必须自己处理。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">2. 一块 15000 RPM 的磁盘，平均旋转延迟是多少？</div>
+<div class="opts"><button>A. 0.25 ms</button><button>B. 4 ms</button><button>C. 6 ms</button><button>D. 2 ms</button></div>
+<div class="explain">15000 RPM = 250 转/秒，一圈 4ms；平均要等半圈，即 2ms。4ms 是一整圈，6ms 是 10000 RPM 的一圈。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">3. Cheetah 上随机 4KB 读的 T<sub>I/O</sub> ≈ 6ms，其中占比最小的是？</div>
+<div class="opts"><button>A. 传输</button><button>B. 寻道和旋转一样小</button><button>C. 旋转</button><button>D. 寻道</button></div>
+<div class="explain">4KB 在 125MB/s 下只需约 30µs，而寻道 4ms、旋转 2ms。小随机 I/O 的时间几乎全花在机械定位上，这正是随机和顺序差几百倍的原因。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">4. 磁道偏斜（track skew）要解决什么问题？</div>
+<div class="opts"><button>A. 跨磁道顺序读时，换道期间下一个扇区已经转过磁头</button><button>B. 磁头定位不准，需要多次稳定</button><button>C. 外圈磁道比内圈长，扇区数不同</button><button>D. write-back 缓存的乱序问题</button></div>
+<div class="explain">换道需要时间，偏斜让下一条磁道的起始扇区"晚一点"出现，磁头到位时恰好赶上。C 是多区（zone）的问题。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">5. 关于 SSTF，下列说法错误的是：</div>
+<div class="opts"><button>A. OS 看不到几何结构时，可以用最近块优先（NBF）近似</button><button>B. 它同时考虑了寻道和旋转，因此总是最优</button><button>C. 它是 SJF 思想在磁盘上的一种应用</button><button>D. 它可能让远处磁道上的请求饿死</button></div>
+<div class="explain">SSTF 只看寻道距离，忽略了旋转（Figure 37.8 的例子），所以有了 SPTF。而且所有这些调度器都是贪心的，都不保证最优。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">6. C-SCAN 相比 SCAN 的主要好处是？</div>
+<div class="opts"><button>A. 总寻道距离一定更短</button><button>B. 不会产生任何等待</button><button>C. 对内外磁道更公平：SCAN 来回扫描会偏爱中间磁道</button><button>D. 考虑了旋转延迟</button></div>
+<div class="explain">SCAN 服务完最外道后要经过中间两次才回来，中间磁道被照顾得更频繁；C-SCAN 只单向扫、到头跳回，更公平。代价是回跳也要寻道。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">7. 为什么 SPTF 通常在驱动器内部而不是 OS 里实现？</div>
+<div class="opts"><button>A. SPTF 算法需要专用硬件</button><button>B. OS 不知道磁道边界和磁头当前的旋转位置，驱动器知道</button><button>C. 驱动器里没有队列，只能边来边做</button><button>D. OS 没有足够的 CPU 时间</button></div>
+<div class="explain">SPTF 需要精确估计旋转等待，这要求知道磁头此刻的角度和扇区布局，只有驱动器内部掌握。现代 OS 通常一次下发若干请求，让磁盘用 SPTF 排序。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">8. 队列里依次有读块 33、8、34 的请求，OS 调度器应该先做什么优化？</div>
+<div class="opts"><button>A. 把 33 和 34 合并成一个两块的请求</button><button>B. 把 8 提到最前面</button><button>C. 等待更多请求到来，直到凑满 16 个</button><button>D. 把 8 拆成两个半块请求</button></div>
+<div class="explain">这是 I/O 合并（merging）：相邻块合成一个请求，减少发给磁盘的请求数、降低开销；排序再对合并后的请求进行。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">9. 在默认 disk.py 模型下，寻道速率从 1 提高到 2（快一倍），<code>-a 7,30,8</code> 的总时间：</div>
+<div class="opts"><button>A. 减少 80（省下的寻道时间）</button><button>B. 变长</button><button>C. 不变，仍是 795</button><button>D. 减少一半</button></div>
+<div class="explain">磁头提前到位，但目标扇区还没转过来，省下的寻道时间全部变成旋转等待。只有快到能"赶上"本来错过的那一圈时，总时间才会跳变（S≥4 时降到 435）。</div></div>
+
+<h2><span class="num">15</span>常见误区与本章小结</h2>
+<div class="warn">
+<ul>
+<li><strong>"寻道快了，I/O 就一定快"</strong>——不一定。寻道和旋转耦合：早到的磁头只能等扇区转过来（作业 2）。</li>
+<li><strong>"传输率 125MB/s，所以磁盘就有 125MB/s"</strong>——只有顺序大块传输才接近这个数；随机 4KB 只有不到 1MB/s。</li>
+<li><strong>"平均寻道时间 = 全程寻道时间的一半"</strong>——平均寻道距离约为全程的 1/3。</li>
+<li><strong>"lseek() 会让磁头寻道"</strong>——lseek 只改内存里的文件偏移（第 39 章），真正的磁盘寻道发生在后续读写落到不同磁道时。</li>
+<li><strong>"磁盘调度只由 OS 完成"</strong>——现代磁盘内部有自己的（通常是 SPTF）调度器，OS 只负责挑一批、合并请求。</li>
+<li><strong>"write-back 缓存只是更快，没有代价"</strong>——它可能在断电时丢失或打乱写入顺序，危及依赖写顺序的日志等机制。</li>
+</ul>
+</div>
+<div class="key">
+<p><strong>本章要点</strong></p>
+<ul>
+<li>磁盘接口是扇区数组，只有单扇区写原子；"相邻快、顺序最快"是不成文的约定。</li>
+<li>T<sub>I/O</sub> = T<sub>seek</sub> + T<sub>rotation</sub> + T<sub>transfer</sub>；小随机 I/O 几乎全是机械定位时间，顺序与随机相差 200–300 倍。</li>
+<li>track skew、多区、磁道缓冲是真实磁盘的重要细节；write-back 快但有风险。</li>
+<li>磁盘调度近似 SJF：SSTF/NBF 会饿死请求 → SCAN/F-SCAN/C-SCAN 解决饥饿 → SPTF 同时考虑寻道与旋转，通常在驱动器内部实现；再加上 I/O 合并与预期调度。</li>
+</ul>
+</div>
+<p><strong>和后续章节的联系：</strong>单块磁盘不够大、不够快、也不够可靠，下一章 <strong>RAID</strong> 把多块磁盘组合成一个"更好的磁盘"，分析时直接沿用本章的 S（顺序带宽）和 R（随机带宽）。第 41 章 FFS 会利用"相邻块访问快"来布局文件；第 43 章 LFS 则把所有写都变成顺序写，把这一章的"顺序地使用磁盘"推向极致。</p>
+
+</main>
+<script>
+(function () {
+"use strict";
+// ===== CORE BEGIN（纯函数，无 DOM；node 可测） =====
+// 磁盘模型（仿 disk.py）：3 条磁道，每道 12 扇区，每扇区 30°；磁道间距 40 个距离单位。
+// 时间 0：磁头在外道（track 0），正位于扇区 6 的正中间。盘片逆时针转，扇区按编号递增依次经过磁头。
+// 连续的"槽位"坐标 u：磁头下方的位置 u(t) = 6.5 + R·t/30 (mod 12)；扇区所在槽位 = (k + track·skew) mod 12
+const DISK = { TRACKS: 3, SPT: 12, DEG: 30, SPACING: 40, START_SLOT: 6.5 };
+const EPS = 1e-9;
+function mod(a, m) { const r = ((a % m) + m) % m; return Math.abs(r - m) < EPS || Math.abs(r) < EPS ? 0 : r; }
+function trackOf(sec) { return Math.floor(sec / DISK.SPT); }
+function slotOf(sec, skew) { const t = trackOf(sec); return mod((sec % DISK.SPT) + t * skew, DISK.SPT); }
+function slotUnderHead(time, R, u0) { return mod((u0 == null ? DISK.START_SLOT : u0) + (R * time) / DISK.DEG, DISK.SPT); }
+const rnd = (x) => Math.round(x * 1e6) / 1e6;
+// 从 (time, track) 出发服务一个扇区请求：返回三段时间
+function serviceTimes(sec, time, track, o) {
+  const tgt = trackOf(sec);
+  const seek = rnd((Math.abs(tgt - track) * DISK.SPACING) / o.S);
+  const u = slotUnderHead(time + seek, o.R, o.u0);
+  const rotate = rnd((mod(slotOf(sec, o.skew) - u, DISK.SPT) * DISK.DEG) / o.R);
+  const transfer = rnd(DISK.DEG / o.R);
+  return { seek, rotate, transfer, total: rnd(seek + rotate + transfer), track: tgt };
+}
+// 调度：从待服务队列（按到达顺序）的前 window 个里挑一个
+function pickNext(queue, time, track, o, st) {
+  const w = o.window > 0 ? Math.min(o.window, queue.length) : queue.length;
+  const cand = queue.slice(0, w).map((sec, i) => ({ sec, i, tr: trackOf(sec), est: serviceTimes(sec, time, track, o) }));
+  let best = cand[0], why = "";
+  const byMin = (f) => cand.reduce((b, c) => (f(c) < f(b) - EPS ? c : b), cand[0]);
+  switch (o.policy) {
+    case "FIFO": best = cand[0]; why = "FIFO：按到达顺序，取队首。"; break;
+    case "SSTF": best = byMin((c) => Math.abs(c.tr - track)); why = `SSTF：选离当前磁道（${track}）最近的磁道上的请求（距离 ${Math.abs(best.tr - track)} 道）。`; break;
+    case "SATF": best = byMin((c) => c.est.seek + c.est.rotate); why = `SPTF/SATF：比较"寻道 + 旋转"的定位时间，选最短的（${fmt(best.est.seek + best.est.rotate)}）。`; break;
+    case "SCAN": case "CSCAN": {
+      // 方向：+1 表示由外向内（磁道号增大），-1 由内向外
+      const ahead = (dir) => cand.filter((c) => (c.tr - track) * dir >= 0);
+      let dir = st.dir || 1;
+      let pool = ahead(dir);
+      if (!pool.length) {
+        if (o.policy === "SCAN") { dir = -dir; pool = ahead(dir); why = "SCAN：这个方向上没有请求了，掉头。"; }
+        else { pool = cand.slice(); const mn = Math.min(...pool.map((c) => c.tr)); pool = pool.filter((c) => c.tr === mn); why = "C-SCAN：到头了，回到最外侧重新开始一趟由外向内的扫描。"; }
+      }
+      const near = pool.reduce((b, c) => (Math.abs(c.tr - track) < Math.abs(b.tr - track) ? c : b), pool[0]);
+      best = near;
+      st.dir = o.policy === "CSCAN" ? 1 : dir;
+      why = (why ? why + " " : "") + `${o.policy === "SCAN" ? "SCAN" : "C-SCAN"}：沿${st.dir > 0 ? "由外向内" : "由内向外"}方向，服务下一个经过的磁道 ${best.tr} 上的请求。`;
+      break;
+    }
+  }
+  return { best, cand, why };
+}
+function fmt(x) { return Number.isInteger(x) ? String(x) : x.toFixed(1); }
+// 运行整个请求序列：返回每个请求的服务记录
+function simulate(reqs, opts) {
+  const o = Object.assign({ S: 1, R: 1, skew: 0, policy: "FIFO", window: 0, startTrack: 0, u0: DISK.START_SLOT }, opts);
+  let time = 0, track = o.startTrack;
+  const queue = reqs.slice(), out = [], st = {};
+  while (queue.length) {
+    const { best, cand, why } = pickNext(queue, time, track, o, st);
+    queue.splice(best.i, 1);
+    const t = serviceTimes(best.sec, time, track, o);
+    out.push({ sec: best.sec, from: track, start: time, ...t, why, cand: cand.map((c) => ({ sec: c.sec, pos: c.est.seek + c.est.rotate, dist: Math.abs(c.tr - track) })) });
+    time += t.total; track = t.track;
+  }
+  const sum = (k) => rnd(out.reduce((a, r) => a + r[k], 0));
+  return { rows: out, seek: sum("seek"), rotate: sum("rotate"), transfer: sum("transfer"), total: sum("total"), o };
+}
+// ---- 计算器：随机 vs 顺序负载（Figure 37.5 / 37.6） ----
+// sizeKB：请求大小（KB）；约定 1MB = 1024KB（与原书量纲分析一致）
+function ioCalc(d, sizeKB) {
+  const rot = 60000 / d.rpm;             // 一圈 ms
+  const Tseek = d.seek, Trot = rot / 2;  // 平均寻道 + 平均半圈
+  const Ttransfer = (sizeKB / 1024 / d.rate) * 1000;  // ms
+  const T = Tseek + Trot + Ttransfer;
+  const R = (sizeKB / 1024) / (T / 1000); // MB/s
+  return { rot, Tseek, Trot, Ttransfer, T, R };
+}
+// 平均寻道距离：磁道 0..N-1 所有 (x, y) 对的平均 |x-y|
+function avgSeek(N) {
+  let s = 0;
+  for (let x = 0; x < N; x++) for (let y = 0; y < N; y++) s += Math.abs(x - y);
+  return s / (N * N);
+}
+function parseReqs(txt) { return (txt.match(/\d+/g) || []).map(Number).filter((x) => x >= 0 && x < DISK.TRACKS * DISK.SPT); }
+// ===== CORE END =====
+
+// ===== 页面交互部分 =====
+const { h, s } = OSTEP;
+const $ = (id) => document.getElementById(id);
+const f1 = (x) => (Number.isInteger(x) ? String(x) : (Math.round(x * 10) / 10).toString());
+
+// ---------- 图：扇区数组与撕裂写 ----------
+(function sectorArray() {
+  const g = $("sa-cells"), t = $("sa-torn");
+  for (let i = 0; i < 16; i++) {
+    const x = 10 + i * 38, blk = i >= 8;
+    g.append(s("rect", { x, y: 32, width: 34, height: 26, rx: 4, class: blk ? "accent-soft" : "box" }));
+    g.append(s("text", { x: x + 17, y: 49, "text-anchor": "middle", text: i }));
+  }
+  g.append(s("text", { x: 10 + 16 * 38 + 4, y: 49, text: "… n−1" }));
+  g.append(s("path", { d: `M ${10 + 8 * 38} 66 l 0 6 l ${8 * 38 - 4} 0 l 0 -6`, class: "stroke" }));
+  g.append(s("text", { x: 10 + 12 * 38 - 2, y: 86, "text-anchor": "middle", "font-family": "var(--font)", text: "一个 4KB 块 = 8 个扇区" }));
+  for (let i = 0; i < 8; i++) {
+    const x = 10 + i * 46, ok = i < 5;
+    t.append(s("rect", { x, y: 122, width: 42, height: 28, rx: 4, class: ok ? "ok-soft" : "bad-soft" }));
+    t.append(s("text", { x: x + 21, y: 140, "text-anchor": "middle", text: `${8 + i}:${ok ? "N" : "O"}` }));
+  }
+  t.append(s("text", { x: 10 + 5 * 46 - 2, y: 118, "text-anchor": "middle", "font-size": 16, style: "fill:var(--bad)", text: "⚡" }));
+})();
+
+// ---------- 图：多区刻度 ----------
+(function zones() {
+  const g = $("zone-ticks");
+  [[90, 60, 24], [60, 32, 16], [32, 8, 10]].forEach(([r2, r1, n]) => {
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * 2 * Math.PI;
+      g.append(s("line", { x1: r1 * Math.cos(a), y1: r1 * Math.sin(a), x2: r2 * Math.cos(a), y2: r2 * Math.sin(a), style: "stroke:var(--border)" }));
+    }
+  });
+})();
+
+// ---------- 磁盘俯视图（静态图和模拟器共用） ----------
+// 盘片上槽位 s 占据的盘片角度 [165-30s, 195-30s]（数学角度，逆时针为正）；屏幕角度 = 盘片角度 + φ；磁头固定在屏幕角度 0（右侧）
+function makeDisk(host, cfg) {
+  const tracks = cfg.tracks || 3, skew = cfg.skew || 0;
+  const cx = 170, cy = 172;
+  const band = tracks === 1 ? [[80, 150]] : [[120, 160], [80, 120], [40, 80]];
+  const rc = (t) => (band[t][0] + band[t][1]) / 2;
+  const svg = s("svg", { viewBox: "0 0 385 360", width: 385, role: "img", "aria-label": "磁盘俯视图" });
+  const P = (r, a) => [cx + r * Math.cos((a * Math.PI) / 180), cy - r * Math.sin((a * Math.PI) / 180)];
+  const wedge = (r1, r2, a1, a2) => {
+    const [x1, y1] = P(r2, a1), [x2, y2] = P(r2, a2), [x3, y3] = P(r1, a2), [x4, y4] = P(r1, a1);
+    return `M ${x1} ${y1} A ${r2} ${r2} 0 0 0 ${x2} ${y2} L ${x3} ${y3} A ${r1} ${r1} 0 0 1 ${x4} ${y4} Z`;
+  };
+  const plat = s("g");
+  svg.append(s("circle", { cx, cy, r: band[0][1] + 4, style: "fill:var(--surface);stroke:var(--border)" }));
+  svg.append(plat);
+  // 磁臂与磁头（先画，扇区编号压在上面，免得被挡住）
+  const arm = s("rect", { y: cy - 3, height: 6, rx: 3, class: "head-arm", style: "opacity:.5" });
+  const tip = s("rect", { y: cy - 8, width: 12, height: 16, rx: 2, class: "head-tip", style: "opacity:.85" });
+  svg.append(arm, tip, s("circle", { cx: 372, cy, r: 8, class: "box-strong" }));
+  const secs = [];
+  for (let t = 0; t < tracks; t++) {
+    for (let k = 0; k < 12; k++) {
+      const sec = t * 12 + k, slot = (((k + t * skew) % 12) + 12) % 12;
+      const a2 = 195 - 30 * slot, a1 = a2 - 30;
+      const path = s("path", { d: wedge(band[t][0], band[t][1], a1, a2), class: "sec-wedge sec-t" + t });
+      plat.append(path);
+      const lab = s("text", { class: "sec-label", "text-anchor": "middle", "dominant-baseline": "central", text: sec });
+      svg.append(lab);
+      secs.push({ sec, t, slot, path, lab, ac: 180 - 30 * slot });
+    }
+  }
+  svg.append(s("circle", { cx, cy, r: 14, class: "box-strong" }));
+  svg.append(s("text", { x: cx, y: cy + 4, "text-anchor": "middle", "font-size": 9, text: "主轴" }));
+  // 旋转方向箭头
+  svg.append(s("defs", {}, s("marker", { id: "dkah" + (makeDisk.n = (makeDisk.n || 0) + 1), viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto" }, s("path", { d: "M0,0 L10,5 L0,10 z", style: "fill:var(--muted)" }))));
+  const [ax1, ay1] = P(band[0][1] + 12, 70), [ax2, ay2] = P(band[0][1] + 12, 120);
+  svg.append(s("path", { d: `M ${ax1} ${ay1} A ${band[0][1] + 12} ${band[0][1] + 12} 0 0 0 ${ax2} ${ay2}`, class: "arrow", "marker-end": `url(#dkah${makeDisk.n})` }));
+  svg.append(s("text", { x: P(band[0][1] + 16, 128)[0] - 4, y: P(band[0][1] + 16, 128)[1], "font-size": 11, "text-anchor": "end", class: "t-muted", text: "逆时针" }));
+  if (cfg.caption) svg.append(s("text", { x: 10, y: 352, "font-size": 12, class: "t-muted", text: cfg.caption }));
+  host.replaceChildren(svg);
+  // 更新函数：phi 盘片转角（度），headR 磁头半径（像素），mark(sec) → 'want'|'done'|'now'|''
+  function draw(phi, headR, mark) {
+    plat.setAttribute("transform", `rotate(${-phi} ${cx} ${cy})`);
+    for (const x of secs) {
+      const [lx, ly] = P(rc(x.t), x.ac + phi);
+      x.lab.setAttribute("x", lx.toFixed(1)); x.lab.setAttribute("y", ly.toFixed(1));
+      const m = mark ? mark(x.sec) : "";
+      x.path.setAttribute("class", "sec-wedge " + (m === "now" ? "sec-now" : m === "want" ? "sec-want" : m === "done" ? "sec-done" : "sec-t" + x.t));
+      x.lab.style.fill = m === "now" ? "#fff" : "";
+      x.lab.style.fontWeight = m ? "700" : "";
+    }
+    arm.setAttribute("x", cx + headR); arm.setAttribute("width", Math.max(0, 372 - cx - headR));
+    tip.setAttribute("x", cx + headR - 6);
+  }
+  return { draw, rc };
+}
+// 静态图
+document.querySelectorAll(".disk-fig").forEach((el) => {
+  const cfg = JSON.parse(el.dataset.cfg);
+  const d = makeDisk(el, cfg);
+  const want = new Set(cfg.want || []);
+  d.draw(cfg.rot || 0, d.rc(cfg.head || 0), (x) => (want.has(x) ? "want" : ""));
+});
+
+// ---------- 计算器：Cheetah vs Barracuda ----------
+(function calc() {
+  const ids = ["ca-rpm", "ca-seek", "ca-rate", "cb-rpm", "cb-seek", "cb-rate", "c-rsz", "c-ssz"];
+  const v = (id) => Math.max(0.0001, +$(id).value || 0);
+  const ms = (x) => (x < 1 ? `${(x * 1000).toFixed(1)} µs` : `${x < 100 ? x.toFixed(3) : x.toFixed(1)} ms`);
+  function render() {
+    const A = { rpm: v("ca-rpm"), seek: +$("ca-seek").value || 0, rate: v("ca-rate") }, B = { rpm: v("cb-rpm"), seek: +$("cb-seek").value || 0, rate: v("cb-rate") };
+    const rs = v("c-rsz"), ss = v("c-ssz") * 1024;
+    const cases = [["Cheetah 随机", ioCalc(A, rs)], ["Barracuda 随机", ioCalc(B, rs)], ["Cheetah 顺序", ioCalc(A, ss)], ["Barracuda 顺序", ioCalc(B, ss)]];
+    const row = (label, f) => h("tr", {}, h("td", {}, label), ...cases.map(([, c]) => h("td", { class: "num" }, f(c))));
+    $("c-table").replaceChildren(
+      h("thead", {}, h("tr", {}, h("th", {}, ""), ...cases.map(([n]) => h("th", { class: "num" }, n)))),
+      h("tbody", {},
+        row("转一圈", (c) => ms(c.rot)),
+        row("T_seek（平均）", (c) => ms(c.Tseek)),
+        row("T_rotation（半圈）", (c) => ms(c.Trot)),
+        row("T_transfer", (c) => ms(c.Ttransfer)),
+        row("T_I/O", (c) => h("strong", {}, ms(c.T))),
+        row("R_I/O", (c) => h("strong", {}, `${c.R < 10 ? c.R.toFixed(3) : c.R.toFixed(1)} MB/s`)),
+        row("传输占 T_I/O 的比例", (c) => `${((c.Ttransfer / c.T) * 100).toFixed(c.Ttransfer / c.T < 0.01 ? 2 : 1)}%`)));
+    const lo = Math.log10(0.05), hi = Math.log10(2000);
+    $("c-bars").replaceChildren(h("p", { class: "small muted", style: { margin: "10px 0 4px" } }, "R_I/O（对数刻度）："),
+      ...cases.map(([n, c], i) => h("div", { class: "bar-row" }, h("span", {}, n), h("div", {}, h("div", { class: "bar", style: { width: `${Math.max(2, ((Math.log10(Math.max(c.R, 0.05)) - lo) / (hi - lo)) * 100)}%`, background: `var(--c${i < 2 ? 2 : 3})` } })), h("span", { class: "v" }, `${c.R < 10 ? c.R.toFixed(2) : c.R.toFixed(0)} MB/s`))));
+    const ra = cases[2][1].R / cases[0][1].R, rb = cases[3][1].R / cases[1][1].R;
+    $("c-narr").innerHTML = `顺序 / 随机：Cheetah 约 <strong>${ra.toFixed(0)} 倍</strong>，Barracuda 约 <strong>${rb.toFixed(0)} 倍</strong>（原书："almost a factor of 200" 与 "more than a factor 300"）。` +
+      `随机 ${rs}KB 请求里，传输只占 ${((cases[0][1].Ttransfer / cases[0][1].T) * 100).toFixed(1)}% 的时间，其余全是寻道和旋转；顺序大传输则反过来，定位开销被摊薄到几乎为零。试着把随机请求改成 1024KB 看看。`;
+  }
+  ids.forEach((id) => $(id).addEventListener("input", render));
+  $("c-book").onclick = () => { [["ca-rpm", 15000], ["ca-seek", 4], ["ca-rate", 125], ["cb-rpm", 7200], ["cb-seek", 9], ["cb-rate", 105], ["c-rsz", 4], ["c-ssz", 100]].forEach(([id, x]) => ($(id).value = x)); render(); };
+  render();
+})();
+
+// ---------- 小实验：平均寻道 = N/3 ----------
+(function avg() {
+  const inp = $("av-n");
+  function render() {
+    const N = +inp.value;
+    $("av-nv").textContent = N;
+    const a = avgSeek(N);
+    const W = 600, H = 170, bw = (W - 40) / N;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "寻道距离分布" });
+    const maxC = N;
+    for (let d = 0; d < N; d++) {
+      const c = d === 0 ? N : 2 * (N - d), bh = (c / maxC) * 120;
+      svg.append(s("rect", { x: 30 + d * bw, y: 140 - bh, width: Math.max(1, bw - 1), height: bh, style: "fill:color-mix(in srgb, var(--c1) 55%, var(--surface))" }));
+    }
+    const xa = 30 + a * bw;
+    svg.append(s("line", { x1: xa, x2: xa, y1: 10, y2: 142, style: "stroke:var(--bad);stroke-width:2" }));
+    svg.append(s("text", { x: xa + 4, y: 20, "font-size": 12, style: "fill:var(--bad)", text: `平均 ${a.toFixed(2)}` }));
+    svg.append(s("line", { x1: 30, x2: W - 10, y1: 140, y2: 140, class: "stroke" }));
+    svg.append(s("text", { x: 30, y: 158, "font-size": 11, class: "t-muted", text: "距离 0" }));
+    svg.append(s("text", { x: W - 10, y: 158, "font-size": 11, class: "t-muted", "text-anchor": "end", text: `距离 ${N - 1}（全程）` }));
+    $("av-stage").replaceChildren(svg);
+    $("av-stats").replaceChildren(...[[a.toFixed(3), "穷举得到的平均距离"], [(N / 3).toFixed(3), "N/3"], [((N * N - 1) / (3 * N)).toFixed(3), "精确公式 (N²−1)/(3N)"], [`${((a / (N - 1)) * 100).toFixed(1)}%`, "相当于全程的比例"]].map(([x, l]) => h("div", { class: "stat" }, h("div", { class: "v" }, x), h("div", { class: "l" }, l))));
+  }
+  inp.addEventListener("input", render);
+  render();
+})();
+
+// ---------- 模拟器：disk.py ----------
+(function diskSim() {
+  const el = { req: $("dk-req"), pol: $("dk-pol"), S: $("dk-S"), R: $("dk-R"), skew: $("dk-skew"), win: $("dk-win"), st: $("dk-st") };
+  const TN = ["外道", "中道", "内道"];
+  let sim = null, steps = [], disk = null, anim = null, shownT = 0, lastIdx = 0, reqs = [];
+  function opts() {
+    return { S: Math.max(0.01, +el.S.value || 1), R: Math.max(0.001, +el.R.value || 1), skew: Math.max(0, Math.min(11, Math.floor(+el.skew.value || 0))), policy: el.pol.value, window: Math.max(0, Math.floor(+el.win.value || 0)), startTrack: +el.st.value };
+  }
+  function build() {
+    reqs = parseReqs(el.req.value);
+    if (!reqs.length) reqs = [0];
+    const o = opts();
+    sim = simulate(reqs, o);
+    steps = [{ t: 0, ph: "init", j: -1 }];
+    sim.rows.forEach((r, j) => {
+      steps.push({ t: r.start, ph: "pick", j });
+      steps.push({ t: r.start + r.seek, ph: "seek", j });
+      steps.push({ t: r.start + r.seek + r.rotate, ph: "rot", j });
+      steps.push({ t: r.start + r.total, ph: "xfer", j });
+    });
+    steps.push({ t: sim.total, ph: "done", j: sim.rows.length - 1 });
+    disk = makeDisk($("dk-view"), { tracks: 3, skew: o.skew });
+    shownT = 0; lastIdx = 0;
+    if (anim) cancelAnimationFrame(anim);
+    stepper.reset();
+  }
+  function headRAt(t) {
+    const o = sim.o;
+    let r = disk.rc(o.startTrack);
+    for (const row of sim.rows) {
+      if (t < row.start) break;
+      if (t < row.start + row.seek && row.seek > 0) { const f = (t - row.start) / row.seek; return disk.rc(row.from) + (disk.rc(row.track) - disk.rc(row.from)) * f; }
+      r = disk.rc(row.track);
+    }
+    return r;
+  }
+  function frame(t) {
+    const done = new Set(), want = new Set(reqs);
+    let now = -1;
+    for (const row of sim.rows) {
+      if (t >= row.start + row.total - 1e-9) done.add(row.sec);
+      else if (t > row.start + row.seek + row.rotate + 1e-9) now = row.sec;
+    }
+    disk.draw(sim.o.R * t, headRAt(t), (x) => (x === now ? "now" : done.has(x) && !sim.rows.some((r) => r.sec === x && t < r.start + r.total - 1e-9) ? "done" : want.has(x) ? "want" : ""));
+  }
+  function animateTo(t1, instant) {
+    if (anim) cancelAnimationFrame(anim);
+    const t0 = shownT;
+    if (instant || t1 === t0) { shownT = t1; frame(t1); return; }
+    const dur = Math.max(250, Math.min(1600, Math.abs(t1 - t0) * 3.5));
+    const start = performance.now();
+    const tick = (now) => {
+      const f = Math.min(1, (now - start) / dur);
+      shownT = t0 + (t1 - t0) * f;
+      frame(shownT);
+      if (f < 1) anim = requestAnimationFrame(tick);
+    };
+    anim = requestAnimationFrame(tick);
+  }
+  const underHead = (t, track) => {
+    const u = slotUnderHead(t, sim.o.R, sim.o.u0);
+    const slot = Math.floor(u + 1e-9) % 12;
+    return track * 12 + ((((slot - track * sim.o.skew) % 12) + 12) % 12);
+  };
+  function render(i) {
+    if (!sim) return;
+    const st = steps[i];
+    animateTo(st.t, Math.abs(i - lastIdx) !== 1);
+    lastIdx = i;
+    const o = sim.o;
+    // 表格
+    const phaseRank = { pick: 0, seek: 1, rot: 2, xfer: 3 };
+    const body = sim.rows.map((r, j) => {
+      let k = -1;
+      if (st.ph === "done" || j < st.j) k = 3; else if (j === st.j) k = phaseRank[st.ph];
+      const cell = (need, v) => h("td", {}, k >= need ? f1(v) : "—");
+      return h("tr", { class: j === st.j && st.ph !== "done" ? "cur" : k < 0 ? "pend" : "" }, h("td", {}, `Block ${r.sec}`), cell(1, r.seek), cell(2, r.rotate), cell(3, r.transfer), cell(3, r.total));
+    });
+    const tot = st.ph === "done" ? h("tr", {}, h("td", {}, h("strong", {}, "TOTALS")), ...[sim.seek, sim.rotate, sim.transfer, sim.total].map((x) => h("td", {}, h("strong", {}, f1(x))))) : null;
+    $("dk-table").replaceChildren(h("thead", {}, h("tr", {}, ...["请求", "Seek", "Rotate", "Transfer", "Total"].map((x) => h("th", {}, x)))), h("tbody", {}, body, tot));
+    // 候选
+    const cand = $("dk-cand");
+    if (st.ph === "pick") {
+      const r = sim.rows[st.j];
+      cand.replaceChildren(h("div", { class: "muted small" }, `调度器此刻可见的请求（窗口 ${o.window || "全部"}）：`),
+        ...r.cand.map((c) => h("div", { class: c.sec === r.sec ? "best" : "" }, `${c.sec === r.sec ? "→ " : "  "}扇区 ${c.sec}：寻道距离 ${c.dist} 道，定位时间 ${f1(c.pos)}`)));
+    } else cand.replaceChildren();
+    // 甘特图
+    const segs = [];
+    for (const r of sim.rows) {
+      const a = r.start, b = a + r.seek, c = b + r.rotate, d = a + r.total;
+      const clip = (x, y, who, label) => { const e = Math.min(y, st.t); if (e > x + 1e-9) segs.push({ who, start: x, end: e, label }); };
+      clip(a, b, 0, "S"); clip(b, c, 1, "R"); clip(c, d, 2, String(r.sec));
+    }
+    if (segs.length) OSTEP.gantt($("dk-gantt"), segs, { unit: niceUnit(sim.total), pxPer: Math.min(28, 700 / sim.total), names: ["寻道", "旋转", "传输"], aria: "寻道/旋转/传输时间线" });
+    else $("dk-gantt").replaceChildren(h("div", { class: "small muted" }, "时间线：蓝 = 寻道，橙 = 旋转等待，绿 = 传输（标注扇区号）"));
+    // 解说
+    const narr = $("dk-narr");
+    const r = st.j >= 0 ? sim.rows[st.j] : null;
+    if (st.ph === "init") narr.innerHTML = `<span class="phase-pill ph-pick">开始</span> 时间 0：磁头在${TN[o.startTrack]}（第 ${o.startTrack} 道），正对扇区 ${underHead(0, o.startTrack)} 的中间。请求队列：${reqs.join(", ")}；策略 ${o.policy}，寻道速率 ${o.S}，旋转速率 ${o.R}°/单位（传一个扇区 ${f1(30 / o.R)}），偏斜 ${o.skew}。`;
+    else if (st.ph === "pick") narr.innerHTML = `<span class="phase-pill ph-pick">挑选</span> 时间 ${f1(st.t)}：${r.why} → 下一个服务<strong>扇区 ${r.sec}</strong>（${TN[r.track]}）。`;
+    else if (st.ph === "seek") narr.innerHTML = r.seek === 0
+      ? `<span class="phase-pill ph-seek">寻道</span> 扇区 ${r.sec} 就在当前磁道上，<strong>不用寻道</strong>（Seek 0）。`
+      : `<span class="phase-pill ph-seek">寻道</span> 磁臂从第 ${r.from} 道移到第 ${r.track} 道：${Math.abs(r.track - r.from)} × 40 / ${o.S} = <strong>${f1(r.seek)}</strong>。寻道期间盘片照转不误，转过了 ${f1(r.seek * o.R)}°（${f1((r.seek * o.R) / 30)} 个扇区）。现在磁头下是扇区 ${underHead(st.t, r.track)}。`;
+    else if (st.ph === "rot") narr.innerHTML = r.rotate === 0
+      ? `<span class="phase-pill ph-rot">旋转</span> 运气好：到位时扇区 ${r.sec} 的起点正好到达磁头，<strong>不用等</strong>（Rotate 0）。`
+      : `<span class="phase-pill ph-rot">旋转</span> 等扇区 ${r.sec} 的起点转到磁头下：<strong>${f1(r.rotate)}</strong>（${f1((r.rotate * o.R) / 30)} 个扇区的角度）。${r.rotate * o.R > 300 ? "几乎等了一整圈——刚好错过！" : ""}`;
+    else if (st.ph === "xfer") narr.innerHTML = `<span class="phase-pill ph-xfer">传输</span> 扇区 ${r.sec} 从磁头下经过，读出数据：<strong>${f1(r.transfer)}</strong>。该请求合计 ${f1(r.seek)} + ${f1(r.rotate)} + ${f1(r.transfer)} = ${f1(r.total)}，完成于时间 ${f1(st.t)}。`;
+    else {
+      const cmp = ["FIFO", "SSTF", "SCAN", "CSCAN", "SATF"].map((p) => `${p === "SATF" ? "SPTF" : p === "CSCAN" ? "C-SCAN" : p} ${f1(simulate(reqs, Object.assign({}, o, { policy: p })).total)}`).join("，");
+      narr.innerHTML = `<strong>全部完成</strong>：服务顺序 ${sim.rows.map((x) => x.sec).join(" → ")}，Seek ${f1(sim.seek)}、Rotate ${f1(sim.rotate)}、Transfer ${f1(sim.transfer)}、Total <strong>${f1(sim.total)}</strong>。同样参数下各策略总时间：${cmp}。`;
+    }
+    // 统计
+    const sofar = { seek: 0, rotate: 0, transfer: 0 };
+    for (const x of segs) sofar[["seek", "rotate", "transfer"][x.who]] += x.end - x.start;
+    $("dk-stats").replaceChildren(...[[f1(st.t), "当前时间"], [f1(sofar.seek), "累计 Seek"], [f1(sofar.rotate), "累计 Rotate"], [f1(sofar.transfer), "累计 Transfer"], [f1(sim.total), "全部请求 Total"]].map(([v, l]) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l))));
+  }
+  function niceUnit(T) { const raw = T / 8; const p = Math.pow(10, Math.floor(Math.log10(Math.max(raw, 1)))); for (const m of [1, 2, 3, 5, 10]) if (raw <= m * p) return m * p; return 10 * p; }
+  const stepper = OSTEP.stepper($("dk-step"), { steps: () => steps.length || 1, render, autoplayMs: 1500 });
+  Object.values(el).forEach((x) => x.addEventListener("change", build));
+  const P = {
+    a0: ["0", "FIFO", 1, 1, 0, 0], a6: ["6", "FIFO", 1, 1, 0, 0], a30: ["30", "FIFO", 1, 1, 0, 0], a7308: ["7,30,8", "FIFO", 1, 1, 0, 0], a10: ["10,11,12,13", "FIFO", 1, 1, 0, 0],
+    skew2: ["10,11,12,13", "FIFO", 1, 1, 2, 0], sstf: ["7,30,8", "SSTF", 1, 1, 0, 0], f377: ["2,21", "SSTF", 1, 1, 0, 2], f378a: ["16,8", "SSTF", 4, 1, 0, 2], f378b: ["16,8", "SATF", 4, 1, 0, 2],
+  };
+  document.querySelectorAll("#sim-disk button[data-p]").forEach((b) => (b.onclick = () => {
+    const [rq, pol, S, R, sk, stt] = P[b.dataset.p];
+    el.req.value = rq; el.pol.value = pol; el.S.value = S; el.R.value = R; el.skew.value = sk; el.win.value = 0; el.st.value = stt;
+    build();
+  }));
+  build();
+})();
+
+})();
+</script>
+</body></html>

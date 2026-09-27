@@ -1,0 +1,839 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 50 章 · Andrew 文件系统（AFS）</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+  .defs { position: absolute; width: 0; height: 0; overflow: hidden; }
+  .trace td, .trace th { font-size: 13px; padding: 6px 9px; }
+  .trace td.msg { font-family: var(--mono); font-size: 12px; }
+  .trace td.op { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+  .trace td.cache { font-family: var(--mono); font-size: 13px; text-align: center; white-space: nowrap; }
+  .trace th.cache { text-align: center; }
+  .trace tr.cur td { background: var(--accent-soft); }
+  .trace s { color: var(--bad); }
+  .scrolly { max-height: 520px; overflow-y: auto; }
+  .sim select { max-width: 100%; }
+  .ops-area { display: grid; grid-template-columns: minmax(180px, 250px) 1fr; gap: 12px; align-items: start; }
+  @media (max-width: 640px) { .ops-area { grid-template-columns: 1fr; } }
+  .ops-area textarea { min-height: 260px; font-size: 13px; }
+  .err { color: var(--bad); font-size: 13px; white-space: pre-wrap; }
+  .panel-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font-size: 13.5px; }
+  .panel h5 { margin: 0 0 4px; font-size: 13.5px; }
+  .panel.hot { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .panel.down { border-color: var(--bad); background: var(--bad-soft); }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; }
+  .kv span:nth-child(odd) { color: var(--muted); }
+  .kv .mono { font-family: var(--mono); font-size: 12.5px; }
+  .tag-ok { color: var(--ok); font-weight: 600; }
+  .tag-bad { color: var(--bad); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .perf input[type="number"] { width: 6.5em; }
+  .perf td.better { color: var(--ok); font-weight: 600; }
+  .perf td.worse { color: var(--bad); font-weight: 600; }
+  .sched { font-family: var(--mono); letter-spacing: .08em; }
+  .bar { display: inline-block; height: 10px; border-radius: 3px; vertical-align: middle; }
+  #il-table tr { cursor: pointer; }
+  #il-table tr:hover td { background: var(--surface-2); }
+</style>
+</head>
+<body data-chapter="50">
+<main>
+
+<svg class="defs" aria-hidden="true" focusable="false">
+  <defs>
+    <marker id="d50-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker>
+    <marker id="d50-ah-c1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--c1)"/></marker>
+    <marker id="d50-ah-c3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--c3)"/></marker>
+    <marker id="d50-ah-bad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--bad)"/></marker>
+  </defs>
+</svg>
+
+<h2>关键问题：如何设计可扩展的文件协议</h2>
+<div class="crux">
+  <p><strong>如何重新设计协议，使服务器交互次数最少？</strong>也就是说，怎样减少 TestAuth 消息的数量？进一步，怎样让这些服务器交互变得高效？同时解决这两个问题，就能得到一个可扩展得多的 AFS。</p>
+  <p class="small muted">原文：HOW TO DESIGN A SCALABLE FILE PROTOCOL. How should one redesign the protocol to minimize the number of server interactions, i.e., how could they reduce the number of TestAuth messages? Further, how could they design the protocol to make these server interactions efficient?</p>
+</div>
+<p>Andrew 文件系统（AFS）于 20 世纪 80 年代诞生于卡内基梅隆大学（CMU），由 M. Satyanarayanan（"Satya"）教授领导。它的首要目标很简单：<strong>规模（scale）</strong>——怎样设计一个分布式文件系统，让一台服务器支持尽可能多的客户端？</p>
+<p>影响可扩展性的因素很多，最重要的是<strong>客户端与服务器之间的协议</strong>。上一章的 NFS 协议迫使客户端定期向服务器确认缓存内容是否改变；每次检查都消耗服务器资源（CPU、网络带宽），频繁检查就限制了一台服务器能服务的客户端数量。AFS 与 NFS 的另一个不同是：它从一开始就把<strong>合理的用户可见行为</strong>当作一等公民。NFS 的缓存一致性依赖于客户端缓存超时等底层实现细节，很难描述；AFS 的缓存一致性简单易懂：<strong>打开文件时，客户端通常会拿到服务器上最新的一致副本</strong>。</p>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>整文件缓存</h4><p>open 时把整个文件取到客户端<strong>本地磁盘</strong>；之后的 read/write 都在本地完成，close 时若修改过再整个传回。</p></div>
+  <div class="card"><h4>Venus / Vice</h4><p>Venus 是 AFS 的客户端代码，Vice 是服务器端。</p></div>
+  <div class="card"><h4>TestAuth（AFSv1）</h4><p>每次打开缓存文件都问服务器"文件变了没"——太多了，成为瓶颈。</p></div>
+  <div class="card"><h4>回调（callback）</h4><p>服务器承诺：你缓存的文件被修改时我会通知你。把"轮询"变成"中断"。</p></div>
+  <div class="card"><h4>文件标识符（FID）</h4><p>卷 ID + 文件 ID + uniquifier，取代完整路径名；由客户端逐级查找路径并缓存。</p></div>
+  <div class="card"><h4>关闭时更新 + 中断回调</h4><p>close 把新版本存到服务器，同时服务器"打断"其他客户端的回调，使其缓存失效。</p></div>
+  <div class="card"><h4>最后写者胜</h4><p>两台机器同时修改文件，最后 close 的那个整份文件留在服务器上（其实是"最后关闭者胜"）。</p></div>
+  <div class="card"><h4>有状态的代价</h4><p>回调保存在服务器内存里；服务器或客户端崩溃后，都要把缓存视为可疑并重新验证。</p></div>
+</div>
+
+<h2>AFS 第 1 版：整文件缓存</h2>
+<p>我们讨论两个版本：第一版（称为 AFSv1，原名 ITC 分布式文件系统）已有基本设计，但扩展性不达预期，于是重新设计出最终协议（AFSv2，简称 AFS）。</p>
+<p>所有版本 AFS 的基本信条之一是在访问文件的客户端的<strong>本地磁盘上做整文件缓存（whole-file caching）</strong>：</p>
+<figure class="fig">
+  <svg viewBox="0 0 740 250" width="740" role="img" aria-label="整文件缓存">
+    <g font-size="13">
+      <rect x="20" y="20" width="300" height="210" rx="12" class="box"/>
+      <text x="170" y="42" text-anchor="middle" font-weight="700">客户端（Venus）</text>
+      <rect x="40" y="55" width="120" height="34" rx="6" class="box-strong"/><text x="100" y="77" text-anchor="middle">应用</text>
+      <rect x="40" y="170" width="260" height="46" rx="8" class="accent-soft"/>
+      <text x="170" y="190" text-anchor="middle" font-weight="600">本地磁盘缓存</text>
+      <text x="170" y="208" text-anchor="middle" font-size="12" class="mono">notes.txt（整个文件）</text>
+      <line x1="100" y1="89" x2="100" y2="168" class="arrow" marker-end="url(#d50-ah)"/><line x1="112" y1="168" x2="112" y2="89" class="arrow" marker-end="url(#d50-ah)"/>
+      <text x="122" y="125" font-size="12">read()/write()</text>
+      <text x="122" y="142" font-size="12" class="t-muted">全在本地，无网络通信</text>
+      <rect x="440" y="60" width="280" height="130" rx="12" class="box"/>
+      <text x="580" y="84" text-anchor="middle" font-weight="700">服务器（Vice）</text>
+      <text x="580" y="112" text-anchor="middle" class="mono" font-size="12.5">/home/remzi/notes.txt</text>
+      <line x1="440" y1="130" x2="322" y2="185" style="stroke:var(--c1);stroke-width:2" marker-end="url(#d50-ah-c1)"/>
+      <text x="345" y="124" style="fill:var(--c1)" font-size="12.5">open()：Fetch 整个文件</text>
+      <line x1="322" y1="208" x2="440" y2="160" style="stroke:var(--c3);stroke-width:2" marker-end="url(#d50-ah-c3)"/>
+      <text x="345" y="235" style="fill:var(--c3)" font-size="12.5">close()：若修改过，Store 整个文件</text>
+    </g>
+  </svg>
+  <figcaption>图 50-A：整文件缓存。注意与 NFS 的对比：NFS 缓存的是块（虽然也可以缓存一个文件的所有块），而且缓存在客户端内存而不是本地磁盘。</figcaption>
+</figure>
+<p>应用第一次调用 <code>open()</code> 时，AFS 客户端代码（设计者称之为 <strong>Venus</strong>）向服务器发 <strong>Fetch</strong> 协议消息，传递目标文件的<strong>完整路径名</strong>（如 <code>/home/remzi/notes.txt</code>）。服务器（称为 <strong>Vice</strong>）遍历路径名，找到文件，把整个文件发回客户端；客户端把它存进本地磁盘上的缓存。之后应用的 <code>read()</code>/<code>write()</code> 被重定向到本地文件系统中的那份副本，完全不需要网络通信，很快。由于这些调用就像访问本地文件系统一样，被访问过的块还可能被缓存在客户端内存里，所以 AFS 也利用客户端内存缓存本地磁盘上的块。最后 <code>close()</code> 时，如果文件被修改过（被以写方式打开），客户端用 <strong>Store</strong> 消息把整个新版本和路径名发回服务器永久保存。</p>
+<p>下次访问该文件时，AFSv1 会更高效：客户端先用 <strong>TestAuth</strong> 消息问服务器文件是否变了；没变就直接用本地缓存副本，省去网络传输。注意这个早期版本只缓存文件内容，目录只保存在服务器上。</p>
+<div class="table-wrap"><table>
+  <tr><th>AFSv1 协议消息</th><th>作用</th></tr>
+  <tr><td><code>TestAuth</code></td><td>测试文件是否改变（用于验证缓存项）</td></tr>
+  <tr><td><code>GetFileStat</code></td><td>获取文件的 stat 信息</td></tr>
+  <tr><td><code>Fetch</code></td><td>获取文件内容</td></tr>
+  <tr><td><code>Store</code></td><td>把这个文件存到服务器上</td></tr>
+  <tr><td><code>SetFileStat</code></td><td>设置文件的 stat 信息</td></tr>
+  <tr><td><code>ListDir</code></td><td>列出目录内容</td></tr>
+</table></div>
+<p class="small muted">表：原书 Figure 50.1，AFSv1 协议要点。</p>
+
+<h2>第 1 版的问题</h2>
+<p>为了找出问题所在，AFS 的设计者花了大量时间<strong>测量</strong>他们的原型。这种实验是好事：测量是理解系统如何工作、如何改进的关键。他们发现了两个主要问题：</p>
+<ul>
+  <li><strong>路径遍历开销太高</strong>：每次 Fetch 或 Store 都把完整路径名（如 <code>/home/remzi/notes.txt</code>）交给服务器，服务器必须从根目录开始，先找 home，再在 home 中找 remzi……一路走到目标文件。许多客户端同时访问时，服务器的大量 CPU 时间就花在了沿目录路径往下走上。</li>
+  <li><strong>客户端发出太多 TestAuth 消息</strong>：就像 NFS 的 GETATTR 过多一样，AFSv1 产生大量检查本地文件（或其 stat 信息）是否有效的流量。服务器把很多时间花在告诉客户端"可以用你缓存的副本"上，而绝大多数时候答案都是"文件没变"。</li>
+</ul>
+<p>另外还有两个问题：<strong>服务器之间负载不均衡</strong>——通过引入<strong>卷（volume）</strong>解决，管理员可以在服务器之间移动卷来平衡负载；服务器<strong>为每个客户端使用一个独立进程</strong>，导致上下文切换等开销——AFSv2 改用线程构建服务器来解决。本章聚焦前两个限制可扩展性的协议问题。它们让服务器 CPU 成为系统瓶颈：<strong>每台服务器只能服务 20 个客户端</strong>，再多就过载。</p>
+<div class="aside" data-title="提示：先测量，再构建（Patterson 定律）">
+  <p>David Patterson（RISC 和 RAID 的知名学者）总是鼓励学生：在构建新系统解决某个问题之前，先测量现有系统、证明问题确实存在。用实验证据而不是直觉，能把系统构建变成更科学的事业；还有一个附带好处：它迫使你在新系统完成之前就想清楚如何测量。等你真正做出新系统时，你既有证据表明自己在解决真实问题，又已经有了现成的方法证明新系统确实优于现状。</p>
+</div>
+
+<h2>AFS 第 2 版：回调与 FID</h2>
+<p>AFSv2 引入了<strong>回调（callback）</strong>来减少客户端与服务器的交互。回调就是服务器对客户端的一个<strong>承诺</strong>：当客户端缓存的文件被修改时，服务器会通知它。有了这份（保存在服务器上的）状态，客户端不再需要联系服务器确认缓存文件是否有效，而是<strong>假设它有效，直到服务器告诉它不是</strong>。这正好对应<strong>轮询（polling）与中断（interrupt）</strong>的区别（回想第 36 章 I/O 设备）。</p>
+<figure class="fig">
+  <svg viewBox="0 0 740 230" width="740" role="img" aria-label="轮询与回调对比">
+    <g font-size="12.5">
+      <text x="180" y="20" text-anchor="middle" font-weight="700">AFSv1 / NFS：轮询</text>
+      <text x="70" y="42" text-anchor="middle" font-weight="600">客户端</text><text x="290" y="42" text-anchor="middle" font-weight="600">服务器</text>
+      <line x1="70" y1="50" x2="70" y2="220" class="stroke"/><line x1="290" y1="50" x2="290" y2="220" class="stroke"/>
+      <g style="stroke:var(--c1);stroke-width:1.8">
+        <line x1="70" y1="60" x2="288" y2="72" marker-end="url(#d50-ah-c1)"/><line x1="70" y1="100" x2="288" y2="112" marker-end="url(#d50-ah-c1)"/>
+        <line x1="70" y1="140" x2="288" y2="152" marker-end="url(#d50-ah-c1)"/><line x1="70" y1="180" x2="288" y2="192" marker-end="url(#d50-ah-c1)"/>
+      </g>
+      <g style="stroke:var(--c3);stroke-width:1.5">
+        <line x1="290" y1="76" x2="72" y2="88" marker-end="url(#d50-ah-c3)"/><line x1="290" y1="116" x2="72" y2="128" marker-end="url(#d50-ah-c3)"/>
+        <line x1="290" y1="156" x2="72" y2="168" marker-end="url(#d50-ah-c3)"/><line x1="290" y1="196" x2="72" y2="208" marker-end="url(#d50-ah-c3)"/>
+      </g>
+      <text x="120" y="62" style="fill:var(--c1)">变了吗？</text><text x="200" y="98" style="fill:var(--c3)">没变</text>
+      <text x="120" y="102" style="fill:var(--c1)">变了吗？</text><text x="200" y="138" style="fill:var(--c3)">没变</text>
+      <text x="120" y="142" style="fill:var(--c1)">变了吗？</text><text x="200" y="178" style="fill:var(--c3)">没变</text>
+      <text x="120" y="182" style="fill:var(--c1)">变了吗？</text><text x="200" y="218" style="fill:var(--c3)">没变</text>
+      <text x="560" y="20" text-anchor="middle" font-weight="700">AFSv2：回调（类似中断）</text>
+      <text x="450" y="42" text-anchor="middle" font-weight="600">客户端</text><text x="670" y="42" text-anchor="middle" font-weight="600">服务器</text>
+      <line x1="450" y1="50" x2="450" y2="220" class="stroke"/><line x1="670" y1="50" x2="670" y2="220" class="stroke"/>
+      <line x1="450" y1="60" x2="668" y2="72" style="stroke:var(--c1);stroke-width:1.8" marker-end="url(#d50-ah-c1)"/><text x="490" y="62" style="fill:var(--c1)">Fetch</text>
+      <line x1="670" y1="76" x2="452" y2="88" style="stroke:var(--c3);stroke-width:1.8" marker-end="url(#d50-ah-c3)"/><text x="530" y="96" style="fill:var(--c3)">文件 + 登记回调</text>
+      <text x="678" y="80" font-size="11.5">记下：C1 缓存了 F</text>
+      <text x="460" y="130" class="t-muted">打开、读、写、再打开……</text>
+      <text x="460" y="148" class="t-muted">全都在本地，一条消息都不发</text>
+      <text x="678" y="178" font-size="11.5">别人更新了 F</text>
+      <line x1="670" y1="186" x2="452" y2="200" style="stroke:var(--bad);stroke-width:2" marker-end="url(#d50-ah-bad)"/><text x="520" y="215" style="fill:var(--bad)">打断回调：你的 F 失效了</text>
+    </g>
+  </svg>
+  <figcaption>图 50-B：轮询 vs 回调。服务器为此要记住"谁缓存了什么"——AFS 的服务器是有状态的。</figcaption>
+</figure>
+<p>AFSv2 还引入了<strong>文件标识符（file identifier，FID）</strong>（类似 NFS 的文件句柄），取代路径名来指定客户端感兴趣的文件。AFS 的 FID 由<strong>卷标识符、文件标识符和一个"uniquifier"</strong>组成（uniquifier 让文件删除后卷 ID 和文件 ID 可以被重用）。于是，客户端不再把整条路径交给服务器去走，而是<strong>自己逐级遍历路径</strong>，缓存每一步的结果，从而减轻服务器负担。</p>
+<p>例如客户端访问 <code>/home/remzi/notes.txt</code>，其中 home 是挂载在 / 上的 AFS 目录（/ 是本地根目录，home 及其子项在 AFS 中）。客户端先 Fetch home 的目录内容放进本地磁盘缓存并在 home 上建立回调；再 Fetch 目录 remzi，缓存并建立回调；最后 Fetch 普通文件 notes.txt，缓存到本地磁盘、建立回调，然后把文件描述符返回给应用。下面的模拟器复刻原书 Figure 50.2（从 home 已缓存开始），并可切换到 AFSv1 对比：</p>
+
+<section class="sim" id="sim-open">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>打开 /home/remzi/notes.txt：AFSv1 vs AFSv2</h3>
+    <div class="desc">客户端 C1 两次打开、读取、关闭同一个文件。数一数每个版本发了多少条消息、服务器做了多少次路径查找；再让别人在两次打开之间修改 notes.txt（服务器会打断回调），看第二次打开要重新取什么。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>协议 <select id="op-ver"><option value="v2">AFSv2（回调 + FID）</option><option value="v1">AFSv1（路径名 + TestAuth）</option></select></label>
+      <label>两次打开之间 <select id="op-brk"><option value="none">无人修改</option><option value="notes">别人修改了 notes.txt</option><option value="remzi">别人修改了目录 remzi</option></select></label>
+      <label>打开次数 <input type="number" id="op-n" min="1" max="5" value="2"></label>
+    </div>
+    <div id="op-step"></div>
+    <div class="stage"><div class="table-wrap scrolly" style="margin:0"><table class="trace" id="op-table"></table></div></div>
+    <div class="narrate" id="op-narr"></div>
+    <div class="stats" id="op-stats"></div>
+  </div>
+</section>
+
+<p>与 NFS 的关键区别在于：<strong>每次取目录或文件时，AFS 客户端都会与服务器建立回调</strong>，确保服务器在其缓存状态改变时通知它。第一次访问 <code>/home/remzi/notes.txt</code> 会产生多条消息，但也为所有目录和 notes.txt 建立了回调，<strong>之后的访问完全在本地进行，不需要任何服务器交互</strong>。在文件已缓存在客户端这一常见情况下，AFS 的表现几乎和本地磁盘文件系统一样：第二次访问一个文件应该和访问本地文件一样快。</p>
+<figure class="fig">
+  <svg viewBox="0 0 560 90" width="560" role="img" aria-label="AFS FID">
+    <g font-size="13">
+      <text x="10" y="50" font-weight="700">FID =</text>
+      <rect x="70" y="30" width="150" height="32" rx="5" class="accent-soft"/><text x="145" y="51" text-anchor="middle">卷标识符</text>
+      <rect x="224" y="30" width="150" height="32" rx="5" class="ok-soft"/><text x="299" y="51" text-anchor="middle">文件标识符</text>
+      <rect x="378" y="30" width="170" height="32" rx="5" class="warn-soft"/><text x="463" y="51" text-anchor="middle">uniquifier</text>
+      <text x="463" y="80" text-anchor="middle" font-size="12" class="t-muted">文件删除后允许重用前两者</text>
+      <text x="299" y="20" text-anchor="middle" font-size="12" class="t-muted">对比 NFS 文件句柄：卷 ID + inode 号 + 世代号</text>
+    </g>
+  </svg>
+  <figcaption>图 50-C：AFS 的文件标识符。</figcaption>
+</figure>
+
+<h2>缓存一致性</h2>
+<p>讨论 NFS 时我们考虑过两方面：<strong>更新可见性</strong>（服务器何时拿到新版本？）和<strong>缓存陈旧</strong>（服务器有了新版本后，多久客户端才能看到新版本而不是旧的缓存副本？）。有了回调和整文件缓存，AFS 的一致性很容易描述，分两种情况：</p>
+<ul>
+  <li><strong>不同机器上的进程之间</strong>：AFS 在<strong>同一时刻</strong>让更新在服务器上可见并使其他缓存副本失效——那就是<strong>被更新的文件被关闭时</strong>。客户端打开文件、（也许反复地）写它；最终关闭时，新文件被刷到服务器（于是可见）。此时服务器"打断"所有缓存了该文件的客户端的回调：逐个联系它们，告知其回调不再有效。这确保这些客户端不会再读陈旧副本：它们之后的 open 需要从服务器重新取新版本（并在新版本上重新建立回调）。</li>
+  <li><strong>同一台机器上的进程之间</strong>：AFS 在这里做了例外——对文件的写<strong>立即对本地其他进程可见</strong>（不必等文件关闭）。这让单台机器的行为和典型 UNIX 语义完全一致，只有换到另一台机器上，才会察觉到更一般的 AFS 一致性机制。</li>
+</ul>
+<p>还有一个值得讨论的跨机器情况：在罕见的情况下，不同机器上的进程<strong>同时修改</strong>一个文件，AFS 自然地采用<strong>最后写者胜（last writer wins）</strong>的方法（也许应该叫"最后关闭者胜"）：谁最后调用 <code>close()</code>，谁就最后把<strong>整个文件</strong>更新到服务器上，成为"胜出"的文件。结果是一个完全由某一个客户端生成的文件。对比 NFS 这样基于块的协议：各个客户端更新文件时，单个块的写可能陆续被刷到服务器，最终服务器上的文件可能是两个客户端更新的<strong>混合</strong>。很多情况下混合的文件毫无意义——想象一张 JPEG 图片被两个客户端分块修改，混合的结果多半不是合法的 JPEG。</p>
+<figure class="fig">
+  <svg viewBox="0 0 720 170" width="720" role="img" aria-label="最后写者胜与块级混合">
+    <g font-size="12.5">
+      <text x="180" y="20" text-anchor="middle" font-weight="700">AFS：整文件，最后关闭者胜</text>
+      <text x="40" y="50">C1 写的版本</text>
+      <rect x="130" y="36" width="40" height="22" rx="3" style="fill:var(--c1)"/><rect x="172" y="36" width="40" height="22" rx="3" style="fill:var(--c1)"/><rect x="214" y="36" width="40" height="22" rx="3" style="fill:var(--c1)"/>
+      <text x="40" y="82">C2 写的版本</text>
+      <rect x="130" y="68" width="40" height="22" rx="3" style="fill:var(--c2)"/><rect x="172" y="68" width="40" height="22" rx="3" style="fill:var(--c2)"/><rect x="214" y="68" width="40" height="22" rx="3" style="fill:var(--c2)"/>
+      <text x="40" y="130">服务器最终</text>
+      <rect x="130" y="116" width="40" height="22" rx="3" style="fill:var(--c1)"/><rect x="172" y="116" width="40" height="22" rx="3" style="fill:var(--c1)"/><rect x="214" y="116" width="40" height="22" rx="3" style="fill:var(--c1)"/>
+      <text x="264" y="131" class="t-muted">C1 最后 close</text>
+      <text x="190" y="160" text-anchor="middle" class="tag-ok" style="fill:var(--ok)">完整来自某一个客户端</text>
+      <text x="540" y="20" text-anchor="middle" font-weight="700">NFS：按块刷写，可能混合</text>
+      <text x="400" y="50">C1 写的版本</text>
+      <rect x="490" y="36" width="40" height="22" rx="3" style="fill:var(--c1)"/><rect x="532" y="36" width="40" height="22" rx="3" style="fill:var(--c1)"/><rect x="574" y="36" width="40" height="22" rx="3" style="fill:var(--c1)"/>
+      <text x="400" y="82">C2 写的版本</text>
+      <rect x="490" y="68" width="40" height="22" rx="3" style="fill:var(--c2)"/><rect x="532" y="68" width="40" height="22" rx="3" style="fill:var(--c2)"/><rect x="574" y="68" width="40" height="22" rx="3" style="fill:var(--c2)"/>
+      <text x="400" y="130">服务器最终</text>
+      <rect x="490" y="116" width="40" height="22" rx="3" style="fill:var(--c1)"/><rect x="532" y="116" width="40" height="22" rx="3" style="fill:var(--c2)"/><rect x="574" y="116" width="40" height="22" rx="3" style="fill:var(--c1)"/>
+      <text x="624" y="131" class="t-muted">块交错刷到服务器</text>
+      <text x="550" y="160" text-anchor="middle" style="fill:var(--bad)">两者混合（比如坏掉的 JPEG）</text>
+    </g>
+  </svg>
+  <figcaption>图 50-D：并发修改时 AFS 与 NFS 的不同结局。</figcaption>
+</figure>
+
+<p>下面的模拟器默认载入原书 <strong>Figure 50.3</strong> 的完整时间线：Client1 上有进程 P1、P2，Client2 上有进程 P3，所有操作都针对文件 F。服务器一列显示该行操作完成后服务器上的文件内容；被删除线划掉的缓存表示回调已被打断（失效）。你可以编辑操作序列，也可以切换到 NFS 语义，用同一串操作做对比。</p>
+
+<section class="sim" id="sim-afs">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>AFS 缓存一致性时间线（Figure 50.3）</h3>
+    <div class="desc">每一步显示两个客户端的缓存内容、服务器上的文件、每次 read 读到的值和发出的协议消息。试试：本地进程能立刻看到写；远端要等 close；两个客户端同时写时谁胜出；客户端宕机错过回调、服务器崩溃丢失回调时会怎样。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <span class="muted small">预设：</span>
+      <button data-af="fig">原书 Figure 50.3</button>
+      <button data-af="session">打开期间远端提交</button>
+      <button data-af="cdown">客户端宕机错过回调</button>
+      <button data-af="scrash">服务器崩溃丢失回调</button>
+    </div>
+    <div class="controls">
+      <label>语义 <select id="af-mode"><option value="afs">AFS（整文件 + 回调）</option><option value="nfs">NFS（块缓存 + GETATTR + 属性缓存）</option></select></label>
+      <label>NFS 属性缓存超时 T <input type="number" id="af-T" min="0" max="30" value="3"></label>
+      <label><input type="checkbox" id="af-sus" checked> 恢复后把缓存视为可疑（TestAuth）</label>
+    </div>
+    <div class="ops-area">
+      <div>
+        <textarea id="af-ops" spellcheck="false" aria-label="操作序列"></textarea>
+        <div class="muted small">语法：<code>P1 open</code> · <code>P1 write A</code> · <code>P1 read</code> · <code>P1 close</code>（P1、P2 在 Client1，P3、P4 在 Client2）· <code>C1 down</code> / <code>C1 up</code> · <code>S crash</code> · <code>wait 3</code>。每个操作耗时 1 秒。</div>
+        <div class="err" id="af-err"></div>
+      </div>
+      <div>
+        <div id="af-step"></div>
+        <div class="panel-row" id="af-panels"></div>
+      </div>
+    </div>
+    <div class="stage" style="margin-top:12px"><div class="table-wrap scrolly" style="margin:0"><table class="trace" id="af-table"></table></div></div>
+    <div class="narrate" id="af-narr"></div>
+    <div class="stats" id="af-stats"></div>
+  </div>
+</section>
+
+<p>逐行读 Figure 50.3，理解每次 read 为什么返回那个值：</p>
+<ul>
+  <li><strong>第 5 行 P2 read → A</strong>：P1 写 A 并关闭，A 已存到服务器；P2 在同一台机器上打开，直接用本地缓存。</li>
+  <li><strong>第 10 行 P2 read → B</strong>：P1 写了 B 但还没关闭，同一台机器上的 P2 <strong>立刻</strong>看到 B（本地进程遵循 UNIX 语义）。服务器上仍是 A。</li>
+  <li><strong>第 13 行 P3 read → A</strong>：Client2 上的 P3 打开时，B 还只在 Client1 上，服务器仍是 A——远端进程看不到还没关闭的写。</li>
+  <li><strong>第 15 行 P1 close</strong>：B 被存到服务器，服务器打断 Client2 的回调（缓存中的 A 被划掉）。</li>
+  <li><strong>第 17 行 P3 read → B</strong>：P3 重新打开时回调已失效，于是重新 Fetch，得到 B。</li>
+  <li><strong>第 21–26 行</strong>：P1 写 D、P3 写 C；P3 先关闭（服务器变为 C，Client1 的回调被打断，但 P1 仍在使用自己修改过的副本），P1 后关闭（服务器变为 D）。"不幸的 P3"：最后写者胜，P3 重新打开读到的是 D。</li>
+</ul>
+
+<div class="aside" data-title="旁注：缓存一致性不是万灵药">
+  <p>讨论分布式文件系统时，人们常大谈它提供的缓存一致性。但这种基础一致性并不能解决多客户端访问文件的所有问题。比如你在构建一个代码仓库，多个客户端同时签入、签出代码，就不能指望底层文件系统替你做完所有事，而必须使用显式的<strong>文件级锁</strong>，确保并发访问时发生"正确"的事。事实上，任何真正在意并发更新的应用都会加上额外机制来处理冲突。本章和上一章描述的基础一致性主要适用于日常使用——用户换一台客户端登录时，希望看到自己文件的某个合理版本。对这些协议期望更多，只会让自己失望、沮丧、泪流满面。</p>
+</div>
+
+<h3>交错枚举：两个客户端的所有执行顺序</h3>
+<p>类似 AFS 模拟器 <code>afs.py</code> 作业的第 4–6 题：两个客户端各执行三步，一共有 C(6,3) = 20 种交错顺序。调度串中 <code>0</code> 表示让 Client1（P1）执行下一步、<code>1</code> 表示让 Client2（P3）执行下一步（与 <code>afs.py -S</code> 的记法相同）。先预测，再点"枚举"。点击任意一行，可以把它载入上面的时间线模拟器逐步查看。</p>
+<section class="sim" id="sim-il">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>交错枚举器</h3>
+    <div class="desc">工作负载 1：Client1 执行 open → write 1 → close，Client2 执行 open → read → close，文件初值 0，统计 Client2 读到的值。工作负载 2：两个客户端都 open → write → close（分别写 X、Y），统计服务器上的最终内容。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>工作负载 <select id="il-w"><option value="1">1：一写一读（作业第 4、5 题）</option><option value="2">2：两个都写（作业第 6 题）</option></select></label>
+      <label>NFS 属性缓存超时 T <input type="number" id="il-T" min="0" max="30" value="0"></label>
+    </div>
+    <div class="stats" id="il-stats" style="margin-top:0"></div>
+    <div class="stage" style="margin-top:12px"><div class="table-wrap scrolly" style="margin:0"><table class="trace" id="il-table"></table></div></div>
+    <div class="narrate" id="il-narr"></div>
+  </div>
+</section>
+
+<h2>崩溃恢复</h2>
+<p>从上面的描述你可能感觉到，AFS 的崩溃恢复比 NFS 复杂。没错。</p>
+<figure class="fig">
+  <svg viewBox="0 0 740 220" width="740" role="img" aria-label="AFS 崩溃恢复两种情况">
+    <g font-size="12.5">
+      <rect x="10" y="10" width="350" height="200" rx="10" class="box"/>
+      <text x="185" y="32" text-anchor="middle" font-weight="700">客户端重启：可能错过了回调中断</text>
+      <text x="30" y="60">① C1 缓存了 F（持有回调）</text>
+      <text x="30" y="84" style="fill:var(--bad)">② C1 正在重启，联系不上</text>
+      <text x="30" y="108">③ C2 更新 F，服务器向 C1 发回调中断……</text>
+      <text x="50" y="126" style="fill:var(--bad)">消息没送到</text>
+      <text x="30" y="150">④ C1 重新加入：把全部缓存视为<b>可疑</b></text>
+      <text x="30" y="174">⑤ 下次访问 F 先发 <tspan class="mono">TestAuth</tspan>：</text>
+      <text x="50" y="194">仍有效就用，否则重新取新版本</text>
+      <rect x="380" y="10" width="350" height="200" rx="10" class="box"/>
+      <text x="555" y="32" text-anchor="middle" font-weight="700">服务器重启：回调表在内存里丢了</text>
+      <text x="400" y="60">① 服务器记着"C1、C2 缓存了 F"</text>
+      <text x="400" y="84" style="fill:var(--bad)">② 服务器崩溃重启：不知道谁缓存了什么</text>
+      <text x="400" y="108">③ 每个客户端必须<b>及时</b>意识到服务器崩溃过，</text>
+      <text x="420" y="126">把缓存视为可疑、使用前重新验证</text>
+      <text x="400" y="150">通知方式：服务器重启后给每个客户端发消息</text>
+      <text x="420" y="168">（"别相信你的缓存！"），或客户端定期</text>
+      <text x="420" y="186">发<b>心跳（heartbeat）</b>检查服务器是否还活着</text>
+    </g>
+  </svg>
+  <figcaption>图 50-E：回调是服务器端状态，崩溃恢复因此变得复杂。相比之下，NFS 客户端几乎察觉不到服务器崩溃。</figcaption>
+</figure>
+<p>设想服务器 S 有一小段时间联系不上客户端 C1（比如 C1 正在重启）。这期间 S 可能向 C1 发过一条或多条回调撤销消息：假设 C1 本地磁盘缓存了文件 F，然后 C2 更新了 F，于是 S 向所有缓存了 F 的客户端发消息，让它们从本地缓存中删掉 F。C1 在重启时可能错过这些关键消息，所以<strong>重新加入系统时，C1 应把所有缓存内容视为可疑</strong>：下次访问 F 时，先用 TestAuth 问服务器缓存的副本是否仍然有效；有效就用，否则从服务器取新版本。</p>
+<p>服务器崩溃后的恢复也更复杂：回调保存在内存里，服务器重启后不知道哪台客户端缓存了哪些文件。因此服务器重启后，每个客户端都必须意识到服务器崩溃过，并把缓存内容视为可疑、在使用前重新确认有效性。服务器崩溃是件大事：必须确保每个客户端及时知道这次崩溃，否则就有客户端访问陈旧文件的风险。实现方式很多，比如服务器恢复后给每个客户端发消息（"别相信你的缓存内容！"），或者客户端定期检查服务器是否活着（<strong>心跳</strong>消息）。可以看到，构建更可扩展、更合理的缓存模型是有代价的；而用 NFS 时，客户端几乎注意不到服务器崩溃。在上面的时间线模拟器里，点"客户端宕机错过回调"或"服务器崩溃丢失回调"，再取消"恢复后把缓存视为可疑"，就能看到后果。</p>
+
+<h2>AFSv2 的规模与性能</h2>
+<p>新协议到位后，测量发现 AFSv2 的可扩展性大大提高：<strong>每台服务器可以支持约 50 个客户端（而不是 20 个）</strong>。另一个好处是客户端性能常常接近本地性能：常见情况下所有文件访问都是本地的，读文件通常访问本地磁盘缓存（也可能是本地内存）。只有客户端创建新文件或写已有文件时，才需要向服务器发 Store 消息。</p>
+<p>原书 Figure 50.4 用简单的定性分析比较了常见访问场景下 AFS 与 NFS 的性能。小文件有 N<sub>s</sub> 个块，中等文件 N<sub>m</sub> 个块，大文件 N<sub>L</sub> 个块；假设小、中等文件能放进客户端内存，大文件能放进本地磁盘但放不进内存。通过网络访问远程服务器的一个块需要 L<sub>net</sub>，访问本地内存需要 L<sub>mem</sub>，访问本地磁盘需要 L<sub>disk</sub>，一般假设 L<sub>net</sub> &gt; L<sub>disk</sub> &gt; L<sub>mem</sub>。第一次访问文件不命中任何缓存；之后的访问（"重读"）如果相应缓存装得下，就会命中。改改参数，看看比值：</p>
+
+<section class="sim" id="sim-perf">
+  <div class="sim-head"><span class="tag">计算器</span><h3>AFS vs NFS 工作负载对比（Figure 50.4）</h3>
+    <div class="desc">表中"公式"两列是原书的结果，"数值"列按你输入的参数计算；最右列是 AFS/NFS 的比值（&lt; 1 表示 AFS 更快，标绿；&gt; 1 表示 AFS 更慢，标红）。</div></div>
+  <div class="sim-body">
+    <div class="controls perf">
+      <label>N<sub>s</sub> <input type="number" id="pf-ns" min="1" value="10"></label>
+      <label>N<sub>m</sub> <input type="number" id="pf-nm" min="1" value="100"></label>
+      <label>N<sub>L</sub> <input type="number" id="pf-nl" min="1" value="10000"></label>
+      <label>L<sub>net</sub> <input type="number" id="pf-lnet" min="0" step="any" value="100"></label>
+      <label>L<sub>disk</sub> <input type="number" id="pf-ldisk" min="0" step="any" value="10"></label>
+      <label>L<sub>mem</sub> <input type="number" id="pf-lmem" min="0" step="any" value="0.1"></label>
+      <button id="pf-reset">恢复默认</button>
+    </div>
+    <div class="err" id="pf-warn"></div>
+    <div class="table-wrap"><table class="perf" id="pf-table"></table></div>
+  </div>
+</section>
+<p>几点观察（原书）：</p>
+<ol>
+  <li><strong>很多情况下两者性能大致相当</strong>。例如第一次读文件（工作负载 1、3、5），从远程服务器取文件的时间占主导，两个系统差不多。你可能觉得 AFS 要把文件写到本地磁盘会更慢，但这些写会被本地文件系统缓存吸收；同样，从本地磁盘缓存副本读看似更慢，但 AFS 同样受益于本地文件系统的内存缓存，读很可能命中客户端内存，性能与 NFS 相近。</li>
+  <li><strong>大文件顺序重读（工作负载 6）</strong>差异明显：AFS 有很大的本地磁盘缓存，再次访问时从那里读；NFS 只能在客户端内存里缓存块，比内存大的文件重读时必须从服务器重新取整个文件。所以 AFS 快 L<sub>net</sub>/L<sub>disk</sub> 倍（假设远程访问确实比本地磁盘慢）。而且 NFS 在这种情况下增加了服务器负载，也影响扩展性。</li>
+  <li><strong>新文件的顺序写（工作负载 8、9）</strong>两者相近：AFS 写到本地缓存副本，关闭时把数据推给服务器；NFS 把写缓冲在客户端内存中，可能因内存压力提前把一些块写到服务器，但关闭时一定会写，以保持 flush-on-close 一致性。AFS 写本地文件系统，同样先进入页缓存、稍后才在后台写盘，从而受益于客户端操作系统的内存缓存。</li>
+  <li><strong>顺序覆写（工作负载 10）</strong>AFS 更差：前面的写负载都是创建新文件；这里文件已存在并被覆写。AFS 客户端先把旧文件整个取回来，然后又整个覆盖掉；NFS 只是覆写块，省掉了开头那次（无用的）读。（假设 NFS 的写都是块大小且块对齐的，文件也不是用 O_TRUNC 打开的——否则 AFS 的 open 不会去取即将被截断的文件内容。）</li>
+  <li><strong>只访问大文件中一小部分数据</strong>（工作负载 7、11）NFS 好得多：AFS 在打开时取回整个文件，却只做了一次小读或小写；如果文件被修改，还要把整个文件写回服务器，性能影响翻倍。NFS 作为基于块的协议，I/O 量与读写大小成正比。</li>
+</ol>
+<p>总的来说，NFS 和 AFS 做了不同的假设，自然得到不同的性能结果。这些差异重不重要，一如既往，取决于<strong>工作负载</strong>。</p>
+<div class="aside" data-title="旁注：工作负载的重要性">
+  <p>评估任何系统的一个难题是选择工作负载。计算机系统的用法千差万别，存储系统设计者该如何判断哪些工作负载重要？AFS 的设计者根据他们测量文件系统使用情况的经验做了一些假设：大多数文件<strong>不常被共享</strong>，并且会被<strong>从头到尾顺序访问</strong>。在这些假设下，AFS 的设计非常合理。但假设并不总成立：比如一个应用周期性地往日志里追加少量信息，这种向大文件追加小数据的写对 AFS 很不友好；事务数据库中的随机更新也是难题。</p>
+</div>
+
+<h2>AFS 的其他改进</h2>
+<p>就像 Berkeley FFS 趁机加入了符号链接等新特性，AFS 的设计者也借机加入了许多让系统更好用、更好管理的特性：</p>
+<div class="cards">
+  <div class="card"><h4>真正的全局命名空间</h4><p>所有文件在所有客户端上的名字都一样。NFS 允许每个客户端随意挂载服务器，只能靠约定和大量管理工作让各处命名一致。</p></div>
+  <div class="card"><h4>认真对待安全</h4><p>内置用户认证机制，能保证文件在用户需要时保持私密。NFS 在很多年里对安全的支持都很原始。</p></div>
+  <div class="card"><h4>灵活的访问控制</h4><p>用户可管理的访问控制列表（ACL），精确控制谁能访问哪些文件；NFS 和大多数 UNIX 文件系统对这类共享支持较少。</p></div>
+  <div class="card"><h4>简化服务器管理</h4><p>提供让管理员更容易管理服务器的工具（如在服务器间迁移卷）。在系统管理方面，AFS 领先业界好几光年。</p></div>
+</div>
+
+<h2>先预测再验证</h2>
+<div class="exercise"><div class="q">在"打开 notes.txt"模拟器中，打开次数设为 3，比较 AFSv1 与 AFSv2 的消息总数和服务器路径查找次数。</div>
+  <details class="reveal"><summary>看答案</summary><div>AFSv1：第 1 次 Fetch（服务器走 3 级路径），之后每次 open 都发 TestAuth（服务器每次再走 3 级路径），共 3 条消息、9 次路径查找。AFSv2：第 1 次发 2 条 Fetch（remzi、notes.txt，服务器各查 1 次），之后回调都有效，一条消息都不发：共 2 条消息、2 次查找。两者差距随打开次数线性增长——这就是 AFSv2 能把每台服务器的客户端数从 20 提到 50 的原因。</div></details></div>
+<div class="exercise"><div class="q">AFSv2 中选"别人修改了 notes.txt"。预测第 2 次打开会发几条消息？如果改成"别人修改了目录 remzi"呢？</div>
+  <details class="reveal"><summary>看答案</summary><div>notes.txt 被修改：服务器打断了 C1 对 notes.txt 的回调，home 和 remzi 的回调仍有效，所以只重新 Fetch notes.txt，1 条消息。remzi 被修改：只重新 Fetch 目录 remzi（从中重新找到 notes.txt 的 FID），notes.txt 本身的回调仍有效，直接打开本地副本，也是 1 条消息。</div></details></div>
+<div class="exercise"><div class="q">载入原书 Figure 50.3，在第 12 行之前暂停：预测 P3 的 read 会读到什么？第 15 行 P1 close 之后，Client2 的缓存发生了什么？</div>
+  <details class="reveal"><summary>看答案</summary><div>P3 读到 A：P1 写的 B 只在 Client1 的缓存里，服务器还是 A，P3 打开时取回的是 A。第 15 行 P1 close 把 B 存到服务器，服务器打断 Client2 的回调，Client2 缓存中的 A 被划掉（失效）；P3 下次 open 时重新取回 B。</div></details></div>
+<div class="exercise"><div class="q">把 Figure 50.3 切换成 NFS 语义，T 分别设为 3、4、5。预测第 17 行（t=16）和第 26 行（t=25）的 P3 read 各读到什么？与 AFS 相同吗？</div>
+  <details class="reveal"><summary>看答案</summary><div>T=3：两次都与 AFS 相同（B、D）——P3 在 t=22 关闭时 WRITE 的回复刷新了属性缓存，t=25 read 时恰好过了 3 秒，GETATTR 发现 P1 在 t=23 刷写的新版本。T=4：第 26 行读到 <strong>C</strong>（陈旧读）：属性缓存还没过期，客户端直接用缓存里的 C。T=5：连第 17 行也读到 <strong>A</strong>（陈旧读）：P3 在 t=12 的 READ 刷新了属性缓存，t=16 还没过期。同一串操作，结果取决于超时参数和时间间隔——这就是"实现细节定义语义"。AFS 靠回调在 P1 close 的那一刻就让 Client2 的缓存失效，不依赖任何超时。</div></details></div>
+<div class="exercise"><div class="q">在交错枚举器里选工作负载 1。预测：AFS 下 20 种交错中 Client2 有几种读到 1？NFS（T=0）呢？</div>
+  <details class="reveal"><summary>看答案</summary><div>AFS 下只有 1 种（调度 000111：Client1 完全关闭之后 Client2 才打开）。因为 AFS 的读取看的是 open 时拿到的版本，只有 Client1 的 close 早于 Client2 的 open 才能读到 1。NFS 在 read 时检查（Client2 在 read 之前没有缓存数据，READ 总是取服务器当前内容），只要 Client1 的 close 早于 Client2 的 <em>read</em> 就能读到 1，共 4 种：000111、001011、010011、100011。</div></details></div>
+<div class="exercise"><div class="q">工作负载 2（两个客户端都写）：预测 AFS 下服务器最终内容由什么决定？</div>
+  <details class="reveal"><summary>看答案</summary><div>只由两个 close 的先后决定：谁最后 close，服务器上就是谁写的整份文件（最后写者胜/最后关闭者胜）。open 和 write 的先后都不重要。枚举结果中 X、Y 各占 10 种：最后一步是 Client1 执行（调度以 0 结尾）时 X 胜，否则 Y 胜。</div></details></div>
+
+<h2>动手实验</h2>
+<div class="lab">
+  <p><code>afs_sim.c</code> 是一个与本页时间线模拟器逻辑相同的小型 C 模拟器：它逐行执行 Figure 50.3 的操作并打印表格，然后枚举两个作业工作负载的全部 20 种交错。</p>
+  <pre><code><span class="cmd">cd labs/50-afs &amp;&amp; make &amp;&amp; ./afs_sim</span></code></pre>
+  <p class="small muted">示例输出（本机真实运行结果；程序是确定性的，你的输出应当相同）：</p>
+  <pre><code>=== Figure 50.3: AFS cache consistency timeline (~X = callback broken) ===
+#   P1            P2            C1     P3            C2     Server
+1   open(F)                     -                    -      -     
+2   write(A)                    A                    -      -     
+3   close()                     A                    -      A     
+4                 open(F)       A                    -      A     
+5                 read() -&gt; A   A                    -      A     
+6                 close()       A                    -      A     
+7   open(F)                     A                    -      A     
+8   write(B)                    B                    -      A     
+9                 open(F)       B                    -      A     
+10                read() -&gt; B   B                    -      A     
+11                close()       B                    -      A     
+12                              B      open(F)       A      A     
+13                              B      read() -&gt; A   A      A     
+14                              B      close()       A      A     
+15  close()                     B                    ~A     B     
+16                              B      open(F)       B      B     
+17                              B      read() -&gt; B   B      B     
+18                              B      close()       B      B     
+19                              B      open(F)       B      B     
+20  open(F)                     B                    B      B     
+21  write(D)                    D                    B      B     
+22                              D      write(C)      C      B     
+23                              D      close()       C      C     
+24  close()                     D                    ~C     D     
+25                              D      open(F)       D      D     
+26                              D      read() -&gt; D   D      D     
+27                              D      close()       D      D     
+messages: Fetch=4 Store=4 callback-breaks=3 TestAuth=0
+
+=== Workload 1: client0 = open,write 1,close   client1 = open,read,close  (file starts as 0) ===
+schedule  AFS  NFS(T=0)
+000111    1    1
+001011    0    1
+001101    0    0
+001110    0    0
+010011    0    1
+...
+summary (20 interleavings):  AFS 0 x19  AFS 1 x1  NFS 0 x16  NFS 1 x4
+
+=== Workload 2: client0 = open,write X,close   client1 = open,write Y,close  (file starts as 0) ===
+schedule  AFS  NFS(T=0)
+000111    Y    Y
+001011    Y    Y
+001101    Y    Y
+001110    X    X
+010011    Y    Y
+...
+summary (20 interleavings):  AFS X x10  AFS Y x10  NFS X x10  NFS Y x10</code></pre>
+  <p>表中 <code>~A</code> 表示该缓存的回调已被打断（原书中划掉的 A）。可以尝试修改程序开头的操作数组，或把 <code>SUSPECT_ON_RECOVER</code> 设为 0 并加入 <code>C1 down</code> / <code>C1 up</code> 操作，观察错过回调的后果。详见 <code>labs/50-afs/README.md</code>。</p>
+</div>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="3"><div class="q">AFS 设计的首要目标是什么？</div>
+  <div class="opts"><button>A. 降低客户端磁盘占用</button><button>B. 简单快速的服务器崩溃恢复</button><button>C. 与 NFS 协议兼容</button><button>D. 规模：让一台服务器支持尽可能多的客户端</button></div>
+  <div class="explain">"the main goal of this project was simple: scale"。简单快速的崩溃恢复是 NFS 的目标；AFS 恰恰为了扩展性牺牲了崩溃恢复的简单性。</div></div>
+<div class="mcq" data-answer="2"><div class="q">AFSv1 的两个主要协议问题是？</div>
+  <div class="opts"><button>A. 文件句柄没有世代号；写不幂等</button><button>B. 缓存放在内存而非磁盘；不支持目录</button><button>C. 服务器路径遍历开销太高；客户端发出太多 TestAuth</button><button>D. 没有回调；使用了 UDP</button></div>
+  <div class="explain">这两点让服务器 CPU 成为瓶颈，每台服务器只能服务 20 个客户端。负载不均（用卷解决）和每客户端一个进程（改用线程）是另外两个问题。</div></div>
+<div class="mcq" data-answer="1"><div class="q">回调（callback）的本质是？</div>
+  <div class="opts"><button>A. 客户端把修改推送给其他客户端</button><button>B. 服务器承诺在客户端缓存的文件被修改时通知它——类似中断而非轮询</button><button>C. 客户端定期询问服务器文件是否改变</button><button>D. 服务器定期把整个文件推送给所有客户端</button></div>
+  <div class="explain">C 是轮询（AFSv1 的 TestAuth、NFS 的 GETATTR）。回调让客户端假定缓存有效，直到服务器说它无效。</div></div>
+<div class="mcq" data-answer="3"><div class="q">Client1 上的 P1 打开 F 并写入 B（尚未关闭）。以下哪个进程此时读 F 能看到 B？</div>
+  <div class="opts"><button>A. 两者都不能</button><button>B. Client2 上刚打开 F 的 P3</button><button>C. 两者都能</button><button>D. Client1 上刚打开 F 的 P2</button></div>
+  <div class="explain">同一台机器上的进程立即看到写（UNIX 语义）；其他机器要等 P1 close 把文件存到服务器后，重新 open 才能看到（Figure 50.3 第 10、13 行）。</div></div>
+<div class="mcq" data-answer="0"><div class="q">两台机器上的进程同时修改 F，AFS 服务器上最终是？</div>
+  <div class="opts"><button>A. 最后一个 close 的客户端的完整版本</button><button>B. 服务器拒绝第二个 Store</button><button>C. 第一个 close 的版本</button><button>D. 两者的块级混合</button></div>
+  <div class="explain">最后写者胜（更准确说是最后关闭者胜），而且整个文件来自同一个客户端；块级混合是 NFS 可能出现的情况。</div></div>
+<div class="mcq" data-answer="0"><div class="q">AFS 客户端重启后重新加入系统，应该怎么做？</div>
+  <div class="opts"><button>A. 把所有缓存内容视为可疑，下次访问前用 TestAuth 向服务器确认</button><button>B. 什么都不用做，服务器会重发错过的回调</button><button>C. 删除整个本地磁盘缓存并重新下载所有文件</button><button>D. 直接使用缓存，因为回调还在</button></div>
+  <div class="explain">重启期间可能错过了回调中断消息。原书：C1 should treat all of its cache contents as suspect，下次访问时先 TestAuth，有效就用，否则取新版本。</div></div>
+<div class="mcq" data-answer="2"><div class="q">按照 Figure 50.4，哪种工作负载 AFS 明显比 NFS 快？</div>
+  <div class="opts"><button>A. 小文件顺序读</button><button>B. 大文件顺序覆写</button><button>C. 大文件顺序重读（文件放不进内存但放得进本地磁盘）</button><button>D. 大文件单次小读</button></div>
+  <div class="explain">工作负载 6：AFS 从本地磁盘缓存读（N<sub>L</sub>·L<sub>disk</sub>），NFS 要重新从服务器取（N<sub>L</sub>·L<sub>net</sub>）。B、D 都是 AFS 更慢（比值 N<sub>L</sub> 和 2）；A 两者相同。</div></div>
+<div class="mcq" data-answer="1"><div class="q">为什么"周期性地向一个大日志文件追加少量数据"对 AFS 很不友好？</div>
+  <div class="opts"><button>A. AFS 的本地缓存放不下大文件</button><button>B. 每次打开都要取回整个大文件，关闭时又要把整个文件存回服务器，I/O 量与文件大小而非写入量成正比</button><button>C. 追加会导致回调无法建立</button><button>D. AFS 不支持追加写</button></div>
+  <div class="explain">AFS 基于"文件很少共享、整体顺序访问"的工作负载假设设计；小的追加写违背了这个假设（参见工作负载 11：比值 2·N<sub>L</sub>）。</div></div>
+
+<h2>常见误区与小结</h2>
+<div class="warn">
+  <ul>
+    <li><strong>"AFS 和 NFS 一样是无状态的"</strong>：AFSv2 服务器要记住每个客户端缓存了哪些文件（回调），是有状态的；这是它扩展性好的原因，也是崩溃恢复复杂的原因。</li>
+    <li><strong>"AFS 保证其他机器立刻看到写"</strong>：不是。远端要等写者 close、并重新 open 才能看到；已经打开的远端进程仍在读自己的副本。</li>
+    <li><strong>"最后写者胜 = 最后一次 write 的数据胜出"</strong>：决定胜负的是 close 的先后（最后关闭者胜），而且胜出的是整个文件。</li>
+    <li><strong>"整文件缓存总是更快"</strong>：大文件的小读小写、覆写已有文件时 AFS 更慢；这取决于工作负载。</li>
+    <li><strong>"有了一致性协议就不需要锁"</strong>：真正在意并发更新的应用仍需要显式的文件级锁。</li>
+  </ul>
+</div>
+<div class="key">
+  <p><strong>本章小结</strong></p>
+  <ul>
+    <li>AFS 展示了与 NFS 截然不同的分布式文件系统设计。其<strong>协议设计</strong>尤其重要：通过<strong>整文件缓存和回调</strong>把服务器交互降到最少，每台服务器能支持更多客户端，管理一个站点所需的服务器数量随之减少。</li>
+    <li>AFSv2 的两大改进：回调取代 TestAuth 轮询；FID + 客户端逐级查找取代服务器路径遍历。服务器从支持 20 个客户端提升到约 50 个。</li>
+    <li>AFS 的一致性模型简单易懂：跨机器的更新在 close 时可见并同时使其他缓存失效；本机进程立即可见；并发修改时最后关闭者胜。它不会像 NFS 那样偶尔出现奇怪行为。</li>
+    <li>代价：服务器有状态，客户端或服务器崩溃后都要把缓存视为可疑并重新验证。</li>
+    <li>全局命名空间、安全、访问控制列表、管理工具等特性让 AFS 很好用。</li>
+    <li>AFS 可能正在衰落：NFS 成为开放标准，得到众多厂商支持，和 Windows 的 CIFS 一起主导了市场。AFS 最持久的影响可能来自它的思想——事实上 <strong>NFSv4 加入了服务器状态（例如"open"协议消息）</strong>，越来越像基本的 AFS 协议。</li>
+    <li>分布式系统部分到此结束：从第 48 章的通信与 RPC，到 NFS 的"无状态 + 幂等"，再到 AFS 的"回调 + 整文件缓存"，核心问题始终是——<strong>怎样在部件会出故障的前提下，做出又快又可靠的系统</strong>。</li>
+  </ul>
+</div>
+
+</main>
+<script>
+/*CORE-BEGIN*/
+// ================= AFS / NFS 一致性时间线引擎 =================
+const PROC_CLIENT = { P1: "C1", P2: "C1", P3: "C2", P4: "C2" };
+// cfg: { mode: "afs"|"nfs", T: NFS 属性缓存超时, suspect: 恢复后是否把缓存视为可疑, init: 服务器上 F 的初值（null 表示不存在） }
+function afsRun(text, cfg) {
+  const mode = cfg.mode, errors = [], rows = [];
+  const srv = { val: cfg.init == null ? null : cfg.init, exists: cfg.init != null, ver: cfg.init == null ? 0 : 1, mtime: 0, cb: [] };
+  const mkc = () => ({ cache: null, dirty: false, up: true, attr: null });
+  const C = { C1: mkc(), C2: mkc() };
+  const P = {}; for (const p in PROC_CLIENT) P[p] = { open: false, wrote: false, openStale: false };
+  const st = { Fetch: 0, Store: 0, TestAuth: 0, Break: 0, BreakLost: 0, GETATTR: 0, READ: 0, WRITE: 0, CREATE: 0, stale: 0, reads: 0 };
+  const used = new Set();
+  let t = 0;
+  const show = (v) => (v == null ? "-" : v);
+  const snap = () => ({ C: JSON.parse(JSON.stringify(C)), srv: JSON.parse(JSON.stringify(srv)), st: { ...st } });
+  const addCb = (c) => { if (!srv.cb.includes(c)) srv.cb.push(c); };
+  const procsOn = (c) => Object.keys(PROC_CLIENT).filter((q) => PROC_CLIENT[q] === c);
+  text.split("\n").forEach((raw, ln) => {
+    const line = raw.replace(/#.*/, "").trim();
+    if (!line) return;
+    let m;
+    const r = { t, line, who: null, client: null, op: "", msgs: [], notes: [], result: undefined, tag: null, cls: "" };
+    if ((m = line.match(/^wait\s+(\d+)$/i))) {
+      r.op = `wait ${m[1]}`; r.notes.push(`时间流逝 ${m[1]} 秒`); r.snap = snap(); rows.push(r); t += +m[1]; return;
+    }
+    if ((m = line.match(/^(C[12])\s+(down|up)$/i))) {
+      const c = m[1].toUpperCase(), cl = C[c]; r.client = c; r.op = `${c} ${m[2].toLowerCase()}`;
+      if (m[2].toLowerCase() === "down") { cl.up = false; r.notes.push(`${c} 宕机/重启中，暂时联系不上`); }
+      else {
+        cl.up = true;
+        if (mode === "afs" && cl.cache) {
+          if (cfg.suspect) { cl.cache.suspect = true; r.notes.push(`${c} 重新加入：把全部缓存视为可疑，下次打开前先 TestAuth`); }
+          else r.notes.push(`${c} 重新加入，但<b>没有</b>把缓存视为可疑——仍然相信自己的回调`);
+        } else r.notes.push(`${c} 重新加入`);
+      }
+      r.snap = snap(); rows.push(r); t += 1; return;
+    }
+    if (/^S\s+crash$/i.test(line)) {
+      r.op = "S crash";
+      if (mode === "afs") {
+        srv.cb = [];
+        r.notes.push("服务器崩溃重启：内存中的回调表丢失（文件数据在磁盘上，完好）");
+        if (cfg.suspect) { for (const c in C) if (C[c].cache) C[c].cache.suspect = true; r.notes.push("客户端得知服务器重启过（服务器通知或心跳），把缓存全部视为可疑"); }
+        else r.notes.push("客户端<b>不知道</b>服务器崩溃过，仍然相信自己的回调");
+      } else r.notes.push("服务器崩溃重启：NFS 服务器无状态，客户端几乎察觉不到");
+      r.snap = snap(); rows.push(r); t += 1; return;
+    }
+    m = line.match(/^(P[1-4])\s+(open|read|write|close)(?:\s+(\S+))?$/i);
+    if (!m) { errors.push(`第 ${ln + 1} 行无法识别：${line}`); return; }
+    const p = m[1].toUpperCase(), op = m[2].toLowerCase(), arg = m[3];
+    if (op === "write" && !arg) { errors.push(`第 ${ln + 1} 行：write 需要一个值，例如 P1 write A`); return; }
+    const c = PROC_CLIENT[p], cl = C[c], pr = P[p];
+    used.add(p);
+    r.who = p; r.client = c; r.op = op === "read" ? "read()" : op === "write" ? `write(${arg})` : op === "open" ? "open(F)" : "close()";
+    if (!cl.up) { r.notes.push(`${c} 宕机中，操作无法执行`); r.cls = "bad"; r.snap = snap(); rows.push(r); t += 1; return; }
+    if (op !== "open" && !pr.open) r.notes.push(`（注意：${p} 没有打开 F）`);
+
+    const fetch = (why) => {
+      r.msgs.push("Fetch"); st.Fetch++;
+      cl.cache = { val: srv.val, ver: srv.ver, valid: true, suspect: false };
+      addCb(c);
+      r.notes.push(why + (srv.exists ? `Fetch 整个文件（F=${show(srv.val)}）存入本地磁盘，服务器登记回调` : "服务器上还没有 F：在本地创建空文件，服务器登记回调"));
+    };
+    const validate = () => {   // NFS
+      if (cl.attr && t - cl.attr.at < cfg.T) r.notes.push(`属性缓存未过期（取于 t=${cl.attr.at}），不联系服务器`);
+      else { r.msgs.push("GETATTR"); st.GETATTR++; cl.attr = { mtime: srv.mtime, at: t }; }
+      if (cl.cache && !cl.dirty && cl.attr.mtime > cl.cache.mtime) { r.notes.push(`GETATTR 发现 F 已被修改 → 作废缓存`); cl.cache = null; }
+    };
+    if (op === "open") {
+      if (mode === "afs") {
+        if (cl.dirty) r.notes.push("本机另一个进程正在修改 F：直接使用本地副本");
+        else if (cl.cache && cl.cache.valid && !cl.cache.suspect) r.notes.push("回调有效 → 直接打开本地缓存副本，不联系服务器");
+        else if (cl.cache && cl.cache.valid && cl.cache.suspect) {
+          r.msgs.push("TestAuth"); st.TestAuth++;
+          if (cl.cache.ver === srv.ver) { cl.cache.suspect = false; addCb(c); r.notes.push("缓存可疑 → TestAuth：服务器说未变，继续使用并重建回调"); }
+          else fetch("缓存可疑 → TestAuth：已经过期！重新 ");
+        } else fetch(cl.cache ? "回调已被打断（缓存失效）→ 重新 " : "本地没有缓存 → ");
+        pr.openStale = !!(cl.cache && !cl.dirty && cl.cache.ver < srv.ver);
+        if (pr.openStale) r.notes.push(`<b>打开的是旧版本！</b>服务器上已是 ${show(srv.val)}`);
+      } else {
+        if (cl.dirty) r.notes.push("本机另一个进程有未刷写的修改：直接使用本地缓存");
+        else {
+          validate();
+          if (!srv.exists) { r.msgs.push("CREATE"); st.CREATE++; srv.exists = true; srv.mtime = t; cl.cache = { val: null, ver: srv.ver, mtime: t }; cl.attr = { mtime: t, at: t }; r.notes.push("F 不存在 → CREATE（服务器上立即出现空文件）"); }
+          else if (!cl.cache) r.notes.push("本地无缓存，读的时候再取");
+          else r.notes.push("缓存可用");
+        }
+      }
+      pr.open = true;
+    } else if (op === "read") {
+      st.reads++;
+      if (mode === "nfs" && !cl.dirty) {
+        validate();
+        if (!cl.cache) { r.msgs.push("READ"); st.READ++; cl.cache = { val: srv.val, ver: srv.ver, mtime: srv.mtime }; cl.attr = { mtime: srv.mtime, at: t }; r.notes.push(`READ 从服务器取回 ${show(srv.val)}`); }
+        else r.notes.push("读客户端缓存");
+      } else r.notes.push(cl.dirty ? "读本地副本（含本机未关闭的修改）" : "读本地缓存副本，不联系服务器");
+      r.result = cl.cache ? show(cl.cache.val) : "-";
+      if (!cl.dirty && cl.cache && cl.cache.ver < srv.ver) {
+        if (mode === "afs" && !pr.openStale) { r.tag = "旧版本：打开之后远端才提交（会话语义，预期内）"; r.cls = "warn"; }
+        else { r.tag = "陈旧读！"; r.cls = "bad"; st.stale++; }
+      }
+    } else if (op === "write") {
+      if (!cl.cache) cl.cache = mode === "afs" ? { val: null, ver: srv.ver, valid: true, suspect: false } : { val: null, ver: srv.ver, mtime: srv.mtime };
+      cl.cache.val = arg; cl.dirty = true; pr.wrote = true;
+      r.notes.push(`写入本地副本：${c} 上的进程立刻可见；服务器仍是 ${show(srv.val)}`);
+    } else if (op === "close") {
+      if (pr.wrote) {
+        srv.val = cl.cache.val; srv.exists = true; srv.ver++; cl.cache.ver = srv.ver;
+        if (mode === "afs") {
+          r.msgs.push("Store"); st.Store++;
+          cl.cache.valid = true; cl.cache.suspect = false;
+          r.notes.push(`文件被修改过 → Store 整个文件，服务器上 F=${show(srv.val)}`);
+          for (const o of srv.cb) {
+            if (o === c) continue;
+            if (C[o].up) { if (C[o].cache) C[o].cache.valid = false; st.Break++; r.msgs.push(`Break→${o}`); r.notes.push(`打断 ${o} 的回调，${o} 的缓存失效` + (C[o].dirty ? `（但 ${o} 上的进程仍在使用自己修改过的副本）` : "")); }
+            else { st.BreakLost++; r.notes.push(`想打断 ${o} 的回调，但 ${o} 联系不上：<b>消息丢失</b>`); }
+          }
+          srv.cb = [c];
+        } else {
+          r.msgs.push("WRITE"); st.WRITE++;
+          srv.mtime = t; cl.cache.mtime = t; cl.attr = { mtime: t, at: t };
+          r.notes.push(`flush-on-close：把脏块 WRITE 到服务器，F=${show(srv.val)}（服务器不通知任何人）`);
+        }
+        pr.wrote = false;
+        cl.dirty = procsOn(c).some((q) => P[q].wrote);
+      } else r.notes.push("没有修改，本地关闭");
+      pr.open = false;
+    }
+    r.snap = snap(); rows.push(r); t += 1;
+  });
+  return { rows, errors, st, used: [...used], final: srv.val };
+}
+function cacheCell(cl, mode) {   // 返回 {text, struck, suspect}
+  if (!cl.cache) return { text: "-", struck: false };
+  const v = cl.cache.val == null ? "-" : cl.cache.val;
+  if (mode === "afs") return { text: v, struck: !cl.cache.valid && !cl.dirty, suspect: cl.cache.suspect && cl.cache.valid };
+  return { text: v, struck: false };
+}
+// 两个客户端各 3 步的全部交错（调度串：0 = Client1/P1 执行下一步，1 = Client2/P3）
+function interleavings(n0, n1) {
+  const out = [];
+  (function rec(s, a, b) { if (a === n0 && b === n1) { out.push(s); return; } if (a < n0) rec(s + "0", a + 1, b); if (b < n1) rec(s + "1", a, b + 1); })("", 0, 0);
+  return out;
+}
+function scheduleText(sched, w) {
+  const A = w === 1 ? ["P1 open", "P1 write 1", "P1 close"] : ["P1 open", "P1 write X", "P1 close"];
+  const B = w === 1 ? ["P3 open", "P3 read", "P3 close"] : ["P3 open", "P3 write Y", "P3 close"];
+  let a = 0, b = 0;
+  return [...sched].map((ch) => (ch === "0" ? A[a++] : B[b++])).join("\n");
+}
+function runSchedule(sched, w, mode, T) {
+  const res = afsRun(scheduleText(sched, w), { mode, T, suspect: true, init: "0" });
+  if (w === 1) return res.rows.find((r) => r.who === "P3" && r.op === "read()").result;
+  return res.final;
+}
+// ================= AFSv1 / AFSv2 打开路径 =================
+function afsOpenTrace(cfg) {
+  const rows = [], st = { msgs: 0, lookups: 0, callbacks: 0 };
+  const row = (r) => rows.push(Object.assign({ client: "", msg: "", server: "" }, r, { st: { ...st } }));
+  for (let k = 1; k <= cfg.n; k++) {
+    const first = k === 1;
+    if (!first && cfg.brk !== "none" && k === 2) row({ server: `（另一个客户端修改了 ${cfg.brk === "notes" ? "notes.txt" : "目录 remzi"}${cfg.ver === "v2" ? `，服务器打断 C1 在它上面的回调` : ""}）`, text: cfg.ver === "v2" ? `别人更新并关闭了 ${cfg.brk === "notes" ? "notes.txt" : "remzi"}。服务器查回调表，发现 C1 缓存着它，于是通知 C1：你的回调失效了。` : `别人更新了 ${cfg.brk === "notes" ? "notes.txt" : "remzi"}。AFSv1 没有回调，C1 对此一无所知，只能靠下次打开时的 TestAuth 发现。` });
+    const changedNotes = !first && k === 2 && cfg.brk === "notes";
+    const changedRemzi = !first && k === 2 && cfg.brk === "remzi";
+    const call = `fd = open("/home/remzi/notes.txt", ...);` + (first ? "" : `  // 第 ${k} 次`);
+    if (cfg.ver === "v1") {
+      if (changedNotes) {
+        st.msgs++;
+        row({ call, client: `本地有缓存，先问服务器是否有效`, msg: `TestAuth("/home/remzi/notes.txt") →`, text: `AFSv1 没有回调，只能在打开时询问。` });
+        st.lookups += 3;
+        row({ server: `从根遍历路径（3 次查找），比较版本：<b>已改变</b>`, msg: "← 缓存无效", text: `这次答案是"变了"。` });
+      }
+      if (first || changedNotes) {
+        st.msgs++;
+        row({ call: first ? call : "", client: first ? `本地没有缓存` : `缓存无效，重新取`, msg: `Fetch("/home/remzi/notes.txt") →`, text: `AFSv1 把<strong>完整路径名</strong>交给服务器。` });
+        st.lookups += 3;
+        row({ server: `从根开始遍历路径：找 home → 找 remzi → 找 notes.txt（3 次查找）；把整个文件发回`, msg: "← notes.txt 的全部内容", text: `服务器的 CPU 花在路径遍历上：每个请求都要从头走一遍。` });
+        row({ client: `把 notes.txt 写入本地磁盘缓存；本地 open，返回 fd`, text: `整文件缓存到本地磁盘。目录不缓存（AFSv1 只缓存文件内容）。` });
+      } else {
+        st.msgs++;
+        row({ call, client: `本地有缓存，但必须先问服务器是否有效`, msg: `TestAuth("/home/remzi/notes.txt") →`, text: `即使文件没被任何人改过，AFSv1 每次打开都要发 TestAuth。` });
+        st.lookups += 3;
+        row({ server: `又从根遍历一遍路径（3 次查找），比较版本：未改变`, msg: "← 可以使用缓存", text: `服务器的大部分时间都在回答"文件没变"。` });
+        row({ client: `使用本地缓存副本，返回 fd`, text: `省掉了文件传输，但没省掉一次往返和服务器的路径遍历。` });
+      }
+    } else {
+      if (first || changedRemzi) {
+        st.msgs++;
+        row({ call: first ? call : call, client: first ? `home 已缓存（回调有效）；发送 Fetch(home FID, "remzi")` : `remzi 的回调已失效；发送 Fetch(home FID, "remzi")`, msg: `Fetch(home FID, "remzi") →`, text: `客户端自己逐级查找：用 home 的 FID 和名字 "remzi" 请求目录 remzi。` });
+        st.lookups += 1; if (first) st.callbacks++;
+        row({ server: `在 home 目录中找 remzi；为 C1 在 remzi 上建立回调；返回 remzi 的内容/FID`, msg: "← remzi 的内容 + FID", text: `服务器只查一级，并记下"C1 缓存了 remzi"。` });
+        row({ client: `把 remzi 写入本地磁盘缓存；记录 remzi 的回调状态`, text: `目录也被缓存到本地，之后在 remzi 中查找名字无需联系服务器。` });
+      } else if (!first) row({ call, client: `foreach dir (home, remzi)：callback(dir) == VALID → 用本地副本查找`, text: `目录的回调都有效，路径查找完全在本地完成。` });
+      if (first || changedNotes) {
+        st.msgs++;
+        row({ call: first ? "" : (changedRemzi ? "" : call), client: first || changedRemzi ? `发送 Fetch(remzi FID, "notes.txt")` : `notes.txt 的回调已失效；发送 Fetch(remzi FID, "notes.txt")`, msg: `Fetch(remzi FID, "notes.txt") →`, text: `再用 remzi 的 FID 请求 notes.txt。` });
+        st.lookups += 1; if (first) st.callbacks++;
+        row({ server: `在 remzi 目录中找 notes.txt；为 C1 在 notes.txt 上建立回调；返回 notes.txt 的内容/FID`, msg: "← notes.txt 的全部内容 + FID", text: `整个文件被送回，服务器记下第二个回调。` });
+        row({ client: `把 notes.txt 写入本地磁盘缓存；记录回调状态；本地 open() 缓存副本；返回 fd`, text: `现在 home、remzi、notes.txt 都有有效回调。` });
+      } else row({ client: `callback(notes.txt) == VALID → 打开本地缓存副本，返回 fd`, text: `一条消息都没发：和打开本地文件一样快。` });
+    }
+    row({ call: "read(fd, buffer, MAX);", client: `对缓存副本做本地 read()`, text: `读完全在本地。` });
+    row({ call: "close(fd);", client: `对缓存副本做本地 close()；若文件被修改则刷回服务器（此处只读，无需）`, text: `只读打开，关闭时不需要 Store。` });
+  }
+  return rows;
+}
+// ================= Figure 50.4 =================
+function perfRows(p) {
+  const { Ns, Nm, NL, Lnet, Lmem, Ldisk } = p;
+  return [
+    ["1. 小文件，顺序读", "Ns·Lnet", "Ns·Lnet", "1", Ns * Lnet, Ns * Lnet],
+    ["2. 小文件，顺序重读", "Ns·Lmem", "Ns·Lmem", "1", Ns * Lmem, Ns * Lmem],
+    ["3. 中等文件，顺序读", "Nm·Lnet", "Nm·Lnet", "1", Nm * Lnet, Nm * Lnet],
+    ["4. 中等文件，顺序重读", "Nm·Lmem", "Nm·Lmem", "1", Nm * Lmem, Nm * Lmem],
+    ["5. 大文件，顺序读", "NL·Lnet", "NL·Lnet", "1", NL * Lnet, NL * Lnet],
+    ["6. 大文件，顺序重读", "NL·Lnet", "NL·Ldisk", "Ldisk/Lnet", NL * Lnet, NL * Ldisk],
+    ["7. 大文件，单次读", "Lnet", "NL·Lnet", "NL", Lnet, NL * Lnet],
+    ["8. 小文件，顺序写", "Ns·Lnet", "Ns·Lnet", "1", Ns * Lnet, Ns * Lnet],
+    ["9. 大文件，顺序写", "NL·Lnet", "NL·Lnet", "1", NL * Lnet, NL * Lnet],
+    ["10. 大文件，顺序覆写", "NL·Lnet", "2·NL·Lnet", "2", NL * Lnet, 2 * NL * Lnet],
+    ["11. 大文件，单次写", "Lnet", "2·NL·Lnet", "2·NL", Lnet, 2 * NL * Lnet],
+  ].map(([w, fn, fa, fr, nfs, afs]) => ({ w, fn, fa, fr, nfs, afs, ratio: nfs === 0 ? NaN : afs / nfs }));
+}
+/*CORE-END*/
+
+(function () {
+  const { h } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  const stat = (v, l, cls) => h("div", { class: "stat" }, h("div", { class: "v " + (cls || "") }, v), h("div", { class: "l" }, l));
+  const keepVisible = (tb) => { const wrap = tb.parentElement, cur = tb.querySelector("tr.cur"); if (cur) wrap.scrollTop = Math.max(0, cur.offsetTop - wrap.clientHeight + cur.offsetHeight + 8); };
+
+  // ---------- 打开路径 ----------
+  let orows = [];
+  const oStep = OSTEP.stepper($("op-step"), { steps: () => Math.max(1, orows.length), render: renderOpen, autoplayMs: 1100 });
+  function openRun() { orows = afsOpenTrace({ ver: $("op-ver").value, brk: $("op-brk").value, n: Math.max(1, Math.min(5, +$("op-n").value || 1)) }); oStep.reset(); }
+  ["op-ver", "op-brk", "op-n"].forEach((id) => $(id).addEventListener("input", openRun));
+  function renderOpen(i) {
+    const tb = $("op-table");
+    tb.replaceChildren(h("tr", {}, h("th", {}, "#"), h("th", {}, "应用调用"), h("th", {}, "客户端（Venus）"), h("th", {}, "消息"), h("th", {}, "服务器（Vice）")));
+    orows.slice(0, i + 1).forEach((r, k) => tb.append(h("tr", { class: k === i ? "cur" : "" }, h("td", { class: "num" }, k + 1), h("td", { class: "op" }, r.call || ""), h("td", {}, r.client), h("td", { class: "msg" }, r.msg), h("td", {}, r.server))));
+    keepVisible(tb);
+    const r = orows[i];
+    $("op-narr").innerHTML = r.text;
+    $("op-stats").replaceChildren(stat(r.st.msgs, "发给服务器的消息"), stat(r.st.lookups, "服务器路径查找次数"), stat($("op-ver").value === "v2" ? r.st.callbacks : "—", "服务器登记的回调"));
+  }
+  openRun();
+
+  // ---------- 一致性时间线 ----------
+  const FIG = "# 原书 Figure 50.3\nP1 open\nP1 write A\nP1 close\nP2 open\nP2 read\nP2 close\nP1 open\nP1 write B\nP2 open\nP2 read\nP2 close\nP3 open\nP3 read\nP3 close\nP1 close\nP3 open\nP3 read\nP3 close\nP3 open\nP1 open\nP1 write D\nP3 write C\nP3 close\nP1 close\nP3 open\nP3 read\nP3 close";
+  const PRE = {
+    fig: FIG,
+    session: "# P3 打开期间，远端 P1 提交了新版本\nP1 open\nP1 write A\nP1 close\nP3 open\nP3 read\nP1 open\nP1 write B\nP1 close\nP3 read\nP3 close\nP3 open\nP3 read\nP3 close",
+    cdown: "# Client1 重启期间错过回调中断\nP1 open\nP1 write A\nP1 close\nC1 down\nP3 open\nP3 write B\nP3 close\nC1 up\nP1 open\nP1 read\nP1 close",
+    scrash: "# 服务器崩溃，回调表丢失\nP1 open\nP1 write A\nP1 close\nP3 open\nP3 read\nP3 close\nS crash\nP1 open\nP1 write B\nP1 close\nP3 open\nP3 read\nP3 close",
+  };
+  let res = null;
+  const aStep = OSTEP.stepper($("af-step"), { steps: () => (res && res.rows.length ? res.rows.length : 1), render: renderAf, autoplayMs: 1000 });
+  function afRun() {
+    res = afsRun($("af-ops").value, { mode: $("af-mode").value, T: Math.max(0, +$("af-T").value || 0), suspect: $("af-sus").checked, init: null });
+    $("af-err").textContent = res.errors.join("\n");
+    aStep.reset();
+  }
+  document.querySelectorAll("#sim-afs [data-af]").forEach((b) => b.addEventListener("click", () => { $("af-ops").value = PRE[b.dataset.af]; afRun(); }));
+  ["af-ops", "af-mode", "af-T", "af-sus"].forEach((id) => $(id).addEventListener("input", afRun));
+  function cellNode(cl, mode) {
+    const c = cacheCell(cl, mode);
+    const txt = c.text + (c.suspect ? "?" : "") + (cl.up ? "" : "（宕机）");
+    return c.struck ? h("s", { title: "回调已被打断，缓存失效" }, txt) : h("span", {}, txt);
+  }
+  function renderAf(i) {
+    const tb = $("af-table"), mode = $("af-mode").value;
+    const hasP4 = res.used.includes("P4");
+    const head = [h("th", {}, "t"), h("th", {}, "P1"), h("th", {}, "P2"), h("th", { class: "cache" }, "Client1 缓存"), h("th", {}, "P3")];
+    if (hasP4) head.push(h("th", {}, "P4"));
+    head.push(h("th", { class: "cache" }, "Client2 缓存"), h("th", { class: "cache" }, "服务器磁盘"), h("th", {}, "消息"), h("th", {}, "说明"));
+    tb.replaceChildren(h("tr", {}, head));
+    if (!res.rows.length) { $("af-panels").replaceChildren(); $("af-narr").textContent = "没有可执行的操作。"; $("af-stats").replaceChildren(); return; }
+    res.rows.slice(0, i + 1).forEach((r, k) => {
+      const opCell = (p) => h("td", { class: "op" }, r.who === p ? r.op + (r.result !== undefined ? " → " + r.result : "") : "");
+      const cells = [h("td", { class: "num" }, r.t), opCell("P1"), opCell("P2"), h("td", { class: "cache" }, cellNode(r.snap.C.C1, mode)), opCell("P3")];
+      if (hasP4) cells.push(opCell("P4"));
+      cells.push(h("td", { class: "cache" }, r.snap.srv.val == null ? "-" : r.snap.srv.val), h("td", { class: "msg" }, r.msgs.join(", ") || (r.who ? "—" : "")),
+        h("td", { class: "small", html: (r.who ? "" : `<b>${r.op}</b>：`) + r.notes.join("；") + (r.tag ? `；<span class="${r.cls === "bad" ? "tag-bad" : "tag-warn"}">${r.tag}</span>` : "") }));
+      tb.append(h("tr", { class: k === i ? "cur" : "" }, cells));
+    });
+    keepVisible(tb);
+    const r = res.rows[i], sn = r.snap;
+    const panel = (name, cl, procs) => h("div", { class: "panel" + (r.client === name ? " hot" : "") + (cl.up ? "" : " down") }, h("h5", {}, name.replace("C", "Client") + (cl.up ? "" : "（宕机）")),
+      h("div", { class: "kv" }, h("span", {}, "缓存"), h("span", { class: "mono" }, cellNode(cl, mode)),
+        h("span", {}, mode === "afs" ? "回调" : "属性缓存"), h("span", { class: "mono" }, mode === "afs" ? (cl.cache ? (cl.cache.valid ? (cl.cache.suspect ? "可疑，需 TestAuth" : "有效") : "已打断") : "—") : (cl.attr ? `取于 t=${cl.attr.at}` : "—")),
+        h("span", {}, "脏"), h("span", { class: "mono" }, cl.dirty ? "是（未关闭的修改）" : "否"), h("span", {}, "进程"), h("span", { class: "mono" }, procs)));
+    $("af-panels").replaceChildren(
+      panel("C1", sn.C.C1, "P1、P2"), panel("C2", sn.C.C2, "P3、P4"),
+      h("div", { class: "panel" }, h("h5", {}, "服务器"), h("div", { class: "kv" }, h("span", {}, "磁盘上的 F"), h("span", { class: "mono" }, sn.srv.val == null ? "-" : sn.srv.val),
+        h("span", {}, mode === "afs" ? "回调表" : "状态"), h("span", { class: "mono" }, mode === "afs" ? (sn.srv.cb.join("、") || "（空）") : "无状态"))));
+    $("af-narr").innerHTML = `<b>t=${r.t} · ${r.who ? r.who + "（" + r.client + "）" : ""} ${r.op}</b>` + (r.result !== undefined ? ` 读到 <b>${r.result}</b>` : "") + "：" + r.notes.join("；") + (r.tag ? `。<span class="${r.cls === "bad" ? "tag-bad" : "tag-warn"}">${r.tag}</span>` : "") + "。";
+    const st = sn.st;
+    const items = mode === "afs"
+      ? [stat(st.Fetch, "Fetch"), stat(st.Store, "Store"), stat(st.TestAuth, "TestAuth"), stat(st.Break, "回调中断"), stat(st.BreakLost, "丢失的回调中断", st.BreakLost ? "tag-bad" : "")]
+      : [stat(st.GETATTR, "GETATTR"), stat(st.READ, "READ"), stat(st.WRITE, "WRITE"), stat(st.CREATE, "CREATE")];
+    items.push(stat(st.stale, "陈旧读", st.stale ? "tag-bad" : ""));
+    $("af-stats").replaceChildren(...items);
+  }
+  $("af-ops").value = FIG;
+  afRun();
+
+  // ---------- 交错枚举 ----------
+  function ilRun() {
+    const w = +$("il-w").value, T = Math.max(0, +$("il-T").value || 0);
+    const all = interleavings(3, 3);
+    const tb = $("il-table");
+    tb.replaceChildren(h("tr", {}, h("th", {}, "#"), h("th", {}, "调度"), h("th", {}, "操作顺序"), h("th", {}, w === 1 ? "AFS：Client2 读到" : "AFS：最终内容"), h("th", {}, w === 1 ? `NFS（T=${T}）：读到` : `NFS（T=${T}）：最终内容`)));
+    const cntA = {}, cntN = {};
+    all.forEach((sch, k) => {
+      const a = runSchedule(sch, w, "afs", T), n = runSchedule(sch, w, "nfs", T);
+      cntA[a] = (cntA[a] || 0) + 1; cntN[n] = (cntN[n] || 0) + 1;
+      const tr = h("tr", { title: "点击载入时间线模拟器" }, h("td", { class: "num" }, k + 1), h("td", { class: "sched" }, sch),
+        h("td", { class: "small" }, scheduleText(sch, w).split("\n").map((x) => x.replace(/^(P\d) /, "$1:")).join(" → ")),
+        h("td", { class: "cache" }, a), h("td", { class: "cache" }, n));
+      tr.onclick = () => { $("af-ops").value = `# 调度 ${sch}\n` + scheduleText(sch, w); $("af-mode").value = "afs"; afRun(); $("sim-afs").scrollIntoView({ behavior: "smooth" }); };
+      tb.append(tr);
+    });
+    const fmt = (o) => Object.keys(o).sort().map((k) => `${k}：${o[k]} 种`).join("，");
+    $("il-stats").replaceChildren(stat(all.length, "交错总数"), stat(fmt(cntA), "AFS"), stat(fmt(cntN), `NFS（T=${T}）`));
+    $("il-narr").innerHTML = w === 1
+      ? "AFS 中 Client2 读到的是它 <b>open 时</b>拿到的版本，所以只有 Client1 的 close 早于 Client2 的 open 才读到 1；NFS 在 <b>read 时</b>从服务器取数据，close 早于 read 即可。（这个负载里 Client2 在 read 之前没有缓存数据，所以属性缓存超时 T 不影响结果。）"
+      : "两种语义下，最终内容都只取决于哪个客户端<b>最后 close</b>：调度以 0 结尾则 X 胜，以 1 结尾则 Y 胜（最后写者胜）。在真实的多块文件上，NFS 还可能出现块级混合，这里的单值模型体现不出来。";
+  }
+  ["il-w", "il-T"].forEach((id) => $(id).addEventListener("input", ilRun));
+  ilRun();
+
+  // ---------- 性能表 ----------
+  const DEF = { ns: 10, nm: 100, nl: 10000, lnet: 100, ldisk: 10, lmem: 0.1 };
+  const fmtN = (x) => (Number.isFinite(x) ? (Math.abs(x) >= 1e6 ? x.toExponential(2) : +x.toFixed(3) + "") : "—");
+  function perfRun() {
+    const p = { Ns: +$("pf-ns").value, Nm: +$("pf-nm").value, NL: +$("pf-nl").value, Lnet: +$("pf-lnet").value, Ldisk: +$("pf-ldisk").value, Lmem: +$("pf-lmem").value };
+    $("pf-warn").textContent = p.Lnet > p.Ldisk && p.Ldisk > p.Lmem ? "" : "注意：原书假设 Lnet > Ldisk > Lmem，当前参数不满足这一假设。";
+    const tb = $("pf-table");
+    tb.replaceChildren(h("tr", {}, h("th", {}, "工作负载"), h("th", {}, "NFS（公式）"), h("th", {}, "AFS（公式）"), h("th", {}, "AFS/NFS（公式）"), h("th", { class: "num" }, "NFS 数值"), h("th", { class: "num" }, "AFS 数值"), h("th", { class: "num" }, "AFS/NFS")));
+    perfRows(p).forEach((r) => {
+      const cls = r.ratio < 0.999 ? "better" : r.ratio > 1.001 ? "worse" : "";
+      tb.append(h("tr", {}, h("td", {}, r.w), h("td", { class: "mono small" }, r.fn), h("td", { class: "mono small" }, r.fa), h("td", { class: "mono small" }, r.fr),
+        h("td", { class: "num" }, fmtN(r.nfs)), h("td", { class: "num" }, fmtN(r.afs)), h("td", { class: "num " + cls }, fmtN(r.ratio))));
+    });
+  }
+  ["pf-ns", "pf-nm", "pf-nl", "pf-lnet", "pf-ldisk", "pf-lmem"].forEach((id) => $(id).addEventListener("input", perfRun));
+  $("pf-reset").onclick = () => { for (const k in DEF) $("pf-" + k).value = DEF[k]; perfRun(); };
+  perfRun();
+})();
+</script>
+</body></html>

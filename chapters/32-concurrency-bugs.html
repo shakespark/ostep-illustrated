@@ -1,0 +1,1180 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 32 章 · 常见并发问题</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+.dl-wrap { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
+.dl-threads { flex: 1 1 250px; display: grid; gap: 8px; min-width: 0; }
+.dl-graph { flex: 1 1 320px; min-width: 0; }
+.dl-graph svg { display: block; width: 100%; max-width: 480px; height: auto; margin: 0 auto; }
+.dl-t { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); padding: 6px 10px; font-size: 13px; }
+.dl-t .hd { display: flex; gap: 8px; align-items: center; font-weight: 600; flex-wrap: wrap; }
+.dl-t .sw { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+.dl-t ol { margin: 4px 0 0; padding-left: 2em; font: 12.5px/1.65 var(--mono); }
+.dl-t li { margin: 0; padding: 0 4px; border-radius: 3px; }
+.dl-t li.cur { background: color-mix(in srgb, var(--warn) 24%, transparent); }
+.dl-t.dead { border-color: var(--bad); background: var(--bad-soft); }
+.pill.ready { border-color: var(--accent); color: var(--accent); }
+.pill.blocked { border-color: var(--bad); color: var(--bad); background: var(--bad-soft); }
+.pill.done { border-color: var(--ok); color: var(--ok); background: var(--ok-soft); }
+.pill.backoff { border-color: var(--warn); color: var(--warn); background: var(--warn-soft); }
+.pill.sleep { border-color: var(--warn); color: var(--warn); background: var(--warn-soft); }
+.pill.unborn { color: var(--muted); }
+.dl-log { max-height: 180px; overflow-y: auto; }
+.bad-text { color: var(--bad); font-weight: 650; }
+.ok-text { color: var(--ok); font-weight: 650; }
+.iv-cols { display: flex; flex-wrap: wrap; gap: 12px; }
+.iv-cols > div { flex: 1 1 240px; min-width: 0; }
+.iv-vars { font: 13px var(--mono); margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+.cond-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin: 16px 0; }
+.cond { background: var(--surface); border: 1px solid var(--border); border-top: 4px solid var(--c2); border-radius: var(--radius); padding: 12px 14px; font-size: 14.5px; }
+.cond h4 { margin: 0 0 4px; font-size: 15.5px; }
+.cond .fix { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); color: var(--muted); }
+.cond .fix b { color: var(--ok); }
+.sch-lane { display: flex; gap: 8px; align-items: center; }
+</style>
+</head>
+<body data-chapter="32">
+<main>
+
+<h2 id="intro">关键问题与本章位置</h2>
+<div class="crux">
+<p><strong>如何处理常见的并发缺陷？</strong>并发缺陷往往呈现为几种常见的模式。知道该提防哪些模式，是写出更健壮、更正确的并发代码的第一步。</p>
+<p class="small muted">CRUX: How to handle common concurrency bugs — Concurrency bugs tend to come in a variety of common patterns. Knowing which ones to look out for is the first step to writing more robust, correct concurrent code.</p>
+</div>
+<p>前几章我们一直在"造工具"：锁（lock）、条件变量（condition variable）、信号量（semaphore）。这一章换个角度——<strong>真实世界里的程序员拿这些工具写代码时，到底犯了哪些错？</strong></p>
+<p>原书借助 Lu 等人对 MySQL、Apache、Mozilla、OpenOffice 四个成熟开源项目的研究，把并发缺陷分成两大类：<strong>非死锁缺陷（non-deadlock bug）</strong>，其中绝大多数是"原子性违反"和"顺序违反"；以及经典的<strong>死锁（deadlock）</strong>。对死锁，本章系统地讲四个必要条件，以及预防（prevention）、避免（avoidance）、检测与恢复（detect and recover）三类对策。下一章（基于事件的并发）则干脆换一种不靠多线程的并发方式，从根上绕开其中一部分问题。</p>
+
+<h2 id="cards">核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>原子性违反（atomicity violation）</h4><p>一段本应"一口气"执行完的代码（如先检查再使用），执行时却被别的线程插了队。</p></div>
+  <div class="card"><h4>顺序违反（order violation）</h4><p>A 本该总在 B 之前发生，但程序没有强制这个顺序，偶尔 B 先跑了。</p></div>
+  <div class="card"><h4>死锁（deadlock）</h4><p>一组线程互相等待对方手里的资源，谁也无法前进，永远卡住。</p></div>
+  <div class="card"><h4>四个必要条件</h4><p>互斥、持有并等待、非抢占、循环等待——四者同时成立才会死锁，破坏任意一个即可预防。</p></div>
+  <div class="card"><h4>锁顺序（lock ordering）</h4><p>所有线程按同一个全序（或偏序）获取锁，就不可能形成等待环。实践中最常用。</p></div>
+  <div class="card"><h4>活锁（livelock）</h4><p>线程都在运行、都在不停重试，却谁也没有进展。trylock 回退方案可能出现。</p></div>
+  <div class="card"><h4>通过调度避免（avoidance）</h4><p>事先知道每个线程要拿哪些锁，调度时不让"危险组合"同时运行。需要全局知识。</p></div>
+  <div class="card"><h4>检测与恢复（detect &amp; recover）</h4><p>允许偶尔死锁，定期在资源图里找环，找到就重启或人工修复。数据库常用。</p></div>
+</div>
+
+<h2 id="study">真实世界里有哪些并发缺陷？</h2>
+<p>Lu 等人（ASPLOS '08）逐个分析了四个著名开源项目中<strong>已经被发现并修复</strong>的并发缺陷，把开发者的修复记录变成了定量统计。原书 Figure 32.1 的数据如下：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>应用</th><th>是什么</th><th class="num">非死锁</th><th class="num">死锁</th><th class="num">合计</th></tr></thead>
+<tbody>
+<tr><td>MySQL</td><td>数据库服务器</td><td class="num">14</td><td class="num">9</td><td class="num">23</td></tr>
+<tr><td>Apache</td><td>Web 服务器</td><td class="num">13</td><td class="num">4</td><td class="num">17</td></tr>
+<tr><td>Mozilla</td><td>Web 浏览器</td><td class="num">41</td><td class="num">16</td><td class="num">57</td></tr>
+<tr><td>OpenOffice</td><td>办公套件</td><td class="num">6</td><td class="num">2</td><td class="num">8</td></tr>
+<tr><th>合计</th><th></th><th class="num">74</th><th class="num">31</th><th class="num">105</th></tr>
+</tbody></table></div>
+<figure class="fig">
+<svg viewBox="0 0 640 262" width="640" role="img" aria-label="各应用并发缺陷数量条形图">
+  <rect x="110" y="8" width="14" height="14" rx="2" style="fill:var(--c1)"/><text x="130" y="20" font-size="13">非死锁缺陷</text>
+  <rect x="230" y="8" width="14" height="14" rx="2" style="fill:var(--c2)"/><text x="250" y="20" font-size="13">死锁缺陷</text>
+  <text x="100" y="56" font-size="13" text-anchor="end">MySQL</text>
+  <rect x="110" y="38" width="98" height="26" rx="3" style="fill:var(--c1)"/><text x="159" y="56" font-size="12" text-anchor="middle" style="fill:#fff;font-weight:600">14</text>
+  <rect x="208" y="38" width="63" height="26" rx="3" style="fill:var(--c2)"/><text x="239" y="56" font-size="12" text-anchor="middle" style="fill:#fff;font-weight:600">9</text>
+  <text x="100" y="98" font-size="13" text-anchor="end">Apache</text>
+  <rect x="110" y="80" width="91" height="26" rx="3" style="fill:var(--c1)"/><text x="155" y="98" font-size="12" text-anchor="middle" style="fill:#fff;font-weight:600">13</text>
+  <rect x="201" y="80" width="28" height="26" rx="3" style="fill:var(--c2)"/><text x="215" y="98" font-size="12" text-anchor="middle" style="fill:#fff;font-weight:600">4</text>
+  <text x="100" y="140" font-size="13" text-anchor="end">Mozilla</text>
+  <rect x="110" y="122" width="287" height="26" rx="3" style="fill:var(--c1)"/><text x="253" y="140" font-size="12" text-anchor="middle" style="fill:#fff;font-weight:600">41</text>
+  <rect x="397" y="122" width="112" height="26" rx="3" style="fill:var(--c2)"/><text x="453" y="140" font-size="12" text-anchor="middle" style="fill:#fff;font-weight:600">16</text>
+  <text x="100" y="182" font-size="13" text-anchor="end">OpenOffice</text>
+  <rect x="110" y="164" width="42" height="26" rx="3" style="fill:var(--c1)"/><text x="131" y="182" font-size="12" text-anchor="middle" style="fill:#fff;font-weight:600">6</text>
+  <rect x="152" y="164" width="14" height="26" rx="3" style="fill:var(--c2)"/><text x="174" y="182" font-size="12" class="t-muted">2</text>
+  <line x1="110" y1="204" x2="630" y2="204" class="stroke" stroke-width="0.6"/>
+  <text x="100" y="236" font-size="13" text-anchor="end">合计 105</text>
+  <rect x="110" y="218" width="364" height="28" rx="3" style="fill:var(--c1)"/><text x="292" y="237" font-size="12.5" text-anchor="middle" style="fill:#fff;font-weight:600">非死锁 74（≈70%）</text>
+  <rect x="474" y="218" width="153" height="28" rx="3" style="fill:var(--c2)"/><text x="550" y="237" font-size="12.5" text-anchor="middle" style="fill:#fff;font-weight:600">死锁 31（≈30%）</text>
+</svg>
+<figcaption>Figure 32.1 的数据：上面四行每格 = 1 个缺陷 × 7px；最后一行按比例画出 105 个缺陷里两类的占比。非死锁缺陷才是多数。</figcaption>
+</figure>
+<p>两个结论值得记住：第一，<strong>大多数（74/105）并发缺陷不是死锁</strong>，所以只盯着死锁是不够的；第二，缺陷数与代码规模、并发复杂度相关——OpenOffice 只有 8 个，Mozilla 将近 60 个。</p>
+
+<h2 id="nondeadlock">非死锁缺陷：原子性违反与顺序违反</h2>
+<h3>原子性违反（Atomicity Violation）——MySQL 的例子</h3>
+<p>先别看解释，自己找找下面这段 MySQL 代码（原书 Figure 32.2）的问题：</p>
+<pre><code>Thread 1::
+if (thd-&gt;proc_info) {            // ① 检查：非 NULL 吗？
+    fputs(thd-&gt;proc_info, ...);  // ② 使用：打印它
+}
+
+Thread 2::
+thd-&gt;proc_info = NULL;           // ③ 置空</code></pre>
+<p>线程 1 先检查 <code>proc_info</code> 非 NULL，再去用它。如果恰好在 ① 和 ② 之间发生中断、线程 2 执行了 ③，线程 1 恢复后就会把 NULL 交给 <code>fputs</code>，程序崩溃。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 196" width="640" role="img" aria-label="原子性违反的交错时间线">
+  <defs><marker id="m-av" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="8" y="58" font-size="13" font-weight="600">线程 1</text>
+  <text x="8" y="128" font-size="13" font-weight="600">线程 2</text>
+  <line x1="70" y1="52" x2="632" y2="52" class="stroke" stroke-dasharray="2 4" stroke-width="0.8"/>
+  <line x1="70" y1="122" x2="632" y2="122" class="stroke" stroke-dasharray="2 4" stroke-width="0.8"/>
+  <rect x="76" y="30" width="170" height="44" rx="5" style="fill:var(--c1)"/>
+  <text x="161" y="48" font-size="12" text-anchor="middle" class="mono" style="fill:#fff">① if (thd-&gt;proc_info)</text>
+  <text x="161" y="65" font-size="12" text-anchor="middle" style="fill:#fff">非 NULL，检查通过</text>
+  <path d="M246,74 C262,92 262,100 270,104" class="arrow" marker-end="url(#m-av)"/>
+  <text x="255" y="94" font-size="11" class="t-muted" text-anchor="end">中断</text>
+  <rect x="272" y="100" width="170" height="44" rx="5" style="fill:var(--c2)"/>
+  <text x="357" y="118" font-size="12" text-anchor="middle" class="mono" style="fill:#fff">③ proc_info = NULL</text>
+  <text x="357" y="135" font-size="12" text-anchor="middle" style="fill:#fff">线程 2 插队</text>
+  <path d="M442,100 C454,84 456,78 464,74" class="arrow" marker-end="url(#m-av)"/>
+  <rect x="466" y="30" width="166" height="44" rx="5" class="bad-soft" stroke-width="1.5"/>
+  <text x="549" y="48" font-size="12" text-anchor="middle" class="mono">② fputs(proc_info)</text>
+  <text x="549" y="65" font-size="12" text-anchor="middle" style="fill:var(--bad);font-weight:600">传入 NULL → 崩溃</text>
+  <line x1="76" y1="172" x2="626" y2="172" class="arrow" marker-end="url(#m-av)"/>
+  <text x="600" y="190" font-size="11" class="t-muted">时间</text>
+  <text x="161" y="94" font-size="11" class="t-muted" text-anchor="middle">检查……</text>
+  <text x="549" y="94" font-size="11" class="t-muted" text-anchor="middle">……使用：此时前提已失效</text>
+</svg>
+<figcaption>原子性违反：线程 1 默认"检查"和"使用"之间不会有人改 <code>proc_info</code>，但这个假设没有任何机制保证。</figcaption>
+</figure>
+<p>Lu 等人的正式定义是：<em>"多次内存访问之间所期望的可串行性被违反了（即一段代码本意是原子的，但执行时原子性没有被强制保证）。"</em>这里的"原子性假设"就是：对 <code>proc_info</code> 的非 NULL 检查与 <code>fputs()</code> 中对它的使用是一个整体。</p>
+<p>修复通常很直接：给共享变量的访问加锁（原书 Figure 32.3）。注意<strong>所有</strong>访问这个结构的代码都要拿同一把锁，只给线程 1 加锁是没用的：</p>
+<pre><code>pthread_mutex_t proc_info_lock = PTHREAD_MUTEX_INITIALIZER;
+
+Thread 1::
+pthread_mutex_lock(&amp;proc_info_lock);
+if (thd-&gt;proc_info) {
+    fputs(thd-&gt;proc_info, ...);
+}
+pthread_mutex_unlock(&amp;proc_info_lock);
+
+Thread 2::
+pthread_mutex_lock(&amp;proc_info_lock);
+thd-&gt;proc_info = NULL;
+pthread_mutex_unlock(&amp;proc_info_lock);</code></pre>
+
+<h3>顺序违反（Order Violation）——Mozilla 的例子</h3>
+<p>再看原书 Figure 32.4：</p>
+<pre><code>Thread 1::
+void init() {
+    mThread = PR_CreateThread(mMain, ...);   // 创建线程 2，返回后才赋值给 mThread
+}
+
+Thread 2::
+void mMain(...) {
+    mState = mThread-&gt;State;                 // 假设 mThread 已经被赋值
+}</code></pre>
+<p>线程 2 的代码默认 <code>mThread</code> 已经初始化好了。但新线程一被创建就可能立即运行——那时 <code>PR_CreateThread</code> 还没返回，<code>mThread</code> 仍是 NULL，线程 2 解引用 NULL 就崩溃（如果初值不是 NULL，更糟：会访问任意内存）。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 176" width="640" role="img" aria-label="顺序违反的交错时间线">
+  <defs><marker id="m-ov" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="8" y="50" font-size="13" font-weight="600">线程 1</text>
+  <text x="8" y="120" font-size="13" font-weight="600">线程 2</text>
+  <rect x="76" y="24" width="180" height="44" rx="5" style="fill:var(--c1)"/>
+  <text x="166" y="42" font-size="12" text-anchor="middle" class="mono" style="fill:#fff">PR_CreateThread(mMain)</text>
+  <text x="166" y="59" font-size="12" text-anchor="middle" style="fill:#fff">线程 2 诞生，尚未返回</text>
+  <path d="M256,62 C266,80 268,88 276,94" class="arrow" marker-end="url(#m-ov)"/>
+  <rect x="278" y="94" width="180" height="44" rx="5" class="bad-soft" stroke-width="1.5"/>
+  <text x="368" y="112" font-size="12" text-anchor="middle" class="mono">mState = mThread-&gt;State</text>
+  <text x="368" y="129" font-size="12" text-anchor="middle" style="fill:var(--bad);font-weight:600">mThread 仍是 NULL → 崩溃</text>
+  <rect x="470" y="24" width="160" height="44" rx="5" class="box" stroke-dasharray="4 3"/>
+  <text x="550" y="42" font-size="12" text-anchor="middle" class="mono">mThread = 返回值</text>
+  <text x="550" y="59" font-size="12" text-anchor="middle" class="t-muted">本该在前，却来晚了</text>
+  <line x1="76" y1="158" x2="626" y2="158" class="arrow" marker-end="url(#m-ov)"/>
+  <text x="600" y="174" font-size="11" class="t-muted">时间</text>
+</svg>
+<figcaption>顺序违反："赋值 mThread"应该总在"读取 mThread"之前，但程序没有强制这个先后关系。</figcaption>
+</figure>
+<p>正式定义：<em>"两组内存访问之间所期望的顺序被颠倒了（即 A 应该总在 B 之前执行，但执行时这个顺序没有被强制保证）。"</em>修复方法就是<strong>强制顺序</strong>——条件变量正是为此而生（原书 Figure 32.5）：</p>
+<pre><code>pthread_mutex_t mtLock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  mtCond = PTHREAD_COND_INITIALIZER;
+int mtInit = 0;                          // 状态变量：线程是否已初始化
+
+Thread 1::
+void init() {
+    mThread = PR_CreateThread(mMain, ...);
+    pthread_mutex_lock(&amp;mtLock);         // 通知：线程已创建好
+    mtInit = 1;
+    pthread_cond_signal(&amp;mtCond);
+    pthread_mutex_unlock(&amp;mtLock);
+}
+
+Thread 2::
+void mMain(...) {
+    pthread_mutex_lock(&amp;mtLock);         // 等待初始化完成
+    while (mtInit == 0)
+        pthread_cond_wait(&amp;mtCond, &amp;mtLock);
+    pthread_mutex_unlock(&amp;mtLock);
+    mState = mThread-&gt;State;             // 现在一定安全
+}</code></pre>
+<p>如果线程 2 先跑，它会在 <code>wait</code> 上睡着，等线程 1 设置 <code>mtInit=1</code> 并发信号；如果线程 2 后跑，它看到 <code>mtInit</code> 已是 1，直接继续。两种顺序都正确。（原书提到也可以直接用 <code>mThread</code> 本身当状态变量，这里为了清晰单独用了 <code>mtInit</code>。）</p>
+<div class="key"><p><strong>小结：</strong>Lu 等人研究的非死锁缺陷中，<strong>97%</strong> 要么是原子性违反，要么是顺序违反。所以写并发代码时重点审视两件事："这段代码是否默认自己不会被打断？"以及"这段代码是否默认别人已经做完了某事？"自动化检查工具也应该重点针对这两类。不过也不是所有缺陷都这么好修，有的需要深入理解程序、大幅重组代码或数据结构。</p></div>
+
+<section class="sim" id="sim-iv">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>交错选择器：让缺陷现形，再用修复版本对照</h3>
+    <div class="desc">选择缺陷类型和"线程 2 在什么时候插进来"，逐步执行，观察共享变量如何变化；勾选"修复版本"后，同样的插队时机会发生什么？</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>缺陷 <select id="iv-bug"><option value="atom">原子性违反（MySQL proc_info）</option><option value="order">顺序违反（Mozilla mThread）</option></select></label>
+      <label>线程 2 何时运行 <select id="iv-pos"></select></label>
+      <label><input type="checkbox" id="iv-fix"> 修复版本（加锁 / 条件变量）</label>
+    </div>
+    <div id="iv-step"></div>
+    <div class="stage"><div class="iv-cols" id="iv-cols"></div><div class="iv-vars" id="iv-vars"></div></div>
+    <div class="narrate" id="iv-narr"></div>
+    <div class="readout dl-log" id="iv-log"></div>
+  </div>
+</section>
+
+<h2 id="deadlock">死锁：为什么会发生</h2>
+<p>除了上面两类，另一类经典问题出现在锁协议复杂的系统里：<strong>死锁</strong>。比如线程 1 持有锁 L1、正在等 L2，而持有 L2 的线程 2 正在等 L1 被释放。下面这段代码（原书 Figure 32.6）就<strong>可能</strong>死锁：</p>
+<pre><code>Thread 1:                    Thread 2:
+pthread_mutex_lock(L1);      pthread_mutex_lock(L2);
+pthread_mutex_lock(L2);      pthread_mutex_lock(L1);</code></pre>
+<p>注意是"可能"：如果线程 1 一口气拿到 L1 和 L2，就不会出事。只有当线程 1 拿到 L1 后发生上下文切换、线程 2 又拿到了 L2，二者才会各自握着一把锁去等另一把——然后永远等下去。依赖图里出现了<strong>环</strong>，就是死锁的标志：</p>
+<figure class="fig">
+<svg viewBox="-70 0 700 260" width="700" role="img" aria-label="死锁依赖图">
+  <defs><marker id="m-dg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--bad)"/></marker></defs>
+  <circle cx="120" cy="64" r="34" style="fill:var(--c1)"/><text x="120" y="69" font-size="14" text-anchor="middle" style="fill:#fff;font-weight:600">Thread 1</text>
+  <circle cx="440" cy="196" r="34" style="fill:var(--c2)"/><text x="440" y="201" font-size="14" text-anchor="middle" style="fill:#fff;font-weight:600">Thread 2</text>
+  <rect x="396" y="46" width="88" height="36" rx="6" class="box-strong"/><text x="440" y="69" font-size="14" text-anchor="middle">Lock L2</text>
+  <rect x="76" y="178" width="88" height="36" rx="6" class="box-strong"/><text x="120" y="201" font-size="14" text-anchor="middle">Lock L1</text>
+  <line x1="156" y1="64" x2="392" y2="64" style="stroke:var(--bad)" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#m-dg)"/>
+  <text x="274" y="54" font-size="13" text-anchor="middle">Thread 1 想要 L2（Wanted by）</text>
+  <line x1="440" y1="84" x2="440" y2="158" style="stroke:var(--bad)" stroke-width="2" marker-end="url(#m-dg)"/>
+  <text x="452" y="126" font-size="13">L2 被 Thread 2 持有（Holds）</text>
+  <line x1="404" y1="196" x2="168" y2="196" style="stroke:var(--bad)" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#m-dg)"/>
+  <text x="286" y="226" font-size="13" text-anchor="middle">Thread 2 想要 L1（Wanted by）</text>
+  <line x1="120" y1="176" x2="120" y2="102" style="stroke:var(--bad)" stroke-width="2" marker-end="url(#m-dg)"/>
+  <text x="108" y="144" font-size="13" text-anchor="end">L1 被 Thread 1 持有</text>
+  <text x="280" y="134" font-size="15" text-anchor="middle" style="fill:var(--bad);font-weight:700">环 = 死锁</text>
+</svg>
+<figcaption>原书 Figure 32.7 的依赖图：实线"锁 → 线程"表示持有，虚线"线程 → 锁"表示等待。沿箭头走一圈回到起点。</figcaption>
+</figure>
+<div class="crux">
+<p><strong>如何应对死锁？</strong>应该如何构建系统，才能预防、避免死锁，或者至少能检测到死锁并从中恢复？这在今天的系统里真的是个问题吗？</p>
+<p class="small muted">CRUX: How to deal with deadlock — How should we build systems to prevent, avoid, or at least detect and recover from deadlock? Is this a real problem in systems today?</p>
+</div>
+<h3>既然这么明显，为什么还会发生？</h3>
+<p>上面的例子只要两个线程按相同顺序拿锁就能避免。可死锁在真实系统里仍然屡见不鲜，原书给了两个原因：</p>
+<p><strong>① 大型代码库中组件之间有复杂的依赖。</strong>以操作系统为例：虚拟内存系统换入页面时要访问文件系统读磁盘块；文件系统读块时又需要一页内存来存放数据，于是回头找虚拟内存系统。两个子系统各自持有自己的锁再调用对方，就天然存在循环依赖，锁策略必须精心设计。</p>
+<figure class="fig">
+<svg viewBox="0 0 600 178" width="600" role="img" aria-label="虚拟内存与文件系统的循环依赖">
+  <defs><marker id="m-vf" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <rect x="20" y="55" width="190" height="60" rx="8" class="accent-soft"/>
+  <text x="115" y="81" font-size="14" text-anchor="middle" font-weight="600">虚拟内存子系统</text>
+  <text x="115" y="101" font-size="12" text-anchor="middle" class="t-muted">持有 VM 的锁</text>
+  <rect x="390" y="55" width="190" height="60" rx="8" class="warn-soft"/>
+  <text x="485" y="81" font-size="14" text-anchor="middle" font-weight="600">文件系统</text>
+  <text x="485" y="101" font-size="12" text-anchor="middle" class="t-muted">持有 FS 的锁</text>
+  <path d="M210,70 C280,30 320,30 388,70" class="arrow" marker-end="url(#m-vf)"/>
+  <text x="300" y="22" font-size="12" text-anchor="middle">缺页：要从磁盘读一个块</text>
+  <path d="M390,100 C320,140 280,140 212,100" class="arrow" marker-end="url(#m-vf)"/>
+  <text x="300" y="168" font-size="12" text-anchor="middle">读块：需要一页内存来装数据</text>
+</svg>
+<figcaption>子系统之间的自然循环依赖：各自持锁再调用对方，就可能形成等待环。</figcaption>
+</figure>
+<p><strong>② 封装（encapsulation）与锁不太合拍。</strong>我们被教导要隐藏实现细节，可有些看似无害的接口简直是在"邀请"你死锁。比如 Java 的 <code>Vector.AddAll()</code>：</p>
+<pre><code>Vector v1, v2;
+v1.AddAll(v2);    // 内部：先锁 v1，再锁 v2</code></pre>
+<p>为了线程安全，这个方法内部要同时锁住 <code>v1</code> 和参数 <code>v2</code>，以某种固定顺序（比如先 v1 后 v2）。如果另一个线程几乎同时调用 <code>v2.AddAll(v1)</code>，它就会先锁 v2 再锁 v1——和 Figure 32.6 一模一样的死锁，而调用者完全看不出来。（下面的模拟器里有这个预设。）</p>
+
+<h2 id="conditions">死锁的四个必要条件</h2>
+<p>Coffman 等人（1971）指出，死锁发生需要<strong>同时</strong>满足四个条件。<strong>只要有任何一个不成立，死锁就不可能发生。</strong>因此每一种"预防"技术，都是想办法让其中一个条件不成立：</p>
+<div class="cond-grid">
+  <div class="cond"><h4>① 互斥（Mutual exclusion）</h4><p>线程对所需资源独占控制（例如线程抓住一把锁）。</p><div class="fix"><b>打破：</b>不用锁——借助 CompareAndSwap 等硬件指令写无锁（lock-free）/ 无等待（wait-free）数据结构。</div></div>
+  <div class="cond"><h4>② 持有并等待（Hold-and-wait）</h4><p>线程持有已分配给它的资源（如已拿到的锁），同时等待更多资源。</p><div class="fix"><b>打破：</b>一次性、原子地拿到所有锁：先抢一把全局的 <code>prevention</code> 锁。</div></div>
+  <div class="cond"><h4>③ 非抢占（No preemption）</h4><p>资源（如锁）不能被强行从持有它的线程手中夺走。</p><div class="fix"><b>打破（近似）：</b><code>trylock</code> 拿不到就主动放掉已持有的锁、从头再来。</div></div>
+  <div class="cond"><h4>④ 循环等待（Circular wait）</h4><p>存在一个线程环，每个线程都持有下一个线程正在请求的资源。</p><div class="fix"><b>打破：</b>规定锁的全序 / 偏序，所有人都按顺序拿锁。最实用。</div></div>
+</div>
+
+<h2 id="prevention">预防（Prevention）：逐个打破四个条件</h2>
+<h3>循环等待：给锁定一个顺序</h3>
+<p>最实用、也最常用的预防技术：写加锁代码时保证<strong>永远不会产生循环等待</strong>。最直接的办法是给锁的获取规定一个<strong>全序（total ordering）</strong>：系统里只有 L1、L2 两把锁时，规定总是先拿 L1 再拿 L2，就不会形成环。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 214" width="640" role="img" aria-label="加锁顺序如何消除环">
+  <defs>
+    <marker id="m-or1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--bad)"/></marker>
+    <marker id="m-or2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker>
+  </defs>
+  <text x="155" y="18" font-size="13" text-anchor="middle" font-weight="600">T1: L1→L2　T2: L2→L1（无顺序）</text>
+  <circle cx="60" cy="70" r="22" style="fill:var(--c1)"/><text x="60" y="75" font-size="13" text-anchor="middle" style="fill:#fff;font-weight:600">T1</text>
+  <circle cx="250" cy="70" r="22" style="fill:var(--c2)"/><text x="250" y="75" font-size="13" text-anchor="middle" style="fill:#fff;font-weight:600">T2</text>
+  <rect x="30" y="150" width="60" height="28" rx="5" class="box-strong"/><text x="60" y="169" font-size="13" text-anchor="middle">L1</text>
+  <rect x="220" y="150" width="60" height="28" rx="5" class="box-strong"/><text x="250" y="169" font-size="13" text-anchor="middle">L2</text>
+  <line x1="60" y1="148" x2="60" y2="94" style="stroke:var(--bad)" stroke-width="2" marker-end="url(#m-or1)"/>
+  <line x1="250" y1="148" x2="250" y2="94" style="stroke:var(--bad)" stroke-width="2" marker-end="url(#m-or1)"/>
+  <line x1="78" y1="84" x2="222" y2="152" style="stroke:var(--bad)" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#m-or1)"/>
+  <line x1="232" y1="84" x2="88" y2="152" style="stroke:var(--bad)" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#m-or1)"/>
+  <text x="155" y="205" font-size="13" text-anchor="middle" style="fill:var(--bad);font-weight:600">两人各握一把、互等对方：有环</text>
+  <line x1="320" y1="10" x2="320" y2="206" class="stroke" stroke-width="0.6" stroke-dasharray="3 4"/>
+  <text x="485" y="18" font-size="13" text-anchor="middle" font-weight="600">T1、T2 都是 L1→L2（全局顺序）</text>
+  <circle cx="390" cy="70" r="22" style="fill:var(--c1)"/><text x="390" y="75" font-size="13" text-anchor="middle" style="fill:#fff;font-weight:600">T1</text>
+  <circle cx="580" cy="70" r="22" style="fill:var(--c2)"/><text x="580" y="75" font-size="13" text-anchor="middle" style="fill:#fff;font-weight:600">T2</text>
+  <rect x="360" y="150" width="60" height="28" rx="5" class="box-strong"/><text x="390" y="169" font-size="13" text-anchor="middle">L1</text>
+  <rect x="550" y="150" width="60" height="28" rx="5" class="box"/><text x="580" y="169" font-size="13" text-anchor="middle">L2 空闲</text>
+  <line x1="390" y1="148" x2="390" y2="94" style="stroke:var(--fg)" stroke-width="2" marker-end="url(#m-or2)"/>
+  <line x1="562" y1="86" x2="422" y2="154" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#m-or2)"/>
+  <text x="485" y="205" font-size="13" text-anchor="middle" style="fill:var(--ok);font-weight:600">T2 在 L1 处排队、手里空空：无环</text>
+</svg>
+<figcaption>有了顺序，后来者在"第一把锁"处就被挡住，它不持有任何东西，自然不会成为环的一部分；持有 L1 的 T1 总能拿到 L2 并最终释放。</figcaption>
+</figure>
+<p>更复杂的系统里锁很多，全序难以做到（也未必需要），<strong>偏序（partial ordering）</strong>就是一种有用的折中。原书举了 Linux 内存映射代码（<code>mm/filemap.c</code>）的真实例子：文件开头的注释列出了十组加锁顺序，简单的如"<code>i_mutex</code> 在 <code>i_mmap_rwsem</code> 之前"，复杂的如"<code>i_mmap_rwsem</code> 在 <code>private_lock</code> 之前，在 <code>swap_lock</code> 之前，在 <code>i_pages lock</code> 之前"。</p>
+<p>当然，全序和偏序都需要精心设计，而且<strong>顺序只是约定</strong>：一个粗心的程序员无视它，就可能导致死锁。它还要求对代码库、各函数如何被调用有深入理解，一个失误就会招来那个"D"开头的词。</p>
+<div class="tip"><p><strong>按锁的地址强制加锁顺序。</strong>如果一个函数要拿两把作为参数传进来的锁，如 <code>do_something(mutex_t *m1, mutex_t *m2)</code>，总是先拿 m1 就会出问题：一个线程调 <code>do_something(L1, L2)</code>，另一个调 <code>do_something(L2, L1)</code>。聪明的做法是按锁的<strong>地址</strong>排序，无论参数顺序如何，加锁顺序都一样：</p>
+<pre><code>if (m1 &gt; m2) {   // 按地址从高到低加锁
+    pthread_mutex_lock(m1);
+    pthread_mutex_lock(m2);
+} else {
+    pthread_mutex_lock(m2);
+    pthread_mutex_lock(m1);
+}
+// 假设 m1 != m2（不是同一把锁）</code></pre>
+<p>下方实验里的 <code>ordered</code> 模式就是这段代码。</p></div>
+
+<h3>持有并等待：一次性拿齐所有锁</h3>
+<p>让线程<strong>原子地</strong>一次拿到所有需要的锁，就不存在"拿着一些等另一些"的情况：</p>
+<pre><code>pthread_mutex_lock(prevention);   // 开始获取
+pthread_mutex_lock(L1);
+pthread_mutex_lock(L2);
+...
+pthread_mutex_unlock(prevention); // 结束</code></pre>
+<p>先抢到全局的 <code>prevention</code> 锁，就保证了获取锁的过程中不会有"不合时宜"的线程切换插进来。另一个线程即使以不同顺序拿 L1、L2 也没关系，因为它也得先持有 prevention。前提是：<strong>任何</strong>线程拿任何锁之前都要先拿 prevention。</p>
+<p>缺点很明显：封装又一次和我们作对——调用一个函数前必须准确知道它要拿哪些锁并提前拿好；而且所有锁都得提前一起拿，而不是真正需要时再拿，<strong>并发度会下降</strong>。</p>
+
+<h3>非抢占：trylock，拿不到就退回去</h3>
+<p>锁一般要等到 unlock 才释放，这正是"拿着一个、等着另一个"的根源。很多线程库提供 <code>pthread_mutex_trylock()</code>：锁空闲就拿到并返回成功，否则立即返回错误码，而不是睡眠等待。用它可以构造一个不怕加锁顺序、不会死锁的协议：</p>
+<pre><code>top:
+    pthread_mutex_lock(L1);
+    if (pthread_mutex_trylock(L2) != 0) {  // L2 拿不到？
+        pthread_mutex_unlock(L1);          // 那就把 L1 也放掉
+        goto top;                          // 从头再来
+    }</code></pre>
+<p>另一个线程按 L2、L1 的顺序走同样的协议，程序依然不会死锁。但出现了新问题——<strong>活锁（livelock）</strong>：两个线程可能一直重复这个序列、一直失败，都在运行（所以不是死锁），却都没有进展。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 150" width="640" role="img" aria-label="活锁时间线">
+  <text x="8" y="44" font-size="13" font-weight="600">CPU1 · T1</text>
+  <text x="8" y="104" font-size="13" font-weight="600">CPU2 · T2</text>
+  <g font-size="11.5" text-anchor="middle">
+    <rect x="80" y="24" width="84" height="30" rx="4" style="fill:var(--c1)"/><text x="122" y="43" style="fill:#fff">lock(L1)</text>
+    <rect x="80" y="84" width="84" height="30" rx="4" style="fill:var(--c2)"/><text x="122" y="103" style="fill:#fff">lock(L2)</text>
+    <rect x="168" y="24" width="96" height="30" rx="4" class="bad-soft"/><text x="216" y="43">trylock(L2) ✗</text>
+    <rect x="168" y="84" width="96" height="30" rx="4" class="bad-soft"/><text x="216" y="103">trylock(L1) ✗</text>
+    <rect x="268" y="24" width="84" height="30" rx="4" class="box"/><text x="310" y="43">unlock(L1)</text>
+    <rect x="268" y="84" width="84" height="30" rx="4" class="box"/><text x="310" y="103">unlock(L2)</text>
+    <rect x="356" y="24" width="84" height="30" rx="4" style="fill:var(--c1)"/><text x="398" y="43" style="fill:#fff">lock(L1)</text>
+    <rect x="356" y="84" width="84" height="30" rx="4" style="fill:var(--c2)"/><text x="398" y="103" style="fill:#fff">lock(L2)</text>
+    <rect x="444" y="24" width="96" height="30" rx="4" class="bad-soft"/><text x="492" y="43">trylock(L2) ✗</text>
+    <rect x="444" y="84" width="96" height="30" rx="4" class="bad-soft"/><text x="492" y="103">trylock(L1) ✗</text>
+    <text x="590" y="73" font-size="18" class="t-muted">……</text>
+  </g>
+  <text x="330" y="140" font-size="12.5" text-anchor="middle" class="t-muted">两个线程步调一致地"拿一把 → 抢不到另一把 → 放掉重来"，永远在忙，永远没进展</text>
+</svg>
+<figcaption>活锁：与死锁不同，线程并没有睡眠，CPU 一直在转，但全是白做的工作。</figcaption>
+</figure>
+<p>解决活锁也有办法：比如在跳回开头前<strong>随机延迟</strong>一段时间，降低两个线程反复互相干扰的概率（下面模拟器的"随机退避"选项）。</p>
+<p>这个方案还回避了 trylock 的一些难点。首先又是封装：如果某把锁藏在被调用的某个函数深处，"跳回开头"就很难实现；其次，如果拿到 L1 之后还申请了别的资源（例如分配了内存），失败时必须小心地把这些也都释放掉。不过在一些受限场景（比如前面的 Java vector 方法）里，这种方法可以工作得很好。还要注意，它并没有真正实现"抢占"（强行从别人手里夺走锁），而是让开发者<strong>体面地主动放弃</strong>自己的所有权——原书承认它在这一点上不够完美，但它很实用。</p>
+
+<h3>互斥：干脆不用锁（lock-free）</h3>
+<p>最后一种预防技术是彻底避免互斥。一般来说这很难，因为代码里确实有临界区。Herlihy 提出可以借助强大的硬件指令，设计完全不用锁的数据结构：<strong>无锁（lock-free）</strong>以及相关的<strong>无等待（wait-free）</strong>方法。回忆比较并交换（compare-and-swap）指令：</p>
+<pre><code>int CompareAndSwap(int *address, int expected, int new) {
+    if (*address == expected) {   // 整个函数由硬件原子执行
+        *address = new;
+        return 1;  // 成功
+    }
+    return 0;      // 失败
+}
+
+void AtomicIncrement(int *value, int amount) {
+    do {
+        int old = *value;
+    } while (CompareAndSwap(value, old, old + amount) == 0);
+}</code></pre>
+<p><code>AtomicIncrement</code> 不获取任何锁，只是不断尝试用 CAS 把值更新为新值：如果期间别人改过，CAS 失败就重试。没有锁，就不会死锁（但活锁仍可能存在，健壮的实现会比这复杂）。</p>
+<p>稍复杂一点的例子是链表头插。朴素版本在多线程下有竞态：</p>
+<pre><code>void insert(int value) {
+    node_t *n = malloc(sizeof(node_t));
+    assert(n != NULL);
+    n-&gt;value = value;
+    n-&gt;next = head;     // 两个线程可能读到同一个 head……
+    head = n;           // ……后写的覆盖先写的，丢一个节点
+}</code></pre>
+<p>传统做法是在最后两行外面加锁（<code>listlock</code>）。原书留了个思考题：为什么锁拿得这么晚、不在函数一开头拿？——因为前面的 <code>malloc</code> 和初始化只涉及新节点这个私有对象（假设 <code>malloc</code> 本身线程安全），不必放进临界区。无锁版本则用 CAS：</p>
+<pre><code>void insert(int value) {
+    node_t *n = malloc(sizeof(node_t));
+    assert(n != NULL);
+    n-&gt;value = value;
+    do {
+        n-&gt;next = head;
+    } while (CompareAndSwap(&amp;head, n-&gt;next, n) == 0);
+}</code></pre>
+<figure class="fig">
+<svg viewBox="0 0 640 230" width="640" role="img" aria-label="用 CAS 做无锁链表插入">
+  <defs><marker id="m-cas" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <text x="8" y="22" font-size="13" font-weight="600">① 准备：n-&gt;next = head（此刻 head 指向 A）</text>
+  <text x="22" y="60" font-size="13" class="mono">head</text>
+  <line x1="62" y1="55" x2="158" y2="55" class="arrow" marker-end="url(#m-cas)"/>
+  <rect x="160" y="40" width="46" height="30" rx="4" class="box-strong"/><text x="183" y="60" font-size="13" text-anchor="middle">A</text>
+  <line x1="206" y1="55" x2="246" y2="55" class="arrow" marker-end="url(#m-cas)"/>
+  <rect x="248" y="40" width="46" height="30" rx="4" class="box-strong"/><text x="271" y="60" font-size="13" text-anchor="middle">B</text>
+  <rect x="360" y="40" width="46" height="30" rx="4" style="fill:var(--c1)"/><text x="383" y="60" font-size="13" text-anchor="middle" style="fill:#fff">n</text>
+  <path d="M360,62 C300,90 220,90 190,72" class="arrow" marker-end="url(#m-cas)"/>
+  <text x="440" y="60" font-size="12" class="t-muted">n-&gt;next 指向 A</text>
+  <text x="8" y="122" font-size="13" font-weight="600" style="fill:var(--ok)">② 没人打扰：CAS(&amp;head, A, n) 成功 → head 指向 n</text>
+  <text x="22" y="160" font-size="13" class="mono">head</text>
+  <line x1="62" y1="155" x2="98" y2="155" class="arrow" marker-end="url(#m-cas)"/>
+  <rect x="100" y="140" width="46" height="30" rx="4" style="fill:var(--c1)"/><text x="123" y="160" font-size="13" text-anchor="middle" style="fill:#fff">n</text>
+  <line x1="146" y1="155" x2="178" y2="155" class="arrow" marker-end="url(#m-cas)"/>
+  <rect x="180" y="140" width="46" height="30" rx="4" class="box-strong"/><text x="203" y="160" font-size="13" text-anchor="middle">A</text>
+  <line x1="226" y1="155" x2="258" y2="155" class="arrow" marker-end="url(#m-cas)"/>
+  <rect x="260" y="140" width="46" height="30" rx="4" class="box-strong"/><text x="283" y="160" font-size="13" text-anchor="middle">B</text>
+  <text x="340" y="122" font-size="13" font-weight="600" style="fill:var(--bad)">③ 别人抢先插入了 m：head 已不是 A</text>
+  <text x="340" y="160" font-size="13" class="mono">head → m → A → B</text>
+  <text x="340" y="184" font-size="12.5">CAS(&amp;head, A, n) 失败（head ≠ A）</text>
+  <text x="340" y="204" font-size="12.5">→ 重试：n-&gt;next = m，再 CAS(&amp;head, m, n)</text>
+  <text x="8" y="222" font-size="12" class="t-muted">CAS 保证"检查 head 没变"和"把 head 改成 n"是一个原子动作——正是原子性违反缺失的那一步</text>
+</svg>
+<figcaption>无锁头插：先把新节点指向当前 head，再用 CAS 尝试把它换成新 head；如果期间有人改过 head，就用新的 head 重试。</figcaption>
+</figure>
+<p>当然，一个真正可用的链表不止插入，还要删除、查找；构建一个无锁的完整链表并不简单，有大量文献专门研究它。</p>
+
+<h2 id="sim-deadlock">模拟器：死锁检测器</h2>
+<p>下面你来当调度器：每一步选一个线程执行一条"指令"（加锁、临界区、解锁）。右侧实时画出<strong>资源分配图</strong>——实线"锁 → 线程"表示持有，虚线"线程 → 锁"表示等待。一旦图中出现环，模拟器会把环标红，并逐条说明四个必要条件如何同时成立。换一种策略，再试试能不能把它逼进死锁。</p>
+<section class="sim" id="sim-dl">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>死锁检测器：你来调度，看等待图里何时出现环</h3>
+    <div class="desc">编辑每个线程的加锁顺序（如 <code>L1 L2</code>），选择策略，然后逐步选择下一个运行的线程，或随机调度。每个线程执行：按序加锁 → 临界区 → 逆序解锁。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>线程数 <select id="dl-n"><option>2</option><option>3</option><option>4</option></select></label>
+      <label>策略 <select id="dl-strat">
+        <option value="none">无策略（照写的顺序加锁）</option>
+        <option value="order">全局锁顺序（按锁名排序）</option>
+        <option value="trylock">trylock 回退</option>
+        <option value="global">prevention 全局锁</option>
+      </select></label>
+      <label><input type="checkbox" id="dl-backoff"> trylock 失败后随机退避</label>
+      <label>随机种子 <input type="number" id="dl-seed" value="7" min="1"></label>
+    </div>
+    <div class="controls" id="dl-lists"></div>
+    <div class="controls">
+      <span class="muted">预设：</span>
+      <button id="dl-p1">Figure 32.6 死锁交错</button>
+      <button id="dl-p2">3 线程环</button>
+      <button id="dl-p3">Vector.AddAll</button>
+      <button id="dl-p4">trylock 活锁交错</button>
+      <button id="dl-p5">全局顺序下重放 32.6</button>
+    </div>
+    <div class="controls" id="dl-run"></div>
+    <div class="stage"><div class="dl-wrap"><div class="dl-threads" id="dl-threads"></div><div class="dl-graph" id="dl-graph"></div></div></div>
+    <div class="narrate" id="dl-narr"></div>
+    <div class="stats" id="dl-stats"></div>
+    <div class="readout dl-log" id="dl-log"></div>
+    <div class="controls" style="margin-top:12px"><button id="dl-mc" class="primary">对当前加锁顺序：每种策略随机调度 1000 次</button><span class="muted small">每次随机调度直到全部完成、出现死锁，或超过 2000 步（记为疑似活锁）</span></div>
+    <div class="table-wrap" id="dl-mc-out"></div>
+  </div>
+</section>
+
+<h2 id="avoidance">避免（Avoidance）：通过调度绕开死锁</h2>
+<p>另一条思路不是"预防"，而是<strong>避免</strong>：需要事先掌握全局信息——各个线程在执行过程中可能会拿哪些锁——然后据此调度，保证死锁不可能发生。</p>
+<p>假设有 2 个 CPU、4 个线程。T1 会拿 L1 和 L2（顺序不定、时机不定），T2 也会拿 L1 和 L2，T3 只拿 L2，T4 不拿锁：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>例 1</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th></tr></thead>
+<tbody><tr><td>L1</td><td>yes</td><td>yes</td><td>no</td><td>no</td></tr><tr><td>L2</td><td>yes</td><td>yes</td><td>yes</td><td>no</td></tr></tbody></table></div>
+<p>聪明的调度器能算出：<strong>只要 T1 和 T2 不同时运行</strong>，就不会死锁。T3 与 T1（或 T2）重叠没关系——T3 只拿一把锁，永远不会因为"拿着一把等另一把"而参与到环里。</p>
+<p>第二个例子竞争更激烈：T1、T2、T3 都要拿 L1 和 L2：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>例 2</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th></tr></thead>
+<tbody><tr><td>L1</td><td>yes</td><td>yes</td><td>yes</td><td>no</td></tr><tr><td>L2</td><td>yes</td><td>yes</td><td>yes</td><td>no</td></tr></tbody></table></div>
+<figure class="fig">
+<svg viewBox="0 0 640 150" width="640" role="img" aria-label="两个例子的保守调度">
+  <text x="160" y="18" font-size="13" text-anchor="middle" font-weight="600">例 1 的一种安全调度</text>
+  <text x="10" y="54" font-size="12.5">CPU 1</text><text x="10" y="100" font-size="12.5">CPU 2</text>
+  <g font-size="13" text-anchor="middle" style="font-weight:600">
+  <rect x="60" y="34" width="100" height="30" rx="4" style="fill:var(--c1)"/><text x="110" y="54" style="fill:#fff">T1</text>
+  <rect x="162" y="34" width="100" height="30" rx="4" style="fill:var(--c2)"/><text x="212" y="54" style="fill:#fff">T2</text>
+  <rect x="60" y="80" width="100" height="30" rx="4" style="fill:var(--c3)"/><text x="110" y="100" style="fill:#fff">T3</text>
+  <rect x="162" y="80" width="100" height="30" rx="4" style="fill:var(--c4)"/><text x="212" y="100" style="fill:#fff">T4</text>
+  </g>
+  <text x="160" y="134" font-size="12" text-anchor="middle" class="t-muted">T1、T2 错开；T3 可以与任何一个重叠</text>
+  <line x1="320" y1="8" x2="320" y2="140" class="stroke" stroke-width="0.6" stroke-dasharray="3 4"/>
+  <text x="480" y="18" font-size="13" text-anchor="middle" font-weight="600">例 2 的保守调度</text>
+  <text x="332" y="54" font-size="12.5">CPU 1</text><text x="332" y="100" font-size="12.5">CPU 2</text>
+  <g font-size="13" text-anchor="middle" style="font-weight:600">
+  <rect x="380" y="34" width="80" height="30" rx="4" style="fill:var(--c1)"/><text x="420" y="54" style="fill:#fff">T1</text>
+  <rect x="462" y="34" width="80" height="30" rx="4" style="fill:var(--c2)"/><text x="502" y="54" style="fill:#fff">T2</text>
+  <rect x="544" y="34" width="80" height="30" rx="4" style="fill:var(--c3)"/><text x="584" y="54" style="fill:#fff">T3</text>
+  <rect x="380" y="80" width="80" height="30" rx="4" style="fill:var(--c4)"/><text x="420" y="100" style="fill:#fff">T4</text>
+  </g>
+  <rect x="462" y="80" width="162" height="30" rx="4" class="box" stroke-dasharray="4 3"/><text x="543" y="100" font-size="12" text-anchor="middle" class="t-muted">CPU 2 空闲</text>
+  <text x="480" y="134" font-size="12" text-anchor="middle" class="t-muted">T1、T2、T3 挤在同一个 CPU 上串行</text>
+</svg>
+<figcaption>静态调度导致保守：例 2 里本可并发的任务被串行化，总完成时间明显变长。代价是性能。</figcaption>
+</figure>
+<p>这类方法的著名代表是 Dijkstra 的<strong>银行家算法（Banker's Algorithm）</strong>（1964 年；有趣的是，Dijkstra 当时把死锁叫做"致命拥抱"（deadly embrace），好在这个名字没流行开来）。遗憾的是，它们只在非常受限的环境里有用——比如嵌入式系统，事先完全知道要运行哪些任务、它们需要哪些锁；而且如例 2 所示，它们会限制并发。所以<strong>通过调度避免死锁并不是被广泛使用的通用方案</strong>。</p>
+
+<section class="sim" id="sim-sch">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>调度避免：在 2 个 CPU 上排出安全又快的调度</h3>
+    <div class="desc">勾选每个线程需要的锁、设定运行时长，在两个 CPU 的输入框里写出执行顺序（如 <code>T1 T2</code>）。模拟器会标出"两个都需要 L1 和 L2 的线程同时运行"的危险区间，并与穷举得到的最优调度对比。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <button id="sc-e1">载入例 1</button><button id="sc-e2">载入例 2</button>
+      <span class="sep"></span>
+      <button id="sc-book">原书调度</button><button id="sc-fast">最快（不管死锁）</button><button id="sc-safe" class="primary">最快的安全调度</button>
+    </div>
+    <div class="table-wrap"><table id="sc-need"></table></div>
+    <div class="controls">
+      <label class="sch-lane">CPU 1 <input type="text" id="sc-c1" size="14"></label>
+      <label class="sch-lane">CPU 2 <input type="text" id="sc-c2" size="14"></label>
+    </div>
+    <div class="stage" id="sc-stage"></div>
+    <div class="narrate" id="sc-narr"></div>
+    <div class="stats" id="sc-stats"></div>
+  </div>
+</section>
+<div class="aside" data-title="Tom West 定律：别总想着做到完美"><p>Tom West（经典计算机行业纪实《新机器的灵魂》（Soul of a New Machine）的主人公）有句名言："并不是所有值得做的事都值得做好。"如果一件坏事很少发生、代价也小，就不值得花大力气去预防；如果你在造航天飞机，出错的代价是飞机爆炸，那就请忽略这条建议。难点在于判断什么时候该做到哪一步——这只能靠经验和投入。</p></div>
+
+<h2 id="detect">检测与恢复（Detect and Recover）</h2>
+<p>最后一种通用策略：<strong>允许死锁偶尔发生，发生后再处理</strong>。如果操作系统一年才死机一次，重启一下接着干活就是了——当死锁足够罕见时，这种"非方案"其实相当务实。</p>
+<figure class="fig">
+<svg viewBox="0 0 620 120" width="620" role="img" aria-label="检测与恢复流程">
+  <defs><marker id="m-dr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--muted)"/></marker></defs>
+  <rect x="10" y="36" width="130" height="44" rx="6" class="box"/><text x="75" y="63" font-size="13" text-anchor="middle">定期运行检测器</text>
+  <line x1="140" y1="58" x2="178" y2="58" class="arrow" marker-end="url(#m-dr)"/>
+  <rect x="180" y="36" width="130" height="44" rx="6" class="box"/><text x="245" y="63" font-size="13" text-anchor="middle">构建资源图</text>
+  <line x1="310" y1="58" x2="348" y2="58" class="arrow" marker-end="url(#m-dr)"/>
+  <rect x="350" y="36" width="100" height="44" rx="22" class="warn-soft"/><text x="400" y="63" font-size="13" text-anchor="middle">有环吗？</text>
+  <line x1="450" y1="58" x2="488" y2="58" class="arrow" marker-end="url(#m-dr)"/>
+  <text x="469" y="50" font-size="11" text-anchor="middle" class="t-muted">有</text>
+  <rect x="490" y="36" width="122" height="44" rx="6" class="bad-soft"/><text x="551" y="55" font-size="12.5" text-anchor="middle">重启 / 修复</text><text x="551" y="72" font-size="11" text-anchor="middle" class="t-muted">必要时人工介入</text>
+  <path d="M400,80 C400,112 75,112 75,82" class="arrow" marker-end="url(#m-dr)"/>
+  <text x="240" y="108" font-size="11" text-anchor="middle" class="t-muted">没有：过一会儿再查</text>
+</svg>
+<figcaption>许多数据库系统采用检测与恢复：死锁检测器周期性地构建资源图并找环；找到就需要重启，若数据结构需要更复杂的修复，可能要人来帮忙。上面的死锁检测器模拟器做的正是"找环"这一步。</figcaption>
+</figure>
+
+<h2 id="exercises">先预测，再验证</h2>
+<div class="exercise"><div class="q">在死锁检测器里载入 Figure 32.6 的加锁顺序（T1: <code>L1 L2</code>，T2: <code>L2 L1</code>），策略"无策略"。最少需要几步才能进入死锁？必须满足什么先后关系？先想，再手动点出来。</div>
+<details class="reveal"><summary>看答案</summary><div>最少 4 步：T1 lock(L1) → T2 lock(L2) → T1 lock(L2)（阻塞）→ T2 lock(L1)（阻塞），此时出现环 T1→L2→T2→L1→T1。关键在于：<strong>两个线程都在对方拿第二把锁之前拿到了自己的第一把锁</strong>。只要某个线程一口气拿到两把锁（比如 T1、T1 连着走两步），就不会死锁。这也是为什么死锁"可能"发生而不是"必然"发生。</div></details></div>
+<div class="exercise"><div class="q">3 线程预设是 T1: <code>L1 L2</code>，T2: <code>L2 L3</code>，T3: <code>L3 L1</code>。如果只把 T3 改成 <code>L1 L3</code>，还能死锁吗？用"每种策略随机跑 1000 次"验证。</div>
+<details class="reveal"><summary>看答案</summary><div>不能。改完后三个线程都按 L1 &lt; L2 &lt; L3 的递增顺序加锁，这就是一个全局锁顺序；无策略一行的死锁数会变成 0。环需要"有人先拿编号大的、再等编号小的"，全序让这件事不可能发生。</div></details></div>
+<div class="exercise"><div class="q">用"trylock 活锁交错"预设：两个线程会一直失败重试吗？预测"随机跑 1000 次"里 trylock（不退避）和 trylock（退避）两行的死锁数和平均重试次数。</div>
+<details class="reveal"><summary>看答案</summary><div>预设按"T1、T2、T1、T1、T2、T2……"的节奏调度，两个线程每轮都各自拿到第一把锁、trylock 第二把失败、放掉重来，重试次数不断增长却没有任何进展——活锁。只要这个节奏一直持续就会一直失败；随机调度时，这种不幸的节奏很难一直持续，所以两行的死锁数都是 0，全部完成。退避让一个失败的线程暂停几拍，另一个线程更容易连续拿到两把锁，所以平均重试次数通常更低（具体数值取决于随机种子）。</div></details></div>
+<div class="exercise"><div class="q">在调度避免模拟器里载入例 2（每个线程时长 1）。最快的安全调度要多长时间？不管死锁的最快调度呢？再把 T4 的时长改成 3，差距还在吗？</div>
+<details class="reveal"><summary>看答案</summary><div>例 2 中 T1、T2、T3 两两都不能同时运行，只能串行，安全调度最少 3 个时间单位；不管死锁时两 CPU 各分两个任务，2 个单位就够。把 T4 改成 3 后，不管死锁的最优调度也要 3（T4 一个人就要 3），安全调度 CPU1 跑 T1 T2 T3、CPU2 跑 T4，同样是 3——这时"保守"没有代价。避免策略的性能损失取决于具体负载。</div></details></div>
+<div class="exercise"><div class="q">在交错选择器里选"原子性违反"、线程 2 在"检查之后、使用之前"运行。先不勾修复版本看它崩溃；再勾上修复版本，同样的时机线程 2 会发生什么？</div>
+<details class="reveal"><summary>看答案</summary><div>修复版本里，线程 1 在检查之前就拿到了 <code>proc_info_lock</code>。线程 2 想在危险窗口里插队，第一步 <code>lock</code> 就会睡眠等待；线程 1 顺利完成 <code>fputs</code> 并解锁后，线程 2 才被唤醒、拿锁、置 NULL。"检查 + 使用"被锁保护成了一个整体，危险窗口消失了。</div></details></div>
+<div class="exercise"><div class="q">（对应原书作业第 2、3 题）实验程序 <code>vector_deadlock naive</code> 会不会<em>每次</em>都死锁？如果只有一个线程做 vector_add（不管顺序），会死锁吗？</div>
+<details class="reveal"><summary>看答案</summary><div>不会每次都死锁：在我们的机器上默认参数大约一半的运行会死锁，循环次数调小（<code>naive 1000</code>）时更常侥幸跑完——它取决于两个线程是否恰好各拿一把锁时发生交错。只有一个线程时永远不会死锁：环至少需要两个线程互相等待。这也是为什么死锁很难靠测试发现。</div></details></div>
+
+<h2 id="lab">动手实验：亲手制造（和消灭）一次死锁</h2>
+<div class="lab">
+<p>实验目录 <code>labs/32-concurrency-bugs/</code> 里有两个程序：</p>
+<ul>
+<li><code>vector_deadlock.c</code>：两个线程反复 <code>vector_add</code>，线程 0 做 <code>add(v0, v1)</code>，线程 1 做 <code>add(v1, v0)</code>——正是 Vector.AddAll 那种隐藏的相反加锁顺序。四种模式：<code>naive</code>（先锁 dst 再锁 src）、<code>ordered</code>（按锁地址排序）、<code>trylock</code>（lock + trylock，失败全部释放重来）、<code>global</code>（先拿 prevention 锁）。主线程当看门狗：1 秒内毫无进展就报告"疑似死锁"并退出，不会永远挂住。</li>
+<li><code>atomicity.c</code>：MySQL <code>proc_info</code> 的原子性违反。为了不真的段错误，"使用"时再读一次指针，若已变成 NULL 就计一次违反（真实程序会在这里崩溃）。</li>
+</ul>
+<pre><code><span class="cmd">cd labs/32-concurrency-bugs &amp;&amp; make</span>
+<span class="cmd">./vector_deadlock naive</span>
+<span class="cmd">./vector_deadlock ordered 1000000</span>
+<span class="cmd">./vector_deadlock trylock 1000000</span>
+<span class="cmd">./vector_deadlock global 1000000</span>
+<span class="cmd">./atomicity bug</span>
+<span class="cmd">./atomicity fixed</span></code></pre>
+<p>示例输出（WSL2、gcc 14；你的机器上数字会不同，每次运行也不同）：</p>
+<pre><code>[naive] 疑似死锁！已完成 3 / 200000 次 vector_add，1 秒内毫无进展
+  线程 0: 持有 v0 的锁，等待 v1 的锁
+  线程 1: 持有 v1 的锁，等待 v0 的锁
+  等待图: T0 -&gt; v1 -&gt; T1 -&gt; v0 -&gt; T0  (出现环)
+[naive] 完成 200000 次 vector_add，用时 0.014 秒        ← 另一次运行：侥幸没死锁
+[ordered] 完成 2000000 次 vector_add，用时 0.157 秒
+[trylock] 完成 2000000 次 vector_add，用时 0.250 秒，trylock 失败重试 3420323 次
+[global] 完成 2000000 次 vector_add，用时 0.178 秒
+[bug] 检查通过后成功使用 1757021 次；检查通过、使用时却已是 NULL（原子性违反）3103 次
+[fixed] 检查通过后成功使用 683798 次；检查通过、使用时却已是 NULL（原子性违反）0 次</code></pre>
+<p>我们用默认参数把 <code>naive</code> 连跑 20 次，其中 10 次死锁。观察要点：</p>
+<ol>
+<li><strong>naive 的死锁是概率性的</strong>：同一个程序有时死锁、有时顺利跑完——测试通过不代表没有死锁。死锁报告里的"持有 v0 等 v1 / 持有 v1 等 v0"就是 Figure 32.7 那个环。</li>
+<li><strong>ordered 与 global 从不死锁</strong>，分别破坏了"循环等待"和"持有并等待"。</li>
+<li><strong>trylock 也不死锁，但重试次数可能比完成次数还多</strong>——这就是活锁的苗头：两个线程都在忙，大量工作白做。</li>
+<li><strong>原子性违反真实存在</strong>：几十万次里出现几千次"检查时非 NULL、使用时 NULL"；加锁后恒为 0，代价是两个线程互相等锁。</li>
+</ol>
+</div>
+
+<h2 id="quiz">自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="2"><div class="q">1. 在 Lu 等人研究的 105 个并发缺陷中，非死锁缺陷大约占多少？</div>
+<div class="opts"><button>A. 97%</button><button>B. 约一半</button><button>C. 约 70%（74 个）</button><button>D. 约 30%</button></div>
+<div class="explain">74/105 ≈ 70%。97% 是另一个数字：非死锁缺陷中属于原子性违反或顺序违反的比例。别把两个数混了。</div></div>
+<div class="mcq" data-answer="0"><div class="q">2. MySQL 中"先检查 <code>thd->proc_info</code> 非 NULL、再 <code>fputs</code> 它"，而另一线程可能把它置 NULL，这属于：</div>
+<div class="opts"><button>A. 原子性违反</button><button>B. 顺序违反</button><button>C. 死锁</button><button>D. 活锁</button></div>
+<div class="explain">"检查"与"使用"本应构成一个原子整体，却没有被保护，这正是原子性违反。顺序违反关心的是"A 必须在 B 之前"，如 Mozilla 的 mThread 例子。</div></div>
+<div class="mcq" data-answer="3"><div class="q">3. 下列哪一项<strong>不是</strong>死锁的四个必要条件之一？</div>
+<div class="opts"><button>A. 互斥</button><button>B. 持有并等待</button><button>C. 非抢占</button><button>D. 优先级反转</button></div>
+<div class="explain">四个条件是互斥、持有并等待、非抢占、循环等待。优先级反转是另一类调度问题。</div></div>
+<div class="mcq" data-answer="3"><div class="q">4. "按锁的地址大小决定加锁顺序"这个技巧打破的是哪个条件？</div>
+<div class="opts"><button>A. 持有并等待</button><button>B. 互斥</button><button>C. 非抢占</button><button>D. 循环等待</button></div>
+<div class="explain">它给所有锁规定了一个全序，于是任何线程都不会"先拿大的、再等小的"，环无法形成。线程依然会持有一把锁去等另一把（持有并等待仍成立），但没关系——四个条件破坏一个就够了。</div></div>
+<div class="mcq" data-answer="0"><div class="q">5. "lock(L1); 若 trylock(L2) 失败就 unlock(L1) 并 goto top"这一方案会引入什么新问题？</div>
+<div class="opts"><button>A. 活锁：线程一直在跑、一直重试，却没有进展</button><button>B. 优先级反转</button><button>C. 必然死锁</button><button>D. 丢失唤醒</button></div>
+<div class="explain">两个线程可能步调一致地反复"拿一把、抢不到另一把、全部放掉"。它们都没睡眠，所以不是死锁，而是活锁；加随机延迟可以降低这种概率。</div></div>
+<div class="mcq" data-answer="2"><div class="q">6. 关于"先获取全局 prevention 锁、再依次获取所需锁"的方案，哪个说法正确？</div>
+<div class="opts"><button>A. 它没有任何代价，应该总是使用</button><button>B. 它破坏了互斥条件</button><button>C. 它破坏了持有并等待，但要求提前知道要拿哪些锁，并降低并发度</button><button>D. 只有部分线程遵守也能保证不死锁</button></div>
+<div class="explain">prevention 让"获取全部锁"变成一个原子过程。缺点：封装让你很难提前知道所有要拿的锁；锁被提前一起拿走，并发度下降；而且要求<strong>所有</strong>线程都先拿 prevention。</div></div>
+<div class="mcq" data-answer="1"><div class="q">7. 在例 1（T1、T2 都要 L1 和 L2，T3 只要 L2，T4 不要锁）中，调度器只需保证哪两个线程不同时运行？</div>
+<div class="opts"><button>A. T3 与 T4</button><button>B. T1 与 T2</button><button>C. T1 与 T3</button><button>D. T2 与 T3</button></div>
+<div class="explain">只有同时需要两把锁的线程之间才可能形成"各持一把、互等另一把"的环。T3 只拿一把锁，与谁重叠都不会死锁。</div></div>
+<div class="mcq" data-answer="0"><div class="q">8. 对于 Mozilla 的 mThread 顺序违反，原书推荐的修复方式是：</div>
+<div class="opts"><button>A. 用条件变量（或信号量）加状态变量 mtInit 强制先后顺序</button><button>B. 把 mThread 声明为 volatile</button><button>C. 把 init 与 mMain 都改用 trylock</button><button>D. 发现崩溃后自动重启</button></div>
+<div class="explain">顺序违反的修复就是强制顺序：线程 2 在 <code>while (mtInit == 0) wait()</code> 里等待，线程 1 赋值后设置 <code>mtInit = 1</code> 并 signal。volatile 保证不了先后。</div></div>
+<div class="mcq" data-answer="0"><div class="q">9. Figure 32.6 的代码（T1 先 L1 后 L2，T2 先 L2 后 L1）每次运行都会死锁吗？</div>
+<div class="opts"><button>A. 不一定，取决于线程如何交错</button><button>B. 一定会</button><button>C. 在单 CPU 上永远不会</button><button>D. 只要有两个以上 CPU 就一定会</button></div>
+<div class="explain">只有当两个线程都在对方拿第二把锁之前拿到了第一把锁时才死锁。单 CPU 上也会发生：T1 拿到 L1 后恰好被切换出去即可。</div></div>
+
+<h2 id="summary">常见误区与本章小结</h2>
+<div class="warn"><ul>
+<li><strong>"测试跑了一百遍都没死锁，所以没有死锁。"</strong>死锁取决于交错，可能千万次才出现一次。实验里同一个程序大约一半运行会死锁，另一半顺利跑完。</li>
+<li><strong>"检查一下非 NULL 就安全了。"</strong>检查与使用之间若没有同一把锁保护，检查结果在使用时可能已失效——这正是原子性违反。</li>
+<li><strong>"只给出错的那个线程加锁。"</strong>所有访问该共享数据的代码都必须拿<em>同一把</em>锁，否则锁形同虚设。</li>
+<li><strong>"trylock 方案就是抢占。"</strong>它只是让线程主动放弃自己的锁，并没有强行夺走别人的锁；而且会引入活锁。</li>
+<li><strong>"无锁就万事大吉。"</strong>无锁结构仍可能活锁，完整的无锁数据结构（插入、删除、查找都支持）非常难写对。</li>
+<li><strong>"定好锁顺序就一劳永逸。"</strong>顺序只是约定，一个不遵守的调用（或一个隐藏在封装后面的加锁）就能破坏它。</li>
+</ul></div>
+<div class="key"><ul>
+<li>真实程序中<strong>非死锁缺陷占多数</strong>（74/105），其中 97% 是<strong>原子性违反</strong>（用锁把本应原子的代码保护起来）或<strong>顺序违反</strong>（用条件变量/信号量强制先后）。</li>
+<li><strong>死锁</strong>需要四个条件同时成立：互斥、持有并等待、非抢占、循环等待。资源图中的<strong>环</strong>就是死锁的标志。</li>
+<li><strong>预防</strong>：全序/偏序加锁（最实用，可按锁地址排序）；prevention 全局锁（并发度低）；trylock 回退（小心活锁，加随机退避）；无锁数据结构（CAS，通用性有限、实现复杂）。</li>
+<li><strong>避免</strong>：银行家算法式的调度，需要全局知识、牺牲并发，只适合受限环境。<strong>检测与恢复</strong>：定期找环、重启，数据库常用。</li>
+<li>原书的结论：实践中最好的办法是<strong>小心谨慎、规定加锁顺序</strong>，从源头预防死锁；无等待数据结构正逐步进入 Linux 等关键系统；更根本的也许是新的并发编程模型，例如 MapReduce 让程序员不用任何锁就能描述某些并行计算。</li>
+<li><strong>下一章</strong>换一种思路：基于事件的并发（event-based concurrency）用单线程事件循环，在单 CPU 上完全不需要锁，从而绕开本章的许多问题——但它也有自己的难处（阻塞调用、状态管理）。</li>
+</ul></div>
+
+</main>
+
+<script id="dl-core">
+// ===== 死锁检测器核心逻辑（纯函数，不碰 DOM，可在 node 中单独测试） =====
+const DL = (() => {
+  const PREV = "prevention";
+  const cmp = (a, b) => a.localeCompare(b, "en", { numeric: true });
+  const tn = (i) => "T" + (i + 1);
+  // "L1 L2" → ["L1","L2"]；去重，最多 4 把
+  function parse(txt) {
+    const out = [];
+    for (const t of String(txt).split(/[^A-Za-z0-9_]+/)) {
+      if (!t || !/^[A-Za-z][A-Za-z0-9_]{0,5}$/.test(t) || out.includes(t)) continue;
+      out.push(t);
+    }
+    return out.slice(0, 4);
+  }
+  // 把"要拿的锁"翻译成指令序列：按序加锁 → 临界区 → 逆序解锁
+  function program(locks, strategy) {
+    const L = strategy === "order" ? locks.slice().sort(cmp) : locks.slice();
+    const ops = [];
+    if (strategy === "global") ops.push({ op: "lock", l: PREV });
+    L.forEach((l, i) => ops.push({ op: strategy === "trylock" && i > 0 ? "trylock" : "lock", l }));
+    if (strategy === "global") ops.push({ op: "unlock", l: PREV });
+    ops.push({ op: "cs" });
+    for (let i = L.length - 1; i >= 0; i--) ops.push({ op: "unlock", l: L[i] });
+    return ops;
+  }
+  function init(lists, strategy) {
+    return {
+      strategy, tick: 0, steps: 0, owner: {}, waiters: {},
+      threads: lists.map((ls, i) => ({ id: i, ops: program(ls, strategy), pc: 0, held: [], wants: null, state: "ready", retries: 0, sleepUntil: 0 })),
+    };
+  }
+  const clone = (s) => JSON.parse(JSON.stringify(s));
+  const runnable = (s) => s.threads.filter((t) => t.state === "ready" && t.sleepUntil <= s.tick).map((t) => t.id);
+  // 释放锁；若有线程在等，直接把锁交给队首（它被唤醒并越过 lock 指令）
+  function release(s, t, l) {
+    delete s.owner[l];
+    t.held = t.held.filter((x) => x !== l);
+    const q = s.waiters[l] || [];
+    if (q.length) {
+      const w = s.threads[q.shift()];
+      s.owner[l] = w.id; w.held.push(l); w.wants = null; w.state = "ready"; w.pc++;
+      return `，${l} 直接交给等待中的 ${tn(w.id)}（${tn(w.id)} 被唤醒）`;
+    }
+    return "";
+  }
+  // 线程 tid 执行一条指令，返回中文解说；不能运行则返回 null
+  function step(s, tid, opt = {}) {
+    const t = s.threads[tid];
+    if (!t || t.state !== "ready" || t.sleepUntil > s.tick) return null;
+    const op = t.ops[t.pc], me = tn(tid);
+    s.tick++; s.steps++;
+    let msg;
+    if (op.op === "lock" || op.op === "trylock") {
+      const o = s.owner[op.l];
+      if (o == null) {
+        s.owner[op.l] = tid; t.held.push(op.l); t.pc++;
+        msg = `${me} ${op.op}(${op.l}) 成功，现在持有 ${t.held.join("、")}`;
+      } else if (op.op === "lock") {
+        t.state = "blocked"; t.wants = op.l; (s.waiters[op.l] = s.waiters[op.l] || []).push(tid);
+        msg = `${me} lock(${op.l})：${op.l} 正被 ${tn(o)} 持有 → ${me} 睡眠等待` + (t.held.length ? `（手里还握着 ${t.held.join("、")}：持有并等待）` : "（手里没有别的锁）");
+      } else {
+        const had = t.held.slice(); let extra = "";
+        for (let i = had.length - 1; i >= 0; i--) extra += release(s, t, had[i]);
+        t.pc = 0; t.retries++;
+        msg = `${me} trylock(${op.l}) 失败（被 ${tn(o)} 持有）→ 放掉 ${had.join("、") || "（无）"}${extra}，回到开头重试（第 ${t.retries} 次）`;
+        if (opt.backoff) {
+          const r = opt.rng ? opt.rng.int(0, 1 << Math.min(t.retries, 4)) : 1;
+          t.sleepUntil = s.tick + 1 + r;
+          msg += `；随机退避 ${1 + r} 拍`;
+        }
+      }
+    } else if (op.op === "cs") {
+      t.pc++;
+      msg = `${me} 在临界区里干活（持有 ${t.held.filter((x) => x !== PREV).join("、") || "—"}）`;
+    } else {
+      const extra = release(s, t, op.l); t.pc++;
+      msg = `${me} unlock(${op.l})${extra}`;
+    }
+    if (t.state === "ready" && t.pc >= t.ops.length) { t.state = "done"; msg += `；${me} 完成`; }
+    return msg;
+  }
+  // 在等待图里找环：阻塞线程 → 它等的锁 → 锁的持有者 → ……
+  function cycle(s) {
+    for (const t0 of s.threads) {
+      if (t0.state !== "blocked") continue;
+      const seen = new Map(), path = [];
+      let cur = t0;
+      while (cur && cur.state === "blocked") {
+        if (seen.has(cur.id)) {
+          const seg = path.slice(seen.get(cur.id));
+          return { threads: seg.map((p) => p.t), locks: seg.map((p) => p.l) };
+        }
+        seen.set(cur.id, path.length);
+        const l = cur.wants, o = s.owner[l];
+        path.push({ t: cur.id, l });
+        cur = o == null ? null : s.threads[o];
+      }
+    }
+    return null;
+  }
+  function status(s) {
+    if (s.threads.every((t) => t.state === "done")) return "done";
+    if (cycle(s)) return "deadlock";
+    if (!runnable(s).length) return s.threads.some((t) => t.state === "ready") ? "backoff" : "stuck";
+    return "running";
+  }
+  // 所有就绪线程都在退避：时间快进到最早醒来的那一拍
+  function idle(s) {
+    const w = s.threads.filter((t) => t.state === "ready" && t.sleepUntil > s.tick);
+    if (w.length) s.tick = Math.min(...w.map((t) => t.sleepUntil));
+  }
+  function randomRun(lists, strategy, seed, opt = {}) {
+    const mk = opt.rngFactory || (typeof OSTEP !== "undefined" ? OSTEP.rng : null);
+    const rng = mk(seed), max = opt.maxSteps || 2000, s = init(lists, strategy);
+    let st;
+    while ((st = status(s)) === "running" || st === "backoff") {
+      if (s.steps >= max) { st = "timeout"; break; }
+      if (st === "backoff") { idle(s); continue; }
+      step(s, rng.pick(runnable(s)), { backoff: opt.backoff, rng });
+    }
+    return { result: st, steps: s.steps, retries: s.threads.reduce((a, t) => a + t.retries, 0) };
+  }
+  return { PREV, parse, program, init, clone, runnable, step, cycle, status, idle, randomRun, cmp };
+})();
+</script>
+
+<script>
+// ===== 模拟器 1：死锁检测器 UI =====
+(() => {
+  const { h, s: S, color, rng } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  const nSel = $("dl-n"), stSel = $("dl-strat"), boCb = $("dl-backoff"), seedIn = $("dl-seed");
+  const STRAT = { none: "无策略", order: "全局锁顺序", trylock: "trylock 回退", global: "prevention 全局锁" };
+  const STATE = { ready: "就绪", blocked: "阻塞等待", done: "完成", backoff: "退避中" };
+  const esc = (x) => String(x).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  let lists = ["L1 L2", "L2 L1", "L3 L1", "L1 L3"];
+  let hist = [], rand;
+
+  function buildInputs() {
+    const box = $("dl-lists");
+    box.replaceChildren(h("span", { class: "muted" }, "加锁顺序："));
+    for (let i = 0; i < +nSel.value; i++) {
+      const inp = h("input", { type: "text", value: lists[i], size: 11, "aria-label": `T${i + 1} 的加锁顺序` });
+      inp.addEventListener("change", () => { lists[i] = inp.value; reset(); });
+      box.append(h("label", {}, h("b", { style: { color: color(i) } }, `T${i + 1}`), inp));
+    }
+  }
+  const curLists = () => lists.slice(0, +nSel.value).map(DL.parse);
+  const cur = () => hist[hist.length - 1];
+  function reset() {
+    rand = rng(+seedIn.value || 1);
+    hist = [{ s: DL.init(curLists(), stSel.value), msg: "初始状态：所有线程就绪，所有锁空闲。点「运行 Tn」选择下一个执行的线程，或点「随机一步」。" }];
+    render();
+  }
+  function stepQuiet(tid) {
+    const s = DL.clone(cur().s);
+    const msg = DL.step(s, tid, { backoff: boCb.checked, rng: rand });
+    if (msg == null) return false;
+    hist.push({ s, msg }); return true;
+  }
+  function randomQuiet() {
+    const s0 = cur().s, r = DL.runnable(s0);
+    if (r.length) return stepQuiet(rand.pick(r));
+    if (DL.status(s0) === "backoff") {
+      const s = DL.clone(s0); DL.idle(s);
+      hist.push({ s, msg: `所有就绪线程都在退避，时间快进到第 ${s.tick} 拍` }); return true;
+    }
+    return false;
+  }
+  function play(schedule) { reset(); for (const t of schedule) stepQuiet(t); render(); }
+  function preset(n, ls, strat, sched) {
+    nSel.value = String(n); ls.forEach((x, i) => (lists[i] = x)); stSel.value = strat; boCb.checked = false;
+    buildInputs(); play(sched || []);
+  }
+
+  function opText(o) {
+    if (o.op === "lock") return o.l === DL.PREV ? "lock(prevention);" : `lock(${o.l});`;
+    if (o.op === "trylock") return `if (trylock(${o.l}) != 0) { 全放掉; goto top; }`;
+    if (o.op === "cs") return "/* 临界区 */";
+    return o.l === DL.PREV ? "unlock(prevention);" : `unlock(${o.l});`;
+  }
+
+  function drawGraph(s, cyc) {
+    const locks = [];
+    s.threads.forEach((t) => t.ops.forEach((o) => { if (o.l && !locks.includes(o.l)) locks.push(o.l); }));
+    const W = 460, H = 236, n = s.threads.length;
+    const TP = s.threads.map((t, i) => ({ x: W * (i + 0.5) / n, y: 50 }));
+    const LP = {}; locks.forEach((l, j) => (LP[l] = { x: W * (j + 0.5) / locks.length, y: 178 }));
+    const svg = S("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "资源分配图" });
+    const mk = (id, fill) => S("marker", { id, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto" }, S("path", { d: "M0,0 L10,5 L0,10 z", style: `fill:${fill}` }));
+    svg.append(S("defs", {}, mk("dlg-h", "var(--fg)"), mk("dlg-w", "var(--muted)"), mk("dlg-b", "var(--bad)")));
+    const inCyc = new Set();
+    if (cyc) cyc.threads.forEach((t, i) => { inCyc.add(`w${t}|${cyc.locks[i]}`); inCyc.add(`h${cyc.locks[i]}|${cyc.threads[(i + 1) % cyc.threads.length]}`); });
+    const edge = (a, b, ra, rb, kind, key) => {
+      const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 1;
+      const bad = inCyc.has(key);
+      svg.append(S("line", {
+        x1: a.x + dx / d * ra, y1: a.y + dy / d * ra, x2: b.x - dx / d * rb, y2: b.y - dy / d * rb,
+        style: `stroke:${bad ? "var(--bad)" : kind === "h" ? "var(--fg)" : "var(--muted)"}`, "stroke-width": bad ? 3 : 1.6,
+        "stroke-dasharray": kind === "w" ? "6 4" : null, "marker-end": `url(#dlg-${bad ? "b" : kind})`,
+      }));
+    };
+    for (const l of locks) if (s.owner[l] != null) edge(LP[l], TP[s.owner[l]], 17, 24, "h", `h${l}|${s.owner[l]}`);
+    for (const t of s.threads) if (t.state === "blocked") edge(TP[t.id], LP[t.wants], 24, 17, "w", `w${t.id}|${t.wants}`);
+    s.threads.forEach((t, i) => {
+      const p = TP[i], dead = cyc && cyc.threads.includes(i);
+      svg.append(S("circle", { cx: p.x, cy: p.y, r: 21, style: `fill:${color(i)};stroke:${dead ? "var(--bad)" : "none"}`, "stroke-width": 4 }));
+      svg.append(S("text", { x: p.x, y: p.y + 5, "text-anchor": "middle", "font-size": 14, style: "fill:#fff;font-weight:700", text: `T${i + 1}` }));
+      svg.append(S("text", { x: p.x, y: p.y - 28, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", text: t.state === "ready" && t.sleepUntil > s.tick ? "退避中" : STATE[t.state] }));
+    });
+    for (const l of locks) {
+      const p = LP[l], lw = l === DL.PREV ? 84 : 58, o = s.owner[l];
+      svg.append(S("rect", { x: p.x - lw / 2, y: p.y - 15, width: lw, height: 30, rx: 5, class: o != null ? "box-strong" : "box" }));
+      svg.append(S("text", { x: p.x, y: p.y + 5, "text-anchor": "middle", "font-size": 13, class: "mono", text: l }));
+      svg.append(S("text", { x: p.x, y: p.y + 32, "text-anchor": "middle", "font-size": 11, class: "t-muted", text: o != null ? `被 T${o + 1} 持有` : "空闲" }));
+    }
+    svg.append(S("text", { x: 4, y: H - 2, "font-size": 10.5, class: "t-muted", text: "实线 锁→线程：持有　虚线 线程→锁：等待　红色：死锁环" }));
+    $("dl-graph").replaceChildren(svg);
+  }
+
+  function explain(s, cyc) {
+    const k = cyc.threads.length;
+    const chain = cyc.threads.map((t, i) => `T${t + 1} 等 ${cyc.locks[i]}（被 T${cyc.threads[(i + 1) % k] + 1} 持有）`).join(" → ") + ` → 回到 T${cyc.threads[0] + 1}`;
+    const hw = cyc.threads.map((t, i) => `T${t + 1} 握着 ${s.threads[t].held.join("、")} 却在等 ${cyc.locks[i]}`).join("；");
+    return `<div style="margin-top:8px"><span class="bad-text">检测到死锁！</span>等待环：${esc(chain)}。四个必要条件同时成立：` +
+      `<br>① 互斥：每把锁同一时刻只属于一个线程；② 持有并等待：${esc(hw)}；` +
+      `③ 非抢占：lock() 只会睡眠等待，没有人能把锁从持有者手里夺走；④ 循环等待：上面这条环。` +
+      `环里的线程永远醒不来${s.threads.some((t) => t.state === "ready") ? "（环外的线程还能继续跑，但帮不上忙）" : ""}。</div>`;
+  }
+
+  function render() {
+    const { s, msg } = cur(), cyc = DL.cycle(s), st = DL.status(s), run = DL.runnable(s);
+    const box = $("dl-run");
+    box.replaceChildren(h("span", { class: "muted" }, "下一步运行："));
+    s.threads.forEach((t) => {
+      const b = h("button", { onclick: () => { if (stepQuiet(t.id)) render(); } }, `T${t.id + 1}`);
+      b.disabled = !run.includes(t.id); b.style.borderColor = color(t.id); b.style.borderWidth = "2px";
+      box.append(b);
+    });
+    const bR = h("button", { onclick: () => { randomQuiet(); render(); } }, "随机一步");
+    bR.disabled = st === "done" || (!run.length && st !== "backoff");
+    const bA = h("button", { onclick: () => { for (let k = 0; k < 400; k++) { if (DL.status(cur().s) === "deadlock" || !randomQuiet()) break; } render(); } }, "随机跑到底");
+    bA.disabled = bR.disabled;
+    const bU = h("button", { onclick: () => { if (hist.length > 1) { hist.pop(); render(); } } }, "撤销");
+    bU.disabled = hist.length <= 1;
+    box.append(bR, bA, bU, h("button", { onclick: reset }, "重置"));
+
+    $("dl-threads").replaceChildren(...s.threads.map((t) => {
+      const back = t.state === "ready" && t.sleepUntil > s.tick;
+      const stKey = back ? "backoff" : t.state;
+      return h("div", { class: "dl-t" + (cyc && cyc.threads.includes(t.id) ? " dead" : "") },
+        h("div", { class: "hd" }, h("span", { class: "sw", style: { background: color(t.id) } }), `T${t.id + 1}`,
+          h("span", { class: "pill " + stKey }, STATE[stKey] + (t.state === "blocked" ? ` ${t.wants}` : "")),
+          h("span", { class: "muted small" }, `持有：${t.held.join("、") || "—"}` + (t.retries ? `　重试 ${t.retries}` : ""))),
+        h("ol", {}, t.ops.map((o, k) => h("li", { class: k === t.pc && t.state !== "done" ? "cur" : "" }, opText(o)))));
+    }));
+    drawGraph(s, cyc);
+    let html = `<b>${hist.length === 1 ? "开始" : "第 " + (hist.length - 1) + " 步"}：</b>${esc(msg)}`;
+    if (cyc) html += explain(s, cyc);
+    else if (st === "done") html += `　<span class="ok-text">全部线程完成，没有死锁。</span>`;
+    else if (st === "backoff") html += "　（所有就绪线程都在退避，点「随机一步」让时间前进）";
+    $("dl-narr").innerHTML = html;
+    const retries = s.threads.reduce((a, t) => a + t.retries, 0);
+    const stat = (v, l) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+    $("dl-stats").replaceChildren(stat(s.steps, "已执行指令数"),
+      stat(cyc ? "死锁" : st === "done" ? "完成" : "运行中", "系统状态"),
+      stat(s.threads.filter((t) => t.state === "done").length + " / " + s.threads.length, "已完成线程"),
+      stat(retries, "trylock 失败重试"), stat(STRAT[s.strategy], "当前策略"));
+    $("dl-log").textContent = hist.slice(1).map((x, i) => `${i + 1}. ${x.msg}`).join("\n") || "（尚未执行任何指令）";
+    $("dl-log").scrollTop = 1e6;
+  }
+
+  $("dl-mc").onclick = () => {
+    const L = curLists();
+    const rows = [["none", false], ["order", false], ["trylock", false], ["trylock", true], ["global", false]];
+    const body = rows.map(([st, bo]) => {
+      let dead = 0, to = 0, done = 0, steps = 0, retr = 0;
+      for (let k = 1; k <= 1000; k++) {
+        const r = DL.randomRun(L, st, k * 7919 + (+seedIn.value || 1), { backoff: bo, maxSteps: 2000 });
+        if (r.result === "deadlock") dead++; else if (r.result === "timeout") to++; else done++;
+        steps += r.steps; retr += r.retries;
+      }
+      return h("tr", {}, h("td", {}, STRAT[st] + (st === "trylock" ? (bo ? "（随机退避）" : "（不退避）") : "")),
+        h("td", { class: "num", style: dead ? { color: "var(--bad)", fontWeight: 700 } : {} }, dead),
+        h("td", { class: "num" }, to), h("td", { class: "num" }, done),
+        h("td", { class: "num" }, (steps / 1000).toFixed(1)), h("td", { class: "num" }, (retr / 1000).toFixed(2)));
+    });
+    $("dl-mc-out").replaceChildren(h("table", {},
+      h("thead", {}, h("tr", {}, ["策略", "死锁", "超时（疑似活锁）", "全部完成", "平均指令数", "平均重试"].map((x, i) => h("th", { class: i ? "num" : "" }, x)))),
+      h("tbody", {}, body),
+      h("caption", { style: { captionSide: "bottom", fontSize: "13px", color: "var(--muted)", padding: "6px" } },
+        `加锁顺序：${L.map((l, i) => `T${i + 1}: ${l.join(" ") || "（无）"}`).join("；")}`)));
+  };
+
+  nSel.onchange = () => { buildInputs(); reset(); };
+  stSel.onchange = reset; boCb.onchange = reset; seedIn.onchange = reset;
+  $("dl-p1").onclick = () => preset(2, ["L1 L2", "L2 L1"], "none", [0, 1, 0, 1]);
+  $("dl-p2").onclick = () => preset(3, ["L1 L2", "L2 L3", "L3 L1"], "none", [0, 1, 2, 0, 1, 2]);
+  $("dl-p3").onclick = () => preset(2, ["v1 v2", "v2 v1"], "none", []);
+  $("dl-p4").onclick = () => preset(2, ["L1 L2", "L2 L1"], "trylock", [0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1]);
+  $("dl-p5").onclick = () => preset(2, ["L1 L2", "L2 L1"], "order", [0, 1, 0, 1]);
+  buildInputs(); reset();
+})();
+
+// ===== 模拟器 2：调度避免 =====
+(() => {
+  const { h, s: S, color } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  const EX = {
+    1: { need: [[1, 1], [1, 1], [0, 1], [0, 0]], dur: [1, 1, 1, 1], book: ["T1 T2", "T3 T4"] },
+    2: { need: [[1, 1], [1, 1], [1, 1], [0, 0]], dur: [1, 1, 1, 1], book: ["T1 T2 T3", "T4"] },
+  };
+  let ex = 1, need, dur;
+  const danger = (a, b) => need[a][0] && need[a][1] && need[b][0] && need[b][1];
+  function parseCpu(txt) { return String(txt).toUpperCase().split(/[^T0-9]+/).filter(Boolean).map((x) => parseInt(x.replace("T", ""), 10) - 1); }
+  function evaluate(c1, c2) {
+    const iv = [];
+    [c1, c2].forEach((q, cpu) => { let t = 0; q.forEach((i) => { iv.push({ i, cpu, s: t, e: t + dur[i] }); t += dur[i]; }); });
+    const bad = [];
+    for (const a of iv) for (const b of iv)
+      if (a.cpu === 0 && b.cpu === 1 && a.s < b.e && b.s < a.e && danger(a.i, b.i)) bad.push({ a: a.i, b: b.i, s: Math.max(a.s, b.s), e: Math.min(a.e, b.e) });
+    return { iv, bad, span: Math.max(0, ...iv.map((x) => x.e)) };
+  }
+  function perms(a) { if (a.length <= 1) return [a]; return a.flatMap((x, i) => perms([...a.slice(0, i), ...a.slice(i + 1)]).map((p) => [x, ...p])); }
+  function search() {
+    let best = null, bestSafe = null;
+    for (const p of perms([0, 1, 2, 3])) for (let k = 0; k <= 4; k++) {
+      const c1 = p.slice(0, k), c2 = p.slice(k), r = evaluate(c1, c2);
+      if (!best || r.span < best.r.span) best = { c1, c2, r };
+      if (!r.bad.length && (!bestSafe || r.span < bestSafe.r.span)) bestSafe = { c1, c2, r };
+    }
+    return { best, bestSafe };
+  }
+  const fmt = (q) => q.map((i) => "T" + (i + 1)).join(" ");
+  function load(k) {
+    ex = k; need = EX[k].need.map((x) => x.slice()); dur = EX[k].dur.slice();
+    $("sc-c1").value = EX[k].book[0]; $("sc-c2").value = EX[k].book[1];
+    buildTable(); render();
+  }
+  function buildTable() {
+    const t = $("sc-need");
+    const row = (label, cells) => h("tr", {}, h("th", {}, label), ...cells);
+    t.replaceChildren(
+      h("thead", {}, row(`例 ${ex}`, [0, 1, 2, 3].map((i) => h("th", { style: { color: color(i) } }, `T${i + 1}`)))),
+      h("tbody", {},
+        ...[0, 1].map((l) => row(`需要 L${l + 1}`, [0, 1, 2, 3].map((i) => {
+          const cb = h("input", { type: "checkbox", "aria-label": `T${i + 1} 需要 L${l + 1}` }); cb.checked = !!need[i][l];
+          cb.onchange = () => { need[i][l] = cb.checked ? 1 : 0; render(); };
+          return h("td", {}, cb);
+        }))),
+        row("运行时长", [0, 1, 2, 3].map((i) => {
+          const inp = h("input", { type: "number", min: 1, max: 9, value: dur[i], "aria-label": `T${i + 1} 时长` });
+          inp.onchange = () => { dur[i] = Math.max(1, Math.min(9, +inp.value || 1)); inp.value = dur[i]; render(); };
+          return h("td", {}, inp);
+        }))));
+  }
+  function render() {
+    const c1 = parseCpu($("sc-c1").value), c2 = parseCpu($("sc-c2").value);
+    const all = [...c1, ...c2].sort();
+    const stage = $("sc-stage");
+    if (all.join() !== "0,1,2,3") {
+      stage.replaceChildren(h("p", { class: "muted" }, "请让 T1–T4 每个线程在两个 CPU 中恰好出现一次。"));
+      $("sc-narr").textContent = "调度无效：检查是否漏写或重复写了某个线程。"; $("sc-stats").replaceChildren(); return;
+    }
+    const r = evaluate(c1, c2), { best, bestSafe } = search();
+    const px = Math.min(90, 500 / Math.max(1, r.span)), X0 = 70, W = X0 + r.span * px + 24, H = 150;
+    const svg = S("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "两 CPU 调度甘特图" });
+    for (const b of r.bad) svg.append(S("rect", { x: X0 + b.s * px, y: 6, width: (b.e - b.s) * px, height: 104, class: "bad-soft", "stroke-dasharray": "4 3", "stroke-width": 1.5 }));
+    ["CPU 1", "CPU 2"].forEach((nm, k) => svg.append(S("text", { x: 8, y: 36 + k * 50, "font-size": 13, text: nm })));
+    for (const x of r.iv) {
+      const y = 14 + x.cpu * 50;
+      svg.append(S("rect", { x: X0 + x.s * px + 1, y, width: Math.max(2, (x.e - x.s) * px - 2), height: 36, rx: 4, style: `fill:${color(x.i)}` }));
+      svg.append(S("text", { x: X0 + (x.s + x.e) / 2 * px, y: y + 23, "text-anchor": "middle", "font-size": 13, style: "fill:#fff;font-weight:600", text: `T${x.i + 1}` }));
+    }
+    for (let t = 0; t <= r.span; t++) {
+      svg.append(S("line", { x1: X0 + t * px, x2: X0 + t * px, y1: 114, y2: 119, class: "stroke" }));
+      svg.append(S("text", { x: X0 + t * px, y: 134, "text-anchor": "middle", "font-size": 11, class: "t-muted mono", text: t }));
+    }
+    stage.replaceChildren(svg);
+    const names = (b) => `T${b.a + 1} 与 T${b.b + 1}`;
+    let msg;
+    if (r.bad.length) {
+      msg = `<span class="bad-text">可能死锁：</span>` + r.bad.map((b) => `${names(b)} 在时间 [${b.s}, ${b.e}) 同时运行，二者都需要 L1 和 L2，可能以相反顺序加锁、各握一把互等`).join("；") + "。调度器应把它们错开。";
+    } else {
+      msg = `<span class="ok-text">安全：</span>任意同时运行的两个线程最多共享一把锁，不可能形成"各持一把、互等另一把"的环。`;
+      if (r.span > bestSafe.r.span) msg += ` 不过还有更快的安全调度（${bestSafe.r.span} 个时间单位）。`;
+    }
+    if (bestSafe.r.span > best.r.span) msg += ` 本例中"安全"的代价：最优安全调度 ${bestSafe.r.span}，不顾死锁可以做到 ${best.r.span}——这就是原书说的"保守、牺牲性能"。`;
+    $("sc-narr").innerHTML = msg;
+    const stat = (v, l) => h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l));
+    $("sc-stats").replaceChildren(stat(r.span, "当前调度总完成时间"), stat(r.bad.length, "危险并发对"),
+      stat(bestSafe.r.span, "最优安全调度时间"), stat(best.r.span, "不顾死锁的最优时间"));
+    $("sc-safe").onclick = () => { $("sc-c1").value = fmt(bestSafe.c1); $("sc-c2").value = fmt(bestSafe.c2); render(); };
+    $("sc-fast").onclick = () => {
+      // 优先挑一个"最快但危险"的调度来演示；若最快调度本就安全则用它
+      let pick = best;
+      for (const p of perms([0, 1, 2, 3])) for (let k = 0; k <= 4; k++) {
+        const c1x = p.slice(0, k), c2x = p.slice(k), rx = evaluate(c1x, c2x);
+        if (rx.span === best.r.span && rx.bad.length && pick === best) pick = { c1: c1x, c2: c2x, r: rx };
+      }
+      $("sc-c1").value = fmt(pick.c1); $("sc-c2").value = fmt(pick.c2); render();
+    };
+  }
+  $("sc-e1").onclick = () => load(1);
+  $("sc-e2").onclick = () => load(2);
+  $("sc-book").onclick = () => { $("sc-c1").value = EX[ex].book[0]; $("sc-c2").value = EX[ex].book[1]; render(); };
+  $("sc-c1").addEventListener("input", render);
+  $("sc-c2").addEventListener("input", render);
+  load(1);
+})();
+
+// ===== 模拟器 3：原子性违反 / 顺序违反交错选择器 =====
+(() => {
+  const { h, color } = OSTEP;
+  const $ = (id) => document.getElementById(id);
+  const lock = (c) => ({ c, k: "lock" }), unlock = (c) => ({ c, k: "unlock" });
+  const act = (c, f) => ({ c, k: "act", f });
+  const SC = {
+    atom: {
+      vars: () => ({ proc_info: '"query"', lock: null }),
+      show: (v) => [`thd->proc_info = ${v.proc_info === null ? "NULL" : v.proc_info}`, `proc_info_lock: ${v.lock === null ? "空闲" : "线程 " + (v.lock + 1) + " 持有"}`],
+      pos: [
+        { label: "线程 1 检查之前", k: [0, 0] },
+        { label: "线程 1 检查之后、使用之前（危险窗口）", k: [1, 2] },
+        { label: "线程 1 使用之后", k: [2, 4] },
+      ],
+      code(fixed) {
+        const check = act("if (thd->proc_info) {", (v, L) => (L.ok = v.proc_info !== null) ? { msg: "检查：proc_info 非 NULL，进入 if 体" } : { msg: "检查：proc_info 已是 NULL，跳过 if 体" });
+        const use = act("  fputs(thd->proc_info, ...); }", (v, L) => !L.ok ? { msg: "if 不成立，这一行不执行" }
+          : v.proc_info === null ? { crash: true, msg: "fputs 读取 thd->proc_info——它已经被线程 2 改成 NULL！解引用 NULL，程序崩溃。检查时成立的前提，到使用时已经失效：原子性违反。" }
+          : { msg: `fputs 打印 ${v.proc_info}，一切正常` });
+        const setn = act("thd->proc_info = NULL;", (v) => { v.proc_info = null; return { msg: "线程 2 把 proc_info 置为 NULL" }; });
+        return fixed ? [[lock("pthread_mutex_lock(&proc_info_lock);"), check, use, unlock("pthread_mutex_unlock(&proc_info_lock);")],
+                        [lock("pthread_mutex_lock(&proc_info_lock);"), setn, unlock("pthread_mutex_unlock(&proc_info_lock);")]]
+                     : [[check, use], [setn]];
+      },
+    },
+    order: {
+      vars: () => ({ mThread: null, mtInit: 0, mState: "?", lock: null }),
+      show: (v) => [`mThread = ${v.mThread === null ? "NULL" : v.mThread}`, `mtInit = ${v.mtInit}`, `mState = ${v.mState}`, `mtLock: ${v.lock === null ? "空闲" : "线程 " + (v.lock + 1) + " 持有"}`],
+      pos: [
+        { label: "一被创建就立即运行", k: [1, 1] },
+        { label: "线程 1 执行完 init() 之后", k: [2, 6] },
+      ],
+      code(fixed) {
+        const create = act("PR_CreateThread(mMain, ...)  // 创建线程 2", (v, L, T) => { T[1].state = "ready"; return { msg: "线程 1 调用 PR_CreateThread：线程 2 诞生，随时可能被调度（此时调用还没返回，mThread 仍为 NULL）" }; });
+        const assign = act("mThread = <返回值>;", (v) => { v.mThread = "0x7f3a…"; return { msg: "PR_CreateThread 返回，线程 1 把结果赋给 mThread" }; });
+        const use = act("mState = mThread->State;", (v) => v.mThread === null
+          ? { crash: true, msg: "线程 2 读取 mThread->State——mThread 还是 NULL！解引用 NULL，崩溃。本应\"先赋值、后读取\"，顺序却被颠倒：顺序违反。" }
+          : ((v.mState = "RUNNING"), { msg: "线程 2 读取 mThread->State 成功，mState = RUNNING" }));
+        if (!fixed) return [[create, assign], [use]];
+        return [[create, assign, lock("pthread_mutex_lock(&mtLock);"),
+                 act("mtInit = 1;", (v) => { v.mtInit = 1; return { msg: "线程 1 设置 mtInit = 1" }; }),
+                 { c: "pthread_cond_signal(&mtCond);", k: "signal" }, unlock("pthread_mutex_unlock(&mtLock);")],
+                [lock("pthread_mutex_lock(&mtLock);"), { c: "while (mtInit == 0) cond_wait(&mtCond, &mtLock);", k: "wait" },
+                 unlock("pthread_mutex_unlock(&mtLock);"), use]];
+      },
+    },
+  };
+  const bugSel = $("iv-bug"), posSel = $("iv-pos"), fixCb = $("iv-fix");
+  let trace = [], code = [];
+
+  function simulate() {
+    const sc = SC[bugSel.value], fixed = fixCb.checked, p = sc.pos[+posSel.value || 0];
+    code = sc.code(fixed);
+    const v = sc.vars(), L = [{}, {}];
+    const T = [{ pc: 0, state: "ready", reacq: false }, { pc: 0, state: bugSel.value === "order" ? "unborn" : "ready", reacq: false }];
+    const out = [{ who: -1, line: -1, msg: "初始状态。下一步开始按你选择的交错执行。", v: { ...v }, st: T.map((t) => ({ ...t })) }];
+    let crashed = false;
+    const wakeLock = () => T.forEach((t) => { if (t.state === "blocked") t.state = "ready"; });
+    function exec(w) {
+      const t = T[w], op = code[w][t.pc]; let r;
+      if (op.k === "lock" || (op.k === "wait" && t.reacq)) {
+        if (v.lock !== null && v.lock !== w) { t.state = "blocked"; r = { msg: `线程 ${w + 1} 想拿锁，但锁被线程 ${v.lock + 1} 持有 → 睡眠等待` }; }
+        else if (op.k === "lock") { v.lock = w; t.pc++; r = { msg: `线程 ${w + 1} 拿到锁` }; }
+        else { v.lock = w; t.reacq = false; r = { msg: `线程 ${w + 1} 从 cond_wait 返回，重新拿到 mtLock，回到 while 再检查一次` }; }
+      } else if (op.k === "unlock") { v.lock = null; t.pc++; wakeLock(); r = { msg: `线程 ${w + 1} 释放锁` }; }
+      else if (op.k === "wait") {
+        if (v.mtInit === 0) { v.lock = null; wakeLock(); t.state = "sleep"; t.reacq = true; r = { msg: "mtInit == 0：线程 2 调用 cond_wait，释放 mtLock 并睡眠，等线程 1 的信号" }; }
+        else { t.pc++; r = { msg: `mtInit == 1：线程 ${w + 1} 不用等，跳出 while` }; }
+      } else if (op.k === "signal") {
+        const sl = T.findIndex((x) => x.state === "sleep");
+        if (sl >= 0) T[sl].state = "ready";
+        t.pc++; r = { msg: sl >= 0 ? `线程 ${w + 1} 发信号，唤醒睡在 mtCond 上的线程 ${sl + 1}（它还需要重新拿锁）` : `线程 ${w + 1} 发信号，但没有线程在等（信号丢了也无妨，因为 mtInit 记住了状态）` };
+      } else { r = op.f(v, L[w], T); t.pc++; }
+      if (t.pc >= code[w].length && t.state === "ready") t.state = "done";
+      out.push({ who: w, opIdx: code[w].indexOf(op), msg: r.msg, crash: !!r.crash, v: { ...v }, st: T.map((x) => ({ ...x })) });
+      if (r.crash) crashed = true;
+    }
+    const phases = [[0, p.k[fixed ? 1 : 0]], [1, 99], [0, 99], [1, 99], [0, 99], [1, 99]];
+    for (const [w, lim] of phases) {
+      let c = 0;
+      while (!crashed && c < lim && T[w].state === "ready" && T[w].pc < code[w].length) { exec(w); c++; }
+    }
+    for (let g = 0; g < 40 && !crashed; g++) {
+      const w = T.findIndex((t) => t.state === "ready" && t.pc < code[T.indexOf(t)].length);
+      if (w < 0) break; exec(w);
+    }
+    const last = out[out.length - 1];
+    if (!crashed) out.push({ who: -1, line: -1, done: true, msg: "两个线程都执行完毕，没有崩溃。", v: last.v, st: last.st });
+    trace = out;
+  }
+  const STN = { ready: "就绪", blocked: "等锁", sleep: "睡眠（等 mtCond）", done: "完成", unborn: "尚未创建" };
+  const STC = { ready: "ready", blocked: "blocked", sleep: "sleep", done: "done", unborn: "unborn" };
+  function render(i) {
+    const x = trace[i], sc = SC[bugSel.value];
+    $("iv-cols").replaceChildren(...[0, 1].map((w) => h("div", {},
+      h("div", { class: "dl-t" + (x.crash && x.who === w ? " dead" : "") },
+        h("div", { class: "hd" }, h("span", { class: "sw", style: { background: color(w) } }), `线程 ${w + 1}`,
+          h("span", { class: "pill " + STC[x.st[w].state] }, STN[x.st[w].state])),
+        h("ol", {}, code[w].map((op, k) => h("li", { class: x.who === w && x.opIdx === k ? "cur" : "" }, op.c)))))));
+    $("iv-vars").replaceChildren(...sc.show(x.v).map((t) => h("span", { class: "pill" }, t)));
+    $("iv-narr").innerHTML = (x.who >= 0 ? `<b>线程 ${x.who + 1}：</b>` : "") + x.msg.replace(/&/g, "&amp;").replace(/</g, "&lt;") +
+      (x.crash ? ' <span class="bad-text">[崩溃]</span>' : x.done ? ' <span class="ok-text">[正确]</span>' : "");
+    $("iv-log").textContent = trace.slice(1, i + 1).map((y, k) => `${k + 1}. ${y.who >= 0 ? "线程 " + (y.who + 1) + "：" : ""}${y.msg}`).join("\n") || "（尚未执行）";
+    $("iv-log").scrollTop = 1e6;
+  }
+  const st = OSTEP.stepper($("iv-step"), { steps: () => trace.length, render, autoplayMs: 1400 });
+  function fillPos() {
+    posSel.replaceChildren(...SC[bugSel.value].pos.map((p, i) => h("option", { value: i }, p.label)));
+    posSel.value = bugSel.value === "atom" ? "1" : "0";   // 默认选中会出错的交错
+  }
+  function rebuild() { simulate(); st.reset(); }
+  bugSel.onchange = () => { fillPos(); rebuild(); };
+  posSel.onchange = rebuild; fixCb.onchange = rebuild;
+  fillPos(); simulate();
+})();
+</script>
+</body>
+</html>

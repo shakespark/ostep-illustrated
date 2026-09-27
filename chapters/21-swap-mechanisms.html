@@ -1,0 +1,757 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 21 章 · 超越物理内存：机制</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+.flow-node rect { transition: fill .2s, stroke .2s; }
+.flow-node.cur rect { fill: var(--warn-soft); stroke: var(--warn); stroke-width: 2.5; }
+.flow-node.done rect { stroke: var(--accent); }
+.flow-node.bad rect { fill: var(--bad-soft); stroke: var(--bad); stroke-width: 2.5; }
+.flow-node.good rect { fill: var(--ok-soft); stroke: var(--ok); stroke-width: 2.5; }
+.state-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; margin-top: 12px; }
+.state-grid h4 { margin: 0 0 6px; font-size: 14px; }
+.mini { width: 100%; font-size: 12.5px; }
+.mini th, .mini td { padding: 3px 6px; font-family: var(--mono); }
+.mini th { font-family: var(--font); }
+.mini tr.chg td { background: var(--warn-soft); }
+.mini tr.use td { background: var(--accent-soft); }
+.slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 6px; }
+.slot { border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; font: 12px/1.35 var(--mono); background: var(--surface); min-height: 44px; }
+.slot b { display: block; font-family: var(--font); font-size: 11px; color: var(--muted); font-weight: 600; }
+.slot.free { color: var(--faint); background: var(--surface-2); }
+.slot.chg { border-color: var(--warn); background: var(--warn-soft); }
+.slot.use { border-color: var(--accent); background: var(--accent-soft); }
+.slot.p0 { box-shadow: inset 4px 0 0 var(--c1); } .slot.p1 { box-shadow: inset 4px 0 0 var(--c2); }
+.slot.p2 { box-shadow: inset 4px 0 0 var(--c3); } .slot.p3 { box-shadow: inset 4px 0 0 var(--c4); }
+.codecols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; }
+.codecols pre { font-size: 12px; margin: 6px 0 0; line-height: 1.5; }
+.codecols pre .ln { display: block; padding: 0 4px; border-radius: 3px; }
+.codecols pre .ln.hl { background: color-mix(in srgb, var(--warn) 28%, transparent); }
+.codecols h4 { margin: 0; font-size: 13.5px; }
+.procbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 13.5px; }
+.pill.run { background: var(--ok-soft); border-color: var(--ok); }
+.pill.blk { background: var(--warn-soft); border-color: var(--warn); }
+.pill.dead { background: var(--bad-soft); border-color: var(--bad); }
+.memrow { display: flex; flex-wrap: wrap; gap: 3px; }
+.memrow .m { width: 22px; height: 22px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface-2); }
+.memrow .m.ev { outline: 2px solid var(--bad); outline-offset: -2px; }
+</style>
+</head>
+<body data-chapter="21">
+<main>
+
+<h2>这一章要解决什么</h2>
+<div class="crux">
+  <p><strong>如何超越物理内存？</strong>操作系统如何利用一个更大、更慢的设备，透明地提供"巨大虚拟地址空间"的假象？</p>
+  <p class="muted small">How can the OS make use of a larger, slower device to transparently provide the illusion of a large virtual address space?</p>
+</div>
+<p>到目前为止（第 13～20 章）我们一直假设：每个进程的地址空间都很小，并且<strong>所有进程的所有页都能放进物理内存</strong>。这显然不现实。本章放宽这个假设：要支持许多同时运行的<strong>大</strong>地址空间，就需要在存储层次中再加一层——容量更大但更慢的磁盘（或 SSD），把暂时不用的页"藏"到那里。</p>
+<p>为什么要给进程一个大地址空间？因为<strong>方便</strong>：程序员只管自然地分配内存，不必操心内存够不够。对比早年的<strong>内存覆盖（memory overlays）</strong>：程序员要在调用函数或访问数据之前，手动把相应的代码或数据搬进内存——想想就头疼。再加上<strong>多道程序（multiprogramming）</strong>需要同时容纳许多进程，"用比物理内存更多的内存"成了所有现代 VM 系统的标配。本章讲<strong>机制</strong>（present 位、页错误、交换空间），下一章（第 22 章）讲<strong>策略</strong>（踢出哪个页）。</p>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>交换空间（swap space）</h4><p>磁盘上预留的区域，以页为单位把页换出（swap out）到这里、再换入（swap in）回来。</p></div>
+  <div class="card"><h4>present 位（present bit）</h4><p>PTE 中的一位：1 = 页在物理内存；0 = 页在磁盘上某处。</p></div>
+  <div class="card"><h4>页错误（page fault）</h4><p>访问一个合法但不在内存中的页。硬件抛出异常，交给 OS 处理（其实更该叫 page miss）。</p></div>
+  <div class="card"><h4>页错误处理程序</h4><p>OS 代码：找空闲页框（没有就先淘汰一页），从磁盘读入页，更新 PTE，重试指令。</p></div>
+  <div class="card"><h4>替换策略（page-replacement policy）</h4><p>内存满时决定踢出哪一页。选错了程序会慢 1 万～10 万倍，下一章详谈。</p></div>
+  <div class="card"><h4>高/低水位线（HW/LW）</h4><p>空闲页少于 LW 时唤醒后台线程，一直换出到空闲页达到 HW 再睡。</p></div>
+  <div class="card"><h4>交换守护进程（swap daemon）</h4><p>也叫 page daemon，在后台成批换出页，还能把写操作聚集（cluster）起来提高磁盘效率。</p></div>
+  <div class="card"><h4>透明（transparency）</h4><p>这一切对进程完全不可见：它只看到自己私有、连续的虚拟内存。</p></div>
+</div>
+
+<h2>交换空间：内存之下的一层</h2>
+<p>首先在磁盘上预留一块空间，用来来回移动页，这就是<strong>交换空间（swap space）</strong>。我们假设 OS 能以页为单位读写交换空间，为此 OS 需要记住每个被换出的页在磁盘上的地址。交换空间的大小很重要：它最终决定了系统某一时刻最多能使用多少个内存页。这里先假设它非常大。</p>
+<p>原书 Figure 21.1 是一个很小的例子：4 个页框的物理内存，8 个块的交换空间。三个进程（Proc 0、1、2）共享物理内存，但每个进程都只有一部分有效页在内存里，其余在磁盘上；Proc 3 的页全部被换出，所以它显然没有在运行。交换空间还剩 1 个空闲块。</p>
+<figure class="fig">
+<svg viewBox="0 0 700 250" width="700" role="img" aria-label="物理内存与交换空间（Figure 21.1）">
+  <text x="20" y="40" font-weight="600">物理内存</text>
+  <g id="f211-mem"></g>
+  <text x="20" y="160" font-weight="600">交换空间</text>
+  <g id="f211-swap"></g>
+</svg>
+<figcaption>复刻原书 Figure 21.1：4 页物理内存 + 8 块交换空间。颜色表示所属进程；Proc 3 的页全在磁盘上。</figcaption>
+</figure>
+<p>还要注意：交换空间并不是换页流量唯一的磁盘位置。比如程序二进制（<code>ls</code> 或你编译的程序）的代码页一开始就在磁盘的可执行文件里，运行时才被载入内存（一次全部载入，或像现代系统那样用到一页载入一页）。如果系统需要腾出内存，可以放心地<strong>直接丢弃</strong>这些代码页（不用写到交换空间），因为以后还能从文件系统里的二进制文件重新读回来。</p>
+<div class="aside" data-title="旁注：存储技术">
+  <p>这个"更大更慢的设备"不一定是机械硬盘，也可以是更现代的基于闪存的 SSD（第 44 章）。现在只需假设有一个大而相对慢的设备，用来帮我们构造"比物理内存更大的虚拟内存"这一假象。</p>
+</div>
+
+<h2>present 位：页在内存里吗？</h2>
+<p>先回顾一次内存访问（假设 <strong>硬件管理的 TLB</strong>）：硬件从虚拟地址中取出 VPN，查 TLB；命中就直接得到物理地址去访存（常见情况，快）。TLB 未命中时，硬件用<strong>页表基址寄存器（PTBR）</strong>找到内存中的页表，以 VPN 为索引取出 PTE；如果页有效且在物理内存中，就取出 PFN 装入 TLB，然后重试指令，这次 TLB 命中。</p>
+<p>允许页被换到磁盘后，硬件查 PTE 时可能发现<strong>页不在物理内存中</strong>。判断依据是 PTE 中新增的一位：<strong>present 位（present bit）</strong>。</p>
+<figure class="fig">
+<svg viewBox="0 0 720 200" width="720" role="img" aria-label="带 present 位的 PTE">
+  <g id="pte-fig"></g>
+</svg>
+<figcaption>present = 1 时，PTE 里存的是 PFN；present = 0 时，OS 可以复用这些位存放页在交换空间中的<strong>磁盘地址</strong>。</figcaption>
+</figure>
+<div class="aside" data-title="旁注：交换术语">
+  <p>"页错误（page fault）"这个词有点奇怪：访问一个映射在地址空间里、只是暂时不在内存中的页，是<strong>完全合法</strong>的，本该叫 page miss。之所以叫"fault"，大概是因为处理机制相同：硬件遇到自己处理不了的情况，就抛出异常把控制权交给 OS——这和进程做了非法操作时一模一样。更广义地，"page fault"有时也指非法内存访问。人们说程序"在大量 page fault"，通常指它在访问被 OS 换到磁盘上的部分。</p>
+</div>
+
+<h2>页错误：谁来处理、怎么处理</h2>
+<p>无论 TLB 由硬件还是软件管理，页不在内存时都由 OS 接管：运行<strong>页错误处理程序（page-fault handler）</strong>。几乎所有系统都用软件处理页错误，即使 TLB 由硬件管理。</p>
+<div class="aside" data-title="旁注：为什么硬件不处理页错误？">
+  <p>硬件设计者一向不太信任 OS，为什么这件事却交给 OS？两点原因：一是<strong>性能</strong>——访问磁盘本来就极慢，OS 多执行一些指令的开销相比之下微不足道；二是<strong>简单</strong>——硬件要处理页错误，就得懂交换空间、懂如何向磁盘发 I/O 等一大堆它本不关心的细节。</p>
+</div>
+<p>OS 如何知道页在磁盘哪里？页表是存放这个信息的天然位置：PTE 中原本存 PFN 的那些位可以改存<strong>磁盘地址</strong>。处理流程：</p>
+<ol>
+  <li>OS 从 PTE 中找到磁盘地址，向磁盘发请求，把页读进内存；</li>
+  <li>磁盘 I/O 期间，进程处于<strong>阻塞（blocked）</strong>状态，OS 可以运行其他就绪进程——I/O 与计算重叠，这是多道程序充分利用硬件的又一方式；</li>
+  <li>I/O 完成后，OS 更新页表：present 置 1，PFN 字段记录新页框号；</li>
+  <li>重试指令。这次可能 TLB 未命中，查页表后装入 TLB（也可以在处理页错误时顺便更新 TLB，省掉这一步）；最后一次重试 TLB 命中，取到数据。</li>
+</ol>
+<figure class="fig">
+<svg viewBox="0 0 720 190" width="720" role="img" aria-label="页错误期间 I/O 与计算重叠">
+  <g id="overlap-fig"></g>
+</svg>
+<figcaption>进程 A 发生页错误后被阻塞，OS 在磁盘读页的这段时间里运行进程 B；I/O 完成中断后 A 回到就绪态，稍后重试那条指令。</figcaption>
+</figure>
+
+<h3>内存满了怎么办？</h3>
+<p>上面的流程假设有空闲内存可以放换入的页。可内存可能已经满了（或接近满）。这时 OS 需要先<strong>换出（page out）</strong>一个或多个页腾出空间。挑选踢出哪个页的过程叫<strong>页替换策略（page-replacement policy）</strong>。踢错了页代价巨大：程序可能以磁盘速度而不是内存速度运行，按当前技术这意味着慢 1 万到 10 万倍。策略是下一章的主题；现在只需知道它建立在本章的机制之上。</p>
+
+<h2>完整控制流：一次内存访问的所有可能</h2>
+<p>现在可以回答"程序从内存取一个数据时到底发生了什么"。原书用两段伪代码描述：Figure 21.2 是硬件在地址转换时做的事，Figure 21.3 是 OS 处理页错误时做的事。</p>
+<div class="codecols">
+<div><h4>Figure 21.2 硬件控制流</h4>
+<pre><code>1  VPN = (VirtualAddress &amp; VPN_MASK) &gt;&gt; SHIFT
+2  (Success, TlbEntry) = TLB_Lookup(VPN)
+3  if (Success == True)   // TLB Hit
+4      if (CanAccess(TlbEntry.ProtectBits) == True)
+5          Offset   = VirtualAddress &amp; OFFSET_MASK
+6          PhysAddr = (TlbEntry.PFN &lt;&lt; SHIFT) | Offset
+7          Register = AccessMemory(PhysAddr)
+8      else
+9          RaiseException(PROTECTION_FAULT)
+10 else                   // TLB Miss
+11     PTEAddr = PTBR + (VPN * sizeof(PTE))
+12     PTE = AccessMemory(PTEAddr)
+13     if (PTE.Valid == False)
+14         RaiseException(SEGMENTATION_FAULT)
+15     else
+16         if (CanAccess(PTE.ProtectBits) == False)
+17             RaiseException(PROTECTION_FAULT)
+18         else if (PTE.Present == True)
+19             // assuming hardware-managed TLB
+20             TLB_Insert(VPN, PTE.PFN, PTE.ProtectBits)
+21             RetryInstruction()
+22         else if (PTE.Present == False)
+23             RaiseException(PAGE_FAULT)</code></pre></div>
+<div><h4>Figure 21.3 软件（OS）控制流</h4>
+<pre><code>1 PFN = FindFreePhysicalPage()
+2 if (PFN == -1)              // no free page found
+3     PFN = EvictPage()       // replacement algorithm
+4 DiskRead(PTE.DiskAddr, PFN) // sleep (wait for I/O)
+5 PTE.present = True          // update page table:
+6 PTE.PFN     = PFN           // (present/translation)
+7 RetryInstruction()          // retry instruction</code></pre>
+<p class="small" style="margin-top:10px">TLB 未命中时有<strong>三种情况</strong>：</p>
+<ul class="small">
+  <li><strong>有效且 present</strong>（第 18–21 行）：从 PTE 取 PFN 装入 TLB，重试，TLB 命中。</li>
+  <li><strong>有效但不 present</strong>（第 22–23 行）：合法访问，但页不在内存 → 页错误，运行页错误处理程序。</li>
+  <li><strong>无效</strong>（第 13–14 行）：比如程序 bug 访问了未分配的页。其他位都不重要了，硬件陷入 OS，进程多半被终止。</li>
+</ul></div>
+</div>
+<p>软件部分：OS 先为即将换入的页找一个物理页框；没有就等替换算法踢出一些页。拿到页框后发 I/O 读入页；这个慢操作完成后更新页表并重试指令——重试先导致一次 TLB 未命中，再重试才 TLB 命中。下面的模拟器把这两段控制流合在一起，一步一步走给你看。</p>
+
+<section class="sim" id="sim-path">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>一次内存访问的完整路径（复刻 Figure 21.2 + 21.3）</h3><div class="desc">系统状态沿用 Figure 21.1。当前运行的是 Proc 0：VPN 0 是代码页（r-x，已在内存），VPN 1、2 是数据页（rw-，在交换空间），VPN 3 未分配（无效）。TLB 只有 2 项。每一步在流程图和伪代码中高亮当前位置，右侧显示 TLB、页表、物理内存和交换空间的变化。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>访问序列 <input type="text" id="ap-seq" value="0 0 1w 2 1 3" style="width:14em"></label>
+      <label>物理页框 <select id="ap-frames"><option value="4">4（满，同 Fig 21.1）</option><option value="6">6（有 2 个空闲）</option></select></label>
+      <button id="ap-apply" class="primary">载入</button>
+    </div>
+    <div class="controls">
+      <span class="muted small">预设：</span>
+      <button data-seq="0 0 1w 2 1 3" data-fr="4">全流程（命中/缺页/淘汰/段错误）</button>
+      <button data-seq="0 1 2" data-fr="6">有空闲页框的页错误</button>
+      <button data-seq="0 0w" data-fr="4">写只读代码页（保护错误）</button>
+      <span class="muted small">记法：<code>1</code> 读 VPN 1，<code>1w</code> 写 VPN 1</span>
+    </div>
+    <div id="ap-step"></div>
+    <div class="stage">
+      <svg id="ap-flow" viewBox="0 0 790 470" width="790" role="img" aria-label="内存访问控制流程图"></svg>
+    </div>
+    <div class="narrate" id="ap-n"></div>
+    <div class="procbar" style="margin-top:10px" id="ap-proc"></div>
+    <div class="state-grid" id="ap-state"></div>
+    <div class="codecols" style="margin-top:12px">
+      <div><h4>硬件（Fig 21.2）</h4><pre id="ap-hw"></pre></div>
+      <div><h4>OS 页错误处理（Fig 21.3）</h4><pre id="ap-sw"></pre></div>
+    </div>
+    <div class="stats" id="ap-stats"></div>
+  </div>
+</section>
+<p class="small muted">模拟器的简化：沿用 Figure 21.1 的"每个页要么在内存、要么在交换空间"——页换入后它的交换块就被释放，所以换出时一律写到一个空闲交换块；替换策略用最简单的 FIFO（按装入先后）；访问内存计 100 ns，一次磁盘 I/O 计 10 ms。真实系统往往保留干净页在磁盘上的副本，用脏位（dirty bit）省掉写回，见下一章。</p>
+
+<p>请特别留意三点：① 一次页错误要"重试"<strong>两次</strong>才能真正访问到数据（第一次 TLB 未命中，第二次才命中）；② 进程在磁盘 I/O 期间被<strong>阻塞</strong>，CPU 会转去运行别的进程；③ 如果被淘汰的页正是本进程的某个页，它在 TLB 中的旧翻译也必须作废，否则就会访问到已经装了别人数据的页框。</p>
+
+<h2>替换何时真正发生：高低水位线与交换守护进程</h2>
+<p>前面的描述假设 OS 等到内存<strong>完全满了</strong>才替换（淘汰）一页，这不太现实。OS 有很多理由<strong>主动</strong>保持一小部分内存空闲。为此，大多数操作系统设置<strong>高水位线（high watermark，HW）</strong>和<strong>低水位线（low watermark，LW）</strong>：</p>
+<ul>
+  <li>当 OS 发现可用页<strong>少于 LW</strong> 时，一个负责释放内存的后台线程开始运行；</li>
+  <li>它不断淘汰页，直到可用页<strong>达到 HW</strong>，然后心满意足地去睡觉。</li>
+</ul>
+<p>这个后台线程叫<strong>交换守护进程（swap daemon）</strong>或<strong>页守护进程（page daemon）</strong>。（"daemon"读作"demon"，是后台进程的老称呼，源自 Multics 项目组借用的物理学"麦克斯韦妖"。）一次替换多个页还带来新的优化：许多系统会把一批页<strong>聚集（cluster）</strong>起来一次写入交换分区，减少磁盘寻道和旋转开销，显著提高效率。</p>
+<p>配合后台线程，Figure 21.3 的控制流要稍作修改：处理程序不再直接替换页，而是检查有没有空闲页；没有就通知后台分页线程"需要空闲页"，等它释放出一些页后再唤醒原线程，继续换入所需的页。</p>
+
+<section class="sim" id="sim-daemon">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>高/低水位线与交换守护进程</h3><div class="desc">每个时钟滴答，进程们因页错误等原因申请若干新页框。空闲页跌破 LW 时守护进程醒来，按 FIFO 淘汰旧页直到空闲页回到 HW，并把写出操作按"聚集大小"打包。观察空闲页曲线的锯齿形状，以及聚集如何减少磁盘写次数。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>页框总数 <input type="number" id="dm-n" value="32" min="8" max="128"></label>
+      <label>LW <input type="number" id="dm-lw" value="4" min="0"></label>
+      <label>HW <input type="number" id="dm-hw" value="10" min="1"></label>
+      <label>每滴答最多申请 <input type="number" id="dm-rate" value="3" min="1" max="16"></label>
+      <label>聚集大小 <input type="number" id="dm-cl" value="4" min="1" max="32"></label>
+      <label>种子 <input type="number" id="dm-seed" value="3"></label>
+      <button id="dm-apply" class="primary">应用</button>
+    </div>
+    <div id="dm-step"></div>
+    <div class="stage">
+      <div class="memrow" id="dm-mem"></div>
+      <div class="chart-wrap" id="dm-chart" style="margin-top:10px"></div>
+    </div>
+    <div class="narrate" id="dm-nr"></div>
+    <div class="stats" id="dm-stats"></div>
+  </div>
+</section>
+<div class="tip"><p><strong>把工作放到后台做。</strong>OS 经常在后台做事：例如先把文件写缓存在内存里，稍后再写到磁盘。好处包括：磁盘可以一次收到很多写请求、更好地调度（效率）；应用觉得写操作很快就完成了（延迟）；有些写可能根本不用做，比如文件很快被删除（减少工作）；后台工作可以利用系统空闲时间（更好地利用硬件）。</p></div>
+
+<h2>先预测再验证</h2>
+<div class="exercise"><div class="q">在访问路径模拟器里载入"全流程"预设。先预测：第三个访问 <code>1w</code> 总共会导致几次 TLB 查找？会有几次磁盘 I/O？被淘汰的是谁的页？</div>
+<details class="reveal"><summary>看答案</summary><div>TLB 查找 3 次：第一次未命中 → 查页表发现 present=0 → 页错误；OS 处理完后重试，第二次仍未命中（TLB 里还没有这条翻译）→ 查页表 present=1 → 装入 TLB 再重试；第三次命中。磁盘 I/O 2 次：先把被淘汰页写到交换空间（块 2），再把 VPN 1 从块 0 读入。按 FIFO，最先装入的是 PFN 1 上的 Proc 1 [VPN 2]，所以被淘汰的是 Proc 1 的页——当前进程的页也可能挤掉别的进程的页（全局替换）。</div></details></div>
+
+<div class="exercise"><div class="q">把物理页框改成 6，再跑同样的序列。哪些步骤消失了？总耗时如何变化？</div>
+<details class="reveal"><summary>看答案</summary><div><code>FindFreePhysicalPage()</code> 直接找到空闲页框，不再执行 <code>EvictPage()</code>，也就不需要把牺牲页写回磁盘。每次页错误少一次磁盘写（约 10 ms），这正是交换守护进程要"预先保持一些空闲页"的动机：把淘汰和写回移出页错误的关键路径。</div></details></div>
+
+<div class="exercise"><div class="q">序列最后访问 VPN 3。PTE 的 present 位此时是什么值重要吗？</div>
+<details class="reveal"><summary>看答案</summary><div>不重要。VPN 3 的 valid 位为 0，硬件在第 13–14 行就抛出 SEGMENTATION_FAULT，根本不会看 present 位（原书："no other bits in the PTE really matter"）。OS 通常会终止该进程。</div></details></div>
+
+<div class="exercise"><div class="q">在守护进程模拟器里把聚集大小从 1 改为 8，预测"磁盘写次数"怎样变化？LW 和 HW 靠得很近（比如 LW=4、HW=5）会怎样？</div>
+<details class="reveal"><summary>看答案</summary><div>被换出的页数不变，但写操作被打包成更少、更大的 I/O，磁盘写次数大约变为原来的 1/8（每次唤醒至少一次写）。LW 与 HW 太近时，守护进程每次只腾出一两页，于是频繁醒来、每次写得很少，无法有效聚集；两者拉开，每次唤醒成批工作，但会有更多内存闲置。这是一个权衡。</div></details></div>
+
+<div class="exercise"><div class="q">（改编自 Homework 2、5）运行下面实验中的 <code>./mem 1024</code>。第 0 轮和之后几轮的速度为什么差了约 10 倍？如果分配量超过物理内存又会怎样？</div>
+<details class="reveal"><summary>看答案</summary><div>第 0 轮每页首次被触碰都会产生一次 minor page fault（OS 找一个页框、清零、建立映射），1024 MB 就是 26 万多次页错误；之后页都已 present，只剩纯内存访问。如果分配量超过物理内存，第 1 轮起页会被换出又换入，<code>vmstat</code> 的 si/so 列变为非零，带宽跌到磁盘/SSD 的水平。</div></details></div>
+
+<h2>动手实验</h2>
+<div class="lab">
+  <p><strong>实验 1：亲眼看到 present 位。</strong>Linux 的 <code>/proc/self/pagemap</code> 为每个虚拟页提供一个条目：第 63 位是"页在内存中（present）"，第 62 位是"页在交换空间中（swapped）"。<code>present.c</code> 分配 16 页，写偶数页，再用 <code>madvise(MADV_PAGEOUT)</code> 请内核把它们换出，最后重新读取。</p>
+  <pre><code><span class="cmd">cd labs/21-swap-mechanisms &amp;&amp; make</span>
+<span class="cmd">./present</span></code></pre>
+  <p>示例输出（本机 WSL2 实际运行，有 4 GB 交换空间；你的机器上地址和数字会不同）：</p>
+  <pre><code>16 pages at 0x7e79c7ab3000   (P = present in RAM, S = swapped out, . = never touched)
+after mmap:                      ................   present= 0 swapped= 0
+after writing even pages:        P.P.P.P.P.P.P.P.   present= 8 swapped= 0
+   -&gt; write even pages: minor faults 9, major faults 0
+after MADV_PAGEOUT:              S.S.S.S.S.S.S.S.   present= 0 swapped= 8
+after reading even pages:        P.P.P.P.P.P.P.P.   present= 8 swapped= 0
+   -&gt; re-read even pages: minor faults 8, major faults 0
+data intact after swap-in? yes</code></pre>
+  <p>解读：mmap 之后一页都没有（按需分配）；写入触发页错误后页变为 present；换出后 PTE 的 present 位清零、改记交换位置（S）；再读时每页一次页错误把页换回，数据完好。为什么记成 <em>minor</em> 而不是 major？因为刚换出的页还留在内核的<strong>交换缓存（swap cache）</strong>里，处理程序不必真的读磁盘；只有需要实际磁盘 I/O 的才算 major fault。</p>
+  <p><strong>实验 2：按需分页的代价（Homework 的 mem.c）。</strong>在另一个终端运行 <code>vmstat 1</code>，观察 swpd、free、si、so 列：</p>
+  <pre><code><span class="cmd">./mem 1024 3</span>
+allocated 1024 MB (262144 pages of 4KB) at 0x763875dd9010
+loop 0:  1113.53 ms      919.6 MB/s  minor faults  262145  major faults 0
+loop 1:    92.97 ms    11013.8 MB/s  minor faults       0  major faults 0
+loop 2:    86.35 ms    11858.6 MB/s  minor faults       0  major faults 0</code></pre>
+  <p>第 0 轮 262,145 次 minor fault ≈ 1024 MB / 4 KB：每页第一次被触碰都要陷入 OS 分配页框。之后没有页错误，速度快了约 12 倍。想看真正的换页，可以让分配量接近或超过 <code>free -m</code> 显示的可用内存（小心：机器会变得很卡），观察 si/so 与带宽的变化。</p>
+</div>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="2"><div class="q">PTE 中 present 位为 0、valid 位为 1，访问该页会发生什么？</div>
+<div class="opts"><button>A. 保护错误</button><button>B. 段错误，进程被终止</button><button>C. 页错误，OS 从磁盘把页读入后重试指令</button><button>D. 硬件自动从磁盘读取该页</button></div>
+<div class="explain">有效但不在内存：合法访问，硬件抛出 PAGE_FAULT，OS 的页错误处理程序负责换入。硬件不懂磁盘，不会自己去读（D 错）。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">为什么即使 TLB 由硬件管理，页错误也由 OS（软件）处理？</div>
+<div class="opts"><button>A. 磁盘 I/O 本身极慢，软件开销可忽略；且硬件需要了解交换空间和磁盘 I/O 等细节，太复杂</button><button>B. 因为硬件无法访问页表</button><button>C. 因为 OS 比硬件快</button><button>D. 因为页错误很少发生</button></div>
+<div class="explain">原书给出的两点：性能（磁盘太慢，软件额外开销微不足道）和简单性（硬件不必懂交换空间、磁盘 I/O）。</div></div>
+
+<div class="mcq" data-answer="0"><div class="q">OS 在处理页错误时如何知道页在磁盘上的位置？</div>
+<div class="opts"><button>A. 页不在内存时，PTE 中原本存 PFN 的位可以用来存磁盘地址</button><button>B. 由硬件在异常中传递</button><button>C. 扫描整个交换空间</button><button>D. 在 TLB 中查找</button></div>
+<div class="explain">许多系统就把磁盘地址存在 PTE 里：present=0 时 PFN 字段没用，正好复用。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">页错误处理期间（磁盘 I/O 进行中），发生页错误的进程处于什么状态？</div>
+<div class="opts"><button>A. 就绪（ready）</button><button>B. 阻塞（blocked），OS 可以运行其他就绪进程</button><button>C. 运行（running），CPU 忙等 I/O 完成</button><button>D. 终止（terminated）</button></div>
+<div class="explain">I/O 期间进程被阻塞，CPU 转去运行别的进程；I/O 完成后它才回到就绪态。这种重叠是多道程序提高利用率的方式之一。</div></div>
+
+<div class="mcq" data-answer="2"><div class="q">一次需要从磁盘换入的页错误，从第一次 TLB 查找到最终取到数据，一共要做几次 TLB 查找（假设处理页错误时不顺便更新 TLB）？</div>
+<div class="opts"><button>A. 4 次</button><button>B. 1 次</button><button>C. 3 次</button><button>D. 2 次</button></div>
+<div class="explain">第一次未命中 → 页错误；OS 处理后重试 → 第二次未命中，查页表装入 TLB；再重试 → 第三次命中。在模拟器里数一数就能验证。</div></div>
+
+<div class="mcq" data-answer="1"><div class="q">关于高低水位线，哪项描述正确？</div>
+<div class="opts"><button>A. LW 必须大于 HW</button><button>B. 空闲页少于 LW 时守护进程醒来，换出页直到空闲页达到 HW</button><button>C. 空闲页少于 HW 时立即换出一页</button><button>D. 空闲页多于 HW 时，守护进程开始换出</button></div>
+<div class="explain">LW 触发，HW 停止。两者之间的间隔让守护进程可以一次成批工作，并把写操作聚集起来。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">程序二进制中的代码页被踢出内存时，通常：</div>
+<div class="opts"><button>A. 必须写入交换空间</button><button>B. 会导致进程崩溃</button><button>C. 不能被踢出</button><button>D. 可以直接丢弃，以后从文件系统中的可执行文件重新读入</button></div>
+<div class="explain">交换空间不是换页流量唯一的磁盘位置：代码页在磁盘的二进制文件里本来就有一份，可以放心复用它们占用的内存。</div></div>
+
+<div class="mcq" data-answer="3"><div class="q">"page fault"这个名字为什么有点名不副实？</div>
+<div class="opts"><button>A. 因为它总是导致进程被终止</button><button>B. 因为它只在硬件出错时发生</button><button>C. 因为它由 TLB 引起</button><button>D. 因为访问一个合法但暂时不在内存的页并不是错误，更准确的叫法是 page miss</button></div>
+<div class="explain">这是合法访问，只是页暂时在磁盘上。叫"fault"是因为处理机制和非法访问相同：硬件抛异常，把控制权交给 OS。</div></div>
+
+<h2>常见误区与小结</h2>
+<div class="warn">
+  <ul>
+    <li><strong>"页错误就是程序出错"</strong>——绝大多数页错误是正常的：按需分配、换入页，程序完全感觉不到。非法访问导致的是段错误/保护错误。</li>
+    <li><strong>"present=0 就是无效页"</strong>——valid 和 present 是两回事：valid=0 表示地址空间里根本没有这一页；present=0 表示页有效但在磁盘上。</li>
+    <li><strong>"页错误处理完就直接返回数据"</strong>——处理程序只是更新页表，然后<strong>重试引起错误的那条指令</strong>，硬件重新走一遍地址转换。</li>
+    <li><strong>"OS 等内存满了才开始换出"</strong>——现实系统用 LW/HW 和后台守护进程主动保持空闲页，并聚集写操作。</li>
+    <li><strong>"页错误期间 CPU 在等"</strong>——阻塞的是发生页错误的进程，CPU 会去运行其他进程。</li>
+  </ul>
+</div>
+<div class="key">
+  <ul>
+    <li>为了访问比物理内存更多的内存，页表需要 present 位：页不在内存时，PTE 里可以存它在交换空间中的磁盘地址。</li>
+    <li>访问不 present 的页触发页错误；OS 的页错误处理程序找空闲页框（必要时先按替换策略淘汰一页），发起磁盘读、让进程阻塞，I/O 完成后更新 PTE，再重试指令。</li>
+    <li>TLB 未命中时有三种情况：present（装入 TLB 重试）、有效但不 present（页错误）、无效（段错误）。</li>
+    <li>现实中 OS 通过 LW/HW 与交换守护进程在后台成批换出，并用聚集提高磁盘效率。</li>
+    <li>这一切对进程透明：它看到的仍是私有、连续的虚拟内存；只是最坏情况下一条指令可能要花好几毫秒。</li>
+    <li>下一章：到底该淘汰哪个页？OPT、FIFO、Random、LRU、时钟算法以及抖动。</li>
+  </ul>
+</div>
+
+</main>
+<script>
+(function () {
+"use strict";
+const { h, s } = OSTEP;
+const $ = (id) => document.getElementById(id);
+const PCOL = ["var(--c1)", "var(--c2)", "var(--c3)", "var(--c4)"];
+
+// ---------------- Figure 21.1 ----------------
+(function fig211() {
+  const mem = [[0, 0], [1, 2], [1, 3], [2, 0]];
+  const swap = [[0, 1], [0, 2], null, [1, 0], [1, 1], [3, 0], [2, 1], [3, 1]];
+  const gm = $("f211-mem"), gs = $("f211-swap");
+  mem.forEach(([p, v], k) => {
+    const x = 110 + k * 90;
+    gm.append(s("rect", { x, y: 20, width: 82, height: 50, rx: 6, style: `fill:${PCOL[p]}` }));
+    gm.append(s("text", { x: x + 41, y: 41, "text-anchor": "middle", style: "fill:#fff;font-weight:600", "font-size": 13, text: "Proc " + p }));
+    gm.append(s("text", { x: x + 41, y: 60, "text-anchor": "middle", style: "fill:#fff", "font-size": 12, class: "mono", text: "[VPN " + v + "]" }));
+    gm.append(s("text", { x: x + 41, y: 88, "text-anchor": "middle", "font-size": 11.5, class: "t-muted mono", text: "PFN " + k }));
+  });
+  swap.forEach((e, k) => {
+    const x = 110 + k * 72;
+    if (e) {
+      gs.append(s("rect", { x, y: 140, width: 66, height: 50, rx: 6, style: `fill:${PCOL[e[0]]}` }));
+      gs.append(s("text", { x: x + 33, y: 161, "text-anchor": "middle", style: "fill:#fff;font-weight:600", "font-size": 12, text: "Proc " + e[0] }));
+      gs.append(s("text", { x: x + 33, y: 180, "text-anchor": "middle", style: "fill:#fff", "font-size": 11.5, class: "mono", text: "[VPN " + e[1] + "]" }));
+    } else {
+      gs.append(s("rect", { x, y: 140, width: 66, height: 50, rx: 6, class: "box", "stroke-dasharray": "4 3" }));
+      gs.append(s("text", { x: x + 33, y: 170, "text-anchor": "middle", "font-size": 12, class: "t-muted", text: "[Free]" }));
+    }
+    gs.append(s("text", { x: x + 33, y: 208, "text-anchor": "middle", "font-size": 11.5, class: "t-muted mono", text: "Block " + k }));
+  });
+  gs.append(s("text", { x: 110, y: 238, "font-size": 12, class: "t-muted", text: "Proc 3 的全部页都在交换空间 → 它当前不可能在运行" }));
+})();
+
+// ---------------- PTE 图 ----------------
+(function pteFig() {
+  const g = $("pte-fig");
+  const fields = [["valid", 60, "有效"], ["prot", 80, "r/w/x"], ["present", 80, "在内存?"], ["dirty", 60, "脏"], ["ref", 60, "访问"], ["PFN 或 磁盘地址", 300, ""]];
+  let x = 30;
+  g.append(s("text", { x: 30, y: 22, "font-size": 13, "font-weight": 600, text: "页表项（PTE）" }));
+  fields.forEach(([name, w, sub], k) => {
+    g.append(s("rect", { x, y: 32, width: w, height: 40, class: k === 2 ? "warn-soft" : "box", "stroke-width": k === 2 ? 2 : 1 }));
+    g.append(s("text", { x: x + w / 2, y: 50, "text-anchor": "middle", "font-size": 12.5, "font-weight": k === 2 ? 700 : 400, text: name }));
+    if (sub) g.append(s("text", { x: x + w / 2, y: 65, "text-anchor": "middle", "font-size": 10.5, class: "t-muted", text: sub }));
+    x += w;
+  });
+  // two cases
+  g.append(s("rect", { x: 30, y: 100, width: 320, height: 84, rx: 8, class: "ok-soft" }));
+  g.append(s("text", { x: 44, y: 124, "font-weight": 600, text: "present = 1" }));
+  g.append(s("text", { x: 44, y: 146, "font-size": 12.5, text: "页在物理内存，低位是 PFN" }));
+  g.append(s("text", { x: 44, y: 166, "font-size": 12.5, text: "→ 装入 TLB，正常访问" }));
+  g.append(s("rect", { x: 370, y: 100, width: 330, height: 84, rx: 8, class: "warn-soft" }));
+  g.append(s("text", { x: 384, y: 124, "font-weight": 600, text: "present = 0（且 valid = 1）" }));
+  g.append(s("text", { x: 384, y: 146, "font-size": 12.5, text: "页在磁盘，低位可存交换空间的块号" }));
+  g.append(s("text", { x: 384, y: 166, "font-size": 12.5, text: "→ 抛出 PAGE_FAULT，交给 OS" }));
+})();
+
+// ---------------- I/O 重叠图 ----------------
+(function overlapFig() {
+  const g = $("overlap-fig");
+  const X = (t) => 110 + t * 5.6;
+  g.append(s("text", { x: 20, y: 48, "font-size": 13, text: "进程 A" }));
+  g.append(s("text", { x: 20, y: 88, "font-size": 13, text: "进程 B" }));
+  g.append(s("text", { x: 20, y: 128, "font-size": 13, text: "磁盘" }));
+  const seg = (row, t0, t1, fill, label, cls) => {
+    g.append(s("rect", { x: X(t0), y: 30 + row * 40, width: X(t1) - X(t0) - 1, height: 26, rx: 4, style: fill ? `fill:${fill}` : "", class: cls || "" }));
+    if (label) g.append(s("text", { x: (X(t0) + X(t1)) / 2, y: 48 + row * 40, "text-anchor": "middle", "font-size": 12, style: fill ? "fill:#fff;font-weight:600" : "", text: label }));
+  };
+  seg(0, 0, 20, "var(--c1)", "运行");
+  seg(0, 20, 26, "var(--c8)", "OS");
+  seg(0, 26, 80, null, "阻塞（等待页读入）", "warn-soft");
+  seg(0, 80, 84, "var(--c8)", "OS");
+  seg(0, 84, 100, "var(--c1)", "重试→运行");
+  seg(1, 26, 80, "var(--c2)", "运行（利用 A 等待的时间）");
+  seg(2, 26, 80, null, "DiskRead：约 10 ms", "box");
+  g.append(s("line", { x1: X(20), x2: X(20), y1: 20, y2: 150, style: "stroke:var(--bad);stroke-dasharray:4 3" }));
+  g.append(s("text", { x: X(20), y: 172, "text-anchor": "middle", "font-size": 11.5, style: "fill:var(--bad)", text: "页错误" }));
+  g.append(s("line", { x1: X(80), x2: X(80), y1: 20, y2: 150, style: "stroke:var(--ok);stroke-dasharray:4 3" }));
+  g.append(s("text", { x: X(80), y: 172, "text-anchor": "middle", "font-size": 11.5, style: "fill:var(--ok)", text: "I/O 完成中断：更新 PTE" }));
+})();
+
+// ---------------- 访问路径模拟器 ----------------
+const HW_CODE = [
+  "VPN = (VirtualAddress & VPN_MASK) >> SHIFT",
+  "(Success, TlbEntry) = TLB_Lookup(VPN)",
+  "if (Success == True)   // TLB Hit",
+  "    if (CanAccess(TlbEntry.ProtectBits) == True)",
+  "        Offset   = VirtualAddress & OFFSET_MASK",
+  "        PhysAddr = (TlbEntry.PFN << SHIFT) | Offset",
+  "        Register = AccessMemory(PhysAddr)",
+  "    else",
+  "        RaiseException(PROTECTION_FAULT)",
+  "else                   // TLB Miss",
+  "    PTEAddr = PTBR + (VPN * sizeof(PTE))",
+  "    PTE = AccessMemory(PTEAddr)",
+  "    if (PTE.Valid == False)",
+  "        RaiseException(SEGMENTATION_FAULT)",
+  "    else",
+  "        if (CanAccess(PTE.ProtectBits) == False)",
+  "            RaiseException(PROTECTION_FAULT)",
+  "        else if (PTE.Present == True)",
+  "            // assuming hardware-managed TLB",
+  "            TLB_Insert(VPN, PTE.PFN, PTE.ProtectBits)",
+  "            RetryInstruction()",
+  "        else if (PTE.Present == False)",
+  "            RaiseException(PAGE_FAULT)",
+];
+const SW_CODE = [
+  "PFN = FindFreePhysicalPage()",
+  "if (PFN == -1)              // no free page found",
+  "    PFN = EvictPage()       // replacement algorithm",
+  "DiskRead(PTE.DiskAddr, PFN) // sleep (wait for I/O)",
+  "PTE.present = True          // update page table:",
+  "PTE.PFN     = PFN           // (present/translation)",
+  "RetryInstruction()          // retry instruction",
+];
+// 流程图节点：[id, x, y, w, 文本, 分区]
+const NODES = [
+  ["A", 20, 44, 190, "① 取出 VPN", "hw"],
+  ["B", 20, 104, 190, "② TLB_Lookup(VPN)", "hw"],
+  ["C", 250, 104, 170, "命中：检查保护位", "hw"],
+  ["D", 250, 44, 170, "访问物理内存 ✓", "hw"],
+  ["E", 20, 164, 190, "③ 读 PTE（PTBR+VPN·size）", "hw"],
+  ["F", 20, 224, 190, "PTE.Valid ?", "hw"],
+  ["G", 250, 224, 170, "SEGMENTATION_FAULT", "hw"],
+  ["H", 20, 284, 190, "CanAccess(ProtectBits) ?", "hw"],
+  ["I", 250, 284, 170, "PROTECTION_FAULT", "hw"],
+  ["J", 20, 344, 190, "PTE.Present ?", "hw"],
+  ["K", 250, 344, 170, "TLB_Insert + 重试", "hw"],
+  ["L", 20, 404, 190, "PAGE_FAULT → 陷入 OS", "hw"],
+  ["M", 580, 104, 190, "FindFreePhysicalPage()", "os"],
+  ["N", 580, 164, 190, "PFN == -1 ?", "os"],
+  ["O", 580, 224, 190, "EvictPage()：淘汰+写回", "os"],
+  ["P", 580, 284, 190, "DiskRead：进程阻塞", "os"],
+  ["Q", 580, 344, 190, "I/O 完成：更新 PTE", "os"],
+  ["R", 580, 404, 190, "RetryInstruction()", "os"],
+];
+const NH = 36;
+function buildFlow(svg) {
+  svg.replaceChildren();
+  svg.append(s("defs", {}, s("marker", { id: "a21", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto" }, s("path", { d: "M0,0 L10,5 L0,10 z", style: "fill:var(--muted)" }))));
+  svg.append(s("rect", { x: 8, y: 8, width: 424, height: 454, rx: 10, fill: "none", style: "stroke:var(--border);stroke-dasharray:5 4" }));
+  svg.append(s("text", { x: 20, y: 28, "font-size": 12.5, "font-weight": 700, class: "t-muted", text: "硬件（MMU）· Fig 21.2" }));
+  svg.append(s("rect", { x: 560, y: 64, width: 222, height: 398, rx: 10, fill: "none", style: "stroke:var(--border);stroke-dasharray:5 4" }));
+  svg.append(s("text", { x: 572, y: 88, "font-size": 12.5, "font-weight": 700, class: "t-muted", text: "操作系统 · Figure 21.3" }));
+  const N = {}; NODES.forEach((n) => (N[n[0]] = n));
+  const mid = (id, side) => { const [, x, y, w] = N[id]; return side === "r" ? [x + w, y + NH / 2] : side === "l" ? [x, y + NH / 2] : side === "t" ? [x + w / 2, y] : [x + w / 2, y + NH]; };
+  const arrow = (p, q, label, lx, ly, dash) => {
+    svg.append(s("path", { d: `M${p[0]},${p[1]} L${q[0]},${q[1]}`, class: "arrow", "marker-end": "url(#a21)", "stroke-dasharray": dash ? "4 3" : null }));
+    if (label) svg.append(s("text", { x: lx, y: ly, "font-size": 11, class: "t-muted", text: label }));
+  };
+  const path = (d, label, lx, ly) => { svg.append(s("path", { d, class: "arrow", "marker-end": "url(#a21)", "stroke-dasharray": "4 3" })); if (label) svg.append(s("text", { x: lx, y: ly, "font-size": 11, class: "t-muted", text: label })); };
+  arrow(mid("A", "b"), mid("B", "t"));
+  arrow(mid("B", "r"), mid("C", "l"), "命中", 218, 116);
+  arrow(mid("C", "t"), mid("D", "b"), "可访问", 340, 96);
+  arrow(mid("B", "b"), mid("E", "t"), "未命中", 120, 158);
+  arrow(mid("E", "b"), mid("F", "t"));
+  arrow(mid("F", "r"), mid("G", "l"), "否", 222, 236);
+  arrow(mid("F", "b"), mid("H", "t"), "是", 120, 278);
+  arrow(mid("H", "r"), mid("I", "l"), "否", 222, 296);
+  arrow(mid("H", "b"), mid("J", "t"), "是", 120, 338);
+  arrow(mid("J", "r"), mid("K", "l"), "是", 222, 356);
+  arrow(mid("J", "b"), mid("L", "t"), "否", 120, 398);
+  path(`M${N.K[1] + N.K[3]},${N.K[2] + NH / 2} L440,${N.K[2] + NH / 2} L440,20 L195,20 L195,${N.A[2]}`, "", 0, 0);
+  path(`M${N.C[1] + N.C[3]},${N.C[2] + NH / 2} L428,${N.C[2] + NH / 2} L428,${N.I[2] + NH / 2} L${N.I[1] + N.I[3]},${N.I[2] + NH / 2}`, "", 0, 0);
+  svg.append(s("text", { x: 372, y: 170, "font-size": 11, class: "t-muted", text: "不可访问" }));
+  path(`M${N.L[1] + N.L[3]},${N.L[2] + NH / 2} L540,${N.L[2] + NH / 2} L540,${N.M[2] + NH / 2} L${N.M[1]},${N.M[2] + NH / 2}`, "", 0, 0);
+  svg.append(s("text", { x: 452, y: N.L[2] + NH / 2 - 6, "font-size": 11, class: "t-muted", text: "陷入 OS" }));
+  arrow(mid("M", "b"), mid("N", "t"));
+  arrow(mid("N", "b"), mid("O", "t"), "是（没有空闲）", 680, 218);
+  arrow(mid("O", "b"), mid("P", "t"));
+  path(`M${N.N[1]},${N.N[2] + NH / 2} L566,${N.N[2] + NH / 2} L566,${N.P[2] + NH / 2} L${N.P[1]},${N.P[2] + NH / 2}`, "否", 540, 262);
+  arrow(mid("P", "b"), mid("Q", "t"));
+  arrow(mid("Q", "b"), mid("R", "t"));
+  path(`M${N.R[1] + N.R[3] / 2},${N.R[2] + NH} L${N.R[1] + N.R[3] / 2},466 L440,466 L440,20`, "", 0, 0);
+  svg.append(s("text", { x: 250, y: 16, "font-size": 11, class: "t-muted", text: "RetryInstruction()：重新走一遍" }));
+  NODES.forEach(([id, x, y, w, text]) => {
+    const g = s("g", { class: "flow-node", id: "fn-" + id });
+    g.append(s("rect", { x, y, width: w, height: NH, rx: 7, class: "box" }));
+    g.append(s("text", { x: x + w / 2, y: y + 23, "text-anchor": "middle", "font-size": 12.5, text }));
+    svg.append(g);
+  });
+}
+
+function initState(nFrames) {
+  const frames = [{ p: 0, v: 0 }, { p: 1, v: 2 }, { p: 1, v: 3 }, { p: 2, v: 0 }];
+  while (frames.length < nFrames) frames.push(null);
+  return {
+    frames,
+    order: [1, 2, 3, 0],        // FIFO：按装入先后（最早在前）
+    swap: [{ p: 0, v: 1 }, { p: 0, v: 2 }, null, { p: 1, v: 0 }, { p: 1, v: 1 }, { p: 3, v: 0 }, { p: 2, v: 1 }, { p: 3, v: 1 }],
+    pt: [
+      { valid: 1, prot: "r-x", present: 1, pfn: 0, blk: null },
+      { valid: 1, prot: "rw-", present: 0, pfn: null, blk: 0 },
+      { valid: 1, prot: "rw-", present: 0, pfn: null, blk: 1 },
+      { valid: 0, prot: "---", present: 0, pfn: null, blk: null },
+    ],
+    tlb: [],                     // {vpn, pfn, prot}，最多 2 项，FIFO
+    proc: "run", cpu: "Proc 0", mode: "用户态",
+    stats: { tlbHit: 0, tlbMiss: 0, faults: 0, dRead: 0, dWrite: 0, time: 0, accTime: 0 },
+  };
+}
+const clone = (o) => JSON.parse(JSON.stringify(o));
+const OFF = 0x0a4;
+const va = (v) => OSTEP.hex((v << 12) | OFF, 4);
+function parseSeq(t) {
+  return String(t).split(/[\s,，]+/).filter(Boolean).map((x) => { const m = /^(\d)([wW])?$/.exec(x); return m ? { vpn: Number(m[1]), w: !!m[2] } : null; }).filter((x) => x && x.vpn < 8);
+}
+function buildSteps(seq, nFrames) {
+  const st = initState(nFrames), steps = [];
+  const push = (node, kind, hw, sw, text, mark) => steps.push({ node, kind, hw, sw, text, mark: mark || {}, snap: clone(st) });
+  push(null, "", [], [], `初始状态（Figure 21.1）。当前运行 Proc 0；它的 VPN 0 在 PFN 0，VPN 1、2 在交换块 0、1，VPN 3 未分配。TLB 为空。页框共 ${nFrames} 个。点"下一步"开始执行访问序列 <code>${seq.map((a) => a.vpn + (a.w ? "w" : "")).join(" ")}</code>。`);
+  for (const a of seq) {
+    if (st.proc === "dead") { push(null, "", [], [], `Proc 0 已被终止，序列中剩下的访问不会再执行。`); break; }
+    const { vpn, w } = a;
+    const pte = st.pt[vpn] || { valid: 0, prot: "---", present: 0 };
+    st.cur = { vpn, w }; st.stats.accTime = 0;
+    const op = w ? "写（store）" : "读（load）";
+    push("A", "", [1], [], `新的访问：Proc 0 对虚拟地址 <code>${va(vpn)}</code> 做${op}。硬件取出 VPN = ${vpn}（高位），偏移 = 0x0A4。`, { pt: vpn });
+    let guard = 0;
+    while (guard++ < 5) {
+      const te = st.tlb.find((e) => e.vpn === vpn);
+      if (te) {
+        st.stats.tlbHit++;
+        push("B", "", [2, 3], [], `TLB_Lookup(${vpn})：<strong>TLB 命中</strong>，得到 PFN ${te.pfn}。`, { tlb: vpn });
+        const ok = w ? te.prot[1] === "w" : true;
+        if (!ok) {
+          push("I", "bad", [4, 8, 9], [], `CanAccess 失败：这是 ${te.prot} 的页，不允许写。硬件抛出 <strong>PROTECTION_FAULT</strong>，陷入 OS，进程多半被终止。`, { tlb: vpn });
+          st.proc = "dead"; st.mode = "内核态";
+          push("I", "bad", [9], [], `Proc 0 因保护错误被终止（或收到 SIGSEGV 信号）。本次访问结束。`);
+          break;
+        }
+        const pa = OSTEP.hex((te.pfn << 12) | OFF, 5);
+        st.stats.time += 100; st.stats.accTime += 100;
+        if (w) { const f = st.frames[te.pfn]; if (f) f.dirty = 1; }
+        push("C", "", [4], [], `CanAccess(${te.prot}) 通过：${w ? "写" : "读"}操作被允许。`, { tlb: vpn });
+        push("D", "good", [5, 6, 7], [], `PhysAddr = (PFN ${te.pfn} &lt;&lt; 12) | 0x0A4 = <code>${pa}</code>，访问内存（约 100 ns）。<strong>访问完成</strong>，本次共耗时 ${fmtT(st.stats.accTime)}。`, { tlb: vpn, frame: te.pfn });
+        break;
+      }
+      st.stats.tlbMiss++;
+      push("B", "", [2, 10], [], `TLB_Lookup(${vpn})：<strong>TLB 未命中</strong>（TLB 中没有 VPN ${vpn} 的翻译）。`, {});
+      st.stats.time += 100; st.stats.accTime += 100;
+      push("E", "", [11, 12], [], `PTEAddr = PTBR + ${vpn} × sizeof(PTE)，额外一次内存访问读出 PTE（约 100 ns）。`, { pt: vpn });
+      if (!pte.valid) {
+        push("F", "", [13], [], `检查 PTE.Valid：VPN ${vpn} <strong>无效</strong>（不在进程地址空间内）。其他位（包括 present）都无关紧要了。`, { pt: vpn });
+        push("G", "bad", [14], [], `硬件抛出 <strong>SEGMENTATION_FAULT</strong>，OS 的陷阱处理程序运行，多半终止这个有 bug 的进程。`, { pt: vpn });
+        st.proc = "dead";
+        break;
+      }
+      push("F", "", [13, 15], [], `PTE.Valid = 1：这是地址空间中的合法页。`, { pt: vpn });
+      const ok = w ? pte.prot[1] === "w" : true;
+      if (!ok) {
+        push("H", "", [16], [], `CanAccess(${pte.prot})：${pte.prot} 的页不允许写。`, { pt: vpn });
+        push("I", "bad", [17], [], `硬件抛出 <strong>PROTECTION_FAULT</strong>（比如向代码页写数据）。OS 多半终止进程。`, { pt: vpn });
+        st.proc = "dead";
+        break;
+      }
+      push("H", "", [16], [], `CanAccess(${pte.prot}) 通过。`, { pt: vpn });
+      if (pte.present) {
+        push("J", "", [18], [], `PTE.Present = 1：页在物理内存 PFN ${pte.pfn}。`, { pt: vpn });
+        let out = "";
+        if (st.tlb.length >= 2) { const old = st.tlb.shift(); out = `TLB 已满，先踢掉最早装入的 VPN ${old.vpn}；`; }
+        st.tlb.push({ vpn, pfn: pte.pfn, prot: pte.prot });
+        push("K", "", [19, 20, 21], [], `${out}TLB_Insert(${vpn}, PFN ${pte.pfn}, ${pte.prot})，然后 <strong>RetryInstruction()</strong>：重新执行这条指令。`, { tlb: vpn, pt: vpn });
+        continue;
+      }
+      push("J", "", [18, 22], [], `PTE.Present = <strong>0</strong>：页合法，但不在内存里，而是在交换块 ${pte.blk}。`, { pt: vpn });
+      st.stats.faults++; st.mode = "内核态";
+      push("L", "", [22, 23], [], `硬件抛出 <strong>PAGE_FAULT</strong> 异常，陷入内核，OS 的页错误处理程序开始运行。`, { pt: vpn });
+      let pfn = st.frames.indexOf(null);
+      if (pfn >= 0) {
+        push("M", "", [], [1], `FindFreePhysicalPage()：找到空闲页框 <strong>PFN ${pfn}</strong>。`, { frame: pfn });
+        push("N", "", [], [2], `PFN ≠ -1，不需要淘汰任何页，直接去读磁盘。`, { frame: pfn });
+      } else {
+        push("M", "", [], [1], `FindFreePhysicalPage()：物理内存已满，返回 -1。`, {});
+        const victim = st.order.shift(); const vf = st.frames[victim];
+        const blk = st.swap.indexOf(null);
+        push("N", "", [], [2], `PFN == -1，必须先淘汰一页。替换策略（这里用 FIFO）选中最早装入的 <strong>PFN ${victim}</strong>：Proc ${vf.p} [VPN ${vf.v}]。`, { frame: victim });
+        st.swap[blk] = { p: vf.p, v: vf.v };
+        st.frames[victim] = null;
+        let extra = "";
+        if (vf.p === 0) {
+          const vp = st.pt[vf.v]; vp.present = 0; vp.pfn = null; vp.blk = blk;
+          const ti = st.tlb.findIndex((e) => e.vpn === vf.v);
+          if (ti >= 0) { st.tlb.splice(ti, 1); extra = `它是 Proc 0 自己的页，还要把 TLB 中 VPN ${vf.v} 的旧翻译作废；`; }
+          extra += `Proc 0 页表中 VPN ${vf.v} 改为 present=0、磁盘块 ${blk}。`;
+        } else extra = `同时更新 Proc ${vf.p} 页表中 VPN ${vf.v} 的 PTE：present=0，磁盘地址 = 块 ${blk}。`;
+        st.stats.dWrite++; st.stats.time += 10e6; st.stats.accTime += 10e6;
+        pfn = victim;
+        push("O", "", [], [3], `EvictPage()：把牺牲页写到交换空间的空闲块 <strong>${blk}</strong>（一次磁盘写，约 10 ms），释放 PFN ${victim}。${extra}`, { frame: victim, swap: blk, pt: vf.p === 0 ? vf.v : null });
+      }
+      st.proc = "blk"; st.cpu = "Proc 1（OS 调度别的就绪进程）";
+      const blk = pte.blk;
+      st.stats.dRead++; st.stats.time += 10e6; st.stats.accTime += 10e6;
+      push("P", "", [], [4], `DiskRead(PTE.DiskAddr = 块 ${blk}, PFN ${pfn})：发起磁盘读（约 10 ms）。Proc 0 进入<strong>阻塞</strong>状态，OS 趁机运行其他就绪进程（如 Proc 1），I/O 与计算重叠。`, { swap: blk, frame: pfn });
+      st.frames[pfn] = { p: 0, v: vpn }; st.order.push(pfn); st.swap[blk] = null;
+      pte.present = 1; pte.pfn = pfn; pte.blk = null;
+      st.proc = "ready"; st.cpu = "Proc 1";
+      push("Q", "", [], [5, 6], `磁盘中断：I/O 完成，页已在 PFN ${pfn}，交换块 ${blk} 释放。OS 更新 PTE：<strong>present = 1，PFN = ${pfn}</strong>。Proc 0 回到就绪态。`, { pt: vpn, frame: pfn, swap: blk });
+      st.proc = "run"; st.cpu = "Proc 0"; st.mode = "用户态";
+      push("R", "", [], [7], `Proc 0 再次被调度。RetryInstruction()：重新执行引起页错误的那条指令——硬件从头开始地址转换。注意 TLB 里还没有 VPN ${vpn} 的翻译。`, {});
+    }
+  }
+  push(null, "", [], [], `访问序列全部执行完毕。共 ${st.stats.faults} 次页错误、${st.stats.dRead} 次磁盘读、${st.stats.dWrite} 次磁盘写；总耗时 ${fmtT(st.stats.time)}${st.stats.dRead + st.stats.dWrite ? `，其中磁盘 I/O 占 ${fmtT((st.stats.dRead + st.stats.dWrite) * 10e6)}——几乎全部时间都花在磁盘上` : "，全部是内存访问"}。`);
+  return steps;
+}
+function fmtT(ns) { return ns >= 1e6 ? (ns / 1e6).toFixed(ns % 1e6 ? 4 : 0) + " ms" : ns + " ns"; }
+
+(function pathSim() {
+  const svg = $("ap-flow");
+  buildFlow(svg);
+  let steps = [];
+  function load() { steps = buildSteps(parseSeq($("ap-seq").value), Number($("ap-frames").value)); }
+  function codeBlock(el, lines, hl) {
+    el.replaceChildren(h("code", {}, lines.map((t, k) => h("span", { class: "ln" + (hl.includes(k + 1) ? " hl" : "") }, String(k + 1).padEnd(3) + t))));
+  }
+  function render(i) {
+    const stp = steps[i], st = stp.snap;
+    const visited = new Set();
+    for (let k = 0; k <= i; k++) if (steps[k].node) visited.add(steps[k].node);
+    // 只把本次访问内经过的节点标为 done
+    let start = i; while (start > 0 && steps[start].node !== "A") start--;
+    const seen = new Set(); for (let k = start; k < i; k++) if (steps[k].node) seen.add(steps[k].node);
+    NODES.forEach(([id]) => {
+      const g = $("fn-" + id);
+      g.setAttribute("class", "flow-node" + (stp.node === id ? " cur" + (stp.kind ? " " + stp.kind : "") : seen.has(id) ? " done" : ""));
+    });
+    $("ap-n").innerHTML = stp.text;
+    codeBlock($("ap-hw"), HW_CODE, stp.hw);
+    codeBlock($("ap-sw"), SW_CODE, stp.sw);
+    const pc = { run: ["run", "运行"], blk: ["blk", "阻塞（等待磁盘）"], ready: ["", "就绪"], dead: ["dead", "已终止"] }[st.proc];
+    $("ap-proc").replaceChildren(h("span", {}, "Proc 0："), h("span", { class: "pill " + pc[0] }, pc[1]), h("span", { class: "muted" }, "　CPU 正在运行："), h("span", { class: "pill" }, st.cpu), h("span", { class: "muted" }, "　特权级："), h("span", { class: "pill" }, st.mode),
+      st.cur ? h("span", { class: "muted" }, `　当前访问：VPN ${st.cur.vpn}${st.cur.w ? "（写）" : "（读）"}`) : null);
+    const mk = stp.mark;
+    const tlb = h("table", { class: "mini" }, h("tr", {}, h("th", {}, "VPN"), h("th", {}, "PFN"), h("th", {}, "prot")),
+      ...[0, 1].map((k) => { const e = st.tlb[k]; return e ? h("tr", { class: mk.tlb === e.vpn ? "use" : "" }, h("td", {}, e.vpn), h("td", {}, e.pfn), h("td", {}, e.prot)) : h("tr", {}, h("td", { class: "muted" }, "—"), h("td", {}, ""), h("td", {}, "")); }));
+    const pt = h("table", { class: "mini" }, h("tr", {}, h("th", {}, "VPN"), h("th", {}, "valid"), h("th", {}, "prot"), h("th", {}, "present"), h("th", {}, "PFN/块")),
+      ...st.pt.map((e, k) => h("tr", { class: mk.pt === k ? (stp.node === "Q" || stp.node === "O" ? "chg" : "use") : "" }, h("td", {}, k), h("td", {}, e.valid), h("td", {}, e.prot), h("td", {}, e.valid ? e.present : "-"),
+        h("td", {}, !e.valid ? "-" : e.present ? "PFN " + e.pfn : "块 " + e.blk))));
+    const mem = h("div", { class: "slots" }, st.frames.map((f, k) => h("div", { class: "slot " + (f ? "p" + f.p : "free") + (mk.frame === k ? (stp.node === "D" ? " use" : " chg") : "") }, h("b", {}, "PFN " + k), f ? `P${f.p} [VPN ${f.v}]` : "空闲")));
+    const sw = h("div", { class: "slots" }, st.swap.map((f, k) => h("div", { class: "slot " + (f ? "p" + f.p : "free") + (mk.swap === k ? " chg" : "") }, h("b", {}, "块 " + k), f ? `P${f.p} [VPN ${f.v}]` : "空闲")));
+    $("ap-state").replaceChildren(
+      h("div", {}, h("h4", {}, "TLB（2 项，Proc 0）"), tlb),
+      h("div", {}, h("h4", {}, "Proc 0 页表"), pt),
+      h("div", {}, h("h4", {}, "物理内存"), mem),
+      h("div", {}, h("h4", {}, "交换空间"), sw));
+    const S = st.stats;
+    $("ap-stats").replaceChildren(
+      h("div", { class: "stat" }, h("div", { class: "v" }, S.tlbHit + " / " + S.tlbMiss), h("div", { class: "l" }, "TLB 命中 / 未命中")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, S.faults), h("div", { class: "l" }, "页错误")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, S.dRead + " / " + S.dWrite), h("div", { class: "l" }, "磁盘读 / 写")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, fmtT(S.accTime)), h("div", { class: "l" }, "本次访问耗时")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, fmtT(S.time)), h("div", { class: "l" }, "累计耗时")));
+  }
+  load();
+  const stepper = OSTEP.stepper($("ap-step"), { steps: () => steps.length, render, autoplayMs: 1300 });
+  $("ap-apply").onclick = () => { load(); stepper.reset(); };
+  $("ap-frames").onchange = () => { load(); stepper.reset(); };
+  document.querySelectorAll("#sim-path [data-seq]").forEach((b) => b.onclick = () => { $("ap-seq").value = b.dataset.seq; $("ap-frames").value = b.dataset.fr; load(); stepper.reset(); });
+})();
+
+// ---------------- 交换守护进程 ----------------
+function daemonRun(cfg) {
+  const { N, LW, HW, rate, cl, seed, ticks } = cfg;
+  const rnd = OSTEP.rng(seed);
+  const cells = new Array(N).fill(-1), fifo = [];
+  // 初始：约 60% 被占用
+  for (let k = 0; k < Math.floor(N * 0.6); k++) { cells[k] = k % 3; fifo.push(k); }
+  const out = [];
+  let wakeups = 0, writes = 0, evicted = 0, stalls = 0, awake = false;
+  const free = () => cells.filter((c) => c < 0).length;
+  out.push({ t: 0, cells: cells.slice(), free: free(), ev: [], alloc: [], note: `初始：${N} 个页框中 ${N - free()} 个已用，空闲 ${free()} 个。LW=${LW}，HW=${HW}。`, wakeups, writes, evicted, stalls, awake });
+  for (let t = 1; t <= ticks; t++) {
+    const want = rnd.int(0, rate), alloc = [];
+    let got = 0;
+    for (let k = 0; k < N && got < want; k++) if (cells[k] < 0) { cells[k] = rnd.int(0, 2); fifo.push(k); alloc.push(k); got++; }
+    const stall = want - got; stalls += stall;
+    let note = `第 ${t} 个滴答：进程申请 ${want} 个页框` + (stall ? `，其中 ${stall} 个没有空闲页框可用，只能等待（相当于在页错误路径上同步淘汰）` : "") + `。空闲页 = ${free()}。`;
+    const ev = [];
+    awake = false;
+    if (free() < LW) {
+      awake = true; wakeups++;
+      const need = HW - free();
+      for (let k = 0; k < need && fifo.length; k++) { const c = fifo.shift(); cells[c] = -1; ev.push(c); }
+      evicted += ev.length;
+      const ios = Math.ceil(ev.length / cl);
+      writes += ios;
+      note += ` 空闲页 &lt; LW=${LW}：<strong>唤醒交换守护进程</strong>，按 FIFO 淘汰 ${ev.length} 页直到空闲页 = HW=${HW}；聚集成 ${ios} 次磁盘写（每次最多 ${cl} 页），然后继续睡眠。`;
+    } else note += ` 空闲页 ≥ LW，守护进程继续睡眠。`;
+    out.push({ t, cells: cells.slice(), free: free(), ev, alloc, note, wakeups, writes, evicted, stalls, awake });
+  }
+  return out;
+}
+(function daemonSim() {
+  let res = [], cfg = {};
+  function load() {
+    const N = Math.max(8, Math.min(128, Number($("dm-n").value) || 32));
+    let LW = Math.max(0, Number($("dm-lw").value) || 0), HW = Math.max(1, Number($("dm-hw").value) || 1);
+    if (HW <= LW) HW = LW + 1;
+    if (HW > N) HW = N;
+    cfg = { N, LW, HW, rate: Math.max(1, Number($("dm-rate").value) || 3), cl: Math.max(1, Number($("dm-cl").value) || 1), seed: Number($("dm-seed").value) || 1, ticks: 40 };
+    res = daemonRun(cfg);
+  }
+  function render(i) {
+    const r = res[i];
+    const ev = new Set(r.ev), al = new Set(r.alloc);
+    $("dm-mem").replaceChildren(...r.cells.map((c, k) => h("div", { class: "m" + (ev.has(k) ? " ev" : ""), title: c < 0 ? "空闲" : "进程 " + c, style: c >= 0 ? { background: OSTEP.color(c + 1), opacity: al.has(k) ? 0.65 : 1 } : {} })));
+    // 曲线
+    const W = 640, H = 200, L = 40, R = 16, T = 12, B = 30, pw = W - L - R, ph = H - T - B, n = res.length - 1;
+    const X = (t) => L + (t / n) * pw, Y = (v) => T + ph - (v / cfg.N) * ph;
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "空闲页随时间变化" });
+    [0, cfg.N / 2, cfg.N].forEach((v) => { svg.append(s("line", { x1: L, x2: W - R, y1: Y(v), y2: Y(v), style: "stroke:var(--border)" })); svg.append(s("text", { x: L - 6, y: Y(v) + 4, "text-anchor": "end", "font-size": 11, class: "t-muted", text: Math.round(v) })); });
+    [["HW", cfg.HW, "var(--ok)"], ["LW", cfg.LW, "var(--bad)"]].forEach(([nm, v, c]) => { svg.append(s("line", { x1: L, x2: W - R, y1: Y(v), y2: Y(v), style: `stroke:${c};stroke-dasharray:5 4` })); svg.append(s("text", { x: W - R - 4, y: Y(v) - 4, "text-anchor": "end", "font-size": 11, style: `fill:${c}`, text: `${nm}=${v}` })); });
+    const pts = res.slice(0, i + 1).map((x) => `${X(x.t)},${Y(x.free)}`).join(" ");
+    svg.append(s("polyline", { points: pts, fill: "none", style: "stroke:var(--c1);stroke-width:2" }));
+    res.slice(1, i + 1).forEach((x) => { if (x.awake) svg.append(s("circle", { cx: X(x.t), cy: Y(x.free), r: 4, style: "fill:var(--c2);stroke:var(--surface);stroke-width:2" })); });
+    svg.append(s("text", { x: L + pw / 2, y: H - 6, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", text: "时间（滴答）· 橙点 = 守护进程被唤醒后" }));
+    svg.append(s("text", { x: L + 4, y: T + 12, "font-size": 11.5, class: "t-muted", text: "空闲页框数" }));
+    $("dm-chart").replaceChildren(svg);
+    $("dm-nr").innerHTML = r.note;
+    $("dm-stats").replaceChildren(
+      h("div", { class: "stat" }, h("div", { class: "v" }, r.free), h("div", { class: "l" }, "当前空闲页框")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, r.wakeups), h("div", { class: "l" }, "守护进程唤醒次数")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, r.evicted), h("div", { class: "l" }, "累计换出页数")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, r.writes), h("div", { class: "l" }, `磁盘写次数（不聚集要 ${r.evicted} 次）`)),
+      h("div", { class: "stat" }, h("div", { class: "v" }, r.stalls), h("div", { class: "l" }, "申请时无页可用的次数")));
+  }
+  load();
+  const stp = OSTEP.stepper($("dm-step"), { steps: () => res.length, render, autoplayMs: 600 });
+  $("dm-apply").onclick = () => { load(); stp.reset(); };
+})();
+})();
+</script>
+</body></html>

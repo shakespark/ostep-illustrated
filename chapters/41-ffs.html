@@ -1,0 +1,1106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 41 章 · 局部性和快速文件系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/chapters.js"></script>
+<script src="../assets/ostep.js"></script>
+<style>
+.fmap { --cw: 17px; font: 12px var(--mono); display: inline-block; min-width: max-content; }
+.frow { display: flex; align-items: center; gap: 8px; margin: 2px 0; }
+.frow.head { color: var(--muted); font-size: 11.5px; }
+.glab { width: 3.4em; color: var(--muted); flex: none; }
+.fseg { display: flex; flex: none; }
+.fc { display: inline-flex; width: var(--cw); height: 21px; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 3px; margin-right: 1px; background: var(--surface); color: var(--fg); flex: none; }
+.fc.own { color: #fff; border-color: transparent; font-weight: 600; }
+.fc.gap { margin-left: 5px; }
+.compact .fmap { --cw: 13px; }
+.compact .fc { height: 18px; font-size: 10.5px; }
+.compact .glab { width: 2em; }
+.fc.hl { outline: 2px solid var(--fg); outline-offset: 1px; }
+.fc.freed { background: var(--bad-soft); border-color: var(--bad); }
+.pair-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+.pair-grid h4 { margin: 0 0 6px; font-size: 14.5px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 13px; margin-top: 8px; }
+.legend i { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.cmp { font-size: 13.5px; }
+.cmp td, .cmp th { padding: 5px 10px; }
+.cmp tr.cur td { background: var(--accent-soft); }
+.oldfs { display: flex; gap: 3px; flex-wrap: wrap; }
+.oldfs .cell { min-width: 44px; }
+.formula { font-family: var(--mono); background: var(--code-bg); border-radius: 8px; padding: 10px 14px; overflow-x: auto; font-size: 14px; }
+.row-inline { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; }
+.row-inline > * { flex: 1 1 280px; min-width: 0; }
+</style>
+</head>
+<body data-chapter="41">
+<main>
+
+<h2>这一章要解决什么</h2>
+<div class="crux">
+  <p><strong>如何组织磁盘上的数据来提高性能？</strong>我们需要怎样的数据结构，又需要在其上叠加怎样的分配策略？怎样让文件系统"感知磁盘"（disk aware）？</p>
+  <p class="small muted">How can we organize file system data structures so as to improve performance? What types of allocation policies do we need on top of those data structures? How do we make the file system "disk aware"?</p>
+</div>
+<p>上一章的 VSFS 只关心"对不对"：超级块、位图、inode 表、数据区，按顺序往磁盘上一摆就完了。最早的 UNIX 文件系统正是这样，结果它只能发挥磁盘 <strong>2%</strong> 的带宽。问题不在接口，而在于它<strong>把磁盘当成了随机访问内存</strong>：数据东一块西一块，每次访问都要付出昂贵的寻道和旋转。</p>
+<p>伯克利的快速文件系统（Fast File System，FFS）保持 <code>open()/read()/write()</code> 等接口完全不变，只改内部布局和分配策略，就让性能大幅提升。它的核心口诀只有一句：<strong>相关的东西放在一起，无关的东西分开放</strong>。本章承接第 37 章（磁盘的定位代价）和第 40 章（文件系统的基本结构），后面的日志（第 42 章）、LFS（第 43 章）都会继续围绕"怎样让磁盘少寻道"做文章。</p>
+
+<h2>核心概念速览</h2>
+<div class="cards">
+  <div class="card"><h4>局部性（locality）</h4><p>一起被访问的数据若在磁盘上也挨着，就能省掉寻道和旋转等待。</p></div>
+  <div class="card"><h4>柱面组 / 块组</h4><p>FFS 把磁盘切成若干组（cylinder group / block group），组内访问只需短距离寻道。</p></div>
+  <div class="card"><h4>组内结构</h4><p>每组都有：超级块副本 S、inode 位图 ib、数据位图 db、inode 表、数据块。</p></div>
+  <div class="card"><h4>目录放置</h4><p>新目录放进"已分配目录少、空闲 inode 多"的组，把目录均匀摊开。</p></div>
+  <div class="card"><h4>文件放置</h4><p>文件的数据块与其 inode 同组；同一目录下的文件与目录本身同组。</p></div>
+  <div class="card"><h4>大文件例外</h4><p>大文件按 chunk 分散到多个组，避免一个文件塞满一组、挤走"相关"文件。</p></div>
+  <div class="card"><h4>分摊（amortization）</h4><p>每次寻道后多传一点数据，让寻道开销占比变小；chunk 要够大。</p></div>
+  <div class="card"><h4>子块与参数化布局</h4><p>512 字节子块减少小文件浪费；跳块布局避免错过下一块、多转一圈。</p></div>
+</div>
+
+<h2>老 UNIX 文件系统：把磁盘当内存用</h2>
+<p>Ken Thompson 写的第一个 UNIX 文件系统结构极其简单：超级块（S）记录卷大小、inode 数量、空闲块链表的表头等信息；接下来是所有 inode；剩下的大部分都是数据块。</p>
+<figure class="fig">
+<svg viewBox="0 0 720 170" width="720" role="img" aria-label="老 UNIX 文件系统布局：inode 与数据相距很远">
+  <rect x="20" y="60" width="40" height="44" class="box-strong"/>
+  <text x="40" y="87" text-anchor="middle" font-size="14" font-weight="600">S</text>
+  <rect x="60" y="60" width="130" height="44" class="accent-soft"/>
+  <text x="110" y="87" text-anchor="middle" font-size="13">Inodes</text>
+  <rect x="190" y="60" width="510" height="44" class="box"/>
+  <text x="445" y="87" text-anchor="middle" font-size="13" class="t-muted">Data（大部分空间）</text>
+  <rect x="166" y="66" width="14" height="32" style="fill:var(--c2)"/>
+  <text x="173" y="120" text-anchor="middle" font-size="11">inode</text>
+  <rect x="520" y="66" width="14" height="32" style="fill:var(--c2)"/>
+  <rect x="610" y="66" width="14" height="32" style="fill:var(--c2)"/>
+  <rect x="272" y="66" width="14" height="32" style="fill:var(--c2)"/>
+  <path d="M173 58 C 260 8, 440 8, 527 58" class="arrow" marker-end="url(#ah41a)"/>
+  <text x="315" y="22" text-anchor="middle" font-size="12" style="fill:var(--bad)">先读 inode，再长距离寻道去读数据</text>
+  <path d="M534 106 C 555 140, 590 140, 612 106" class="arrow" marker-end="url(#ah41a)"/>
+  <path d="M612 106 C 520 165, 350 165, 280 106" class="arrow" marker-end="url(#ah41a)"/>
+  <text x="445" y="160" text-anchor="middle" font-size="12" class="t-muted">同一个文件的数据块也散落各处（碎片化）</text>
+  <defs><marker id="ah41a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" style="fill:var(--muted)"/></marker></defs>
+</svg>
+<figcaption>图 1：老 UNIX 文件系统的布局 <code>S | Inodes | Data</code>。简单，但 inode 与它的数据常常隔着半个磁盘。</figcaption>
+</figure>
+<p>它的性能问题来自三方面：</p>
+<ol>
+  <li><strong>inode 与数据相距很远</strong>：读一个文件几乎总是"先读 inode、再读数据"，两者之间是一次长寻道。</li>
+  <li><strong>碎片化（fragmentation）</strong>：空闲空间没有被认真管理，空闲链表很快就指向散落在全盘的块，新文件"拿下一个空闲块"，逻辑上连续的文件在物理上来回跳。</li>
+  <li><strong>块太小（512 字节）</strong>：小块减少了块内浪费（内部碎片），但每传一小块都可能要付一次定位开销，传输效率很低。</li>
+</ol>
+<p>下面这个小演示复刻原书的碎片化例子：4 个各 2 块的文件 A、B、C、D，删掉 B 和 D，再分配一个 4 块的文件 E。</p>
+
+<section class="sim" id="sim-frag">
+  <div class="sim-head"><span class="tag">演示</span><h3>空闲链表如何制造碎片</h3><div class="desc">单步看：删除 B、D 后空闲空间变成两段，E 只能被拆开存放，顺序读 E 时中间多一次寻道。</div></div>
+  <div class="sim-body">
+    <div id="frag-stepper"></div>
+    <div class="stage"><div class="oldfs" id="frag-cells"></div></div>
+    <div class="narrate" id="frag-narr"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="frag-free">0</div><div class="l">空闲段数</div></div>
+      <div class="stat"><div class="v" id="frag-seg">–</div><div class="l">E 被拆成几段</div></div>
+      <div class="stat"><div class="v" id="frag-seek">–</div><div class="l">顺序读 E 需要的定位次数</div></div>
+    </div>
+  </div>
+</section>
+<p>碎片整理工具（defragmentation）做的正是反过来的事：搬动数据让文件重新连续、让空闲空间合成一两大段，并相应改写 inode。FFS 的思路则是从一开始就少制造这种局面。</p>
+
+<h2>组织结构：柱面组与块组</h2>
+<p>FFS 的第一步是改变磁盘上的结构。<strong>柱面（cylinder）</strong>是不同盘面上与盘心距离相同的一组磁道；FFS 把连续 N 个柱面合成一个<strong>柱面组（cylinder group）</strong>，于是整块磁盘就是一串柱面组。同一组内的两次访问，磁头最多只需在 N 个柱面之间短距离移动。</p>
+<figure class="fig">
+<svg viewBox="0 0 860 275" width="860" role="img" aria-label="六张盘片的侧视图，同色磁道构成柱面，三个柱面构成一个柱面组">
+  <line x1="360" y1="40" x2="360" y2="235" style="stroke:var(--muted);stroke-width:6"/>
+  <text x="360" y="258" text-anchor="middle" font-size="12" class="t-muted">主轴（spindle）</text>
+  <g id="platters41"></g>
+  <path d="M112 36 L112 28 L178 28 L178 36" class="stroke" stroke-width="1.3"/>
+  <text x="145" y="20" text-anchor="middle" font-size="11.5">柱面组（N=3）</text>
+  <text x="640" y="70" font-size="12">单个磁道：一张盘面上的一圈</text>
+  <text x="640" y="90" font-size="12">柱面：各盘面上半径相同的磁道</text>
+  <text x="640" y="110" font-size="12">（同一种颜色 = 同一个柱面）</text>
+  <text x="640" y="140" font-size="12" class="t-muted">N=3 时，第一个组不包含</text>
+  <text x="640" y="158" font-size="12" class="t-muted">最内侧的灰色磁道</text>
+</svg>
+<figcaption>图 2：六张盘片最外侧四圈磁道的侧视示意（左右两侧是同一圈磁道的截面）。同色磁道构成一个柱面，连续 3 个柱面构成一个柱面组。</figcaption>
+</figure>
+<p>现代磁盘不会向文件系统暴露真实几何结构，只提供一个逻辑块地址空间。因此 ext2/ext3/ext4 等现代文件系统改用<strong>块组（block group）</strong>：每个块组只是磁盘地址空间中连续的一段。叫柱面组还是块组都无所谓，关键在于：<strong>把两个文件放进同一组，就能保证先后访问它们不会导致长距离寻道</strong>。</p>
+<figure class="fig">
+<svg viewBox="0 0 720 210" width="720" role="img" aria-label="块组布局以及单个组内的结构">
+  <g id="bgroups41"></g>
+  <line x1="264" y1="72" x2="30" y2="120" class="arrow" stroke-dasharray="4 3"/>
+  <line x1="472" y1="72" x2="690" y2="120" class="arrow" stroke-dasharray="4 3"/>
+  <rect x="30" y="122" width="40" height="46" class="box-strong"/><text x="50" y="150" text-anchor="middle" font-size="13" font-weight="600">S</text>
+  <rect x="70" y="122" width="40" height="46" class="warn-soft"/><text x="90" y="150" text-anchor="middle" font-size="13">ib</text>
+  <rect x="110" y="122" width="40" height="46" class="warn-soft"/><text x="130" y="150" text-anchor="middle" font-size="13">db</text>
+  <rect x="150" y="122" width="150" height="46" class="accent-soft"/><text x="225" y="150" text-anchor="middle" font-size="13">Inodes</text>
+  <rect x="300" y="122" width="390" height="46" class="box"/><text x="495" y="150" text-anchor="middle" font-size="13">Data</text>
+  <text x="50" y="186" text-anchor="middle" font-size="11" class="t-muted">超级块副本</text>
+  <text x="110" y="203" text-anchor="middle" font-size="11" class="t-muted">inode / 数据位图</text>
+  <text x="225" y="190" text-anchor="middle" font-size="11" class="t-muted">本组的 inode 表</text>
+  <text x="495" y="190" text-anchor="middle" font-size="11" class="t-muted">本组的数据块（占大部分）</text>
+</svg>
+<figcaption>图 3：上：每 8 个块组成一个块组（真实系统中一组有成千上万块）。下：FFS 在每个组里都放了一整套文件系统结构。</figcaption>
+</figure>
+<ul>
+  <li><strong>超级块副本 S</strong>：挂载文件系统必须读超级块。每组放一份，某一份损坏了还能用其他副本挂载——这是为了<strong>可靠性</strong>，不是性能。</li>
+  <li><strong>每组的 inode 位图 ib 和数据位图 db</strong>：记录本组 inode 和数据块是否已分配。位图很容易找出一大段连续空闲块分给文件，从而避开老系统空闲链表造成的碎片。</li>
+  <li><strong>inode 表和数据块</strong>：和 VSFS 一样，只是每组各有一份，大部分空间仍是数据块。</li>
+</ul>
+
+<div class="aside" data-title="旁注：在 FFS 里创建一个文件要写多少东西">
+<p>创建 <code>/foo/bar.txt</code>（1 个 4KB 块）：新文件要一个 inode → 写 inode 位图和 inode；文件有数据 → 写数据位图和数据块。这已经是对当前组的<strong>至少 4 次写</strong>（可能先在内存里缓冲一会儿）。还没完：父目录 <code>foo</code> 的数据块要加一个目录项（可能还得分配新块，连带数据位图），<code>foo</code> 的 inode 要更新长度和修改时间。</p>
+<svg viewBox="0 0 680 120" width="680" role="img" aria-label="创建文件时的写操作">
+  <g font-size="12">
+    <rect x="10" y="30" width="95" height="40" rx="5" class="warn-soft"/><text x="57" y="55" text-anchor="middle">① inode 位图</text>
+    <rect x="115" y="30" width="95" height="40" rx="5" class="accent-soft"/><text x="162" y="55" text-anchor="middle">② bar 的 inode</text>
+    <rect x="220" y="30" width="95" height="40" rx="5" class="warn-soft"/><text x="267" y="55" text-anchor="middle">③ 数据位图</text>
+    <rect x="325" y="30" width="95" height="40" rx="5" class="ok-soft"/><text x="372" y="55" text-anchor="middle">④ bar 的数据</text>
+    <rect x="455" y="30" width="100" height="40" rx="5" class="ok-soft"/><text x="505" y="55" text-anchor="middle">⑤ foo 目录项</text>
+    <rect x="565" y="30" width="105" height="40" rx="5" class="accent-soft"/><text x="617" y="55" text-anchor="middle">⑥ foo 的 inode</text>
+    <text x="215" y="20" text-anchor="middle" class="t-muted">新文件本身</text>
+    <text x="562" y="20" text-anchor="middle" class="t-muted">把文件挂进目录树</text>
+    <text x="340" y="100" text-anchor="middle" class="t-muted">FFS 的策略会让这些块尽量落在同一组里，于是这些写之间只有短距离寻道</text>
+  </g>
+</svg>
+</div>
+
+<h2>放置策略：相关的放一起</h2>
+<p>有了组，FFS 还要决定"什么和什么相关"。它用了几条朴素的启发式规则（原书打趣说：CS 不就是 common sense 的缩写吗）：</p>
+<div class="row-inline">
+<div class="key">
+<p><strong>目录</strong>：找一个<em>已分配目录数少</em>（让目录在各组间均衡）且<em>空闲 inode 多</em>（之后能在这里放一批文件）的组，把目录的 inode 和数据放进去。</p>
+</div>
+<div class="key">
+<p><strong>文件</strong>：① 数据块和它的 inode 放在同一组（避免老系统那样的 inode→数据长寻道）；② 同一目录下的文件放进该目录所在的组。</p>
+</div>
+</div>
+<pre><code>// 简化的 FFS inode 放置（本页模拟器与 labs/41-ffs/ffs_sim.c 使用的规则）
+int pick_group(bool is_dir, path) {
+    if (is_dir)                       // 目录：空闲 inode 最多的组（并列时取目录少的）
+        return group_with_most_free_inodes();
+    int g = group_of(parent(path));   // 文件：父目录所在的组
+    while (free_inodes(g) == 0)       // 那一组的 inode 用完了，就往后找
+        g = (g + 1) % NUM_GROUPS;
+    return g;
+}
+// 数据块：从 inode 所在组开始找空闲块；大文件每 L 块换到下一组（大文件例外）</code></pre>
+<p>原书的例子：每组只有 10 个 inode 和 10 个数据块（不现实，但好画），创建目录 <code>/a</code>、<code>/b</code> 和文件 <code>/a/c</code>、<code>/a/d</code>、<code>/a/e</code>、<code>/b/f</code>，文件各 2 块、目录各 1 块。下图左边是 FFS 的结果，右边是一个"只求把 inode 均匀摊到各组"的对照策略（本页称为 spread）的结果——两张图都由下方模拟器的同一套代码实时算出，与原书完全一致。</p>
+<figure class="fig">
+  <div class="pair-grid" id="fig-policy"></div>
+  <figcaption>图 4：FFS 让 <code>/a/c</code>、<code>/a/d</code>、<code>/a/e</code> 与 <code>/a</code> 同在 1 号组，<code>/b/f</code> 与 <code>/b</code> 同在 2 号组；spread 策略虽然也让每个文件的数据紧挨自己的 inode，但同一目录的文件散落在 3 个组里，丢掉了基于名字空间的局部性。</figcaption>
+</figure>
+<p>为什么"同目录"是好的相关性判据？因为同一目录下的文件经常被一起访问：比如编译一堆源文件、再把它们链接成一个可执行文件。下面的模拟器让你亲手验证这一点。</p>
+
+<section class="sim" id="sim-ffs">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>FFS 放置模拟器（仿 ffs.py）</h3><div class="desc">每行一条命令：<code>dir /路径</code>、<code>file /路径 块数</code>、<code>delete /路径</code>。单步执行，观察每个 inode、每个数据块落在哪个组；切换策略比较 dirspan、与父目录的组距离。黑框 = 这一步刚写入的格子。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>策略 <select id="ffs-policy"><option value="ffs">FFS</option><option value="spread">spread（inode 均摊）</option><option value="random">random（随机组）</option></select></label>
+      <label>组数 <input type="number" id="ffs-G" min="2" max="16" value="8"></label>
+      <label>每组 inode <input type="number" id="ffs-I" min="2" max="32" value="10"></label>
+      <label>每组数据块 <input type="number" id="ffs-D" min="4" max="80" value="10"></label>
+      <label>大文件例外 L <input type="number" id="ffs-L" min="0" max="200" value="0" title="0 表示关闭"></label>
+      <label>连续要求 C <input type="number" id="ffs-C" min="1" max="10" value="1"></label>
+      <label>种子 <input type="number" id="ffs-seed" min="1" max="9999" value="1"></label>
+    </div>
+    <div class="controls">
+      <span class="muted small">载入示例：</span>
+      <button data-preset="book">原书例：/a /b</button>
+      <button data-preset="big0">大文件（无例外）</button>
+      <button data-preset="big5">大文件（L=5）</button>
+      <button data-preset="multi">多目录交错创建</button>
+      <button data-preset="frag">碎片化</button>
+    </div>
+    <textarea id="ffs-ops" spellcheck="false" rows="7"></textarea>
+    <div class="controls" style="margin-top:8px"><button class="primary" id="ffs-run">应用命令并从头执行</button><span class="muted small" id="ffs-err"></span></div>
+    <div id="ffs-stepper"></div>
+    <div class="stage"><div id="ffs-map"></div></div>
+    <div class="legend" id="ffs-legend"></div>
+    <div class="narrate" id="ffs-narr"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="ffs-s-dir">0</div><div class="l">平均 dirspan</div></div>
+      <div class="stat"><div class="v" id="ffs-s-file">0</div><div class="l">平均 filespan</div></div>
+      <div class="stat"><div class="v" id="ffs-s-same">0</div><div class="l">与父目录同组的比例</div></div>
+      <div class="stat"><div class="v" id="ffs-s-used">0</div><div class="l">已用 inode / 数据块</div></div>
+    </div>
+    <details class="reveal" style="margin-top:10px"><summary>ffs.py 风格的文本输出（可与原书逐字对照）</summary><div><div class="readout" id="ffs-text"></div></div></details>
+    <h4 style="margin:16px 0 6px">三种策略对比（执行完全部命令后）</h4>
+    <div class="table-wrap"><table class="cmp"><thead><tr><th>策略</th><th class="num">平均 dirspan</th><th class="num">平均 filespan</th><th class="num">与父目录同组</th><th class="num">平均组距离</th></tr></thead><tbody id="ffs-cmp"></tbody></table></div>
+    <div id="ffs-hist"></div>
+  </div>
+</section>
+<div class="tip">
+<p><strong>两个度量</strong>（来自 ffs.py 的作业题）：把磁盘看成一条线，组 g 占地址 <code>g·(I+D)</code> 到 <code>(g+1)·(I+D)−1</code>，其中先是 I 个 inode、后是 D 个数据块。<strong>filespan</strong> = 一个文件的 inode 与所有数据块之间的最大距离；<strong>dirspan</strong> = 一个目录（inode + 数据）与它所有直接子项（inode + 数据）之间的最大距离。数值越小，访问时寻道越短。</p>
+</div>
+
+<h2>测量文件局部性：SEER 迹线</h2>
+<p>"同目录的文件经常一起访问"只是常识，真的成立吗？原书分析了 SEER 迹线（trace），定义了一个<strong>路径距离</strong>：两次相邻的 open 之间，要在目录树里往上走多少层才能到达共同祖先。</p>
+<figure class="fig">
+<svg viewBox="0 0 640 230" width="640" role="img" aria-label="路径距离示例：同一文件为 0，同目录为 1，proj/src 与 proj/obj 为 2">
+  <g font-size="13">
+    <rect x="280" y="10" width="80" height="28" rx="5" class="box-strong"/><text x="320" y="29" text-anchor="middle" class="mono">proj</text>
+    <rect x="130" y="80" width="80" height="28" rx="5" class="box-strong"/><text x="170" y="99" text-anchor="middle" class="mono">src</text>
+    <rect x="430" y="80" width="80" height="28" rx="5" class="box-strong"/><text x="470" y="99" text-anchor="middle" class="mono">obj</text>
+    <rect x="60" y="150" width="80" height="28" rx="5" style="fill:var(--c1)"/><text x="100" y="169" text-anchor="middle" class="mono" style="fill:#fff">foo.c</text>
+    <rect x="200" y="150" width="80" height="28" rx="5" style="fill:var(--c1)"/><text x="240" y="169" text-anchor="middle" class="mono" style="fill:#fff">bar.c</text>
+    <rect x="430" y="150" width="80" height="28" rx="5" style="fill:var(--c2)"/><text x="470" y="169" text-anchor="middle" class="mono" style="fill:#fff">foo.o</text>
+    <line x1="320" y1="38" x2="170" y2="80" class="arrow"/><line x1="320" y1="38" x2="470" y2="80" class="arrow"/>
+    <line x1="170" y1="108" x2="100" y2="150" class="arrow"/><line x1="170" y1="108" x2="240" y2="150" class="arrow"/>
+    <line x1="470" y1="108" x2="470" y2="150" class="arrow"/>
+    <text x="100" y="205" text-anchor="middle">foo.c → foo.c：0</text>
+    <text x="240" y="205" text-anchor="middle">foo.c → bar.c：1</text>
+    <text x="470" y="205" text-anchor="middle">src/foo.c → obj/foo.o：2</text>
+    <text x="320" y="225" text-anchor="middle" class="t-muted" font-size="12">距离 = 从文件所在目录往上走到共同祖先的层数 + 1（同一文件为 0）</text>
+  </g>
+</svg>
+<figcaption>图 5：路径距离。FFS 的策略能照顾到距离 0 和 1，却照顾不到 <code>proj/src</code> ↔ <code>proj/obj</code> 这种距离 2 的访问。</figcaption>
+</figure>
+<p>原书图 41.1 的结论：SEER 迹线中约 <strong>7%</strong> 的访问是重新打开刚打开过的文件（距离 0），近 <strong>40%</strong> 的访问距离为 0 或 1——FFS 的假设站得住。另有约 <strong>25%</strong> 的访问距离为 2，典型场景就是上图的 <code>proj/src/foo.c</code> 之后访问 <code>proj/obj/foo.o</code>，FFS 的策略捕捉不到这类局部性。作为对照，"Random" 曲线把同一批文件打乱顺序后再算距离；因为所有文件最终都有共同祖先（根目录），随机也有一点点局部性，但明显少得多。</p>
+
+<section class="sim" id="sim-seer">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>路径距离与累积分布（Figure 41.1 的思想）</h3><div class="desc">每行一个被打开的文件路径。逐对计算相邻两次 open 的路径距离，并画出"迹线"与"打乱顺序（Random）"两条累积分布曲线。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <span class="muted small">载入迹线：</span>
+      <button data-trace="build">编译一个项目</button>
+      <button data-trace="photo">整理照片</button>
+      <button data-trace="mixed">日常混合</button>
+    </div>
+    <textarea id="seer-text" spellcheck="false" rows="6"></textarea>
+    <div class="controls" style="margin-top:8px"><button class="primary" id="seer-run">重新计算</button></div>
+    <div id="seer-stepper"></div>
+    <div class="stage"><div id="seer-plot"></div></div>
+    <div class="narrate" id="seer-narr"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="seer-d0">0</div><div class="l">距离 0（同一文件）</div></div>
+      <div class="stat"><div class="v" id="seer-d1">0</div><div class="l">距离 ≤ 1（同目录）</div></div>
+      <div class="stat"><div class="v" id="seer-d2">0</div><div class="l">距离 = 2</div></div>
+      <div class="stat"><div class="v" id="seer-r1">0</div><div class="l">Random 中距离 ≤ 1</div></div>
+    </div>
+  </div>
+</section>
+
+<h2>大文件例外</h2>
+<p>一般规则有一个重要例外。如果不做特殊处理，一个大文件会把它的第一个块组整个填满（甚至溢出到别的组），之后与它"相关"的文件就没地方放了，反而破坏局部性。原书用每组 10 个 inode、40 个数据块、一个 30 块的文件 <code>/a</code> 演示：</p>
+<figure class="fig">
+  <div class="pair-grid" id="fig-large" style="grid-template-columns:1fr"></div>
+  <figcaption>图 6：上：没有大文件例外，<code>/a</code> 占满 0 号组的大部分数据块，根目录下以后再建的文件没有空间。下：大文件例外，每个 chunk 5 块，文件被摊到 0~5 号组，每组利用率都不高。</figcaption>
+</figure>
+<p>FFS 的做法：先在第一个组里分配若干块（比如 12 块，即 inode 中直接指针的个数），然后把下一个"大"chunk（比如第一个间接块指向的那些块）放进另一个组（可以选利用率低的），再下一个 chunk 放进又一个组，依此类推。</p>
+<p>细心的你会发现：把文件拆散到各处，<strong>顺序读</strong>整个文件时不就要在 chunk 之间寻道了吗？没错！解决办法是<strong>把 chunk 选得足够大</strong>：只要每次寻道后传输足够多的数据，寻道时间占比就很小。这种"每付一次开销就多干点活"的技巧叫<strong>分摊（amortization）</strong>，是计算机系统里的常用手法。</p>
+<p>原书的计算：平均定位时间（寻道 + 旋转）10 ms，传输速率 40 MB/s。想让一半时间定位、一半时间传输（达到峰值带宽的 50%），每次定位后就要传输 10 ms：</p>
+<div class="formula">40 MB/s × 1024 KB/MB × 10 ms ÷ 1000 ms/s = 409.6 KB</div>
+<p>一般地，要达到峰值带宽的比例 p，传输时间须为定位时间的 p/(1−p) 倍：</p>
+<div class="formula">chunk = 速率 × T<sub>定位</sub> × p / (1 − p)</div>
+<p>90% 需要约 3.6 MB（3686.4 KB，原书图 41.2 中标为 3.69M），99% 需要 39.6 MB！越接近峰值，chunk 越大。</p>
+
+<section class="sim" id="sim-chunk">
+  <div class="sim-head"><span class="tag">计算器</span><h3>分摊：chunk 要多大？（复刻 Figure 41.2）</h3><div class="desc">改定位时间、传输速率和目标带宽比例，看所需 chunk 大小；纵轴为对数刻度。也可以反过来看：给定 chunk，能拿到峰值带宽的百分之几。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>定位时间 <input type="number" id="ch-t" min="0.1" max="100" step="0.1" value="10"> ms</label>
+      <label>传输速率 <input type="number" id="ch-r" min="1" max="10000" step="1" value="40"> MB/s</label>
+      <label>目标带宽 <input type="range" id="ch-p" min="1" max="99.5" step="0.5" value="90"> <span id="ch-pv" class="mono">90%</span></label>
+      <button id="ch-book">原书参数</button>
+    </div>
+    <div class="stage"><div id="ch-plot"></div></div>
+    <div class="narrate" id="ch-narr"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="ch-50">0</div><div class="l">50% 所需 chunk</div></div>
+      <div class="stat"><div class="v" id="ch-90">0</div><div class="l">90% 所需 chunk</div></div>
+      <div class="stat"><div class="v" id="ch-99">0</div><div class="l">99% 所需 chunk</div></div>
+      <div class="stat"><div class="v" id="ch-ffs">0</div><div class="l">FFS 的 4 MB chunk 可达带宽</div></div>
+    </div>
+  </div>
+</section>
+
+<p>不过 FFS 并没有用这种计算来决定怎么拆大文件，而是直接依据 inode 的结构：前 12 个直接块和 inode 放在同一组；之后每个间接块以及它指向的所有块放进另一个组。块大小 4KB、磁盘地址 32 位时，一个间接块能装 1024 个地址，于是<strong>除了前 48KB，文件每 1024 块（4MB）换一个组</strong>。</p>
+<figure class="fig">
+<svg viewBox="0 0 700 190" width="700" role="img" aria-label="FFS 按 inode 结构拆分大文件：12 个直接块同组，每个间接块覆盖 4MB 放到另一组">
+  <g font-size="12">
+    <rect x="20" y="30" width="120" height="130" rx="6" class="box-strong"/>
+    <text x="80" y="50" text-anchor="middle" font-weight="600">inode</text>
+    <rect x="32" y="60" width="96" height="30" rx="3" class="ok-soft"/><text x="80" y="80" text-anchor="middle">12 个直接指针</text>
+    <rect x="32" y="96" width="96" height="24" rx="3" class="warn-soft"/><text x="80" y="113" text-anchor="middle">间接指针</text>
+    <rect x="32" y="126" width="96" height="24" rx="3" class="warn-soft"/><text x="80" y="143" text-anchor="middle">二级间接</text>
+    <rect x="200" y="20" width="140" height="46" rx="6" style="fill:var(--c3)"/><text x="270" y="40" text-anchor="middle" style="fill:#fff">组 i（inode 所在组）</text><text x="270" y="57" text-anchor="middle" style="fill:#fff">48 KB</text>
+    <rect x="370" y="80" width="140" height="46" rx="6" style="fill:var(--c1)"/><text x="440" y="100" text-anchor="middle" style="fill:#fff">组 j</text><text x="440" y="117" text-anchor="middle" style="fill:#fff">1024 块 = 4 MB</text>
+    <rect x="540" y="130" width="140" height="46" rx="6" style="fill:var(--c4)"/><text x="610" y="150" text-anchor="middle" style="fill:#fff">组 k, l, …</text><text x="610" y="167" text-anchor="middle" style="fill:#fff">每 4 MB 一个组</text>
+    <path d="M128 75 L198 45" class="arrow" marker-end="url(#ah41b)"/>
+    <path d="M128 108 L368 103" class="arrow" marker-end="url(#ah41b)"/>
+    <path d="M128 138 L538 153" class="arrow" marker-end="url(#ah41b)"/>
+  </g>
+  <defs><marker id="ah41b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" style="fill:var(--muted)"/></marker></defs>
+</svg>
+<figcaption>图 7：FFS 的实际规则。按上面的计算器，40 MB/s、10 ms 时 4MB 的 chunk 大约能拿到 90% 的峰值带宽。</figcaption>
+</figure>
+<p>还要注意一个趋势：磁盘的<strong>传输速率</strong>提升很快（厂商擅长在同样的盘面上塞进更多比特），而与寻道相关的<strong>机械部分</strong>（磁臂速度、转速）进步很慢。于是机械开销的相对代价越来越高，要摊销它，每次寻道之间就得传输更多数据——在计算器里把速率调到 400 MB/s 试试。</p>
+
+<h2>FFS 的其他创新</h2>
+<h3>子块（sub-block）</h3>
+<p>当时很多文件只有 2KB 左右。用 4KB 块传输效率好，但对这种小文件，内部碎片会浪费大约一半的磁盘。FFS 引入了 512 字节的<strong>子块</strong>：1KB 的文件只占 2 个子块，不必浪费一整个 4KB 块。文件继续增长时继续分配子块，直到凑满 4KB，这时 FFS 找一个完整的 4KB 块，把子块内容拷过去，并释放子块。</p>
+<p>这个过程需要额外的拷贝 I/O，效率不高。所以 FFS 通常修改 <strong>libc</strong>：库先缓冲写操作，再以 4KB 为单位交给文件系统，大多数情况下就完全绕开了子块的特殊处理。</p>
+<section class="sim" id="sim-sub">
+  <div class="sim-head"><span class="tag">计算器</span><h3>子块能省多少空间</h3><div class="desc">拖动文件大小，比较"只有 4KB 块"与"4KB 块 + 512B 子块"两种分配方式实际占用的磁盘空间。</div></div>
+  <div class="sim-body">
+    <div class="controls"><label>文件大小 <input type="range" id="sub-size" min="1" max="12288" step="1" value="1024"></label><span class="mono" id="sub-sv">1024 B</span>
+      <button data-sz="1024">1 KB（原书例）</button><button data-sz="2048">2 KB（典型小文件）</button><button data-sz="5000">5000 B</button></div>
+    <div class="stage"><div id="sub-plot"></div></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="sub-a">0</div><div class="l">只用 4KB 块：占用 / 浪费</div></div>
+      <div class="stat"><div class="v" id="sub-b">0</div><div class="l">加上子块：占用 / 浪费</div></div>
+    </div>
+  </div>
+</section>
+
+<h3>参数化布局（parameterized placement）</h3>
+<p>那个年代（SCSI 等现代接口出现之前）磁盘很"笨"，主机 CPU 得亲自控制它。FFS 发现：如果文件放在连续扇区上（下图左），顺序读时先读块 0，等读完、FFS 再发出块 1 的请求时<strong>已经来不及了</strong>——块 1 已经从磁头下转过去，只能再等将近一整圈。</p>
+<p>FFS 的办法是<strong>跳块布局</strong>（下图右）：每隔一块放一个逻辑块，给主机留出发下一个请求的时间。FFS 还能针对具体磁盘测出应该跳几块，这就叫<strong>参数化（parameterization）</strong>。</p>
+<figure class="fig">
+  <div id="fig-disks"></div>
+  <figcaption>图 8：左：标准布局，逻辑块 0~11 连续摆放。右：参数化布局，每隔一个物理位置放一个逻辑块（0, 6, 1, 7, 2, 8, …）。</figcaption>
+</figure>
+<p>这种布局的代价是：你最多只能拿到峰值带宽的 <strong>50%</strong>，因为读完一圈磁道上的所有块要转两圈。好在现代磁盘聪明多了：它们在内部把整条磁道读进<strong>磁道缓冲区（track buffer）</strong>，之后对这条磁道的读请求直接从缓存返回。文件系统不用再操心这些底层细节——设计得当的抽象和高层接口是好东西。</p>
+
+<section class="sim" id="sim-skip">
+  <div class="sim-head"><span class="tag">模拟器</span><h3>跳几块才合适？</h3><div class="desc">一圈 12 个扇区，读一个块需要 1 个"块时间"；主机读完一块后要过"处理延迟"才能发出下一个请求。改跳块数和延迟，逐块观察要等多久。</div></div>
+  <div class="sim-body">
+    <div class="controls">
+      <label>跳块数 k <select id="sk-k"><option value="0">0（标准布局）</option><option value="1" selected>1（原书图 41.3 右）</option><option value="2">2</option><option value="3">3</option></select></label>
+      <label>主机处理延迟 <input type="range" id="sk-d" min="0" max="3" step="0.1" value="0.5"> <span id="sk-dv" class="mono">0.5</span> 块时间</label>
+    </div>
+    <div id="sk-stepper"></div>
+    <div class="stage"><div id="sk-plot"></div></div>
+    <div class="narrate" id="sk-narr"></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="sk-rot">0</div><div class="l">读完 12 块共转了几圈</div></div>
+      <div class="stat"><div class="v" id="sk-bw">0</div><div class="l">有效带宽（占峰值）</div></div>
+    </div>
+  </div>
+</section>
+
+<h3>让系统好用</h3>
+<div class="tip">
+<p>FFS 最基本的经验不只是"感知磁盘的布局"，还在于它加了不少单纯<strong>让系统更好用</strong>的功能：</p>
+<ul>
+  <li><strong>长文件名</strong>：不再局限于传统的固定长度（例如 8 个字符）。</li>
+  <li><strong>符号链接（symbolic link）</strong>：硬链接不能指向目录（怕形成环），也不能跨卷（inode 号只在本卷有意义）；符号链接可以给任何文件或目录起"别名"，灵活得多。</li>
+  <li><strong>原子的 <code>rename()</code></strong>：重命名要么完成、要么没发生。</li>
+</ul>
+<p>这些功能很难写成研究论文（想象一篇 14 页的《符号链接：硬链接失散多年的表亲》），但它们让 FFS 更实用，也更可能被采用。让系统可用，往往和深刻的技术创新同样重要。</p>
+</div>
+
+<h2>先预测再验证</h2>
+<div class="exercise"><div class="q">在 FFS 模拟器里设置：组数 10、每组 inode 10、每组数据块 40，命令只有一行 <code>file /a 40</code>。先<strong>预测</strong>大文件例外 L=4 时的布局，再运行验证。（原书作业第 1 题）</div>
+<details class="reveal"><summary>看答案</summary><div>40 块被切成 10 个 chunk，每个 4 块。第一个 chunk 与 inode 同在 0 号组（紧跟在根目录的数据块后面），之后每个 chunk 依次放到 1、2、…、9 号组，每组数据区开头都是 <code>aaaa</code>。</div></details></div>
+<div class="exercise"><div class="q">同上的设置，比较 L=4、L=10、L=100 三种情况下 <code>/a</code> 的 filespan。L 从小变大时，filespan 会怎么变？（原书作业第 2、3 题）</div>
+<details class="reveal"><summary>看答案</summary><div>本页的地址模型下依次是 462、168、59。L 越小，文件被切得越碎、跨越的组越多，filespan 越大；L=100 超过文件大小，相当于关闭例外，整个文件挤在 0 号组（最后 1 块溢出到 1 号组开头），filespan 最小。对单个文件来说 filespan 小是好事，但代价是占满一个组——这就是例外要权衡的地方。</div></details></div>
+<div class="exercise"><div class="q">载入"多目录交错创建"：三个目录 <code>/src /doc /bin</code> 的文件是交替创建的。预测 FFS 与 spread 策略下 <code>/src</code> 的 dirspan 各大约是多少量级，再切换策略验证。（原书作业第 4、5 题）</div>
+<details class="reveal"><summary>看答案</summary><div>FFS 下每个目录和它的 6 个文件都在同一组（1、2、3 号组），dirspan 只有 18~28；平均 dirspan（含根目录）约 50。spread 下每个新 inode 都去找空闲 inode 最多的组，同一目录的文件被撒到全部 8 个组，<code>/src</code> 的 dirspan 变成 255，平均约 233。交错创建的顺序对 FFS 没有影响，因为它只看"父目录在哪"。</div></details></div>
+<div class="exercise"><div class="q">仍用"多目录"示例，把每组 inode 数改成 5（FFS 策略）。预测：哪些文件会被挤到别的组？dirspan 会怎么变？（原书作业第 6 题）</div>
+<details class="reveal"><summary>看答案</summary><div>每组只有 5 个 inode，目录自己占 1 个，只能再放 4 个文件。每个目录的第 5、6 个文件（<code>lex.c parse.c</code>、<code>x.md y.md</code>、<code>who zsh</code>）找不到空闲 inode，只好往后找组：它们大多落在 4 号组，最后的 <code>/bin/zsh</code> 落到 5 号组。平均 dirspan 从约 50 增加到 97，与父目录同组的比例从 86% 降到 57%。inode 表太小会直接破坏 FFS 的局部性。</div></details></div>
+<div class="exercise"><div class="q">载入"碎片化"示例：根目录下 8 个 2 块的文件，删掉 a、c、e、g 后再创建 8 块的 <code>/i</code>。预测 C=1 时 <code>/i</code> 的布局；再预测 C=2 和 C=3 时会不会变。（原书作业第 8、9 题）</div>
+<details class="reveal"><summary>看答案</summary><div>C=1：<code>/i</code> 填进 4 个 2 块的空洞，被拆成 4 段，与老 UNIX 文件系统的问题一模一样。C=2：每个空洞恰好有 2 个连续空闲块，满足要求，布局<strong>不变</strong>。C=3：空洞都不够 3 块，于是 <code>/i</code> 被连续放在 h 之后的空闲区，8 块完全连续；代价是 4 个空洞暂时空着，filespan 从 23 变成 33（离 inode 远了一点）。</div></details></div>
+<div class="exercise"><div class="q">在 chunk 计算器里保持 10 ms 定位，先预测：把传输速率从 40 MB/s 提高到 400 MB/s，要拿到 90% 峰值带宽的 chunk 会变成多大？这说明了磁盘发展趋势对文件系统的什么要求？</div>
+<details class="reveal"><summary>看答案</summary><div>chunk 与速率成正比：3686.4 KB × 10 = 36864 KB = 36 MB。传输越快、机械定位不变，同样的 4MB chunk 能拿到的带宽比例就从约 91% 跌到约 50%。所以文件系统必须在每次寻道之间传输越来越多的数据。</div></details></div>
+
+<h2>动手实验</h2>
+<div class="lab">
+<p>实验目录 <code>labs/41-ffs/</code> 有两个程序：<code>ffs_sim</code> 是 C 语言版的放置模拟器（与本页模拟器同一套算法，可以互相对照）；<code>ext4_where</code> 在你真实的 ext4 文件系统上建目录和文件，用 <code>FIEMAP</code> ioctl 查出数据块落在哪个物理块、哪个块组，再用 inode 号算出 inode 所在的块组。</p>
+<pre><code><span class="cmd">cd labs/41-ffs && make && ./ffs_sim</span>
+<span class="cmd">./ext4_where                  # 在 ./playground 下建 3 个目录 × (3 个 8KB 小文件 + 1 个 64MB 大文件)，跑完自动清理</span></code></pre>
+<p><strong><code>ffs_sim</code> 示例输出（节选）</strong>：原书的两张布局图被逐字复现；多目录负载下 FFS 的 dirspan 约为另外两种策略的十分之一。</p>
+<pre><code>[ffs]
+group inodes    data
+    0 /--------- /---------
+    1 acde------ accddee---
+    2 bf-------- bff-------
+    3 ---------- ----------
+  ...
+  dirspan(/a) = 16
+  dirspan(/b) = 12
+
+[spread]
+    1 a--------- a---------
+    2 b--------- b---------
+    3 c--------- cc--------
+    4 d--------- dd--------
+  ...
+  dirspan(/a) = 91
+
+=== 示例 3：40 块文件的 filespan 随大文件例外参数 L 的变化（10 组 × 40 数据块）===
+  L=0   filespan(/a)=59
+  L=4   filespan(/a)=462
+  L=10  filespan(/a)=168
+  L=30  filespan(/a)=68
+  L=100 filespan(/a)=59
+
+=== 示例 4：6 个目录 × 20 个文件（交错创建，大小 1~6 块，种子 42），16 组 × (32 inode + 128 数据块) ===
+policy    avg_dirspan avg_filespan   same_group avg_group_dist
+ffs            228.43        57.40        95.2%           0.17
+spread        2132.43        42.33         0.0%           5.22
+random        2413.29        44.54         7.1%           6.09
+
+=== 分摊：定位 10ms、带宽 40MB/s 时，达到峰值带宽 p 所需的 chunk 大小 ===
+    50%  chunk =     409.6 KB =   0.40 MB
+    90%  chunk =    3686.4 KB =   3.60 MB
+    99%  chunk =   40550.4 KB =  39.60 MB</code></pre>
+<p><strong><code>ext4_where</code> 示例输出</strong>（WSL2 上的 ext4，你的机器上数字会不同）：</p>
+<pre><code>块大小=4096  每组块数=32768  块组数=8192  每组 inode 数=8192
+
+playground/a 目录 inode=1030443   inode组=125   首块=9168842     数据组=279   区段数=1   跨组数=1
+playground/a/f0 小  inode=1030444   inode组=125   首块=9708478     数据组=296   区段数=1   跨组数=1
+playground/a/f1 小  inode=1030445   inode组=125   首块=9708480     数据组=296   区段数=1   跨组数=1
+playground/a/f2 小  inode=1030448   inode组=125   首块=9708483     数据组=296   区段数=1   跨组数=1
+playground/a/big 大  inode=1030449   inode组=125   首块=127557632   数据组=3892  区段数=2   跨组数=1
+
+playground/b 目录 inode=1030447   inode组=125   首块=9168843     数据组=279   区段数=1   跨组数=1
+playground/b/f0 小  inode=1030450   inode组=125   首块=9708486     数据组=296   区段数=1   跨组数=1
+...
+playground/c/big 大  inode=1030934   inode组=125   首块=127567872   数据组=3893  区段数=1   跨组数=1</code></pre>
+<p>该观察到什么：</p>
+<ul>
+  <li>同一目录下的文件拿到<strong>几乎连续的 inode 号</strong>，都在同一个 inode 块组里——"同目录放一起"的 FFS 思想还在。测试目录不是根目录的直接子目录，ext4 的 Orlov 分配器只把"顶层目录"分散到不同组，更深的子目录留在父目录附近，所以 a、b、c 也在同一组。</li>
+  <li>小文件的数据块<strong>一个挨一个</strong>（首块号每次只差 2~3 块）：ext4 的"局部性组预分配"把小文件打包在一起。</li>
+  <li>64MB 的大文件只由 1~3 个大区段（extent）组成：现代文件系统用尽量大的连续区段来<strong>分摊</strong>寻道，而不是像 FFS 那样每 4MB 换一个组。</li>
+  <li>数据所在的组与 inode 所在的组并不相同：ext4 默认启用 flex_bg（把 16 个组的元数据集中存放），而且 WSL2 的"磁盘"本身是虚拟磁盘文件，块组早已不对应真实柱面。块组这个组织方式延续了下来，具体策略则复杂得多。</li>
+</ul>
+</div>
+
+<h2>自测题</h2>
+<p class="quiz-score"></p>
+<div class="mcq" data-answer="0"><div class="q">伯克利的测量显示，老 UNIX 文件系统最终只能发挥磁盘总带宽的多少？</div>
+  <div class="opts"><button>A. 约 2%</button><button>B. 约 90%</button><button>C. 约 20%</button><button>D. 约 50%</button></div>
+  <div class="explain">原书："to the point where the file system was delivering only 2% of overall disk bandwidth"。根源是它把磁盘当作随机访问内存，不考虑定位代价。</div></div>
+<div class="mcq" data-answer="2"><div class="q">FFS 在每个柱面组里都放一份超级块副本，主要目的是什么？</div>
+  <div class="opts"><button>A. 性能：读超级块时不用寻道</button><button>B. 让每组可以使用不同的块大小</button><button>C. 可靠性：某份损坏时仍能用其他副本挂载文件系统</button><button>D. 记录本组的空闲块链表</button></div>
+  <div class="explain">原书明确说是 "for reliability reasons"。挂载必须读超级块，多份副本防止单点损坏。本组的空闲情况由组内位图记录。</div></div>
+<div class="mcq" data-answer="1"><div class="q">FFS 为一个新<strong>目录</strong>选择柱面组时，依据的是什么？</div>
+  <div class="opts"><button>A. 第一个还有空闲数据块的组</button><button>B. 已分配目录数少、空闲 inode 多的组</button><button>C. 总是放在父目录所在的组</button><button>D. 随机选一个组</button></div>
+  <div class="explain">目录要在各组之间摊开（目录少），并且之后还要在该组放一批文件（空闲 inode 多）。"放在父目录所在的组"是<strong>文件</strong>的规则，不是目录的。</div></div>
+<div class="mcq" data-answer="1"><div class="q">用户依次创建 <code>/a/b</code>、<code>/a/c</code>、<code>/a/d</code>、<code>/b/f</code>，FFS 会怎样放置？</div>
+  <div class="opts"><button>A. 四个都放在根目录所在的组</button><button>B. 前三个放在同一组（/a 的组），第四个放在另一个组（/b 的组）</button><button>C. 按创建顺序轮流放进各组</button><button>D. 四个文件各占一个组，均摊负载</button></div>
+  <div class="explain">同一目录下的文件放进该目录所在的组。C、D 描述的是本页的 spread 那类对照策略，它保住了"数据靠近 inode"，却丢掉了名字空间局部性。</div></div>
+<div class="mcq" data-answer="3"><div class="q">定位时间 10 ms、传输速率 40 MB/s。要达到峰值带宽的 50%，每个 chunk 至少多大？</div>
+  <div class="opts"><button>A. 400 MB</button><button>B. 40 KB</button><button>C. 4 MB</button><button>D. 409.6 KB</button></div>
+  <div class="explain">50% 意味着传输时间等于定位时间 10 ms：40 × 1024 KB/s × 0.01 s = 409.6 KB。4MB 大约对应 90%。</div></div>
+<div class="mcq" data-answer="2"><div class="q">FFS 为什么需要"大文件例外"？</div>
+  <div class="opts"><button>A. 为了减少内部碎片</button><button>B. 因为大文件的 inode 放不进 inode 表</button><button>C. 大文件会填满它所在的组，使之后"相关"的文件无法放进同一组</button><button>D. 为了让顺序读大文件更快</button></div>
+  <div class="explain">拆散大文件其实会<strong>损害</strong>顺序读（D 是反的），所以才要用足够大的 chunk 来分摊。目的在于保护其他文件的局部性。</div></div>
+<div class="mcq" data-answer="0"><div class="q">参数化布局"每隔一块放一个逻辑块"时，顺序读一整条磁道最多能达到峰值带宽的多少？</div>
+  <div class="opts"><button>A. 50%</button><button>B. 33%</button><button>C. 90%</button><button>D. 100%</button></div>
+  <div class="explain">读完一圈上的所有块需要转两圈，所以最多 50%。现代磁盘用磁道缓冲区（track buffer）整条磁道读入缓存，解决了这个问题。</div></div>
+<div class="mcq" data-answer="3"><div class="q">用原书的路径距离度量，先打开 <code>proj/src/foo.c</code> 再打开 <code>proj/obj/foo.o</code>，距离是多少？</div>
+  <div class="opts"><button>A. 1</button><button>B. 3</button><button>C. 0</button><button>D. 2</button></div>
+  <div class="explain">共同祖先是 <code>proj</code>，从 <code>src</code> 往上走一层到达 <code>proj</code>，距离为 2。SEER 迹线中约 25% 的访问属于这一类，FFS 的策略捕捉不到。</div></div>
+<div class="mcq" data-answer="1"><div class="q">块大小 4KB、磁盘地址 32 位时，FFS 对大文件的实际拆分规则是？</div>
+  <div class="opts"><button>A. 每 409.6 KB 换一个组</button><button>B. 前 48KB 与 inode 同组，之后每 4MB（一个间接块覆盖的 1024 块）换一个组</button><button>C. 每个块轮流放进不同的组</button><button>D. 整个文件都与 inode 同组</button></div>
+  <div class="explain">FFS 没有用分摊公式，而是按 inode 结构：12 个直接块（48KB）同组，每个间接块及其指向的 1024 个块放进另一个组。</div></div>
+<div class="mcq" data-answer="0"><div class="q">关于子块（sub-block），下列哪项正确？</div>
+  <div class="opts"><button>A. 文件增长到 4KB 时，FFS 把子块内容拷进一个完整块并释放子块；为避免这种开销，libc 会把写缓冲成 4KB 再交给文件系统</button><button>B. 子块让所有文件都能达到更高的传输速率</button><button>C. 子块是为了解决大文件填满块组的问题</button><button>D. 1KB 的文件仍然要占一个完整的 4KB 块</button></div>
+  <div class="explain">子块（512B）解决的是小文件的内部碎片（空间效率），不是速度问题；拷贝开销则由修改 libc 的缓冲策略来规避。</div></div>
+
+<h2>常见误区与小结</h2>
+<div class="warn">
+<ul>
+  <li><strong>"FFS 改变了文件系统接口"</strong>：没有。<code>open/read/write/close</code> 完全不变，只改内部实现——这也是之后几乎所有文件系统的做法。</li>
+  <li><strong>"每组的超级块副本是为了加速"</strong>：是为了可靠性。</li>
+  <li><strong>"把 inode 均匀摊到各组就是好的放置"</strong>：这样能保证数据靠近自己的 inode，却把同目录文件撒到各处，丢掉名字空间局部性。</li>
+  <li><strong>"大文件例外是为了让大文件更快"</strong>：恰恰相反，拆散会引入额外寻道；它保护的是其他文件的局部性，靠大 chunk 把代价摊薄。</li>
+  <li><strong>"现代文件系统还要跳块布局"</strong>：不需要，磁盘自带磁道缓冲区。现代磁盘也不暴露柱面，所以 ext 系列用的是逻辑上的块组。</li>
+</ul>
+</div>
+<div class="key">
+<p><strong>本章小结</strong></p>
+<ul>
+  <li>老 UNIX 文件系统把磁盘当内存用：inode 与数据相距远、空闲链表导致碎片、512B 小块，只能发挥 2% 的带宽。</li>
+  <li>FFS 把磁盘分成柱面组/块组，每组包含超级块副本、inode 位图、数据位图、inode 表和数据块。</li>
+  <li>放置启发式：目录去"目录少、空闲 inode 多"的组；文件的数据与 inode 同组；同目录文件与目录同组。SEER 迹线表明这种名字空间局部性确实存在（距离 ≤1 的访问近 40%）。</li>
+  <li>大文件例外：按 chunk 把大文件分散到多个组；chunk 必须足够大才能分摊寻道（10ms / 40MB/s 下 50%、90%、99% 分别需要 409.6KB、3.6MB、39.6MB）。</li>
+  <li>子块节省小文件空间；参数化布局避免多转一圈；长文件名、符号链接、原子 rename 让系统更好用。</li>
+  <li>最重要的一课：<strong>把磁盘当磁盘对待</strong>（treat the disk like it's a disk）。ext2/ext3 是 FFS 的直系后代。下一章讨论另一个大问题：写到一半断电了，这些分散在各处的结构如何保持一致？</li>
+</ul>
+</div>
+
+</main>
+<script>
+(function () {
+"use strict";
+const { h, s, color, rng, stepper } = OSTEP;
+
+// ==== CORE BEGIN ====（FFS 放置核心，与 labs/41-ffs/ffs_sim.c 同一算法）
+function mulberry(seed) {
+  let a = (seed >>> 0) || 1;
+  return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+function parseOps(text) {
+  const ops = [];
+  for (const raw of text.split("\n")) {
+    const line = raw.replace(/#.*/, "").trim();
+    if (!line) continue;
+    const w = line.split(/\s+/);
+    if (w[0] === "dir" || w[0] === "d") ops.push({ op: "dir", path: w[1] });
+    else if (w[0] === "file" || w[0] === "f") ops.push({ op: "file", path: w[1], size: Math.max(0, parseInt(w[2] || "1", 10) || 0) });
+    else if (w[0] === "delete" || w[0] === "rm") ops.push({ op: "delete", path: w[1] });
+    else ops.push({ op: "bad", path: line });
+  }
+  return ops;
+}
+function makeFS(cfg) {
+  const { G, I, D } = cfg;
+  return {
+    cfg, inodes: Array.from({ length: G }, () => Array(I).fill(null)),
+    data: Array.from({ length: G }, () => Array(D).fill(null)),
+    files: new Map(), order: [], rand: mulberry(cfg.seed || 1), usedSyms: new Set(),
+  };
+}
+const freeInodes = (fs, g) => fs.inodes[g].filter((x) => x === null).length;
+const dirCount = (fs, g) => fs.inodes[g].filter((x) => x && fs.files.get(x).type === "dir").length;
+function pickSym(fs, path) {
+  if (path === "/") return "/";
+  const base = path.split("/").filter(Boolean).pop() || "?";
+  const cands = [base[0], ...base.slice(1), ..."abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"];
+  for (const c of cands) if (!fs.usedSyms.has(c)) return c;
+  return "?";
+}
+function parentOf(path) { const p = path.split("/").filter(Boolean); p.pop(); return "/" + p.join("/"); }
+function groupMostFree(fs) {
+  let best = -1;
+  for (let g = 0; g < fs.cfg.G; g++) {
+    if (freeInodes(fs, g) === 0) continue;
+    if (best < 0 || freeInodes(fs, g) > freeInodes(fs, best) || (freeInodes(fs, g) === freeInodes(fs, best) && dirCount(fs, g) < dirCount(fs, best))) best = g;
+  }
+  return best;
+}
+function inodeGroup(fs, type, path) {
+  const { G, policy } = fs.cfg;
+  if (path === "/") return 0;
+  if (policy === "random") {
+    const ok = []; for (let g = 0; g < G; g++) if (freeInodes(fs, g) > 0) ok.push(g);
+    return ok.length ? ok[Math.floor(fs.rand() * ok.length)] : -1;
+  }
+  if (type === "dir" || policy === "spread") return groupMostFree(fs);
+  const pg = fs.files.get(parentOf(path)).igroup;
+  for (let k = 0; k < G; k++) { const g = (pg + k) % G; if (freeInodes(fs, g) > 0) return g; }
+  return -1;
+}
+function blockInGroup(fs, g, prev) {
+  const row = fs.data[g], C = Math.max(1, fs.cfg.C || 1);
+  if (prev && prev.g === g && prev.j + 1 < row.length && row[prev.j + 1] === null) return prev.j + 1;
+  for (let j = 0; j + C <= row.length; j++) {
+    let ok = true; for (let t = 0; t < C; t++) if (row[j + t] !== null) { ok = false; break; }
+    if (ok) return j;
+  }
+  return -1;
+}
+function allocBlock(fs, startG, prev) {
+  const G = fs.cfg.G;
+  for (let k = 0; k < G; k++) { const g = (startG + k) % G; const j = blockInGroup(fs, g, prev); if (j >= 0) return { g, j }; }
+  for (let k = 0; k < G; k++) { const g = (startG + k) % G; const j = fs.data[g].indexOf(null); if (j >= 0) return { g, j }; }
+  return null;
+}
+function applyOp(fs, o) {
+  const ev = { op: o.op, path: o.path, ok: true, cells: [], msg: "", why: "" };
+  const G = fs.cfg.G;
+  if (o.op === "bad") { ev.ok = false; ev.msg = "无法解析：" + o.path; return ev; }
+  if (o.op === "delete") {
+    const f = fs.files.get(o.path);
+    if (!f) { ev.ok = false; ev.msg = "不存在：" + o.path; return ev; }
+    fs.inodes[f.igroup][f.islot] = null;
+    for (const b of f.blocks) { fs.data[b.g][b.j] = null; ev.cells.push({ kind: "d", g: b.g, j: b.j }); }
+    ev.cells.push({ kind: "i", g: f.igroup, j: f.islot });
+    fs.files.delete(o.path); fs.usedSyms.delete(f.sym);
+    ev.file = f; return ev;
+  }
+  if (!o.path || o.path[0] !== "/") { ev.ok = false; ev.msg = "路径必须以 / 开头：" + o.path; return ev; }
+  if (fs.files.has(o.path)) { ev.ok = false; ev.msg = "已存在：" + o.path; return ev; }
+  if (o.path !== "/" && !fs.files.has(parentOf(o.path))) { ev.ok = false; ev.msg = "父目录不存在：" + parentOf(o.path); return ev; }
+  if (o.path !== "/" && fs.files.get(parentOf(o.path)).type !== "dir") { ev.ok = false; ev.msg = "父路径不是目录：" + parentOf(o.path); return ev; }
+  const type = o.op === "dir" ? "dir" : "file";
+  const freeBefore = Array.from({ length: G }, (_, g) => freeInodes(fs, g));
+  const g = inodeGroup(fs, type, o.path);
+  if (g < 0) { ev.ok = false; ev.msg = "inode 用完了"; return ev; }
+  ev.freeBefore = freeBefore;
+  const slot = fs.inodes[g].indexOf(null);
+  const sym = pickSym(fs, o.path);
+  const f = { path: o.path, type, sym, igroup: g, islot: slot, blocks: [], parent: o.path === "/" ? null : parentOf(o.path), id: fs.order.length };
+  fs.inodes[g][slot] = o.path; fs.usedSyms.add(sym); fs.files.set(o.path, f); fs.order.push(o.path);
+  ev.cells.push({ kind: "i", g, j: slot });
+  const n = type === "dir" ? 1 : o.size;
+  const L = fs.cfg.L || 0;
+  let prev = null, chunkG = g;
+  for (let b = 0; b < n; b++) {
+    if (L > 0 && b > 0 && b % L === 0) { chunkG = (chunkG + 1) % G; prev = null; }
+    const pos = allocBlock(fs, prev ? prev.g : chunkG, prev);
+    if (!pos) { ev.ok = false; ev.msg = "数据块用完了"; break; }
+    fs.data[pos.g][pos.j] = o.path; f.blocks.push(pos); prev = pos;
+    ev.cells.push({ kind: "d", g: pos.g, j: pos.j });
+  }
+  ev.file = f; return ev;
+}
+function addrI(fs, f) { return f.igroup * (fs.cfg.I + fs.cfg.D) + f.islot; }
+function addrD(fs, b) { return b.g * (fs.cfg.I + fs.cfg.D) + fs.cfg.I + b.j; }
+function spanOf(fs, list) {
+  const xs = [];
+  for (const f of list) { xs.push(addrI(fs, f)); for (const b of f.blocks) xs.push(addrD(fs, b)); }
+  return xs.length ? Math.max(...xs) - Math.min(...xs) : 0;
+}
+function metrics(fs) {
+  const files = [...fs.files.values()];
+  const filespan = {}, dirspan = {}, pdist = [];
+  for (const f of files) {
+    if (f.type === "file") filespan[f.path] = spanOf(fs, [f]);
+    if (f.parent) pdist.push(Math.abs(f.igroup - fs.files.get(f.parent).igroup));
+  }
+  for (const d of files.filter((x) => x.type === "dir")) {
+    const kids = files.filter((x) => x.parent === d.path);
+    if (kids.length) dirspan[d.path] = spanOf(fs, [d, ...kids]);
+  }
+  const avg = (o) => { const v = Object.values(o); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : 0; };
+  const same = pdist.filter((x) => x === 0).length;
+  return { filespan, dirspan, pdist, avgFile: avg(filespan), avgDir: avg(dirspan), sameFrac: pdist.length ? same / pdist.length : 0 };
+}
+function runAll(cfg, ops, upto) {
+  const fs = makeFS(cfg);
+  const evs = [applyOp(fs, { op: "dir", path: "/" })];
+  const n = upto == null ? ops.length : Math.min(upto, ops.length);
+  for (let k = 0; k < n; k++) evs.push(applyOp(fs, ops[k]));
+  return { fs, evs };
+}
+function mapText(fs, perRow) {
+  perRow = perRow || 10;
+  const lines = ["group inodes    data"];
+  const sym = (p) => (p === null ? "-" : fs.files.get(p).sym);
+  for (let g = 0; g < fs.cfg.G; g++) {
+    const ino = fs.inodes[g].map(sym).join("");
+    const dat = fs.data[g].map(sym).join("").match(new RegExp(".{1," + perRow + "}", "g")).join(" ");
+    lines.push(String(g).padStart(5) + " " + ino + " " + dat);
+  }
+  return lines.join("\n");
+}
+function pathDistance(a, b) {
+  if (a === b) return 0;
+  const A = a.split("/").filter(Boolean), B = b.split("/").filter(Boolean);
+  const da = A.slice(0, -1), db = B.slice(0, -1);
+  let c = 0; while (c < da.length && c < db.length && da[c] === db[c]) c++;
+  return Math.max(da.length - c, db.length - c) + 1;
+}
+function chunkKB(p, tpos, rate) { return rate * 1024 * (tpos / 1000) * p / (1 - p); }
+function rotationTime(n, S, k, delay) {
+  const slotOf = []; let pos = 0; const used = Array(S).fill(false);
+  for (let i = 0; i < S; i++) { while (used[pos % S]) pos++; slotOf.push(pos % S); used[pos % S] = true; pos += k + 1; }
+  let t = 0, ready = 0; const reads = [];
+  for (let i = 0; i < n; i++) {
+    const sl = slotOf[i % S];
+    let start = Math.ceil(ready - 1e-9);
+    const w = ((sl - (start % S)) % S + S) % S;
+    start += w;
+    reads.push({ block: i, slot: sl, issue: ready, start, end: start + 1, wait: start - ready });
+    t = start + 1; ready = t + delay;
+  }
+  return { t, slotOf, reads };
+}
+// ==== CORE END ====
+
+// ---------- 通用：把 fs 画成组 × (inode, data) 的格子 ----------
+function renderMap(fs, hl, freed) {
+  const key = (k, g, j) => k + g + ":" + j;
+  const hs = new Set((hl || []).map((c) => key(c.kind, c.g, c.j)));
+  const fr = new Set((freed || []).map((c) => key(c.kind, c.g, c.j)));
+  const cell = (p, kind, g, j, gap) => {
+    const f = p === null ? null : fs.files.get(p);
+    const cls = ["fc", f ? "own" : "", gap ? "gap" : "", hs.has(key(kind, g, j)) ? "hl" : "", fr.has(key(kind, g, j)) ? "freed" : ""].join(" ");
+    return h("span", { class: cls, style: f ? { background: color(f.id) } : null, title: f ? `${kind === "i" ? "inode" : "数据块"}：${f.path}` : (kind === "i" ? "空闲 inode" : "空闲数据块") }, f ? f.sym : "");
+  };
+  const wrap = h("div", { class: "fmap" });
+  wrap.append(h("div", { class: "frow head" }, h("span", { class: "glab" }, "组"), h("span", { class: "fseg", style: { width: `calc(${fs.cfg.I} * (var(--cw) + 1px))` } }, "inodes"), h("span", { class: "fseg" }, "data")));
+  for (let g = 0; g < fs.cfg.G; g++) {
+    wrap.append(h("div", { class: "frow" }, h("span", { class: "glab" }, String(g)),
+      h("span", { class: "fseg" }, fs.inodes[g].map((p, j) => cell(p, "i", g, j, false))),
+      h("span", { class: "fseg" }, fs.data[g].map((p, j) => cell(p, "d", g, j, j > 0 && j % 10 === 0)))));
+  }
+  return wrap;
+}
+function legendOf(fs) {
+  return [...fs.files.values()].map((f) => h("span", {}, h("i", { style: { background: color(f.id) } }), `${f.sym} = ${f.path}${f.type === "dir" ? "（目录）" : `（${f.blocks.length} 块）`}`));
+}
+
+// ---------- 静态图：盘片侧视、块组 ----------
+(function drawPlatters() {
+  const g = document.getElementById("platters41");
+  const cols = ["var(--c1)", "var(--c2)", "var(--c3)", "var(--c8)"];
+  for (let k = 0; k < 6; k++) {
+    const y = 50 + k * 30;
+    g.append(s("rect", { x: 110, y, width: 500, height: 8, rx: 2, class: "box" }));
+    for (let r = 0; r < 4; r++) {
+      g.append(s("rect", { x: 114 + r * 22, y: y - 2, width: 18, height: 12, rx: 2, style: `fill:${cols[r]}` }));
+      g.append(s("rect", { x: 588 - r * 22, y: y - 2, width: 18, height: 12, rx: 2, style: `fill:${cols[r]}` }));
+    }
+  }
+})();
+(function drawGroups() {
+  const g = document.getElementById("bgroups41");
+  for (let grp = 0; grp < 3; grp++) {
+    for (let b = 0; b < 8; b++) {
+      const x = 56 + (grp * 8 + b) * 26;
+      g.append(s("rect", { x, y: 36, width: 24, height: 34, rx: 3, style: `fill:${color(grp)};opacity:${grp === 1 ? 1 : 0.55}` }));
+    }
+    g.append(s("text", { x: 56 + grp * 208 + 104, y: 26, "text-anchor": "middle", "font-size": 13, text: "Group " + grp }));
+  }
+})();
+
+// ---------- 碎片化演示 ----------
+(function () {
+  const states = [
+    { cells: ["A1", "A2", "B1", "B2", "C1", "C2", "D1", "D2"], note: "初始：4 个文件 A、B、C、D，各占 2 个连续块，整个数据区是满的。" },
+    { cells: ["A1", "A2", "", "", "C1", "C2", "", ""], note: "删除 B 和 D：空闲链表现在指向两段各 2 块的空闲空间，而不是一整段 4 块。" },
+    { cells: ["A1", "A2", "E1", "E2", "C1", "C2", "E3", "E4"], note: "分配 4 块的文件 E：老文件系统只是依次拿空闲链表上的下一个块，于是 E 被拆成两段。" },
+    { cells: ["A1", "A2", "E1", "E2", "C1", "C2", "E3", "E4"], note: "顺序读 E：先读 E1、E2，然后必须越过 C1、C2 定位到 E3，再读 E3、E4。拿不到磁盘的峰值（顺序）性能。这种情况在老 UNIX 文件系统里经常发生。", seek: true },
+  ];
+  const host = document.getElementById("frag-cells");
+  const who = (c) => (c ? "ABCDE".indexOf(c[0]) : -1);
+  stepper(document.getElementById("frag-stepper"), {
+    steps: states.length,
+    render(i) {
+      const st = states[i];
+      host.replaceChildren(...st.cells.map((c, k) => h("span", { class: "cell" + (st.seek && (k === 3 || k === 6) ? " miss" : ""), style: c ? { background: color(who(c)), color: "#fff", borderColor: "transparent" } : null }, c || "空闲")));
+      document.getElementById("frag-narr").textContent = st.note;
+      const runs = st.cells.reduce((acc, c, k) => acc + (!c && (k === 0 || st.cells[k - 1]) ? 1 : 0), 0);
+      document.getElementById("frag-free").textContent = runs;
+      const hasE = st.cells.some((c) => c && c[0] === "E");
+      document.getElementById("frag-seg").textContent = hasE ? "2" : "–";
+      document.getElementById("frag-seek").textContent = hasE ? "2" : "–";
+    },
+  });
+})();
+
+// ---------- 图 4、图 6：由核心代码生成 ----------
+const BOOK_OPS = "dir /a\ndir /b\nfile /a/c 2\nfile /a/d 2\nfile /a/e 2\nfile /b/f 2";
+function miniMap(host, title, cfg, text) {
+  const r = runAll(cfg, parseOps(text));
+  host.append(h("div", {}, h("h4", {}, title), h("div", { class: "stage compact" }, renderMap(r.fs))));
+}
+miniMap(document.getElementById("fig-policy"), "FFS 策略", { G: 8, I: 10, D: 10, L: 0, C: 1, policy: "ffs" }, BOOK_OPS);
+miniMap(document.getElementById("fig-policy"), "对照：spread（inode 均摊到各组）", { G: 8, I: 10, D: 10, L: 0, C: 1, policy: "spread" }, BOOK_OPS);
+miniMap(document.getElementById("fig-large"), "无大文件例外", { G: 3, I: 10, D: 40, L: 0, C: 1, policy: "ffs" }, "file /a 30");
+miniMap(document.getElementById("fig-large"), "大文件例外，chunk = 5 块", { G: 7, I: 10, D: 40, L: 5, C: 1, policy: "ffs" }, "file /a 30");
+
+// ---------- FFS 模拟器 ----------
+const PRESETS = {
+  book: { G: 8, I: 10, D: 10, L: 0, C: 1, ops: BOOK_OPS },
+  big0: { G: 7, I: 10, D: 40, L: 0, C: 1, ops: "file /a 30" },
+  big5: { G: 7, I: 10, D: 40, L: 5, C: 1, ops: "file /a 30" },
+  multi: { G: 8, I: 10, D: 30, L: 0, C: 1, ops: ["dir /src", "dir /doc", "dir /bin",
+    "file /src/main.c 3", "file /doc/readme 1", "file /bin/cat 4", "file /src/util.c 2", "file /doc/guide 2", "file /bin/kill 3",
+    "file /src/fs.c 4", "file /doc/notes 1", "file /bin/vi 4", "file /src/io.c 1", "file /doc/todo 1", "file /bin/echo 2",
+    "file /src/lex.c 2", "file /doc/x.md 2", "file /bin/who 1", "file /src/parse.c 3", "file /doc/y.md 1", "file /bin/zsh 4"].join("\n") },
+  frag: { G: 4, I: 10, D: 30, L: 0, C: 1, ops: "file /a 2\nfile /b 2\nfile /c 2\nfile /d 2\nfile /e 2\nfile /f 2\nfile /g 2\nfile /h 2\ndelete /a\ndelete /c\ndelete /e\ndelete /g\nfile /i 8" },
+};
+const $ = (id) => document.getElementById(id);
+const clampInt = (el, lo, hi) => { let v = parseInt(el.value, 10); if (!Number.isFinite(v)) v = lo; v = Math.max(lo, Math.min(hi, v)); el.value = v; return v; };
+let ffsOps = [];
+function ffsCfg(policy) {
+  return { G: clampInt($("ffs-G"), 2, 16), I: clampInt($("ffs-I"), 2, 32), D: clampInt($("ffs-D"), 4, 80), L: clampInt($("ffs-L"), 0, 200), C: clampInt($("ffs-C"), 1, 10), seed: clampInt($("ffs-seed"), 1, 9999), policy: policy || $("ffs-policy").value };
+}
+const polName = { ffs: "FFS", spread: "spread", random: "random" };
+function explain(fs, ev) {
+  if (!ev.ok) return `⚠ ${ev.msg}`;
+  const f = ev.file, cfg = fs.cfg;
+  if (ev.op === "delete") return `删除 ${f.path}：释放 ${f.igroup} 号组的 inode 和它的 ${f.blocks.length} 个数据块（红框）。这些空洞之后可能被别的文件"见缝插针"地用掉。`;
+  const groupsUsed = [...new Set(f.blocks.map((b) => b.g))];
+  const dataTxt = f.blocks.length ? `数据块落在 ${groupsUsed.map((g) => g + " 号组").join("、")}` : "没有数据块";
+  let why;
+  if (f.path === "/") why = "根目录固定放在 0 号组。";
+  else if (cfg.policy === "random") why = `random 策略：在还有空闲 inode 的组里随机挑中了 ${f.igroup} 号组。`;
+  else if (f.type === "dir" || cfg.policy === "spread") {
+    const fb = ev.freeBefore;
+    why = `${f.type === "dir" ? "目录" : "spread 策略下的文件"}：找空闲 inode 最多的组——${f.igroup} 号组有 ${fb[f.igroup]} 个空闲 inode${fb.filter((x) => x === fb[f.igroup]).length > 1 ? "（并列时取目录少、编号小的）" : ""}。`;
+  } else {
+    const pg = fs.files.get(f.parent).igroup;
+    why = pg === f.igroup ? `FFS：普通文件跟着父目录 ${f.parent} 放进 ${pg} 号组。` : `FFS：父目录 ${f.parent} 在 ${pg} 号组，但那里的 inode 用完了，只好往后找到 ${f.igroup} 号组。`;
+  }
+  let extra = "";
+  if (f.type === "file" && cfg.L > 0 && f.blocks.length > cfg.L) extra = ` 大文件例外：每 ${cfg.L} 块换到下一个组。`;
+  else if (groupsUsed.some((g) => g !== f.igroup)) extra = " inode 所在组的数据块不够，溢出到了后面的组。";
+  return `创建${f.type === "dir" ? "目录" : "文件"} ${f.path}（符号 ${f.sym}）。${why} inode 放在该组第 ${f.islot} 个位置，${dataTxt}。${extra}`;
+}
+function ffsRender(i) {
+  const cfg = ffsCfg();
+  const r = runAll(cfg, ffsOps, i);
+  const ev = r.evs[r.evs.length - 1];
+  const freed = ev.op === "delete" ? ev.cells : [];
+  $("ffs-map").replaceChildren(renderMap(r.fs, ev.op === "delete" ? [] : ev.cells, freed));
+  $("ffs-legend").replaceChildren(...legendOf(r.fs));
+  $("ffs-narr").textContent = i === 0 ? "初始状态：只有根目录 /（inode 与 1 个数据块都在 0 号组）。点「下一步」逐条执行命令。" : `第 ${i} 条命令 · ` + explain(r.fs, ev);
+  const m = metrics(r.fs);
+  $("ffs-s-dir").textContent = m.avgDir.toFixed(1);
+  $("ffs-s-file").textContent = m.avgFile.toFixed(1);
+  $("ffs-s-same").textContent = Math.round(m.sameFrac * 100) + "%";
+  const usedI = r.fs.inodes.flat().filter((x) => x !== null).length, usedD = r.fs.data.flat().filter((x) => x !== null).length;
+  $("ffs-s-used").textContent = `${usedI} / ${usedD}`;
+  const ds = Object.entries(m.dirspan).map(([k, v]) => `dirspan(${k}) = ${v}`).join("\n");
+  $("ffs-text").textContent = mapText(r.fs) + "\n\n" + (ds || "（还没有非空目录）");
+}
+function ffsCompare() {
+  const cur = $("ffs-policy").value;
+  const rows = [], dists = {};
+  for (const p of ["ffs", "spread", "random"]) {
+    const r = runAll(ffsCfg(p), ffsOps);
+    const m = metrics(r.fs);
+    dists[p] = m.pdist;
+    const avgpd = m.pdist.length ? m.pdist.reduce((a, b) => a + b, 0) / m.pdist.length : 0;
+    rows.push(h("tr", { class: p === cur ? "cur" : "" }, h("td", {}, polName[p]), h("td", { class: "num" }, m.avgDir.toFixed(1)), h("td", { class: "num" }, m.avgFile.toFixed(1)), h("td", { class: "num" }, Math.round(m.sameFrac * 100) + "%"), h("td", { class: "num" }, avgpd.toFixed(2))));
+  }
+  $("ffs-cmp").replaceChildren(...rows);
+  drawHist($("ffs-hist"), dists, ffsCfg().G);
+}
+function drawHist(host, dists, G) {
+  const pols = ["ffs", "spread", "random"];
+  const maxD = Math.max(1, ...pols.flatMap((p) => dists[p]));
+  const nb = Math.min(G, maxD + 1);
+  const counts = pols.map((p) => { const c = Array(nb).fill(0); for (const d of dists[p]) c[Math.min(d, nb - 1)]++; return c; });
+  const tot = Math.max(1, ...pols.map((p) => dists[p].length));
+  const W = Math.max(360, 60 + nb * 70), H = 190, x0 = 44, y0 = 150, bw = 18;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "文件与父目录的组距离分布" });
+  svg.append(s("text", { x: x0, y: 14, "font-size": 12.5, "font-weight": 600, text: "文件（及子目录）与父目录相隔几个组：各策略的分布" }));
+  for (let t = 0; t <= 4; t++) {
+    const y = y0 - t * 30;
+    svg.append(s("line", { x1: x0, x2: W - 10, y1: y, y2: y, style: "stroke:var(--border)" }));
+    svg.append(s("text", { x: x0 - 6, y: y + 4, "text-anchor": "end", "font-size": 10.5, class: "t-muted", text: t * 25 + "%" }));
+  }
+  for (let d = 0; d < nb; d++) {
+    const cx = x0 + 20 + d * 70;
+    counts.forEach((c, k) => {
+      const hgt = (c[d] / tot) * 120;
+      svg.append(s("rect", { x: cx + k * (bw + 2), y: y0 - hgt, width: bw, height: Math.max(0, hgt), style: `fill:${color(k)}` }, s("title", { text: `${polName[pols[k]]}：距离 ${d}${d === nb - 1 && nb < maxD + 1 ? "+" : ""} 有 ${c[d]} 个` })));
+    });
+    svg.append(s("text", { x: cx + 29, y: y0 + 16, "text-anchor": "middle", "font-size": 11, class: "mono", text: d === nb - 1 && nb < maxD + 1 ? d + "+" : String(d) }));
+  }
+  svg.append(s("text", { x: x0 + (W - x0) / 2, y: y0 + 34, "text-anchor": "middle", "font-size": 11, class: "t-muted", text: "组距离 |group(文件) − group(父目录)|" }));
+  pols.forEach((p, k) => {
+    svg.append(s("rect", { x: W - 230 + k * 75, y: 24, width: 10, height: 10, style: `fill:${color(k)}` }));
+    svg.append(s("text", { x: W - 216 + k * 75, y: 33, "font-size": 11, text: polName[p] }));
+  });
+  host.replaceChildren(h("div", { class: "table-wrap" }, svg));
+}
+const ffsStep = stepper($("ffs-stepper"), { steps: () => ffsOps.length + 1, render: ffsRender, autoplayMs: 800 });
+function ffsLoad(reset) {
+  ffsOps = parseOps($("ffs-ops").value);
+  const bad = ffsOps.filter((o) => o.op === "bad");
+  $("ffs-err").textContent = bad.length ? `有 ${bad.length} 行无法解析（会被跳过并提示）` : `共 ${ffsOps.length} 条命令`;
+  ffsCompare();
+  if (reset) ffsStep.reset(); else ffsStep.refresh();
+}
+function ffsPreset(name) {
+  const p = PRESETS[name];
+  $("ffs-G").value = p.G; $("ffs-I").value = p.I; $("ffs-D").value = p.D; $("ffs-L").value = p.L; $("ffs-C").value = p.C;
+  $("ffs-ops").value = p.ops;
+  ffsLoad(true);
+  ffsStep.go(ffsOps.length);
+}
+document.querySelectorAll("#sim-ffs [data-preset]").forEach((b) => (b.onclick = () => ffsPreset(b.dataset.preset)));
+$("ffs-run").onclick = () => ffsLoad(true);
+["ffs-policy", "ffs-G", "ffs-I", "ffs-D", "ffs-L", "ffs-C", "ffs-seed"].forEach((id) => $(id).addEventListener("change", () => ffsLoad(false)));
+$("ffs-ops").value = PRESETS.book.ops;
+ffsLoad(true);
+
+// ---------- SEER 路径距离 ----------
+const TRACES = {
+  build: (() => {
+    const L = ["/usr/include/stdio.h"], mods = ["main", "fs", "io", "lex", "parse", "util"];
+    for (const m of mods) L.push(`/home/u/proj/src/${m}.c`, `/home/u/proj/src/${m}.h`, `/home/u/proj/include/defs.h`, `/home/u/proj/obj/${m}.o`);
+    for (const m of mods) L.push(`/home/u/proj/obj/${m}.o`);
+    L.push("/usr/lib/libc.a", "/home/u/proj/bin/app", "/home/u/proj/bin/app");
+    return L.join("\n");
+  })(),
+  photo: (() => {
+    const L = [];
+    for (let k = 1; k <= 10; k++) { L.push(`/home/u/photos/2024/trip/img${String(k).padStart(3, "0")}.jpg`); if (k % 3 === 0) L.push(`/home/u/photos/2024/trip/img${String(k).padStart(3, "0")}.jpg`); }
+    for (let k = 1; k <= 5; k++) L.push(`/home/u/photos/2023/home/img${String(k).padStart(3, "0")}.jpg`);
+    L.push("/home/u/photos/index.db", "/home/u/photos/2024/trip/img001.jpg");
+    return L.join("\n");
+  })(),
+  mixed: ["/home/u/.bashrc", "/etc/passwd", "/home/u/notes/todo.txt", "/home/u/notes/todo.txt", "/home/u/notes/ideas.txt", "/usr/bin/vim", "/usr/share/vim/vimrc",
+    "/home/u/notes/ideas.txt", "/home/u/mail/inbox", "/home/u/mail/sent", "/home/u/proj/src/a.c", "/home/u/proj/src/b.c", "/home/u/proj/obj/a.o", "/tmp/cc1.s",
+    "/home/u/proj/src/a.c", "/etc/hosts", "/home/u/.bashrc", "/home/u/music/song1.mp3", "/home/u/music/song2.mp3", "/home/u/music/song3.mp3"].join("\n"),
+};
+let seerPaths = [], seerD = [], seerRand = [];
+function cumul(ds, maxX) { const out = []; for (let x = 0; x <= maxX; x++) out.push(ds.length ? ds.filter((d) => d <= x).length / ds.length : 0); return out; }
+function seerCompute() {
+  seerPaths = $("seer-text").value.split("\n").map((x) => x.trim()).filter((x) => x.startsWith("/"));
+  seerD = [];
+  for (let k = 1; k < seerPaths.length; k++) seerD.push(pathDistance(seerPaths[k - 1], seerPaths[k]));
+  // Random：把同一批访问打乱 30 次，汇总所有相邻距离
+  seerRand = [];
+  const r = rng(2024);
+  for (let t = 0; t < 30; t++) {
+    const a = seerPaths.slice();
+    for (let k = a.length - 1; k > 0; k--) { const j = Math.floor(r() * (k + 1)); [a[k], a[j]] = [a[j], a[k]]; }
+    for (let k = 1; k < a.length; k++) seerRand.push(pathDistance(a[k - 1], a[k]));
+  }
+  const pct = (x) => Math.round(x * 100) + "%";
+  const frac = (ds, f) => (ds.length ? ds.filter(f).length / ds.length : 0);
+  $("seer-d0").textContent = pct(frac(seerD, (d) => d === 0));
+  $("seer-d1").textContent = pct(frac(seerD, (d) => d <= 1));
+  $("seer-d2").textContent = pct(frac(seerD, (d) => d === 2));
+  $("seer-r1").textContent = pct(frac(seerRand, (d) => d <= 1));
+}
+function seerRender(i) {
+  const maxX = Math.max(6, ...seerD, ...seerRand);
+  const W = 560, H = 250, x0 = 50, y0 = 200, pw = 480, ph = 170;
+  const X = (x) => x0 + (x / maxX) * pw, Y = (v) => y0 - v * ph;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "路径距离累积分布" });
+  for (let t = 0; t <= 5; t++) {
+    svg.append(s("line", { x1: x0, x2: x0 + pw, y1: Y(t / 5), y2: Y(t / 5), style: "stroke:var(--border)" }));
+    svg.append(s("text", { x: x0 - 6, y: Y(t / 5) + 4, "text-anchor": "end", "font-size": 10.5, class: "t-muted", text: t * 20 + "%" }));
+  }
+  for (let x = 0; x <= maxX; x++) svg.append(s("text", { x: X(x), y: y0 + 16, "text-anchor": "middle", "font-size": 10.5, class: "t-muted mono", text: x }));
+  svg.append(s("text", { x: x0 + pw / 2, y: y0 + 36, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", text: "路径距离（Path Difference）" }));
+  svg.append(s("text", { x: 14, y: y0 - ph / 2, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", transform: `rotate(-90 14 ${y0 - ph / 2})`, text: "累积比例" }));
+  const upto = seerD.slice(0, i);
+  const series = [{ name: "Random（打乱顺序）", c: color(1), v: cumul(seerRand, maxX), dash: "5 4" }, { name: `Trace（前 ${i} 对）`, c: color(0), v: cumul(upto, maxX) }];
+  series.forEach((se, k) => {
+    const pts = se.v.map((v, x) => `${X(x)},${Y(v)}`).join(" ");
+    svg.append(s("polyline", { points: pts, style: `fill:none;stroke:${se.c};stroke-width:2.5${se.dash ? ";stroke-dasharray:" + se.dash : ""}` }));
+    se.v.forEach((v, x) => svg.append(s("circle", { cx: X(x), cy: Y(v), r: 3, style: `fill:${se.c}` })));
+    svg.append(s("rect", { x: x0 + 10, y: 12 + k * 16, width: 12, height: 4, style: `fill:${se.c}` }));
+    svg.append(s("text", { x: x0 + 28, y: 18 + k * 16, "font-size": 11.5, text: se.name }));
+  });
+  $("seer-plot").replaceChildren(svg);
+  if (i === 0) $("seer-narr").textContent = `共 ${seerPaths.length} 次 open，${seerD.length} 对相邻访问。点「下一步」逐对计算距离；虚线是把同一批访问随机打乱后的分布。`;
+  else {
+    const a = seerPaths[i - 1], b = seerPaths[i], d = seerD[i - 1];
+    const A = a.split("/").filter(Boolean).slice(0, -1), B = b.split("/").filter(Boolean).slice(0, -1);
+    let c = 0; while (c < A.length && c < B.length && A[c] === B[c]) c++;
+    const anc = "/" + A.slice(0, c).join("/");
+    $("seer-narr").textContent = d === 0 ? `${a} → 再次打开同一个文件，距离 0。` : `${a} → ${b}：共同祖先目录是 ${anc}，距离 ${d}。${d === 1 ? "同一目录，FFS 会把它们放在同一组。" : d === 2 ? "像 proj/src 与 proj/obj，FFS 的策略照顾不到。" : ""}`;
+  }
+}
+const seerStep = stepper($("seer-stepper"), { steps: () => Math.max(1, seerD.length + 1), render: seerRender, autoplayMs: 500 });
+function seerLoad(name) { if (name) $("seer-text").value = TRACES[name]; seerCompute(); seerStep.reset(); seerStep.go(seerD.length); }
+document.querySelectorAll("#sim-seer [data-trace]").forEach((b) => (b.onclick = () => seerLoad(b.dataset.trace)));
+$("seer-run").onclick = () => seerLoad();
+$("seer-text").value = TRACES.build;
+seerCompute();
+queueMicrotask(() => seerStep.go(seerD.length));
+
+// ---------- chunk 计算器 ----------
+function fmtKB(kb) { return kb >= 1024 ? (kb / 1024).toFixed(kb >= 10240 ? 1 : 2) + " MB" : kb.toFixed(1) + " KB"; }
+function chunkRender() {
+  const t = Math.max(0.1, parseFloat($("ch-t").value) || 10), r = Math.max(1, parseFloat($("ch-r").value) || 40), p = parseFloat($("ch-p").value) / 100;
+  $("ch-pv").textContent = (p * 100).toFixed(1).replace(/\.0$/, "") + "%";
+  const W = 600, H = 270, x0 = 60, y0 = 225, pw = 510, ph = 195;
+  const lo = 0, hi = 6; // log10(KB)：1KB … 1000000KB
+  const X = (q) => x0 + q * pw, Y = (kb) => y0 - ((Math.log10(Math.max(kb, 1)) - lo) / (hi - lo)) * ph;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: W, role: "img", "aria-label": "目标带宽比例与所需 chunk 大小" });
+  const ticks = [[1, "1K"], [32, "32K"], [1024, "1M"], [10240, "10M"], [102400, "100M"], [1024000, "1000M"]];
+  for (const [kb, lab] of ticks) {
+    svg.append(s("line", { x1: x0, x2: x0 + pw, y1: Y(kb), y2: Y(kb), style: "stroke:var(--border)" }));
+    svg.append(s("text", { x: x0 - 6, y: Y(kb) + 4, "text-anchor": "end", "font-size": 10.5, class: "t-muted mono", text: lab }));
+  }
+  for (let q = 0; q <= 4; q++) svg.append(s("text", { x: X(q / 4), y: y0 + 16, "text-anchor": "middle", "font-size": 10.5, class: "t-muted", text: q * 25 + "%" }));
+  svg.append(s("text", { x: x0 + pw / 2, y: y0 + 36, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", text: "期望达到的峰值带宽比例（Percent Bandwidth Desired）" }));
+  svg.append(s("text", { x: 14, y: y0 - ph / 2, "text-anchor": "middle", "font-size": 11.5, class: "t-muted", transform: `rotate(-90 14 ${y0 - ph / 2})`, text: "所需 chunk（对数刻度）" }));
+  const pts = [];
+  for (let q = 0.005; q <= 0.9951; q += 0.005) pts.push(`${X(q)},${Math.max(y0 - ph, Y(chunkKB(q, t, r)))}`);
+  svg.append(s("polyline", { points: pts.join(" "), style: `fill:none;stroke:${color(0)};stroke-width:2.5` }));
+  const mark = (q, c, lab, big) => {
+    const kb = chunkKB(q, t, r), y = Y(kb);
+    if (y < y0 - ph - 2) return;
+    svg.append(s("circle", { cx: X(q), cy: y, r: big ? 6 : 4, style: `fill:${c}` }));
+    svg.append(s("text", { x: X(q) - 8, y: y - 9, "text-anchor": "end", "font-size": 11.5, "font-weight": big ? 700 : 400, text: lab }));
+  };
+  if (Math.abs(p - 0.5) > 0.04) mark(0.5, "var(--fg)", `50%, ${fmtKB(chunkKB(0.5, t, r))}`);
+  if (Math.abs(p - 0.9) > 0.04) mark(0.9, "var(--fg)", `90%, ${fmtKB(chunkKB(0.9, t, r))}`);
+  mark(p, color(1), `${(p * 100).toFixed(1)}%, ${fmtKB(chunkKB(p, t, r))}`, true);
+  $("ch-plot").replaceChildren(svg);
+  const kb = chunkKB(p, t, r), xfer = (kb / 1024 / r) * 1000;
+  $("ch-narr").textContent = `要拿到 ${(p * 100).toFixed(1)}% 的峰值带宽：每次 ${t} ms 的定位之后需要传输 ${xfer.toFixed(1)} ms（是定位时间的 ${(p / (1 - p)).toFixed(2)} 倍），以 ${r} MB/s 计就是 ${kb.toFixed(1)} KB ≈ ${fmtKB(kb)}。`;
+  $("ch-50").textContent = fmtKB(chunkKB(0.5, t, r));
+  $("ch-90").textContent = fmtKB(chunkKB(0.9, t, r));
+  $("ch-99").textContent = fmtKB(chunkKB(0.99, t, r));
+  const x4 = (4 / r) * 1000;
+  $("ch-ffs").textContent = ((x4 / (x4 + t)) * 100).toFixed(1) + "%";
+}
+["ch-t", "ch-r", "ch-p"].forEach((id) => $(id).addEventListener("input", chunkRender));
+$("ch-book").onclick = () => { $("ch-t").value = 10; $("ch-r").value = 40; $("ch-p").value = 50; chunkRender(); };
+chunkRender();
+
+// ---------- 子块 ----------
+function subRender() {
+  const sz = parseInt($("sub-size").value, 10);
+  $("sub-sv").textContent = sz + " B";
+  const nb = Math.ceil(sz / 4096), a = nb * 4096;
+  const full = Math.floor(sz / 4096), tail = sz - full * 4096, frags = Math.ceil(tail / 512), b = full * 4096 + frags * 512;
+  $("sub-a").textContent = `${a} / ${a - sz} B`;
+  $("sub-b").textContent = `${b} / ${b - sz} B`;
+  const W = 620, rowH = 34, svg = s("svg", { viewBox: `0 0 ${W} 120`, width: W, role: "img", "aria-label": "子块分配示意" });
+  const scale = 540 / 12288;
+  const drawRow = (y, title, pieces) => {
+    svg.append(s("text", { x: 0, y: y + 22, "font-size": 12, text: title }));
+    for (const pc of pieces) {
+      svg.append(s("rect", { x: 76 + pc.off * scale, y, width: Math.max(1, pc.len * scale - 1), height: rowH, rx: 2, class: "box" }));
+      const used = Math.max(0, Math.min(pc.len, sz - pc.off));
+      if (used > 0) svg.append(s("rect", { x: 76 + pc.off * scale, y, width: Math.max(1, used * scale - 1), height: rowH, rx: 2, style: `fill:${color(0)}` }));
+    }
+  };
+  const A = []; for (let k = 0; k < nb; k++) A.push({ off: k * 4096, len: 4096 });
+  const B = []; for (let k = 0; k < full; k++) B.push({ off: k * 4096, len: 4096 }); for (let k = 0; k < frags; k++) B.push({ off: full * 4096 + k * 512, len: 512 });
+  drawRow(8, "只用 4KB", A);
+  drawRow(56, "加子块", B);
+  svg.append(s("text", { x: 76, y: 112, "font-size": 11, class: "t-muted", text: `蓝色 = 文件数据，灰色 = 分配了但浪费的空间。子块方案：${full} 个 4KB 块 + ${frags} 个 512B 子块。` }));
+  $("sub-plot").replaceChildren(svg);
+}
+$("sub-size").addEventListener("input", subRender);
+document.querySelectorAll("#sim-sub [data-sz]").forEach((bt) => (bt.onclick = () => { $("sub-size").value = bt.dataset.sz; subRender(); }));
+subRender();
+
+// ---------- 参数化布局：磁盘图 ----------
+function diskSVG(slotOf, readUpTo, cur, title) {
+  const S = slotOf.length, R = 92, cx = 110, cy = 134;
+  const svg = s("svg", { viewBox: "0 0 220 258", width: 220, role: "img", "aria-label": title });
+  svg.append(s("text", { x: cx, y: 14, "text-anchor": "middle", "font-size": 12.5, "font-weight": 600, text: title }));
+  const blockAt = Array(S); slotOf.forEach((sl, b) => (blockAt[sl] = b));
+  for (let sl = 0; sl < S; sl++) {
+    const a0 = (-90 + sl * (360 / S)) * Math.PI / 180, a1 = (-90 + (sl + 1) * (360 / S)) * Math.PI / 180, r0 = 52;
+    const P = (r, a) => `${cx + r * Math.cos(a)},${cy + r * Math.sin(a)}`;
+    const b = blockAt[sl];
+    const done = b < readUpTo, now = b === cur;
+    svg.append(s("path", { d: `M${P(r0, a0)} L${P(R, a0)} A${R},${R} 0 0 1 ${P(R, a1)} L${P(r0, a1)} A${r0},${r0} 0 0 0 ${P(r0, a0)} Z`, style: `fill:${now ? color(1) : done ? color(0) : "var(--surface-2)"};stroke:var(--border)` }));
+    const am = (a0 + a1) / 2;
+    svg.append(s("text", { x: cx + 72 * Math.cos(am), y: cy + 72 * Math.sin(am) + 4, "text-anchor": "middle", "font-size": 12.5, class: "mono", style: done || now ? "fill:#fff;font-weight:600" : "", text: b }));
+  }
+  svg.append(s("circle", { cx, cy, r: 14, class: "box-strong" }));
+  svg.append(s("text", { x: cx, y: cy + 30, "text-anchor": "middle", "font-size": 10, class: "t-muted", text: "Spindle" }));
+  svg.append(s("path", { d: `M${cx - 6} ${cy - R - 12} L${cx + 6} ${cy - R - 12} L${cx} ${cy - R - 2} Z`, style: "fill:var(--bad)" }));
+  svg.append(s("text", { x: cx + 12, y: cy - R - 4, "font-size": 10, class: "t-muted", text: "磁头" }));
+  svg.append(s("text", { x: cx, y: 252, "text-anchor": "middle", "font-size": 10.5, class: "t-muted", text: "数字 = 逻辑块号（顺时针为物理顺序）" }));
+  return svg;
+}
+(function () {
+  const host = document.getElementById("fig-disks");
+  const wrap = h("div", { style: { display: "flex", gap: "20px", justifyContent: "center", flexWrap: "wrap" } });
+  wrap.append(diskSVG(rotationTime(12, 12, 0, 0).slotOf, 0, -1, "标准布局"), diskSVG(rotationTime(12, 12, 1, 0).slotOf, 0, -1, "参数化布局（跳 1 块）"));
+  host.append(wrap);
+})();
+let skRes = null;
+function skCompute() {
+  const k = parseInt($("sk-k").value, 10), d = parseFloat($("sk-d").value);
+  $("sk-dv").textContent = d.toFixed(1);
+  skRes = rotationTime(12, 12, k, d);
+  $("sk-rot").textContent = (skRes.t / 12).toFixed(2);
+  $("sk-bw").textContent = ((12 / skRes.t) * 100).toFixed(1) + "%";
+}
+function skRender(i) {
+  const k = parseInt($("sk-k").value, 10), d = parseFloat($("sk-d").value);
+  const rd = skRes.reads[i];
+  $("sk-plot").replaceChildren(h("div", { style: { display: "flex", justifyContent: "center" } }, diskSVG(skRes.slotOf, i, i, `跳 ${k} 块 · 延迟 ${d.toFixed(1)}`)));
+  const lateness = rd.wait;
+  $("sk-narr").textContent = i === 0
+    ? `读块 0：t=0 时磁头正好在它上面，读完用 1 个块时间（t=1）。之后主机要 ${d.toFixed(1)} 个块时间才能发出下一个请求。`
+    : `读块 ${i}（物理槽位 ${rd.slot}）：请求在 t=${rd.issue.toFixed(1)} 发出，等了 ${lateness.toFixed(1)} 个块时间块 ${i} 才转到磁头下，t=${rd.end} 读完。${lateness >= 10 ? "请求发得太晚，块已经转过去了，只好等将近一整圈！" : lateness > 1.5 ? "中间空转了几个槽位。" : "几乎没有等待。"}`;
+}
+const skStep = stepper($("sk-stepper"), { steps: 12, render: skRender, autoplayMs: 700 });
+["sk-k", "sk-d"].forEach((id) => $(id).addEventListener("input", () => { skCompute(); skStep.refresh(); }));
+skCompute();
+})();
+</script>
+</body></html>
