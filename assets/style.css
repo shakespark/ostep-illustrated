@@ -198,7 +198,9 @@ details.reveal > div { border-left: 3px solid var(--ok); padding: 4px 0 4px 14px
 
 /* 实验 */
 .lab { border: 1px dashed var(--border); border-radius: var(--radius); padding: 14px 18px; margin: 18px 0; background: var(--surface); }
-.lab::before { content: "动手实验 · 在 WSL 终端运行"; display: block; font-size: 12px; font-weight: 700; color: var(--ok); letter-spacing: .05em; margin-bottom: 6px; }
+.lab::before { content: "动手实验 · 在 Linux / WSL 终端运行"; display: block; font-size: 12px; font-weight: 700; color: var(--ok); letter-spacing: .05em; margin-bottom: 6px; }
+.lab-src { font-size: 13px; color: var(--muted); margin: 0 0 10px; }
+.lab-src code { overflow-wrap: anywhere; }
 
 /* ---------- 页脚导航 ---------- */
 .chapter-nav { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 56px; }

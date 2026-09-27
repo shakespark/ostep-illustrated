@@ -197,6 +197,19 @@
     const all = document.querySelectorAll(".mcq"), done = document.querySelectorAll(".mcq.answered"), right = document.querySelectorAll('.mcq[data-correct="1"]');
     document.querySelectorAll(".quiz-score").forEach((el) => (el.textContent = `已答 ${done.length} / ${all.length}，答对 ${right.length}`));
   }
+  // 实验块：从 "cd labs/<slug>" 里认出实验目录，在块首加上 GitHub 源码链接和获取方式
+  const REPO = "https://github.com/shakespark/ostep-illustrated";
+  function wireLabs(root) {
+    root.querySelectorAll(".lab").forEach((lab) => {
+      const m = lab.textContent.match(/labs\/([0-9a-z-]+)/);
+      if (!m || lab.querySelector(".lab-src")) return;
+      const ext = { target: "_blank", rel: "noopener" };
+      lab.prepend(h("p", { class: "lab-src" },
+        "代码：", h("a", { href: `${REPO}/tree/main/labs/${m[1]}`, ...ext }, `GitHub 上的 labs/${m[1]} ↗`),
+        "。下面的命令在仓库根目录运行，先用 ", h("code", {}, `git clone ${REPO}.git`),
+        " 或", h("a", { href: `${REPO}/archive/refs/heads/main.zip` }, "下载 zip"), " 获取整个仓库。"));
+    });
+  }
   function wireCopy(root) {
     root.querySelectorAll("pre").forEach((pre) => {
       if (pre.querySelector(".copy")) return;
@@ -221,6 +234,7 @@
   document.addEventListener("DOMContentLoaded", () => {
     mountChrome();
     wireMcq(document);
+    wireLabs(document);
     wireCopy(document);
     updateScore();
   });
