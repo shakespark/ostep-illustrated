@@ -25,7 +25,7 @@ jobs:
           # 服务器端用 rrsync 把这把钥匙限制在 /var/www/tutorials 内，所以目标路径是相对的 ostep/
           # 跨境线路偶尔会抖，失败重试两次
           for i in 1 2 3; do
-            rsync -rlc --delete --chmod=D755,F644 --timeout=60 \
+            rsync -rlcz --delete --chmod=D755,F644 --timeout=60 \
               --exclude=/.git/ --exclude=/.github/ --exclude=/.gitignore \
               --exclude=/source/ --exclude=/AUTHORING.md --exclude=/NEXT_STEPS.md --exclude=/README.md \
               -e "ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o ConnectTimeout=20" \
